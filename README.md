@@ -42,8 +42,7 @@ freq, r2 = tlsf.autopower(
     fmax=12, #default value
     nterms=3, #default number of terms
     oversampling=5, #frequency density, relative to a dense, uniform FFT
-    solver="levinson", # or "bareiss"
-    # supports "ldlt" and "zohar" solvers as well, although these options are not recommended
+    solver="levinson", # or "bareiss", "zohar", "ldlt"
     backend="pswf", # or "lra"
     normalization="standard" # or "asymptotic"
     )
@@ -86,7 +85,7 @@ freq, nll = tlsdd.autopower(
     fmax=20,
     nterms=1,               # equivalent to Generalised Scargle Periodogram
     oversampling=5,
-    solver="bareiss",       # supports "ldlt" and "zohar" as well, although these options are not recommended
+    solver="bareiss",       # or "levinson", "zohar", "ldlt"
     backend="pswf",         # or "lra"
     normalization="asymptotic" # asymptotic estimate of negative log-likelihood
 )
