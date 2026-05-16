@@ -1,4 +1,4 @@
-// linalg.c  —  Precision-generic Levinson-Durbin and Zohar Toeplitz solvers
+// linalg.c  —  Precision-generic LDLT, Levinson-Durbin, Bareiss, and Zohar Toeplitz solvers
 
 /* nanofft.h provides: dd_t and its arithmetic (dd_add/dd_sub/dd_mul/dd_div …),
  * VEC / VECF GCC vector types, VEC_LEN / VECF_LEN, and all the fast-trig
@@ -39,6 +39,91 @@ static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
 #    define VCONST(x) TLS(vec_splat)(FCONST(x))
 static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return M_SQRT(abs2); }
 #endif
+
+static inline INTERNAL_VEC TLS(ldlt_diag_condition)(size_t n, const INTERNAL_VEC *restrict D) {
+#if defined(DOUBLE_DOUBLE)
+    INTERNAL_VEC dmin = D[0];
+    INTERNAL_VEC dmax = D[0];
+    for (size_t i = 1; i < n; i++) {
+        if (TO_DOUBLE(D[i]) < TO_DOUBLE(dmin)) dmin = D[i];
+        if (TO_DOUBLE(D[i]) > TO_DOUBLE(dmax)) dmax = D[i];
+    }
+    return DIV(dmax, dmin);
+#else
+    INTERNAL_VEC ratio;
+    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+        FLOAT dmin = D[0][lane];
+        FLOAT dmax = D[0][lane];
+        for (size_t i = 1; i < n; i++) {
+            FLOAT d = D[i][lane];
+            if (d < dmin) dmin = d;
+            if (d > dmax) dmax = d;
+        }
+        ratio[lane] = dmax / dmin;
+    }
+    return ratio;
+#endif
+}
+
+/* =========================================================================
+ * tlsf/tls/tlsdd_solve_ldlt
+ *
+ * Dense real LDLT decomposition for full symmetric positive-definite systems
+ * A x = b. A is row-major, with one independent real system per lane.
+ *
+ * Workspace (caller-allocated)
+ *   L      unit-lower-triangular factor, length n*n
+ *   D      diagonal, length n
+ *   y, z   substitution workspaces, length n each
+ *
+ * Returns lane-wise Dmax/Dmin from the LDLT diagonal.
+ * ========================================================================= */
+INTERNAL_VEC TLS(solve_ldlt)(size_t n, const INTERNAL_VEC *restrict A, const INTERNAL_VEC *restrict b, INTERNAL_VEC *restrict x, INTERNAL_VEC *restrict L,
+                             INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict y, INTERNAL_VEC *restrict z) {
+    for (size_t i = 0; i < n; i++) {
+        size_t i_row_offset = i * n;
+        for (size_t j = 0; j < i; j++) {
+            size_t j_row_offset = j * n;
+            INTERNAL_VEC sum = VCONST(0.0);
+            for (size_t k = 0; k < j; k++) {
+                sum = ADD(sum, MUL(MUL(L[i_row_offset + k], L[j_row_offset + k]), D[k]));
+            }
+            L[i_row_offset + j] = DIV(SUB(A[i_row_offset + j], sum), D[j]);
+        }
+
+        INTERNAL_VEC sum2 = VCONST(0.0);
+        for (size_t k = 0; k < i; k++) {
+            sum2 = ADD(sum2, MUL(MUL(L[i_row_offset + k], L[i_row_offset + k]), D[k]));
+        }
+        D[i] = SUB(A[i_row_offset + i], sum2);
+        L[i_row_offset + i] = VCONST(1.0);
+    }
+
+    INTERNAL_VEC condition = TLS(ldlt_diag_condition)(n, D);
+
+    for (size_t i = 0; i < n; i++) {
+        size_t row_offset = i * n;
+        INTERNAL_VEC sum = VCONST(0.0);
+        for (size_t j = 0; j < i; j++) {
+            sum = ADD(sum, MUL(L[row_offset + j], y[j]));
+        }
+        y[i] = SUB(b[i], sum);
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        z[i] = DIV(y[i], D[i]);
+    }
+
+    for (size_t i = n; i-- > 0;) {
+        INTERNAL_VEC sum = VCONST(0.0);
+        for (size_t j = i + 1; j < n; j++) {
+            sum = ADD(sum, MUL(L[j * n + i], x[j]));
+        }
+        x[i] = SUB(z[i], sum);
+    }
+
+    return condition;
+}
 
 /* =========================================================================
  * tlsf/tls/tlsdd_solve_levinson
@@ -143,6 +228,120 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
             x_r[i] = ADD(x_r[i], tr);
             x_i[i] = ADD(x_i[i], ti);
         }
+    }
+
+    return cond_bound;
+}
+
+/* =========================================================================
+ * tlsf/tls/tlsdd_solve_bareiss
+ *
+ * Bareiss fast Cholesky factorization for Hermitian Toeplitz systems T x = y.
+ * Same system definition as solve_levinson above.
+ *
+ * Workspace (caller-allocated)
+ *   U_r, U_i            upper triangular factor, length n*n each
+ *   D                   real diagonal, length n
+ *   u_r, u_i, v_r, v_i  Bareiss generators, length n each
+ *   w_r, w_i            substitution workspace, length n each
+ *
+ * Returns the same lane-wise reflection-coefficient condition bound used by
+ * solve_levinson.
+ * ========================================================================= */
+INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, const INTERNAL_VEC *restrict R_i, const INTERNAL_VEC *restrict y_r,
+                                const INTERNAL_VEC *restrict y_i, INTERNAL_VEC *restrict x_r, INTERNAL_VEC *restrict x_i, INTERNAL_VEC *restrict U_r,
+                                INTERNAL_VEC *restrict U_i, INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict u_r, INTERNAL_VEC *restrict u_i,
+                                INTERNAL_VEC *restrict v_r, INTERNAL_VEC *restrict v_i, INTERNAL_VEC *restrict w_r, INTERNAL_VEC *restrict w_i) {
+    INTERNAL_VEC cond_bound = VCONST(1.0);
+
+    for (size_t j = 0; j < n; j++) {
+        u_r[j] = R_r[j];
+        u_i[j] = R_i[j];
+        if (j < n - 1) {
+            v_r[j] = R_r[j + 1];
+            v_i[j] = R_i[j + 1];
+        } else {
+            v_r[j] = VCONST(0.0);
+            v_i[j] = VCONST(0.0);
+        }
+    }
+
+    for (size_t k = 0; k < n; k++) {
+        D[k] = u_r[0];
+
+        size_t row_offset = k * n + k;
+        for (size_t j = 0; j < n - k; j++) {
+            U_r[row_offset + j] = u_r[j];
+            U_i[row_offset + j] = u_i[j];
+        }
+
+        if (k == n - 1) break;
+
+        INTERNAL_VEC inv_D = DIV(VCONST(1.0), D[k]);
+        INTERNAL_VEC rho_r = MUL(v_r[0], inv_D);
+        INTERNAL_VEC rho_i = MUL(v_i[0], inv_D);
+        INTERNAL_VEC abs2_rho = ADD(MUL(rho_r, rho_r), MUL(rho_i, rho_i));
+        INTERNAL_VEC abs_rho = TLS(reflection_abs)(abs2_rho);
+        cond_bound = MUL(cond_bound, DIV(ADD(VCONST(1.0), abs_rho), SUB(VCONST(1.0), abs_rho)));
+
+        for (size_t j = 0; j < n - k - 1; j++) {
+            INTERNAL_VEC uj_r = u_r[j];
+            INTERNAL_VEC uj_i = u_i[j];
+            INTERNAL_VEC vj_r = v_r[j];
+            INTERNAL_VEC vj_i = v_i[j];
+
+            INTERNAL_VEC up1_r = u_r[j + 1];
+            INTERNAL_VEC up1_i = u_i[j + 1];
+            INTERNAL_VEC vp1_r = v_r[j + 1];
+            INTERNAL_VEC vp1_i = v_i[j + 1];
+
+            u_r[j] = SUB(uj_r, ADD(MUL(rho_r, vj_r), MUL(rho_i, vj_i)));
+            u_i[j] = SUB(uj_i, SUB(MUL(rho_r, vj_i), MUL(rho_i, vj_r)));
+
+            v_r[j] = SUB(vp1_r, SUB(MUL(rho_r, up1_r), MUL(rho_i, up1_i)));
+            v_i[j] = SUB(vp1_i, ADD(MUL(rho_r, up1_i), MUL(rho_i, up1_r)));
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        w_r[i] = y_r[i];
+        w_i[i] = y_i[i];
+    }
+
+    for (size_t j = 0; j < n; j++) {
+        w_r[j] = DIV(w_r[j], D[j]);
+        w_i[j] = DIV(w_i[j], D[j]);
+
+        INTERNAL_VEC wj_r = w_r[j];
+        INTERNAL_VEC wj_i = w_i[j];
+        size_t row_offset = j * n;
+
+        for (size_t i = j + 1; i < n; i++) {
+            INTERNAL_VEC Uji_r = U_r[row_offset + i];
+            INTERNAL_VEC Uji_i = U_i[row_offset + i];
+
+            w_r[i] = SUB(w_r[i], SUB(MUL(Uji_r, wj_r), MUL(Uji_i, wj_i)));
+            w_i[i] = SUB(w_i[i], ADD(MUL(Uji_r, wj_i), MUL(Uji_i, wj_r)));
+        }
+    }
+
+    for (size_t r = n; r-- > 0;) {
+        INTERNAL_VEC sum_r = VCONST(0.0);
+        INTERNAL_VEC sum_i = VCONST(0.0);
+        size_t row_offset = r * n;
+
+        for (size_t j = r + 1; j < n; j++) {
+            INTERNAL_VEC Uij_r = U_r[row_offset + j];
+            INTERNAL_VEC Uij_i = U_i[row_offset + j];
+            INTERNAL_VEC xj_r = x_r[j];
+            INTERNAL_VEC xj_i = x_i[j];
+
+            sum_r = ADD(sum_r, ADD(MUL(Uij_r, xj_r), MUL(Uij_i, xj_i)));
+            sum_i = ADD(sum_i, SUB(MUL(Uij_r, xj_i), MUL(Uij_i, xj_r)));
+        }
+
+        x_r[r] = SUB(w_r[r], DIV(sum_r, D[r]));
+        x_i[r] = SUB(w_i[r], DIV(sum_i, D[r]));
     }
 
     return cond_bound;
