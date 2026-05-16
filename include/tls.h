@@ -11,7 +11,7 @@ enum { TLS_OK = 0, TLS_ERR_ARGUMENT = -1, TLS_ERR_BACKEND = -2, TLS_ERR_ALLOC = 
 
 enum { TLS_BACKEND_PSWF = 0, TLS_BACKEND_LRA = 1 };
 
-enum { TLS_SOLVER_LEVINSON = 1, TLS_SOLVER_ZOHAR = 2 };
+enum { TLS_SOLVER_LEVINSON = 1, TLS_SOLVER_ZOHAR = 2, TLS_SOLVER_BAREISS = 3, TLS_SOLVER_LDLT = 4 };
 
 int tlsf_fastchi2(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver, float *power);
 

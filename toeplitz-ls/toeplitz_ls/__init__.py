@@ -1,8 +1,8 @@
-"""ctypes wrappers for the FastChi2 Toeplitz least-squares periodogram.
+"""ctypes wrappers for the FastChi2/AoVMH(W) least-squares periodogram.
 
 The bundled shared library returns the standard normalized power, i.e. the
 coefficient of determination R^2.  This package can also transform that result
-to the asymptotic AOV-style normalization used by ``ortper.c``.
+to the asymptotic AOV-style normalization used by ``lcperiod.c``.
 
 The library is loaded with ``ctypes.CDLL``.  On CPython, ctypes releases the GIL
 while calling functions from CDLL instances, so independent native
@@ -30,7 +30,7 @@ HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / "tls.so"
 
 _BACKENDS = {"pswf": 0, "lra": 1}
-_SOLVERS = {"levinson": 1, "zohar": 2}
+_SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4}
 _NORMALIZATIONS = {"standard", "asymptotic"}
 _STATUS_MESSAGES = {
     -1: "invalid argument",
@@ -122,9 +122,7 @@ def _backend_id(backend):
         key = backend.lower()
         if key in _BACKENDS:
             return _BACKENDS[key]
-    elif backend in (0, 1):
-        return int(backend)
-    raise ValueError("backend must be 'pswf', 'lra', 0, or 1")
+    raise ValueError("backend must be 'pswf' or 'lra'")
 
 
 def _solver_id(solver):
@@ -132,9 +130,7 @@ def _solver_id(solver):
         key = solver.lower()
         if key in _SOLVERS:
             return _SOLVERS[key]
-    elif solver in (1, 2):
-        return int(solver)
-    raise ValueError("solver must be 'levinson', 'zohar', 1, or 2")
+    raise ValueError("solver must be 'levinson', 'zohar', 'bareiss', or 'ldlt'")
 
 
 def _check_normalization(normalization):

@@ -11,7 +11,7 @@
 /* Return codes from the public fastchi2 entry points. */
 enum { CHI2PER_OK = 0, CHI2PER_ERR_ARGUMENT = -1, CHI2PER_ERR_BACKEND = -2, CHI2PER_ERR_ALLOC = -3, CHI2PER_ERR_DEGENERATE = -4, CHI2PER_ERR_SOLVER = -5 };
 
-enum { CHI2PER_SOLVER_LEVINSON = 1, CHI2PER_SOLVER_ZOHAR = 2 };
+enum { CHI2PER_SOLVER_LEVINSON = 1, CHI2PER_SOLVER_ZOHAR = 2, CHI2PER_SOLVER_BAREISS = 3, CHI2PER_SOLVER_LDLT = 4 };
 
 static inline int bitceil(double x) { return x <= 1.0 ? 1 : 1 << (1 + (int)(log2(x))); }
 
@@ -81,7 +81,9 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define NUFFT_PSWF_FREE tlsdd_nufft_free_pswf_plan
 #    define LRA_PLAN_T tlsdd_nufft_lra_plan
 #    define PSWF_PLAN_T tlsdd_nufft_pswf_plan
+#    define SOLVE_LDLT tlsdd_solve_ldlt
 #    define SOLVE_LEVINSON tlsdd_solve_levinson
+#    define SOLVE_BAREISS tlsdd_solve_bareiss
 #    define SOLVE_ZOHAR tlsdd_solve_zohar
 #    define NUFFT_RANK 27
 #    define NUFFT_W 32
@@ -108,7 +110,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define NUFFT_PSWF_FREE tls_nufft_free_pswf_plan
 #        define LRA_PLAN_T tls_nufft_lra_plan
 #        define PSWF_PLAN_T tls_nufft_pswf_plan
+#        define SOLVE_LDLT tls_solve_ldlt
 #        define SOLVE_LEVINSON tls_solve_levinson
+#        define SOLVE_BAREISS tls_solve_bareiss
 #        define SOLVE_ZOHAR tls_solve_zohar
 #        define NUFFT_RANK 16
 #        define NUFFT_W 16
@@ -130,7 +134,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define NUFFT_PSWF_FREE tlsf_nufft_free_pswf_plan
 #        define LRA_PLAN_T tlsf_nufft_lra_plan
 #        define PSWF_PLAN_T tlsf_nufft_pswf_plan
+#        define SOLVE_LDLT tlsf_solve_ldlt
 #        define SOLVE_LEVINSON tlsf_solve_levinson
+#        define SOLVE_BAREISS tlsf_solve_bareiss
 #        define SOLVE_ZOHAR tlsf_solve_zohar
 #        define NUFFT_RANK 9
 #        define NUFFT_W 8
@@ -170,6 +176,43 @@ static inline int condition_bound_is_singular(FLOAT bound) {
 #else
     return float_is_nan_bits(bound) || bound < 0.0f || bound > COND_SINGULARITY_THRESHOLD;
 #endif
+}
+
+static inline int real_term_harmonic(int term) { return term == 0 ? 0 : (term + 1) / 2; }
+
+static inline int real_term_is_sin(int term) { return term > 0 && (term & 1); }
+
+static inline FLOAT signed_float_value(FLOAT value, int sign) {
+    if (sign < 0) return NEG(value);
+    if (sign > 0) return value;
+    return FCAST(0.0);
+}
+
+static inline FLOAT real_gram_value(const FLOAT *Sw, const FLOAT *Cw, int N, int idx, int row, int col) {
+    int m = real_term_harmonic(col);
+    int n = real_term_harmonic(row);
+    int col_sin = real_term_is_sin(col);
+    int row_sin = real_term_is_sin(row);
+    int diff = abs(m - n);
+    int sum = m + n;
+    FLOAT half = FCAST(0.5);
+
+    if (col_sin && row_sin) {
+        return MUL(half, SUB(Cw[(size_t)diff * N + idx], Cw[(size_t)sum * N + idx]));
+    }
+    if (!col_sin && !row_sin) {
+        return MUL(half, ADD(Cw[(size_t)diff * N + idx], Cw[(size_t)sum * N + idx]));
+    }
+    if (col_sin) {
+        return MUL(half, ADD(signed_float_value(Sw[(size_t)diff * N + idx], m - n), Sw[(size_t)sum * N + idx]));
+    }
+    return MUL(half, ADD(signed_float_value(Sw[(size_t)diff * N + idx], n - m), Sw[(size_t)sum * N + idx]));
+}
+
+static inline FLOAT real_rhs_value(const FLOAT *Syw, const FLOAT *Cyw, int N, int idx, int term) {
+    int h = real_term_harmonic(term);
+    if (real_term_is_sin(term)) return Syw[(size_t)h * N + idx];
+    return Cyw[(size_t)h * N + idx];
 }
 
 static int execute_nufft_block(void *plan, int backend, const FLOAT *src_r, const FLOAT *src_i, FLOAT *out_r, FLOAT *out_i, int freq_factor) {
@@ -298,8 +341,64 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
 }
 
 #if defined(DOUBLE_DOUBLE)
+static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power) {
+    const int norder = 2 * degree + 1;
+    size_t norder_sq = (size_t)norder * (size_t)norder;
+
+    FLOAT *XTX = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
+    FLOAT *XTy = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+    FLOAT *X = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+    FLOAT *L = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
+    FLOAT *D = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+    FLOAT *Y = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+    FLOAT *Z = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+
+    if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
+        free(XTX);
+        free(XTy);
+        free(X);
+        free(L);
+        free(D);
+        free(Y);
+        free(Z);
+        return CHI2PER_ERR_ALLOC;
+    }
+
+    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
+
+    for (int idx = 0; idx < N; ++idx) {
+        for (int row = 0; row < norder; ++row) {
+            XTy[row] = real_rhs_value(Syw, Cyw, N, idx, row);
+            for (int col = 0; col < norder; ++col) {
+                XTX[(size_t)row * norder + col] = real_gram_value(Sw, Cw, N, idx, row, col);
+            }
+        }
+
+        FLOAT condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
+        if (condition_bound_is_singular(condition_bound)) {
+            power[idx] = FCAST(NAN);
+            continue;
+        }
+
+        FLOAT dot = FCAST(0.0);
+        for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
+        power[idx] = MUL(dot, inv_chi2_ref);
+    }
+
+    free(XTX);
+    free(XTy);
+    free(X);
+    free(L);
+    free(D);
+    free(Y);
+    free(Z);
+    return CHI2PER_OK;
+}
+
 static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
                                 FLOAT *power) {
+    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power);
+
     const int norder = 2 * degree + 1;
 
     FLOAT *Rr = (FLOAT *)checked_malloc((size_t)norder + 1, sizeof(FLOAT));
@@ -312,6 +411,15 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
     FLOAT *Ai = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
     FLOAT *Apr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
     FLOAT *Api = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+    FLOAT *BUr = NULL;
+    FLOAT *BUi = NULL;
+    FLOAT *BD = NULL;
+    FLOAT *Bur = NULL;
+    FLOAT *Bui = NULL;
+    FLOAT *Bvr = NULL;
+    FLOAT *Bvi = NULL;
+    FLOAT *Bwr = NULL;
+    FLOAT *Bwi = NULL;
 
     if (!Rr || !Ri || !Yr || !Yi || !Xr || !Xi || !Ar || !Ai || !Apr || !Api) {
         free(Rr);
@@ -325,6 +433,42 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
         free(Apr);
         free(Api);
         return CHI2PER_ERR_ALLOC;
+    }
+
+    if (solver == CHI2PER_SOLVER_BAREISS) {
+        size_t norder_sq = (size_t)norder * (size_t)norder;
+        BUr = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
+        BUi = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
+        BD = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+        Bur = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+        Bui = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+        Bvr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+        Bvi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+        Bwr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+        Bwi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
+
+        if (!BUr || !BUi || !BD || !Bur || !Bui || !Bvr || !Bvi || !Bwr || !Bwi) {
+            free(Rr);
+            free(Ri);
+            free(Yr);
+            free(Yi);
+            free(Xr);
+            free(Xi);
+            free(Ar);
+            free(Ai);
+            free(Apr);
+            free(Api);
+            free(BUr);
+            free(BUi);
+            free(BD);
+            free(Bur);
+            free(Bui);
+            free(Bvr);
+            free(Bvi);
+            free(Bwr);
+            free(Bwi);
+            return CHI2PER_ERR_ALLOC;
+        }
     }
 
     FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
@@ -362,6 +506,12 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
                 power[idx] = FCAST(NAN);
                 continue;
             }
+        } else if (solver == CHI2PER_SOLVER_BAREISS) {
+            FLOAT condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
+            if (condition_bound_is_singular(condition_bound)) {
+                power[idx] = FCAST(NAN);
+                continue;
+            }
         } else {
             free(Rr);
             free(Ri);
@@ -373,6 +523,15 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
             free(Ai);
             free(Apr);
             free(Api);
+            free(BUr);
+            free(BUi);
+            free(BD);
+            free(Bur);
+            free(Bui);
+            free(Bvr);
+            free(Bvi);
+            free(Bwr);
+            free(Bwi);
             return CHI2PER_ERR_SOLVER;
         }
 
@@ -391,11 +550,92 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
     free(Ai);
     free(Apr);
     free(Api);
+    free(BUr);
+    free(BUi);
+    free(BD);
+    free(Bur);
+    free(Bui);
+    free(Bvr);
+    free(Bvi);
+    free(Bwr);
+    free(Bwi);
     return CHI2PER_OK;
 }
 #else
+static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power) {
+    const int norder = 2 * degree + 1;
+    size_t norder_sq = (size_t)norder * (size_t)norder;
+
+    INTERNAL_VEC *XTX = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *XTy = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *X = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *L = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *D = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *Y = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *Z = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+
+    if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
+        free(XTX);
+        free(XTy);
+        free(X);
+        free(L);
+        free(D);
+        free(Y);
+        free(Z);
+        return CHI2PER_ERR_ALLOC;
+    }
+
+    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
+
+    for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
+        for (int row = 0; row < norder; ++row) {
+            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                int idx = base + lane;
+                if (idx >= N) idx = N - 1;
+                XTy[row][lane] = real_rhs_value(Syw, Cyw, N, idx, row);
+            }
+
+            for (int col = 0; col < norder; ++col) {
+                for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                    int idx = base + lane;
+                    if (idx >= N) idx = N - 1;
+                    XTX[(size_t)row * norder + col][lane] = real_gram_value(Sw, Cw, N, idx, row, col);
+                }
+            }
+        }
+
+        INTERNAL_VEC condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
+
+        for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+            int idx = base + lane;
+            if (idx >= N) continue;
+            if (condition_bound_is_singular(condition_bound[lane])) {
+                power[idx] = FCAST(NAN);
+                continue;
+            }
+
+            FLOAT dot = FCAST(0.0);
+            for (int k = 0; k < norder; ++k) {
+                dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
+            }
+            power[idx] = MUL(dot, inv_chi2_ref);
+        }
+    }
+
+    free(XTX);
+    free(XTy);
+    free(X);
+    free(L);
+    free(D);
+    free(Y);
+    free(Z);
+    return CHI2PER_OK;
+}
+
 static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
                                  FLOAT *power) {
+    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power);
+
     const int norder = 2 * degree + 1;
 
     INTERNAL_VEC *Rr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder + 1, sizeof(INTERNAL_VEC));
@@ -408,6 +648,15 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
     INTERNAL_VEC *Ehi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
     INTERNAL_VEC *Ehpr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
     INTERNAL_VEC *Ehpi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    INTERNAL_VEC *BUr = NULL;
+    INTERNAL_VEC *BUi = NULL;
+    INTERNAL_VEC *BD = NULL;
+    INTERNAL_VEC *Bur = NULL;
+    INTERNAL_VEC *Bui = NULL;
+    INTERNAL_VEC *Bvr = NULL;
+    INTERNAL_VEC *Bvi = NULL;
+    INTERNAL_VEC *Bwr = NULL;
+    INTERNAL_VEC *Bwi = NULL;
 
     if (!Rr || !Ri || !Yr || !Yi || !Xr || !Xi || !Ehr || !Ehi || !Ehpr || !Ehpi) {
         free(Rr);
@@ -421,6 +670,42 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
         free(Ehpr);
         free(Ehpi);
         return CHI2PER_ERR_ALLOC;
+    }
+
+    if (solver == CHI2PER_SOLVER_BAREISS) {
+        size_t norder_sq = (size_t)norder * (size_t)norder;
+        BUr = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
+        BUi = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
+        BD = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        Bur = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        Bui = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        Bvr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        Bvi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        Bwr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        Bwi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+
+        if (!BUr || !BUi || !BD || !Bur || !Bui || !Bvr || !Bvi || !Bwr || !Bwi) {
+            free(Rr);
+            free(Ri);
+            free(Yr);
+            free(Yi);
+            free(Xr);
+            free(Xi);
+            free(Ehr);
+            free(Ehi);
+            free(Ehpr);
+            free(Ehpi);
+            free(BUr);
+            free(BUi);
+            free(BD);
+            free(Bur);
+            free(Bui);
+            free(Bvr);
+            free(Bvi);
+            free(Bwr);
+            free(Bwi);
+            return CHI2PER_ERR_ALLOC;
+        }
     }
 
     FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
@@ -475,6 +760,15 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                     power[idx] = FCAST(NAN);
                 }
             }
+        } else if (solver == CHI2PER_SOLVER_BAREISS) {
+            INTERNAL_VEC condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
+            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                int idx = base + lane;
+                if (idx < N && condition_bound_is_singular(condition_bound[lane])) {
+                    singular_lane[lane] = 1;
+                    power[idx] = FCAST(NAN);
+                }
+            }
         } else {
             free(Rr);
             free(Ri);
@@ -486,6 +780,15 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             free(Ehi);
             free(Ehpr);
             free(Ehpi);
+            free(BUr);
+            free(BUi);
+            free(BD);
+            free(Bur);
+            free(Bui);
+            free(Bvr);
+            free(Bvi);
+            free(Bwr);
+            free(Bwi);
             return CHI2PER_ERR_SOLVER;
         }
 
@@ -516,6 +819,15 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
     free(Ehi);
     free(Ehpr);
     free(Ehpi);
+    free(BUr);
+    free(BUi);
+    free(BD);
+    free(Bur);
+    free(Bui);
+    free(Bvr);
+    free(Bvi);
+    free(Bwr);
+    free(Bwi);
     return CHI2PER_OK;
 }
 #endif
@@ -524,7 +836,8 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
                           FLOAT *power) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
     if (backend < 0 || backend >= 2) return CHI2PER_ERR_BACKEND;
-    if (solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR) return CHI2PER_ERR_SOLVER;
+    if (solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS && solver != CHI2PER_SOLVER_LDLT)
+        return CHI2PER_ERR_SOLVER;
 
     double beta = (backend == 0) ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
     double gamma = (backend == 0) ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;

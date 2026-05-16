@@ -42,7 +42,8 @@ freq, r2 = tlsf.autopower(
     fmax=12, #default value
     nterms=3, #default number of terms
     oversampling=5, #frequency density, relative to a dense, uniform FFT
-    solver="levinson", # or "zohar"
+    solver="levinson", # or "ldlt"
+    # supports "zohar" and "bareiss" solvers as well, although these options are not recommended
     backend="pswf", # or "lra"
     normalization="standard" # or "asymptotic"
     )
@@ -80,24 +81,23 @@ t_arr = np.array(t, dtype=object)
 y_arr = np.array(y, dtype=object)
 
 # Compute the periodogram
-freq, r2 = tlsdd.autopower(
+freq, nll = tlsdd.autopower(
     t_arr, y_arr, dy=None,
     fmax=20,
     nterms=1,               # equivalent to Generalised Scargle Periodogram
     oversampling=5,
-    solver="zohar",         # may be faster and more numerically stable than Levinson,
-                            # but skips condition checking — may return garbage values
+    solver="ldlt",          # supports "zohar" and "bareiss" as well, although these options are not recommended
     backend="pswf",         # or "lra"
     normalization="asymptotic" # asymptotic estimate of negative log-likelihood
 )
 
 # Use nanargmax/nanmax — the solver returns NaN at numerically singular frequencies
-best_idx = np.nanargmax(r2)
+best_idx = np.nanargmax(nll)
 best_freq = freq[best_idx]
-best_power = np.nanmax(r2)
+best_power = np.nanmax(nll)
 
 plt.figure(figsize=(12, 5))
-plt.plot(freq, r2, label='nterms = 1', color='blue')
+plt.plot(freq, nll, label='nterms = 1', color='blue')
 plt.xlabel('Frequency')
 plt.ylabel('−log L (asymptotic)')
 plt.legend()
