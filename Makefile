@@ -11,7 +11,7 @@ PY_PACKAGE_DIR := $(PY_DIST_DIR)/toeplitz_ls
 TLS_SO := $(LIB_DIR)/tls.so
 TLS_A := $(LIB_DIR)/tls.a
 PY_TLS_SO := $(PY_PACKAGE_DIR)/tls.so
-OLD_VARIANT_LIBS := $(LIB_DIR)/lib-generic.so $(LIB_DIR)/lib-native.so
+OLD_VARIANT_LIBS := $(LIB_DIR)/generic.so $(LIB_DIR)/native.so
 
 GENERIC_FLAGS := -std=gnu11 -O3 -ffast-math -Wall -Wextra
 NATIVE_FLAGS := $(GENERIC_FLAGS) -march=native -mtune=native
@@ -68,12 +68,12 @@ NATIVE_OBJS := \
 	$(NATIVE_DIR)/tls_chi2per.o \
 	$(NATIVE_DIR)/tlsdd_chi2per.o
 
-.PHONY: all lib-generic lib-native clean
+.PHONY: all generic native clean
 .DELETE_ON_ERROR:
 
-all: lib-generic
+all: generic
 
-lib-generic: $(LIB_SOURCES) $(PUBLIC_HEADERS) | $(LIB_DIR) $(PY_PACKAGE_DIR)
+generic: $(LIB_SOURCES) $(PUBLIC_HEADERS) | $(LIB_DIR) $(PY_PACKAGE_DIR)
 	$(MAKE) $(GENERIC_OBJS)
 	$(AR) rcs $(TLS_A) $(GENERIC_OBJS)
 	$(CC) $(LDFLAGS_SHARED) -o $(TLS_SO) $(GENERIC_OBJS) $(LDLIBS)
@@ -81,7 +81,7 @@ lib-generic: $(LIB_SOURCES) $(PUBLIC_HEADERS) | $(LIB_DIR) $(PY_PACKAGE_DIR)
 	rm -rf $(GENERIC_DIR)
 	rmdir $(TMP_DIR) 2>/dev/null || true
 
-lib-native: $(LIB_SOURCES) $(SCALING_SOURCES) $(PUBLIC_HEADERS) | $(LIB_DIR) $(PY_PACKAGE_DIR)
+native: $(LIB_SOURCES) $(SCALING_SOURCES) $(PUBLIC_HEADERS) | $(LIB_DIR) $(PY_PACKAGE_DIR)
 	$(MAKE) $(NATIVE_OBJS)
 	$(AR) rcs $(TLS_A) $(NATIVE_OBJS)
 	$(CC) $(LDFLAGS_SHARED) -o $(TLS_SO) $(NATIVE_OBJS) $(LDLIBS)
