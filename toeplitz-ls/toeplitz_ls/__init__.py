@@ -208,6 +208,15 @@ def _prepare_numpy_inputs(t, y, dy, y_dtype):
     return t_arr, y_arr, dy_arr
 
 
+def _check_observation_count(num_observations, nterms):
+    min_observations = 2 * nterms + 2
+    if num_observations < min_observations:
+        raise ValueError(
+            f"at least {min_observations} observations are required for "
+            f"nterms={nterms}"
+        )
+
+
 def _asymptotic_dofs(num_observations, nterms):
     d1 = 2 * nterms + 1
     d2 = num_observations - 1 - d1
@@ -323,6 +332,7 @@ class tlsf:
         min_Nf = 32 if backend == _BACKENDS["lra"] else 16
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float32)
+        _check_observation_count(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float32)
 
         status = _load_library().tlsf_fastchi2(
@@ -364,6 +374,7 @@ class tlsf:
         if nterms <= 0:
             raise ValueError("nterms must be positive")
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
+        _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
         Nf, df, f0 = _auto_grid(delta_t, fmin, fmax, oversampling, nterms=nterms)
         frequency = f0 + df * np.arange(Nf, dtype=np.float64)
@@ -404,6 +415,7 @@ class tls:
         solver = _solver_id(solver)
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=8)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
+        _check_observation_count(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float64)
 
         status = _load_library().tls_fastchi2(
@@ -445,6 +457,7 @@ class tls:
         if nterms <= 0:
             raise ValueError("nterms must be positive")
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
+        _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
         Nf, df, f0 = _auto_grid(delta_t, fmin, fmax, oversampling, nterms=nterms)
         frequency = f0 + df * np.arange(Nf, dtype=np.float64)
@@ -508,6 +521,7 @@ class tlsdd:
             raise ValueError("t, y, and dy must have the same length")
         if any(value <= 0 for value in dy_mpf):
             raise ValueError("dy entries must be positive")
+        _check_observation_count(len(t_mpf), nterms)
 
         t_dd = _as_dd_array(t_mpf)
         y_dd = _as_dd_array(y_mpf)
@@ -565,6 +579,7 @@ class tlsdd:
             raise ValueError("x, y, and dy must have the same length")
         if any(value <= 0 for value in dy_mpf):
             raise ValueError("dy entries must be positive")
+        _check_observation_count(len(t_mpf), nterms)
 
         delta_t = max(t_mpf) - min(t_mpf)
         Nf, df, f0 = _auto_grid(delta_t, fmin, fmax, oversampling, nterms=nterms)

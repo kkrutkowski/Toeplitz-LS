@@ -857,6 +857,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     if (backend < 0 || backend >= 2) return CHI2PER_ERR_BACKEND;
     if (solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS && solver != CHI2PER_SOLVER_LDLT)
         return CHI2PER_ERR_SOLVER;
+    if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
 
     double beta = (backend == 0) ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
     double gamma = (backend == 0) ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;
