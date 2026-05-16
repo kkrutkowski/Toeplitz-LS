@@ -92,9 +92,9 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define CHI2_LRA_GAMMA DD_LRA_GAMMA
 #    define CHI2_PSWF_BETA DD_PSWF_BETA
 #    define CHI2_PSWF_GAMMA DD_PSWF_GAMMA
-#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e25
-#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e25
-#    define COND_SINGULARITY_THRESHOLD_LDLT 1e21
+#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e30
+#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e30
+#    define COND_SINGULARITY_THRESHOLD_LDLT 1e10
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #else
@@ -123,9 +123,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_LRA_GAMMA D_LRA_GAMMA
 #        define CHI2_PSWF_BETA D_PSWF_BETA
 #        define CHI2_PSWF_GAMMA D_PSWF_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e11
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e11
-#        define COND_SINGULARITY_THRESHOLD_LDLT 1e9
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e15
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e15
+#        define COND_SINGULARITY_THRESHOLD_LDLT 1e5
 #    else
 #        define CHI2_PREFIX(name) tlsf_##name
 #        define NUFFT_LRA_INIT tlsf_nufft_lra_initialize
@@ -149,8 +149,8 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_LRA_GAMMA F_LRA_GAMMA
 #        define CHI2_PSWF_BETA F_PSWF_BETA
 #        define CHI2_PSWF_GAMMA F_PSWF_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e4
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e4
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e6
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e6
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e3
 #    endif
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
