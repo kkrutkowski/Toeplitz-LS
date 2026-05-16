@@ -92,7 +92,9 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define CHI2_LRA_GAMMA DD_LRA_GAMMA
 #    define CHI2_PSWF_BETA DD_PSWF_BETA
 #    define CHI2_PSWF_GAMMA DD_PSWF_GAMMA
-#    define COND_SINGULARITY_THRESHOLD FCONST(1e25)
+#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e25
+#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e25
+#    define COND_SINGULARITY_THRESHOLD_LDLT 1e21
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #else
@@ -121,7 +123,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_LRA_GAMMA D_LRA_GAMMA
 #        define CHI2_PSWF_BETA D_PSWF_BETA
 #        define CHI2_PSWF_GAMMA D_PSWF_GAMMA
-#        define COND_SINGULARITY_THRESHOLD FCONST(1e11)
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e11
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e11
+#        define COND_SINGULARITY_THRESHOLD_LDLT 1e9
 #    else
 #        define CHI2_PREFIX(name) tlsf_##name
 #        define NUFFT_LRA_INIT tlsf_nufft_lra_initialize
@@ -145,7 +149,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_LRA_GAMMA F_LRA_GAMMA
 #        define CHI2_PSWF_BETA F_PSWF_BETA
 #        define CHI2_PSWF_GAMMA F_PSWF_GAMMA
-#        define COND_SINGULARITY_THRESHOLD FCONST(1e4)
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e4
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e4
+#        define COND_SINGULARITY_THRESHOLD_LDLT 1e3
 #    endif
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
@@ -167,14 +173,24 @@ static inline int float_is_nan_bits(float value) {
     return (bits.u & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000);
 }
 
-static inline int condition_bound_is_singular(FLOAT bound) {
+static const double condition_singularity_thresholds[] = {
+    0.0, COND_SINGULARITY_THRESHOLD_LEVINSON, 9e99, COND_SINGULARITY_THRESHOLD_BAREISS, COND_SINGULARITY_THRESHOLD_LDLT,
+};
+
+static inline double condition_singularity_threshold(int solver) {
+    if (solver < CHI2PER_SOLVER_LEVINSON || solver > CHI2PER_SOLVER_LDLT) return 0.0;
+    return condition_singularity_thresholds[solver];
+}
+
+static inline int condition_bound_is_singular(FLOAT bound, int solver) {
+    double threshold = condition_singularity_threshold(solver);
 #if defined(DOUBLE_DOUBLE)
     double value = TO_DOUBLE(bound);
-    return double_is_nan_bits(bound.hi) || double_is_nan_bits(bound.lo) || value < 0.0 || value > TO_DOUBLE(COND_SINGULARITY_THRESHOLD);
+    return double_is_nan_bits(bound.hi) || double_is_nan_bits(bound.lo) || value < 0.0 || value > threshold;
 #elif defined(DOUBLE)
-    return double_is_nan_bits(bound) || bound < 0.0 || bound > COND_SINGULARITY_THRESHOLD;
+    return double_is_nan_bits(bound) || bound < 0.0 || bound > threshold;
 #else
-    return float_is_nan_bits(bound) || bound < 0.0f || bound > COND_SINGULARITY_THRESHOLD;
+    return float_is_nan_bits(bound) || bound < 0.0f || (double)bound > threshold;
 #endif
 }
 
@@ -375,7 +391,7 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
         }
 
         FLOAT condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
-        if (condition_bound_is_singular(condition_bound)) {
+        if (condition_bound_is_singular(condition_bound, CHI2PER_SOLVER_LDLT)) {
             power[idx] = FCAST(NAN);
             continue;
         }
@@ -496,19 +512,19 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
 
         if (solver == CHI2PER_SOLVER_LEVINSON) {
             FLOAT condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
-            if (condition_bound_is_singular(condition_bound)) {
+            if (condition_bound_is_singular(condition_bound, solver)) {
                 power[idx] = FCAST(NAN);
                 continue;
             }
         } else if (solver == CHI2PER_SOLVER_ZOHAR) {
             FLOAT condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
-            if (condition_bound_is_singular(condition_bound)) {
+            if (condition_bound_is_singular(condition_bound, solver)) {
                 power[idx] = FCAST(NAN);
                 continue;
             }
         } else if (solver == CHI2PER_SOLVER_BAREISS) {
             FLOAT condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
-            if (condition_bound_is_singular(condition_bound)) {
+            if (condition_bound_is_singular(condition_bound, solver)) {
                 power[idx] = FCAST(NAN);
                 continue;
             }
@@ -609,7 +625,7 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
         for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
             int idx = base + lane;
             if (idx >= N) continue;
-            if (condition_bound_is_singular(condition_bound[lane])) {
+            if (condition_bound_is_singular(condition_bound[lane], CHI2PER_SOLVER_LDLT)) {
                 power[idx] = FCAST(NAN);
                 continue;
             }
@@ -746,7 +762,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             INTERNAL_VEC condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
-                if (idx < N && condition_bound_is_singular(condition_bound[lane])) {
+                if (idx < N && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
                     power[idx] = FCAST(NAN);
                 }
@@ -755,7 +771,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             INTERNAL_VEC condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
-                if (idx < N && condition_bound_is_singular(condition_bound[lane])) {
+                if (idx < N && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
                     power[idx] = FCAST(NAN);
                 }
@@ -764,7 +780,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             INTERNAL_VEC condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
-                if (idx < N && condition_bound_is_singular(condition_bound[lane])) {
+                if (idx < N && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
                     power[idx] = FCAST(NAN);
                 }
