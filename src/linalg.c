@@ -40,6 +40,11 @@ static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
 static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return M_SQRT(abs2); }
 #endif
 
+static inline INTERNAL_VEC TLS(reflection_condition_step)(INTERNAL_VEC abs2) {
+    INTERNAL_VEC abs_reflection = TLS(reflection_abs)(abs2);
+    return DIV(ADD(VCONST(1.0), abs_reflection), SUB(VCONST(1.0), abs_reflection));
+}
+
 static inline INTERNAL_VEC TLS(ldlt_diag_condition)(size_t n, const INTERNAL_VEC *restrict D) {
 #if defined(DOUBLE_DOUBLE)
     INTERNAL_VEC dmin = D[0];
@@ -195,8 +200,7 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
 
         /* ----- error energy: E *= (1 - |gamma|^2) */
         INTERNAL_VEC abs2_gamma = ADD(MUL(gamma_r, gamma_r), MUL(gamma_i, gamma_i));
-        INTERNAL_VEC abs_gamma = TLS(reflection_abs)(abs2_gamma);
-        cond_bound = MUL(cond_bound, DIV(ADD(VCONST(1.0), abs_gamma), SUB(VCONST(1.0), abs_gamma)));
+        cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_gamma));
         E = MUL(E, SUB(VCONST(1.0), abs2_gamma));
 
         /* ----- RHS residual: mu = y[k] - sum_{i=0}^{k-1} R[k-i] x[i] */
@@ -281,8 +285,7 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
         INTERNAL_VEC rho_r = MUL(v_r[0], inv_D);
         INTERNAL_VEC rho_i = MUL(v_i[0], inv_D);
         INTERNAL_VEC abs2_rho = ADD(MUL(rho_r, rho_r), MUL(rho_i, rho_i));
-        INTERNAL_VEC abs_rho = TLS(reflection_abs)(abs2_rho);
-        cond_bound = MUL(cond_bound, DIV(ADD(VCONST(1.0), abs_rho), SUB(VCONST(1.0), abs_rho)));
+        cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_rho));
 
         for (size_t j = 0; j < n - k - 1; j++) {
             INTERNAL_VEC uj_r = u_r[j];
@@ -357,8 +360,8 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
  *   e_hat_r, e_hat_i          backwards predictor
  *   e_hat_prev_r, e_hat_prev_i  snapshot from the previous order
  *
- * Returns lane-wise zeros; conditioning is currently reported only by
- * solve_levinson.
+ * Returns the same lane-wise reflection-coefficient condition bound used by
+ * solve_levinson, deriving |rho| from Zohar's lambda recurrence.
  *
  * Note: the loop accesses R[i+1] for i up to n-1, so the caller must ensure
  * R is allocated with at least n+1 slots (or accept the final iteration reads
@@ -380,7 +383,10 @@ INTERNAL_VEC TLS(solve_zohar)(size_t n, const INTERNAL_VEC *restrict R_r, const 
     e_hat_i[0] = NEG(rho_m1_i);
 
     /* lambda = 1 - |rho_{-1}|^2 */
-    INTERNAL_VEC lambda = SUB(VCONST(1.0), ADD(MUL(rho_m1_r, rho_m1_r), MUL(rho_m1_i, rho_m1_i)));
+    INTERNAL_VEC abs2_rho_m1 = ADD(MUL(rho_m1_r, rho_m1_r), MUL(rho_m1_i, rho_m1_i));
+    INTERNAL_VEC lambda = SUB(VCONST(1.0), abs2_rho_m1);
+    INTERNAL_VEC cond_bound = VCONST(1.0);
+    if (n > 1) cond_bound = TLS(reflection_condition_step)(abs2_rho_m1);
 
     for (size_t i = 1; i < n; i++) {
         /* ----- snapshot backwards predictor */
@@ -441,8 +447,13 @@ INTERNAL_VEC TLS(solve_zohar)(size_t n, const INTERNAL_VEC *restrict R_r, const 
 
         /* ----- lambda update */
         INTERNAL_VEC eta_mag_sq = ADD(MUL(eta_r, eta_r), MUL(eta_i, eta_i));
+        /* The final update prepares the next order, so it is not part of this n-by-n solve. */
+        if (i + 1 < n) {
+            INTERNAL_VEC abs2_reflection = ADD(MUL(e_lam_r, e_lam_r), MUL(e_lam_i, e_lam_i));
+            cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_reflection));
+        }
         lambda = SUB(lambda, DIV(eta_mag_sq, lambda));
     }
 
-    return VCONST(0.0);
+    return cond_bound;
 }

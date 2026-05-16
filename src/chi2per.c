@@ -93,6 +93,7 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define CHI2_PSWF_BETA DD_PSWF_BETA
 #    define CHI2_PSWF_GAMMA DD_PSWF_GAMMA
 #    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e24
+#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e24
 #    define COND_SINGULARITY_THRESHOLD_BAREISS 1e24
 #    define COND_SINGULARITY_THRESHOLD_LDLT 1e10
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
@@ -124,6 +125,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF_BETA D_PSWF_BETA
 #        define CHI2_PSWF_GAMMA D_PSWF_GAMMA
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e12
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e12
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 1e12
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e5
 #    else
@@ -150,6 +152,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF_BETA F_PSWF_BETA
 #        define CHI2_PSWF_GAMMA F_PSWF_GAMMA
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 2e5
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 2e5
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 2e5
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e2
 #    endif
@@ -174,7 +177,7 @@ static inline int float_is_nan_bits(float value) {
 }
 
 static const double condition_singularity_thresholds[] = {
-    0.0, COND_SINGULARITY_THRESHOLD_LEVINSON, 9e99, COND_SINGULARITY_THRESHOLD_BAREISS, COND_SINGULARITY_THRESHOLD_LDLT,
+    0.0, COND_SINGULARITY_THRESHOLD_LEVINSON, COND_SINGULARITY_THRESHOLD_ZOHAR, COND_SINGULARITY_THRESHOLD_BAREISS, COND_SINGULARITY_THRESHOLD_LDLT,
 };
 
 static inline double condition_singularity_threshold(int solver) {
