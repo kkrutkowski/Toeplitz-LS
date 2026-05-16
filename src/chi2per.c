@@ -151,7 +151,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF_GAMMA F_PSWF_GAMMA
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e6
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 1e6
-#        define COND_SINGULARITY_THRESHOLD_LDLT 1e3
+#        define COND_SINGULARITY_THRESHOLD_LDLT 1e2
 #    endif
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
