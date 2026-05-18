@@ -23,7 +23,9 @@ toeplitz-ls is compatible with free-threaded CPython (PEP 703, available as an o
 Note that Mpmath is not thread-safe by default; when using tlsdd in a multithreaded context, each worker should maintain its own mp context via mpmath.workprec() rather than mutating the global mp.prec.
 
 ## NaN handling
-When the system matrix at a given frequency is numerically singular, the solver returns NaN rather than raising an exception. Use np.nanargmax() and np.nanmax() in place of their standard counterparts to safely recover the peak frequency and power without short-circuiting on degenerate bins.
+When the system matrix at a given frequency is numerically unstable, the solver returns NaN rather than raising an exception. Use np.nanargmax() and np.nanmax() in place of their standard counterparts to safely recover the peak frequency and power without short-circuiting on degenerate bins.
+
+For manual filtering, call power() or autopower() with autonan=False to receive rough conditionality estimates alongside the periodogram. These estimates are solver-specific: LDLT reports a diagonal-ratio estimate, while the three Toeplitz solvers (levinson, zohar, and bareiss) return a reflection-coefficient-based upper bound. The Toeplitz estimates are generally much higher (and more reliable) for the same frequencies, so threshold values should be chosen with the solver family in mind.
 
 ### Example usage of tls and tlsf modules
 ```python
@@ -47,9 +49,16 @@ freq, r2 = tlsf.autopower(
     normalization="standard" # or "asymptotic"
     )
 
+best_idx = np.nanargmax(r2)
+best_freq = freq[best_idx]
+best_power = r2[best_idx]
+
+print(f"Peak frequency: {best_freq:.6g} (R^2 = {best_power:.6g})")
+
 plt.figure(figsize=(12, 5))
 
 plt.plot(freq, r2, label='degree = 3', color='red')
+plt.axvline(best_freq, linestyle='--', color='black', alpha=0.7)
 plt.xlabel('Frequency')
 plt.ylabel('Coefficient of determination')
 plt.legend()
@@ -59,46 +68,46 @@ plt.show()
 ```
 
 
-### Example usage of tlsdd module
+### Example usage with a custom singularity threshold
 ```python
 import numpy as np
 import matplotlib.pyplot as plt
-from mpmath import mp, mpf, sin, matrix
-from toeplitz_ls import tlsdd
-
-# Set working precision to 106-bit mantissa (double-double equivalent)
-mp.prec = 106
+from toeplitz_ls import tls
 
 rng = np.random.default_rng(seed=123)
 N = 1000
 
-t = sorted([mpf(v) for v in rng.uniform(0, 1000, size=N)])
-noise = [mpf(v) for v in rng.poisson(size=N)]
-y = [sin(mpf(50) * t[i]) + mpf("0.5") * sin(mpf(25) * t[i]) + mpf(1) + noise[i] for i in range(N)]
+t = np.sort(rng.uniform(0, 1000, size=N))
+y = np.sin(50 * t) + 0.5 * np.sin(150 * t) + 1 + rng.poisson(size=N)
 
-t_arr = np.array(t, dtype=object)
-y_arr = np.array(y, dtype=object)
-
-# Compute the periodogram
-freq, nll = tlsdd.autopower(
-    t_arr, y_arr, dy=None,
+# Ask for the raw power and LDLT conditionality estimates.
+freq, power, cond = tls.autopower(
+    t, y, dy=None,
     fmax=20,
-    nterms=1,               # equivalent to Generalised Scargle Periodogram
+    nterms=1, # mathematically equivalent to the generalized Scargle periodogram
     oversampling=5,
-    solver="bareiss",       # or "levinson", "zohar", "ldlt"
-    backend="pswf",         # or "lra"
-    normalization="asymptotic" # asymptotic estimate of negative log-likelihood
+    solver="ldlt", # LDLT condition estimates are on a different scale than Toeplitz bounds.
+    backend="pswf", # or "lra"
+    normalization="asymptotic",
+    autonan=False
 )
 
-# Use nanargmax/nanmax — the solver returns NaN at numerically singular frequencies
-best_idx = np.nanargmax(nll)
+threshold = 1e2
+
+# Mask numerically unreliable estimates so the peak search remains consistent.
+power[cond > threshold] = np.nan
+
+best_idx = np.nanargmax(power)
 best_freq = freq[best_idx]
-best_power = np.nanmax(nll)
+best_power = power[best_idx]
+
+print(f"Peak frequency: {best_freq:.6g} (R^2 = {best_power:.6g})")
 
 plt.figure(figsize=(12, 5))
-plt.plot(freq, nll, label='nterms = 1', color='blue')
+plt.plot(freq, power, label='degree = 1', color='blue')
+plt.axvline(best_freq, linestyle='--', color='black', alpha=0.7)
 plt.xlabel('Frequency')
-plt.ylabel('−log L (asymptotic)')
+plt.ylabel('Negative log-likelihood')
 plt.legend()
 plt.tight_layout()
 plt.show()
