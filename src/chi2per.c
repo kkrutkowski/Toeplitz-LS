@@ -360,7 +360,8 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
 }
 
 #if defined(DOUBLE_DOUBLE)
-static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power) {
+static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power,
+                                     FLOAT *cond) {
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -384,6 +385,7 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
     }
 
     FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
+    int nan_count = 0;
 
     for (int idx = 0; idx < N; ++idx) {
         for (int row = 0; row < norder; ++row) {
@@ -394,8 +396,10 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
         }
 
         FLOAT condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
-        if (condition_bound_is_singular(condition_bound, CHI2PER_SOLVER_LDLT)) {
+        if (cond) cond[idx] = condition_bound;
+        if (!cond && condition_bound_is_singular(condition_bound, CHI2PER_SOLVER_LDLT)) {
             power[idx] = FCAST(NAN);
+            ++nan_count;
             continue;
         }
 
@@ -411,12 +415,12 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
     free(D);
     free(Y);
     free(Z);
-    return CHI2PER_OK;
+    return cond ? CHI2PER_OK : nan_count;
 }
 
 static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
-                                FLOAT *power) {
-    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power);
+                                FLOAT *power, FLOAT *cond) {
+    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power, cond);
 
     const int norder = 2 * degree + 1;
 
@@ -491,6 +495,7 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
     }
 
     FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
+    int nan_count = 0;
 
     for (int idx = 0; idx < N; ++idx) {
         for (int k = 0; k < norder; ++k) {
@@ -513,24 +518,13 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
         Rr[norder] = FCAST(0.0);
         Ri[norder] = FCAST(0.0);
 
+        FLOAT condition_bound;
         if (solver == CHI2PER_SOLVER_LEVINSON) {
-            FLOAT condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
-            if (condition_bound_is_singular(condition_bound, solver)) {
-                power[idx] = FCAST(NAN);
-                continue;
-            }
+            condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
         } else if (solver == CHI2PER_SOLVER_ZOHAR) {
-            FLOAT condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
-            if (condition_bound_is_singular(condition_bound, solver)) {
-                power[idx] = FCAST(NAN);
-                continue;
-            }
+            condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
         } else if (solver == CHI2PER_SOLVER_BAREISS) {
-            FLOAT condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
-            if (condition_bound_is_singular(condition_bound, solver)) {
-                power[idx] = FCAST(NAN);
-                continue;
-            }
+            condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
         } else {
             free(Rr);
             free(Ri);
@@ -552,6 +546,13 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
             free(Bwr);
             free(Bwi);
             return CHI2PER_ERR_SOLVER;
+        }
+
+        if (cond) cond[idx] = condition_bound;
+        if (!cond && condition_bound_is_singular(condition_bound, solver)) {
+            power[idx] = FCAST(NAN);
+            ++nan_count;
+            continue;
         }
 
         FLOAT dot = FCAST(0.0);
@@ -578,10 +579,11 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
     free(Bvi);
     free(Bwr);
     free(Bwi);
-    return CHI2PER_OK;
+    return cond ? CHI2PER_OK : nan_count;
 }
 #else
-static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power) {
+static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power,
+                                      FLOAT *cond) {
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -605,6 +607,7 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
     }
 
     FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
+    int nan_count = 0;
 
     for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
         for (int row = 0; row < norder; ++row) {
@@ -628,8 +631,10 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
         for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
             int idx = base + lane;
             if (idx >= N) continue;
-            if (condition_bound_is_singular(condition_bound[lane], CHI2PER_SOLVER_LDLT)) {
+            if (cond) cond[idx] = condition_bound[lane];
+            if (!cond && condition_bound_is_singular(condition_bound[lane], CHI2PER_SOLVER_LDLT)) {
                 power[idx] = FCAST(NAN);
+                ++nan_count;
                 continue;
             }
 
@@ -648,12 +653,12 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
     free(D);
     free(Y);
     free(Z);
-    return CHI2PER_OK;
+    return cond ? CHI2PER_OK : nan_count;
 }
 
 static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
-                                 FLOAT *power) {
-    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power);
+                                 FLOAT *power, FLOAT *cond) {
+    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power, cond);
 
     const int norder = 2 * degree + 1;
 
@@ -728,6 +733,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
     }
 
     FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
+    int nan_count = 0;
 
     for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
         for (int k = 0; k < norder; ++k) {
@@ -765,27 +771,36 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             INTERNAL_VEC condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
-                if (idx < N && condition_bound_is_singular(condition_bound[lane], solver)) {
+                if (idx >= N) continue;
+                if (cond) cond[idx] = condition_bound[lane];
+                if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
                     power[idx] = FCAST(NAN);
+                    ++nan_count;
                 }
             }
         } else if (solver == CHI2PER_SOLVER_ZOHAR) {
             INTERNAL_VEC condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
-                if (idx < N && condition_bound_is_singular(condition_bound[lane], solver)) {
+                if (idx >= N) continue;
+                if (cond) cond[idx] = condition_bound[lane];
+                if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
                     power[idx] = FCAST(NAN);
+                    ++nan_count;
                 }
             }
         } else if (solver == CHI2PER_SOLVER_BAREISS) {
             INTERNAL_VEC condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
-                if (idx < N && condition_bound_is_singular(condition_bound[lane], solver)) {
+                if (idx >= N) continue;
+                if (cond) cond[idx] = condition_bound[lane];
+                if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
                     power[idx] = FCAST(NAN);
+                    ++nan_count;
                 }
             }
         } else {
@@ -847,12 +862,12 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
     free(Bvi);
     free(Bwr);
     free(Bwi);
-    return CHI2PER_OK;
+    return cond ? CHI2PER_OK : nan_count;
 }
 #endif
 
 int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
-                          FLOAT *power) {
+                          FLOAT *power, FLOAT *cond) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
     if (backend < 0 || backend >= 2) return CHI2PER_ERR_BACKEND;
     if (solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS && solver != CHI2PER_SOLVER_LDLT)
@@ -950,13 +965,13 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     if (status == CHI2PER_OK)
         status = compute_trig_sums(tc, yw, M, f0, df, N, degree, block, backend, plan, Syw, Cyw, src_r, src_i, delta_r, delta_i, out_r, out_i);
 
-    if (status == CHI2PER_OK && degree == 1) {
+    if (status == CHI2PER_OK && degree == 1 && !cond) {
         status = gls_impl(Sw, Cw, Syw, Cyw, N, ws, yws, chi2_ref, power);
     } else if (status == CHI2PER_OK) {
 #if defined(DOUBLE_DOUBLE)
-        status = solve_periodogram_dd(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, power);
+        status = solve_periodogram_dd(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, power, cond);
 #else
-        status = solve_periodogram_vec(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, power);
+        status = solve_periodogram_vec(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, power, cond);
 #endif
     }
 
