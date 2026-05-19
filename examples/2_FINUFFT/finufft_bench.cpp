@@ -198,7 +198,7 @@ int main() {
 
     // --- Custom PSWF Float ---
     t0 = now_seconds();
-    auto plan_pswf_f = tlsf_nufft_pswf_initialize(Mpoints, N, w_f, df, max_ff);
+    auto plan_pswf_f = tlsf_nufft_pswf_initialize(Mpoints, N, w_f, df, max_ff, "21");
     tlsf_nufft_pswf_precompute(plan_pswf_f, x.data());
     double t_pswf_plan_f = now_seconds() - t0;
 
@@ -361,7 +361,7 @@ int main() {
 
     // --- Custom PSWF Double ---
     t0 = now_seconds();
-    auto plan_pswf_d = tls_nufft_pswf_initialize(Mpoints, N, w_d, df, max_ff);
+    auto plan_pswf_d = tls_nufft_pswf_initialize(Mpoints, N, w_d, df, max_ff, "21");
     tls_nufft_pswf_precompute(plan_pswf_d, x.data());
     double t_pswf_plan_d = now_seconds() - t0;
 

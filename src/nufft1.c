@@ -14,6 +14,7 @@
  * ========================================================================= */
 
 static const int pswf_degrees[19] = {0, 0, 1, 2, 3, 4, 6, 7, 8, 10, 11, 14, 14, 16, 18, 18, 20, 20, 23};
+enum { PSWF_MAX_W = 36 };
 
 static inline size_t sz_max(size_t a, size_t b) { return (a > b) ? a : b; }
 
@@ -683,7 +684,9 @@ void PFX(free_lra_plan)(struct PFX(lra_plan) * plan) {
  * ========================================================================= */
 
 struct PFX(pswf_plan) {
-    int Mpoints, N, Nfft, w;
+    int Mpoints, N, Nout, Nfft, w;
+    int output_shift;
+    char upsamp[2];
     FLOAT alpha;
     int num_factors;
     double df;
@@ -695,14 +698,14 @@ struct PFX(pswf_plan) {
     FLOAT *fft_real, *fft_imag;
 };
 
-static inline FLOAT PFX(pswf0)(FLOAT z, int w) {
+static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
     int safe_w = w;
     if (safe_w < 1) safe_w = 1;
-    if (safe_w > 32) safe_w = 32;
+    if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
 
     FLOAT Z = MUL(z, z);
 
-    if (safe_w < 19) {
+    if (!mode43 && safe_w < 19) {
         FLOAT c = FCAST(M_PI * safe_w * 0.75 - 0.05);
         int deg = pswf_degrees[safe_w];
 
@@ -711,7 +714,7 @@ static inline FLOAT PFX(pswf0)(FLOAT z, int w) {
 
         return MUL(M_EXP(MUL(MUL(NEG(c), Z), FCAST(0.5))), poly);
     } else {
-        FLOAT beta = FCAST(2.30 * safe_w);
+        FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
         FLOAT inner = SUB(FCAST(1.0), Z);
         if (TO_DOUBLE(inner) < 0.0) inner = FCAST(0.0);
 
@@ -719,18 +722,19 @@ static inline FLOAT PFX(pswf0)(FLOAT z, int w) {
     }
 }
 
-static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict__ out_arr, int n, int w) {
+static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict__ out_arr, int n, int w, bool mode43) {
     int safe_w = w;
     if (safe_w < 1) safe_w = 1;
-    if (safe_w > 32) safe_w = 32;
+    if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
 
-    if (safe_w < 19) {
+#if INTERNAL_VEC_LEN > 1
+    int n_vec = n - (n % INTERNAL_VEC_LEN);
+
+    if (!mode43 && safe_w < 19) {
         FLOAT neg_c_half = NEG(MUL(FCAST(M_PI * safe_w * 0.75 - 0.05), FCAST(0.5)));
         int deg = pswf_degrees[safe_w];
 
-#if INTERNAL_VEC_LEN > 1
-        /* Vectorized evaluation leveraging overreach up to padding limits */
-        for (int i = 0; i < n; i += INTERNAL_VEC_LEN) {
+        for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
             INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
             INTERNAL_VEC v_Z = MUL(v_z, v_z);
 
@@ -740,19 +744,49 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
             INTERNAL_VEC v_result = MUL(M_EXP(MUL(v_Z, neg_c_half)), v_poly);
             STORE_VEC(&out_arr[i], v_result);
         }
-#else
-        for (int i = 0; i < n; ++i) out_arr[i] = PFX(pswf0)(z_arr[i], w);
-#endif
     } else {
-        for (int i = 0; i < n; ++i) out_arr[i] = PFX(pswf0)(z_arr[i], w);
+        FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
+        INTERNAL_VEC v_one = (INTERNAL_VEC){} + FCAST(1.0);
+        INTERNAL_VEC v_beta = (INTERNAL_VEC){} + beta;
+
+        for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
+            INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
+            INTERNAL_VEC v_Z = MUL(v_z, v_z);
+            INTERNAL_VEC v_inner = SUB(v_one, v_Z);
+
+            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                if (v_inner[lane] < FCAST(0.0)) v_inner[lane] = FCAST(0.0);
+            }
+
+            INTERNAL_VEC v_result = M_EXP(MUL(v_beta, SUB(M_SQRT(v_inner), v_one)));
+            STORE_VEC(&out_arr[i], v_result);
+        }
     }
+
+    for (int i = n_vec; i < n; ++i) out_arr[i] = PFX(pswf0)(z_arr[i], w, mode43);
+#else
+    for (int i = 0; i < n; ++i) out_arr[i] = PFX(pswf0)(z_arr[i], w, mode43);
+#endif
 }
 
-struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double df, int freq_factor) {
+struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2]) {
+    if (!upsamp) return NULL;
+
+    bool mode21 = (upsamp[0] == '2' && upsamp[1] == '1');
+    bool mode43 = (upsamp[0] == '4' && upsamp[1] == '3');
+    if (!mode21 && !mode43) return NULL;
+    if (mode43 && (N % 4) != 0) return NULL;
+    if (w < 1 || w > PSWF_MAX_W) return NULL;
+
     struct PFX(pswf_plan) *plan = (struct PFX(pswf_plan) *)calloc(1, sizeof(struct PFX(pswf_plan)));
+    if (!plan) return NULL;
     plan->Mpoints = Mpoints;
     plan->N = N;
+    plan->Nout = mode43 ? N + (N >> 1) : N;
+    plan->output_shift = mode43 ? 3 * N / 4 : N / 2;
     plan->w = w;
+    plan->upsamp[0] = upsamp[0];
+    plan->upsamp[1] = upsamp[1];
     plan->num_factors = freq_factor;
     plan->df = df;
     plan->Nfft = next_fast_len(2 * N);
@@ -762,7 +796,7 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     plan->spread_weight = (FLOAT *)malloc((size_t)Mpoints * plan->w * freq_factor * sizeof(FLOAT));
     plan->spread_comp_r = PFX(allocate_aligned)(plan->Nfft);
     plan->spread_comp_i = PFX(allocate_aligned)(plan->Nfft);
-    plan->deconv = (FLOAT *)malloc((size_t)N * sizeof(FLOAT));
+    plan->deconv = (FLOAT *)malloc((size_t)plan->Nout * sizeof(FLOAT));
 
     plan->shift_r = (FLOAT *)malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
     plan->shift_i = (FLOAT *)malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
@@ -774,7 +808,8 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
 }
 
 void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) {
-    int p = (int)(1.5 * plan->w + 2);
+    bool mode43 = (plan->upsamp[0] == '4' && plan->upsamp[1] == '3');
+    int p = mode43 ? (4 * plan->w + 16) : (int)(1.5 * plan->w + 2);
     int num_gl_nodes = 2 * p;
 
     FLOAT *gl_nodes = PFX(allocate_aligned)(num_gl_nodes);
@@ -782,13 +817,12 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     FLOAT *precomp_vals = PFX(allocate_aligned)(num_gl_nodes);
 
     PFX(get_lege_roots)(num_gl_nodes, gl_nodes, gl_weights);
-    PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w);
+    PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w, mode43);
 
     for (int j = 0; j < p; ++j) precomp_vals[j] = MUL(gl_weights[j], precomp_vals[j]);
 
-    int n_shift = plan->N / 2;
-    for (int k = 0; k < plan->N; ++k) {
-        FLOAT xi_k = MUL(plan->alpha, FCAST(k - n_shift));
+    for (int k = 0; k < plan->Nout; ++k) {
+        FLOAT xi_k = MUL(plan->alpha, FCAST(k - plan->output_shift));
         FLOAT phi_hat_half = FCAST(0.0);
 
         for (int j = 0; j < p; ++j) phi_hat_half = ADD(phi_hat_half, MUL(precomp_vals[j], M_COS2PI(MUL(xi_k, gl_nodes[j]))));
@@ -814,7 +848,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
 
 #if defined(DOUBLE_DOUBLE)
-        PFX(ff_t) n_half_ff = PFX(ff_make)(FCAST(0.5 * plan->N), FCAST(0.0));
+        PFX(ff_t) out_shift_ff = PFX(ff_make)(FCAST(plan->output_shift), FCAST(0.0));
         PFX(ff_t) n_ff = PFX(ff_make)(FCAST(plan->Nfft), FCAST(0.0));
         PFX(ff_t) scale_ff = PFX(ff_make)(FCAST(plan->df * k_factor), FCAST(0.0));
 
@@ -822,7 +856,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
             PFX(ff_t) x_ff = PFX(ff_make)(FCAST(x[m].hi), FCAST(x[m].lo));
             x_ff = PFX(ff_mul)(x_ff, scale_ff);
 
-            PFX(ff_t) phase_ff = PFX(ff_mul)(x_ff, n_half_ff);
+            PFX(ff_t) phase_ff = PFX(ff_mul)(x_ff, out_shift_ff);
             FLOAT p_int = FCAST((int)TO_DOUBLE(phase_ff.hi));
             PFX(ff_t) phase_frac_ff = PFX(ff_sub)(phase_ff, PFX(ff_make)(p_int, FCAST(0.0)));
             FLOAT phase_frac = ADD(phase_frac_ff.hi, phase_frac_ff.lo);
@@ -842,7 +876,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
                 z_buf[l] = DIV(MUL(FCAST(2.0), dist), FCAST(plan->w));
             }
 
-            PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w);
+            PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
 
             for (int l = 0; l < plan->w; ++l) {
                 int idx = m_left + l;
@@ -854,13 +888,13 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         }
 
 #else
-        double n_half = 0.5 * (double)plan->N;
+        double out_shift = (double)plan->output_shift;
         double n_fft = (double)plan->Nfft;
 
         for (int m = 0; m < plan->Mpoints; ++m) {
             double xm = x[m] * plan->df * k_factor;
 
-            double phase = xm * n_half;
+            double phase = xm * out_shift;
             double p_int = (double)((int)phase);
             double phase_frac = phase - p_int;
 
@@ -876,7 +910,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
                 z_buf[l] = FCAST((2.0 * dist) / (double)plan->w);
             }
 
-            PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w);
+            PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
 
             for (int l = 0; l < plan->w; ++l) {
                 int idx = m_left + l;
@@ -923,9 +957,8 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
 
     NANOFFT_EXECUTE(plan->nanofft_p, plan->fft_real, plan->fft_imag);
 
-    int n_shift = plan->N / 2;
-    for (int k = 0; k < plan->N; ++k) {
-        int k_prime = k - n_shift;
+    for (int k = 0; k < plan->Nout; ++k) {
+        int k_prime = k - plan->output_shift;
         int fft_idx = k_prime >= 0 ? k_prime : plan->Nfft + k_prime;
         out_real[k] = MUL(plan->fft_real[fft_idx], plan->deconv[k]);
         out_imag[k] = MUL(plan->fft_imag[fft_idx], plan->deconv[k]);

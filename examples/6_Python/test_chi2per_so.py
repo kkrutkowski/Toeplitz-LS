@@ -84,7 +84,7 @@ def main():
     print(f"M={t.size}, Nf={nf}, f0={f0}, df={df}, nterms={nterms}")
     print()
 
-    backends = {"pswf": "PSWF", "lra": "LRA"}
+    backends = {"pswf43": "PSWF43", "pswf21": "PSWF21", "lra": "LRA"}
     callers = [
         ("tlsf", call_tlsf),
         ("tls", call_tls),
@@ -93,7 +93,7 @@ def main():
 
     for backend, backend_name in backends.items():
         for precision, caller in callers:
-            for solver in ("levinson", "zohar", "bareiss", "ldlt"):
+            for solver in ("levinson", "ldlt"):
                 candidate = caller(t, y, dy, f0, df, nf, nterms, backend, solver)
                 print_difference(
                     f"{precision}-{backend_name}-{solver.title()}", candidate, reference

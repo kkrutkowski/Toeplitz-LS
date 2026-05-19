@@ -247,7 +247,7 @@ int main(int argc, char **argv) {
 
     /* --- PSWF gamma --- */
     {
-        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w, df, freq_factor);
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w, df, freq_factor, "21");
 
         int wups = 4, reps = 32;
 
@@ -380,7 +380,7 @@ int main(int argc, char **argv) {
 
     /* --- PSWF beta --- */
     {
-        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_beta, N_beta, w, df, freq_factor);
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_beta, N_beta, w, df, freq_factor, "21");
 #if defined(DOUBLE_DOUBLE)
         NUFFT_PSWF_PRE(plan, x_beta_dd);
 #else

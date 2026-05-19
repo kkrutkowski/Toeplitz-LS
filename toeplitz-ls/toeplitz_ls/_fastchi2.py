@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - exercised only without mpmath
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / "tls.so"
 
-_BACKENDS = {"pswf": 0, "lra": 1}
+_BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3, "pswf": 1}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4}
 _NORMALIZATIONS = {"standard", "asymptotic"}
 _STATUS_MESSAGES = {
@@ -123,7 +123,9 @@ def _backend_id(backend):
         key = backend.lower()
         if key in _BACKENDS:
             return _BACKENDS[key]
-    raise ValueError("backend must be 'pswf' or 'lra'")
+    if isinstance(backend, int) and backend in _BACKENDS.values():
+        return backend
+    raise ValueError("backend must be 'pswf43', 'pswf21', or 'lra'")
 
 
 def _solver_id(solver):
@@ -319,7 +321,7 @@ class tlsf:
         t,
         y,
         dy=None,
-        backend="pswf",
+        backend="pswf43",
         solver="levinson",
         nterms=3,
         normalization="standard",
@@ -377,7 +379,7 @@ class tlsf:
         oversampling=5,
         normalization="standard",
         nterms=3,
-        backend="pswf",
+        backend="pswf43",
         solver="levinson",
         *,
         autonan=True,
@@ -421,7 +423,7 @@ class tls:
         t,
         y,
         dy=None,
-        backend="pswf",
+        backend="pswf43",
         solver="levinson",
         nterms=3,
         normalization="standard",
@@ -478,7 +480,7 @@ class tls:
         oversampling=5,
         normalization="standard",
         nterms=3,
-        backend="pswf",
+        backend="pswf43",
         solver="levinson",
         *,
         autonan=True,
@@ -522,7 +524,7 @@ class tlsdd:
         t,
         y,
         dy=None,
-        backend="pswf",
+        backend="pswf43",
         solver="levinson",
         nterms=3,
         normalization="standard",
@@ -603,7 +605,7 @@ class tlsdd:
         oversampling=5,
         normalization="standard",
         nterms=3,
-        backend="pswf",
+        backend="pswf43",
         solver="levinson",
         *,
         autonan=True,

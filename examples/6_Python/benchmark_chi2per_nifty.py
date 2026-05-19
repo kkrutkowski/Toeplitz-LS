@@ -143,32 +143,28 @@ def benchmark(args):
     f0 = 2.0**-7
     df = 2.0**-15
 
-    c_methods = [
-        (
-            "tlsdd-PSWF-L",
-            lambda nf, nt: call_tlsdd(t, y, dy, f0, df, nf, nt, 0, 1),
-        ),
-        ("tls-LRA-L", lambda nf, nt: call_tls(t, y, dy, f0, df, nf, nt, 1, 1)),
-        ("tls-LRA-Z", lambda nf, nt: call_tls(t, y, dy, f0, df, nf, nt, 1, 2)),
-        ("tls-PSWF-L", lambda nf, nt: call_tls(t, y, dy, f0, df, nf, nt, 0, 1)),
-        ("tls-PSWF-Z", lambda nf, nt: call_tls(t, y, dy, f0, df, nf, nt, 0, 2)),
-        (
-            "tlsf-LRA-L",
-            lambda nf, nt: call_tlsf(t, y, dy, f0, df, nf, nt, 1, 1),
-        ),
-        (
-            "tlsf-LRA-Z",
-            lambda nf, nt: call_tlsf(t, y, dy, f0, df, nf, nt, 1, 2),
-        ),
-        (
-            "tlsf-PSWF-L",
-            lambda nf, nt: call_tlsf(t, y, dy, f0, df, nf, nt, 0, 1),
-        ),
-        (
-            "tlsf-PSWF-Z",
-            lambda nf, nt: call_tlsf(t, y, dy, f0, df, nf, nt, 0, 2),
-        ),
-    ]
+    c_methods = []
+    for precision, caller in (
+        ("tlsdd", call_tlsdd),
+        ("tls", call_tls),
+        ("tlsf", call_tlsf),
+    ):
+        for backend_label, backend in (
+            ("PSWF43", "pswf43"),
+            ("PSWF21", "pswf21"),
+            ("LRA", "lra"),
+        ):
+            for solver_label, solver in (("L", "levinson"), ("LDLT", "ldlt")):
+                if precision == "tlsdd" and backend == "lra" and solver == "levinson":
+                    continue
+                c_methods.append(
+                    (
+                        f"{precision}-{backend_label}-{solver_label}",
+                        lambda nf, nt, caller=caller, backend=backend, solver=solver: caller(
+                            t, y, dy, f0, df, nf, nt, backend, solver
+                        ),
+                    )
+                )
 
     for nterms in (1, 3):  # , 8
         print_header(nterms, f0, df)
@@ -181,7 +177,7 @@ def benchmark(args):
             ref_label, ref_time, reference = timed(
                 "tlsdd-LRA-L",
                 lambda nf=nf, nterms=nterms: call_tlsdd(
-                    t, y, dy, f0, df, nf, nterms, 1, 1
+                    t, y, dy, f0, df, nf, nterms, "lra", "levinson"
                 ),
             )
             print_row(nf, ref_label, ref_time, reference, reference)
