@@ -150,9 +150,9 @@ def benchmark(args):
         ("tlsf", call_tlsf),
     ):
         for backend_label, backend in (
-            ("PSWF43", "pswf43"),
-            ("PSWF21", "pswf21"),
             ("LRA", "lra"),
+            ("PSWF21", "pswf21"),
+            ("PSWF43", "pswf43"),
         ):
             for solver_label, solver in (("L", "levinson"), ("LDLT", "ldlt")):
                 if precision == "tlsdd" and backend == "lra" and solver == "levinson":
