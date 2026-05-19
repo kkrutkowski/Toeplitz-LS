@@ -54,8 +54,8 @@ static int optimize_plan_size(int N, int M, int degree, double alpha, double bet
     return block;
 }
 
-static int pswf43_plan_len_for_output(int output_count) {
-    int plan_len = (2 * output_count + 2) / 3;
+static int pswf43_plan_len_from_base(int base_len) {
+    int plan_len = base_len;
     if (plan_len < 4) plan_len = 4;
     return (plan_len + 3) & ~3;
 }
@@ -892,9 +892,9 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
     double beta = use_pswf ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
     double gamma = use_pswf ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;
-    int block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma);
-    int plan_block = use_pswf43 ? pswf43_plan_len_for_output(block) : block;
-    int output_block = use_pswf43 ? pswf43_output_len_for_plan(plan_block) : block;
+    int plan_block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma);
+    if (use_pswf43) plan_block = pswf43_plan_len_from_base(plan_block);
+    int block = use_pswf43 ? pswf43_output_len_for_plan(plan_block) : plan_block;
     int max_factor = 2 * degree;
 
     FLOAT *w = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
@@ -909,8 +909,8 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     FLOAT *src_i = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
     FLOAT *delta_r = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
     FLOAT *delta_i = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
-    FLOAT *out_r = (FLOAT *)checked_aligned_malloc((size_t)output_block, sizeof(FLOAT));
-    FLOAT *out_i = (FLOAT *)checked_aligned_malloc((size_t)output_block, sizeof(FLOAT));
+    FLOAT *out_r = (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
+    FLOAT *out_i = (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
     void *plan = NULL;
     int status = CHI2PER_OK;
 
@@ -963,8 +963,15 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         Syw[k] = FCAST(0.0);
     }
 
-    if (use_pswf) {
-        plan = NUFFT_PSWF_INIT(M, plan_block, use_pswf43 ? NUFFT_W43 : NUFFT_W, df, max_factor, use_pswf43 ? "43" : "21");
+    if (backend == CHI2PER_BACKEND_PSWF43) {
+        plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W43, df, max_factor, "43");
+        if (!plan) {
+            status = CHI2PER_ERR_ALLOC;
+            goto cleanup;
+        }
+        NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
+    } else if (backend == CHI2PER_BACKEND_PSWF21) {
+        plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W, df, max_factor, "21");
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
