@@ -5,9 +5,9 @@ import numpy as np
 from utils import trig_sum
 
 
-def _solve_zohar(R, y):
+def _solve_toeplitz_recursion(R, y):
     """
-    Solves a complex Hermitian Toeplitz system R * s = y using Zohar's algorithm.
+    Solves a complex Hermitian Toeplitz system R * s = y using a recursion.
     Optimized with numpy vectorization.
     """
     n = len(R)
@@ -69,7 +69,7 @@ def lombscargle_fastchi2(
     trig_sum_kwds=None,
     *,
     algorithm="lra",
-    solver="naive",
+    solver="ldlt",
 ):
     """Lomb-Scargle Periodogram.
 
@@ -105,10 +105,10 @@ def lombscargle_fastchi2(
 
         - 'fasper': use Press & Rybicki's piecewise Lagrange polynomial extirpolation. This is the default option.
         - 'lra': Use the more accurate (but slower) Low Rank Approximation by Ruiz-Antolin and Townsend.
-    solver : 'naive' (default) or 'zohar'
+    solver : 'ldlt' (default) or 'levinson'
         The linear solver to use for calculating the periodogram powers.
-        - 'naive': Assembles the real-valued normal equations and uses np.linalg.solve.
-        - 'zohar': Maps the problem to a Hermitian Toeplitz system and uses Zohar's recursion.
+        - 'ldlt': Assembles the real-valued normal equations and uses np.linalg.solve.
+        - 'levinson': Maps the problem to a Hermitian Toeplitz system and uses a recursion.
 
     Returns
     -------
@@ -176,7 +176,7 @@ def lombscargle_fastchi2(
     )
     Syw, Cyw = zip(*SCyw)
 
-    if solver == "naive":
+    if solver == "ldlt":
         # Now create an indexing scheme so we can quickly
         # build-up matrices at each frequency
         order = [("C", 0)] if fit_mean else []
@@ -192,27 +192,27 @@ def lombscargle_fastchi2(
         )
 
         if normalization == "cond":
-            def compute_cond_naive(i):
+            def compute_cond_ldlt(i):
                 XTX = np.array(
                     [[funcs[A[0] + B[0]](A[1], B[1], i) for A in order] for B in order]
                 )
                 return np.linalg.cond(XTX)
 
-            return np.array([compute_cond_naive(i) for i in range(Nf)])
+            return np.array([compute_cond_ldlt(i) for i in range(Nf)])
 
         else:
-            def compute_power_naive(i):
+            def compute_power_ldlt(i):
                 XTX = np.array(
                     [[funcs[A[0] + B[0]](A[1], B[1], i) for A in order] for B in order]
                 )
                 XTy = np.array([funcs[A[0]](A[1], i) for A in order])
                 return np.dot(XTy.T, np.linalg.solve(XTX, XTy))
 
-            p = np.array([compute_power_naive(i) for i in range(Nf)])
+            p = np.array([compute_power_ldlt(i) for i in range(Nf)])
 
-    elif solver == "zohar":
+    elif solver == "levinson":
         if not fit_mean:
-            raise ValueError("The Zohar solver algorithm requires fit_mean=True")
+            raise ValueError("The Levinson solver algorithm requires fit_mean=True")
 
         norder = 2 * nterms + 1
 
@@ -255,7 +255,7 @@ def lombscargle_fastchi2(
                     else:
                         Y[k] = Cyw[abs(h)][i] + 1j * Syw[abs(h)][i]
 
-                s = _solve_zohar(R, Y)
+                s = _solve_toeplitz_recursion(R, Y)
 
                 # Compute power. np.vdot(Y, s) equals sum(conj(Y) * s),
                 # strictly mirroring the Julia calculation.

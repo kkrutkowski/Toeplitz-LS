@@ -93,9 +93,13 @@ int main() {
   int w_d = 16;
   int rank_dd = 27;
   int w_dd = 32; // EoS fallback
+  int w43_f = 9;
+  int w43_d = 18;
+  int w43_dd = 36;
 
   double df = 1.0;
   int max_ff = 2; // Test with max_ff=2 to evaluate freq_factors of 1 and 2
+  int N43 = N + (N >> 1);
 
   double *x = (double *)malloc(Mpoints * sizeof(double));
   dd_t *x_dd = (dd_t *)malloc(Mpoints * sizeof(dd_t));
@@ -108,26 +112,31 @@ int main() {
       "======================================================================"
       "========================================"
       "==========\n");
-  printf(" DEFAULT SWEEP: Mpoints=%d N=%d rank_f=%d w_f=%d rank_d=%d w_d=%d "
-         "rank_dd=%d w_dd=%d df=%.2f freq_factors=%d\n",
-         Mpoints, N, rank_f, w_f, rank_d, w_d, rank_dd, w_dd, df, max_ff);
+  printf(" DEFAULT SWEEP: Mpoints=%d N=%d N43=%d rank_f=%d w_f=%d w43_f=%d "
+         "rank_d=%d w_d=%d w43_d=%d rank_dd=%d w_dd=%d w43_dd=%d df=%.2f "
+         "freq_factors=%d\n",
+         Mpoints, N, N43, rank_f, w_f, w43_f, rank_d, w_d, w43_d, rank_dd,
+         w_dd, w43_dd, df, max_ff);
   printf(
       "======================================================================"
       "========================================"
       "==========\n");
   printf(
-      " num_y |  Naive (s) |   LRA_f (s) |  LRA_f Err |  PSWF_f (s) | PSWF_f "
-      "Err |   LRA_d (s) |  LRA_d Err |  "
-      "PSWF_d (s) | PSWF_d Err |  LRA_dd (s) | LRA_dd Err | PSWF_dd (s) | "
-      "PSWF_dd Err\n");
+      " num_y |  Naive (s) |   LRA_f (s) |  LRA_f Err | PSWF21_f(s) | "
+      "PSWF21_f Err | PSWF43_f(s*) | PSWF43_f Err |   LRA_d (s) |  "
+      "LRA_d Err | PSWF21_d(s) | PSWF21_d Err | PSWF43_d(s*) | "
+      "PSWF43_d Err |  LRA_dd (s) | LRA_dd Err | PSWF21_dd(s) | "
+      "PSWF21_dd Err | PSWF43_dd(s*) | PSWF43_dd Err\n");
   printf(
       "----------------------------------------------------------------------"
       "----------------------------------------"
       "----------\n");
+  printf(" s* = measured 4/3 PSWF time scaled by 2/3\n");
 
   for (int num_y = 10; num_y <= 100; num_y += 30) {
     size_t total_pts = (size_t)num_y * Mpoints;
     size_t total_out = (size_t)num_y * max_ff * N;
+    size_t total_out43 = (size_t)num_y * max_ff * N43;
 
     float *ys_r_f = malloc(total_pts * sizeof(float));
     float *ys_i_f = malloc(total_pts * sizeof(float));
@@ -155,18 +164,26 @@ int main() {
     float *out_lra_i_f = malloc(total_out * sizeof(float));
     float *out_pswf_r_f = malloc(total_out * sizeof(float));
     float *out_pswf_i_f = malloc(total_out * sizeof(float));
+    float *out_pswf43_r_f = malloc(total_out43 * sizeof(float));
+    float *out_pswf43_i_f = malloc(total_out43 * sizeof(float));
 
     double *out_lra_r_d = malloc(total_out * sizeof(double));
     double *out_lra_i_d = malloc(total_out * sizeof(double));
     double *out_pswf_r_d = malloc(total_out * sizeof(double));
     double *out_pswf_i_d = malloc(total_out * sizeof(double));
+    double *out_pswf43_r_d = malloc(total_out43 * sizeof(double));
+    double *out_pswf43_i_d = malloc(total_out43 * sizeof(double));
     dd_t *out_lra_r_dd = malloc(total_out * sizeof(dd_t));
     dd_t *out_lra_i_dd = malloc(total_out * sizeof(dd_t));
     dd_t *out_pswf_r_dd = malloc(total_out * sizeof(dd_t));
     dd_t *out_pswf_i_dd = malloc(total_out * sizeof(dd_t));
+    dd_t *out_pswf43_r_dd = malloc(total_out43 * sizeof(dd_t));
+    dd_t *out_pswf43_i_dd = malloc(total_out43 * sizeof(dd_t));
 
     __float128 *out_naive_r_q = malloc(total_out * sizeof(__float128));
     __float128 *out_naive_i_q = malloc(total_out * sizeof(__float128));
+    __float128 *out_naive43_r_q = malloc(total_out43 * sizeof(__float128));
+    __float128 *out_naive43_i_q = malloc(total_out43 * sizeof(__float128));
 
     double t0 = now_seconds();
     tlsf_nufft_lra_plan *plan_lra_f =
@@ -185,7 +202,7 @@ int main() {
 
     t0 = now_seconds();
     tlsf_nufft_pswf_plan *plan_pswf_f =
-        tlsf_nufft_pswf_initialize(Mpoints, N, w_f, df, max_ff);
+        tlsf_nufft_pswf_initialize(Mpoints, N, w_f, df, max_ff, "21");
     tlsf_nufft_pswf_precompute(plan_pswf_f, x);
     for (int j = 0; j < num_y; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
@@ -197,6 +214,22 @@ int main() {
     }
     tlsf_nufft_free_pswf_plan(plan_pswf_f);
     double t_pswf_f = now_seconds() - t0;
+
+    t0 = now_seconds();
+    tlsf_nufft_pswf_plan *plan_pswf43_f =
+        tlsf_nufft_pswf_initialize(Mpoints, N, w43_f, df, max_ff, "43");
+    tlsf_nufft_pswf_precompute(plan_pswf43_f, x);
+    for (int j = 0; j < num_y; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        tlsf_nufft_pswf_execute(plan_pswf43_f, ys_r_f + j * Mpoints,
+                                ys_i_f + j * Mpoints,
+                                out_pswf43_r_f + out_idx * N43,
+                                out_pswf43_i_f + out_idx * N43, ff);
+      }
+    }
+    tlsf_nufft_free_pswf_plan(plan_pswf43_f);
+    double t_pswf43_f = (now_seconds() - t0) * (2.0 / 3.0);
 
     t0 = now_seconds();
     tls_nufft_lra_plan *plan_lra_d =
@@ -215,7 +248,7 @@ int main() {
 
     t0 = now_seconds();
     tls_nufft_pswf_plan *plan_pswf_d =
-        tls_nufft_pswf_initialize(Mpoints, N, w_d, df, max_ff);
+        tls_nufft_pswf_initialize(Mpoints, N, w_d, df, max_ff, "21");
     tls_nufft_pswf_precompute(plan_pswf_d, x);
     for (int j = 0; j < num_y; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
@@ -227,6 +260,22 @@ int main() {
     }
     tls_nufft_free_pswf_plan(plan_pswf_d);
     double t_pswf_d = now_seconds() - t0;
+
+    t0 = now_seconds();
+    tls_nufft_pswf_plan *plan_pswf43_d =
+        tls_nufft_pswf_initialize(Mpoints, N, w43_d, df, max_ff, "43");
+    tls_nufft_pswf_precompute(plan_pswf43_d, x);
+    for (int j = 0; j < num_y; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        tls_nufft_pswf_execute(plan_pswf43_d, ys_r_d + j * Mpoints,
+                               ys_i_d + j * Mpoints,
+                               out_pswf43_r_d + out_idx * N43,
+                               out_pswf43_i_d + out_idx * N43, ff);
+      }
+    }
+    tls_nufft_free_pswf_plan(plan_pswf43_d);
+    double t_pswf43_d = (now_seconds() - t0) * (2.0 / 3.0);
 
     t0 = now_seconds();
     tlsdd_nufft_lra_plan *plan_lra_dd =
@@ -245,7 +294,7 @@ int main() {
 
     t0 = now_seconds();
     tlsdd_nufft_pswf_plan *plan_pswf_dd =
-        tlsdd_nufft_pswf_initialize(Mpoints, N, w_dd, df, max_ff);
+        tlsdd_nufft_pswf_initialize(Mpoints, N, w_dd, df, max_ff, "21");
     tlsdd_nufft_pswf_precompute(plan_pswf_dd, x_dd);
     for (int j = 0; j < num_y; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
@@ -259,6 +308,22 @@ int main() {
     double t_pswf_dd = now_seconds() - t0;
 
     t0 = now_seconds();
+    tlsdd_nufft_pswf_plan *plan_pswf43_dd =
+        tlsdd_nufft_pswf_initialize(Mpoints, N, w43_dd, df, max_ff, "43");
+    tlsdd_nufft_pswf_precompute(plan_pswf43_dd, x_dd);
+    for (int j = 0; j < num_y; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        tlsdd_nufft_pswf_execute(
+            plan_pswf43_dd, ys_r_dd + j * Mpoints, ys_i_dd + j * Mpoints,
+            out_pswf43_r_dd + out_idx * N43,
+            out_pswf43_i_dd + out_idx * N43, ff);
+      }
+    }
+    tlsdd_nufft_free_pswf_plan(plan_pswf43_dd);
+    double t_pswf43_dd = (now_seconds() - t0) * (2.0 / 3.0);
+
+    t0 = now_seconds();
     for (int j = 0; j < num_y; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
         size_t out_idx = (size_t)j * max_ff + (ff - 1);
@@ -269,30 +334,54 @@ int main() {
     }
     double t_naive = now_seconds() - t0;
 
+    for (int j = 0; j < num_y; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        nufft1_naive_q(x, ys_r_q + j * Mpoints, ys_i_q + j * Mpoints, Mpoints,
+                       N43, out_naive43_r_q + out_idx * N43,
+                       out_naive43_i_q + out_idx * N43, df, ff);
+      }
+    }
+
     double err_lra_f =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y * max_ff,
                         out_lra_r_f, out_lra_i_f, BENCH_FLOAT);
     double err_pswf_f =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y * max_ff,
                         out_pswf_r_f, out_pswf_i_f, BENCH_FLOAT);
+    double err_pswf43_f =
+        compute_avg_rel(out_naive43_r_q, out_naive43_i_q, N43,
+                        num_y * max_ff, out_pswf43_r_f, out_pswf43_i_f,
+                        BENCH_FLOAT);
     double err_lra_d =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y * max_ff,
                         out_lra_r_d, out_lra_i_d, BENCH_DOUBLE);
     double err_pswf_d =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y * max_ff,
                         out_pswf_r_d, out_pswf_i_d, BENCH_DOUBLE);
+    double err_pswf43_d =
+        compute_avg_rel(out_naive43_r_q, out_naive43_i_q, N43,
+                        num_y * max_ff, out_pswf43_r_d, out_pswf43_i_d,
+                        BENCH_DOUBLE);
     double err_lra_dd =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y * max_ff,
                         out_lra_r_dd, out_lra_i_dd, BENCH_DD);
     double err_pswf_dd =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y * max_ff,
                         out_pswf_r_dd, out_pswf_i_dd, BENCH_DD);
+    double err_pswf43_dd =
+        compute_avg_rel(out_naive43_r_q, out_naive43_i_q, N43,
+                        num_y * max_ff, out_pswf43_r_dd, out_pswf43_i_dd,
+                        BENCH_DD);
 
-    printf(" %5d | %10.6f | %11.6f | %10.2e | %11.6f | %10.2e | %11.6f | "
-           "%10.2e | %11.6f | %10.2e | %11.6f | %10.2e | %11.6f | %10.2e\n",
-           num_y, t_naive, t_lra_f, err_lra_f, t_pswf_f, err_pswf_f, t_lra_d,
-           err_lra_d, t_pswf_d, err_pswf_d, t_lra_dd, err_lra_dd, t_pswf_dd,
-           err_pswf_dd);
+    printf(" %5d | %10.6f | %11.6f | %10.2e | %11.6f | %12.2e | "
+           "%12.6f | %12.2e | %11.6f | %10.2e | %11.6f | %12.2e | "
+           "%12.6f | %12.2e | %11.6f | %10.2e | %12.6f | %13.2e | "
+           "%13.6f | %13.2e\n",
+           num_y, t_naive, t_lra_f, err_lra_f, t_pswf_f, err_pswf_f,
+           t_pswf43_f, err_pswf43_f, t_lra_d, err_lra_d, t_pswf_d,
+           err_pswf_d, t_pswf43_d, err_pswf43_d, t_lra_dd, err_lra_dd,
+           t_pswf_dd, err_pswf_dd, t_pswf43_dd, err_pswf43_dd);
 
     free(ys_r_f);
     free(ys_i_f);
@@ -306,16 +395,24 @@ int main() {
     free(out_lra_i_f);
     free(out_pswf_r_f);
     free(out_pswf_i_f);
+    free(out_pswf43_r_f);
+    free(out_pswf43_i_f);
     free(out_lra_r_d);
     free(out_lra_i_d);
     free(out_pswf_r_d);
     free(out_pswf_i_d);
+    free(out_pswf43_r_d);
+    free(out_pswf43_i_d);
     free(out_lra_r_dd);
     free(out_lra_i_dd);
     free(out_pswf_r_dd);
     free(out_pswf_i_dd);
+    free(out_pswf43_r_dd);
+    free(out_pswf43_i_dd);
     free(out_naive_r_q);
     free(out_naive_i_q);
+    free(out_naive43_r_q);
+    free(out_naive43_i_q);
   }
 
   printf(
@@ -328,18 +425,21 @@ int main() {
       "========================================"
       "==========\n");
   printf(
-      "  Rank |  Naive (s) |   LRA_f (s) |  LRA_f Err |  PSWF_f (s) | PSWF_f "
-      "Err |   LRA_d (s) |  LRA_d Err |  "
-      "PSWF_d (s) | PSWF_d Err |  LRA_dd (s) | LRA_dd Err | PSWF_dd (s) | "
-      "PSWF_dd Err\n");
+      " Width |  Naive (s) |   LRA_f (s) |  LRA_f Err | PSWF21_f(s) | "
+      "PSWF21_f Err | PSWF43_f(s*) | PSWF43_f Err |   LRA_d (s) |  "
+      "LRA_d Err | PSWF21_d(s) | PSWF21_d Err | PSWF43_d(s*) | "
+      "PSWF43_d Err |  LRA_dd (s) | LRA_dd Err | PSWF21_dd(s) | "
+      "PSWF21_dd Err | PSWF43_dd(s*) | PSWF43_dd Err\n");
   printf(
       "----------------------------------------------------------------------"
       "----------------------------------------"
       "----------\n");
+  printf(" s* = measured 4/3 PSWF time scaled by 2/3\n");
 
   int num_y_fixed = 10;
   size_t total_pts = (size_t)num_y_fixed * Mpoints;
   size_t total_out = (size_t)num_y_fixed * max_ff * N;
+  size_t total_out43 = (size_t)num_y_fixed * max_ff * N43;
 
   float *ys_r_f = malloc(total_pts * sizeof(float));
   float *ys_i_f = malloc(total_pts * sizeof(float));
@@ -367,18 +467,26 @@ int main() {
   float *out_lra_i_f = malloc(total_out * sizeof(float));
   float *out_pswf_r_f = malloc(total_out * sizeof(float));
   float *out_pswf_i_f = malloc(total_out * sizeof(float));
+  float *out_pswf43_r_f = malloc(total_out43 * sizeof(float));
+  float *out_pswf43_i_f = malloc(total_out43 * sizeof(float));
 
   double *out_lra_r_d = malloc(total_out * sizeof(double));
   double *out_lra_i_d = malloc(total_out * sizeof(double));
   double *out_pswf_r_d = malloc(total_out * sizeof(double));
   double *out_pswf_i_d = malloc(total_out * sizeof(double));
+  double *out_pswf43_r_d = malloc(total_out43 * sizeof(double));
+  double *out_pswf43_i_d = malloc(total_out43 * sizeof(double));
   dd_t *out_lra_r_dd = malloc(total_out * sizeof(dd_t));
   dd_t *out_lra_i_dd = malloc(total_out * sizeof(dd_t));
   dd_t *out_pswf_r_dd = malloc(total_out * sizeof(dd_t));
   dd_t *out_pswf_i_dd = malloc(total_out * sizeof(dd_t));
+  dd_t *out_pswf43_r_dd = malloc(total_out43 * sizeof(dd_t));
+  dd_t *out_pswf43_i_dd = malloc(total_out43 * sizeof(dd_t));
 
   __float128 *out_naive_r_q = malloc(total_out * sizeof(__float128));
   __float128 *out_naive_i_q = malloc(total_out * sizeof(__float128));
+  __float128 *out_naive43_r_q = malloc(total_out43 * sizeof(__float128));
+  __float128 *out_naive43_i_q = malloc(total_out43 * sizeof(__float128));
 
   // Precompute stored Naive baseline for all freq_factors
   double t0 = now_seconds();
@@ -392,7 +500,16 @@ int main() {
   }
   double t_naive_stored = now_seconds() - t0;
 
-  for (int r = 1; r <= 32; ++r) {
+  for (int j = 0; j < num_y_fixed; j++) {
+    for (int ff = 1; ff <= max_ff; ++ff) {
+      size_t out_idx = (size_t)j * max_ff + (ff - 1);
+      nufft1_naive_q(x, ys_r_q + j * Mpoints, ys_i_q + j * Mpoints, Mpoints,
+                     N43, out_naive43_r_q + out_idx * N43,
+                     out_naive43_i_q + out_idx * N43, df, ff);
+    }
+  }
+
+  for (int r = 1; r <= 36; ++r) {
     // LRA Single
     t0 = now_seconds();
     tlsf_nufft_lra_plan *plan_lra_f =
@@ -412,7 +529,7 @@ int main() {
     // PSWF Single
     t0 = now_seconds();
     tlsf_nufft_pswf_plan *plan_pswf_f =
-        tlsf_nufft_pswf_initialize(Mpoints, N, r, df, max_ff);
+        tlsf_nufft_pswf_initialize(Mpoints, N, r, df, max_ff, "21");
     tlsf_nufft_pswf_precompute(plan_pswf_f, x);
     for (int j = 0; j < num_y_fixed; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
@@ -424,6 +541,22 @@ int main() {
     }
     tlsf_nufft_free_pswf_plan(plan_pswf_f);
     double t_pswf_f = now_seconds() - t0;
+
+    t0 = now_seconds();
+    tlsf_nufft_pswf_plan *plan_pswf43_f =
+        tlsf_nufft_pswf_initialize(Mpoints, N, r, df, max_ff, "43");
+    tlsf_nufft_pswf_precompute(plan_pswf43_f, x);
+    for (int j = 0; j < num_y_fixed; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        tlsf_nufft_pswf_execute(plan_pswf43_f, ys_r_f + j * Mpoints,
+                                ys_i_f + j * Mpoints,
+                                out_pswf43_r_f + out_idx * N43,
+                                out_pswf43_i_f + out_idx * N43, ff);
+      }
+    }
+    tlsf_nufft_free_pswf_plan(plan_pswf43_f);
+    double t_pswf43_f = (now_seconds() - t0) * (2.0 / 3.0);
 
     // LRA Double
     t0 = now_seconds();
@@ -444,7 +577,7 @@ int main() {
     // PSWF Double
     t0 = now_seconds();
     tls_nufft_pswf_plan *plan_pswf_d =
-        tls_nufft_pswf_initialize(Mpoints, N, r, df, max_ff);
+        tls_nufft_pswf_initialize(Mpoints, N, r, df, max_ff, "21");
     tls_nufft_pswf_precompute(plan_pswf_d, x);
     for (int j = 0; j < num_y_fixed; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
@@ -456,6 +589,22 @@ int main() {
     }
     tls_nufft_free_pswf_plan(plan_pswf_d);
     double t_pswf_d = now_seconds() - t0;
+
+    t0 = now_seconds();
+    tls_nufft_pswf_plan *plan_pswf43_d =
+        tls_nufft_pswf_initialize(Mpoints, N, r, df, max_ff, "43");
+    tls_nufft_pswf_precompute(plan_pswf43_d, x);
+    for (int j = 0; j < num_y_fixed; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        tls_nufft_pswf_execute(plan_pswf43_d, ys_r_d + j * Mpoints,
+                               ys_i_d + j * Mpoints,
+                               out_pswf43_r_d + out_idx * N43,
+                               out_pswf43_i_d + out_idx * N43, ff);
+      }
+    }
+    tls_nufft_free_pswf_plan(plan_pswf43_d);
+    double t_pswf43_d = (now_seconds() - t0) * (2.0 / 3.0);
 
     // LRA Double-Double
     t0 = now_seconds();
@@ -476,7 +625,7 @@ int main() {
     // PSWF Double-Double
     t0 = now_seconds();
     tlsdd_nufft_pswf_plan *plan_pswf_dd =
-        tlsdd_nufft_pswf_initialize(Mpoints, N, r, df, max_ff);
+        tlsdd_nufft_pswf_initialize(Mpoints, N, r, df, max_ff, "21");
     tlsdd_nufft_pswf_precompute(plan_pswf_dd, x_dd);
     for (int j = 0; j < num_y_fixed; j++) {
       for (int ff = 1; ff <= max_ff; ++ff) {
@@ -489,6 +638,22 @@ int main() {
     tlsdd_nufft_free_pswf_plan(plan_pswf_dd);
     double t_pswf_dd = now_seconds() - t0;
 
+    t0 = now_seconds();
+    tlsdd_nufft_pswf_plan *plan_pswf43_dd =
+        tlsdd_nufft_pswf_initialize(Mpoints, N, r, df, max_ff, "43");
+    tlsdd_nufft_pswf_precompute(plan_pswf43_dd, x_dd);
+    for (int j = 0; j < num_y_fixed; j++) {
+      for (int ff = 1; ff <= max_ff; ++ff) {
+        size_t out_idx = (size_t)j * max_ff + (ff - 1);
+        tlsdd_nufft_pswf_execute(
+            plan_pswf43_dd, ys_r_dd + j * Mpoints, ys_i_dd + j * Mpoints,
+            out_pswf43_r_dd + out_idx * N43,
+            out_pswf43_i_dd + out_idx * N43, ff);
+      }
+    }
+    tlsdd_nufft_free_pswf_plan(plan_pswf43_dd);
+    double t_pswf43_dd = (now_seconds() - t0) * (2.0 / 3.0);
+
     // Errors (comparing to the stored naive calculation over all ff
     // multipliers)
     double err_lra_f =
@@ -497,24 +662,39 @@ int main() {
     double err_pswf_f =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y_fixed * max_ff,
                         out_pswf_r_f, out_pswf_i_f, BENCH_FLOAT);
+    double err_pswf43_f =
+        compute_avg_rel(out_naive43_r_q, out_naive43_i_q, N43,
+                        num_y_fixed * max_ff, out_pswf43_r_f,
+                        out_pswf43_i_f, BENCH_FLOAT);
     double err_lra_d =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y_fixed * max_ff,
                         out_lra_r_d, out_lra_i_d, BENCH_DOUBLE);
     double err_pswf_d =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y_fixed * max_ff,
                         out_pswf_r_d, out_pswf_i_d, BENCH_DOUBLE);
+    double err_pswf43_d =
+        compute_avg_rel(out_naive43_r_q, out_naive43_i_q, N43,
+                        num_y_fixed * max_ff, out_pswf43_r_d,
+                        out_pswf43_i_d, BENCH_DOUBLE);
     double err_lra_dd =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y_fixed * max_ff,
                         out_lra_r_dd, out_lra_i_dd, BENCH_DD);
     double err_pswf_dd =
         compute_avg_rel(out_naive_r_q, out_naive_i_q, N, num_y_fixed * max_ff,
                         out_pswf_r_dd, out_pswf_i_dd, BENCH_DD);
+    double err_pswf43_dd =
+        compute_avg_rel(out_naive43_r_q, out_naive43_i_q, N43,
+                        num_y_fixed * max_ff, out_pswf43_r_dd,
+                        out_pswf43_i_dd, BENCH_DD);
 
-    printf(" %5d | %10.6f | %11.6f | %10.2e | %11.6f | %10.2e | %11.6f | "
-           "%10.2e | %11.6f | %10.2e | %11.6f | %10.2e | %11.6f | %10.2e\n",
-           r, t_naive_stored, t_lra_f, err_lra_f, t_pswf_f, err_pswf_f, t_lra_d,
-           err_lra_d, t_pswf_d, err_pswf_d, t_lra_dd, err_lra_dd, t_pswf_dd,
-           err_pswf_dd);
+    printf(" %5d | %10.6f | %11.6f | %10.2e | %11.6f | %12.2e | "
+           "%12.6f | %12.2e | %11.6f | %10.2e | %11.6f | %12.2e | "
+           "%12.6f | %12.2e | %11.6f | %10.2e | %12.6f | %13.2e | "
+           "%13.6f | %13.2e\n",
+           r, t_naive_stored, t_lra_f, err_lra_f, t_pswf_f, err_pswf_f,
+           t_pswf43_f, err_pswf43_f, t_lra_d, err_lra_d, t_pswf_d,
+           err_pswf_d, t_pswf43_d, err_pswf43_d, t_lra_dd, err_lra_dd,
+           t_pswf_dd, err_pswf_dd, t_pswf43_dd, err_pswf43_dd);
   }
 
   free(ys_r_f);
@@ -529,16 +709,24 @@ int main() {
   free(out_lra_i_f);
   free(out_pswf_r_f);
   free(out_pswf_i_f);
+  free(out_pswf43_r_f);
+  free(out_pswf43_i_f);
   free(out_lra_r_d);
   free(out_lra_i_d);
   free(out_pswf_r_d);
   free(out_pswf_i_d);
+  free(out_pswf43_r_d);
+  free(out_pswf43_i_d);
   free(out_lra_r_dd);
   free(out_lra_i_dd);
   free(out_pswf_r_dd);
   free(out_pswf_i_dd);
+  free(out_pswf43_r_dd);
+  free(out_pswf43_i_dd);
   free(out_naive_r_q);
   free(out_naive_i_q);
+  free(out_naive43_r_q);
+  free(out_naive43_i_q);
 
   free(x);
   free(x_dd);

@@ -4,12 +4,15 @@
 #include <nanofft_precision.h>
 #include <nufft1.h>
 #include <scaling.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
 /* Return codes from the public fastchi2 entry points. */
 enum { CHI2PER_OK = 0, CHI2PER_ERR_ARGUMENT = -1, CHI2PER_ERR_BACKEND = -2, CHI2PER_ERR_ALLOC = -3, CHI2PER_ERR_DEGENERATE = -4, CHI2PER_ERR_SOLVER = -5 };
+
+enum { CHI2PER_BACKEND_PSWF43 = 1, CHI2PER_BACKEND_PSWF21 = 2, CHI2PER_BACKEND_LRA = 3 };
 
 enum { CHI2PER_SOLVER_LEVINSON = 1, CHI2PER_SOLVER_ZOHAR = 2, CHI2PER_SOLVER_BAREISS = 3, CHI2PER_SOLVER_LDLT = 4 };
 
@@ -51,6 +54,14 @@ static int optimize_plan_size(int N, int M, int degree, double alpha, double bet
     return block;
 }
 
+static int pswf43_plan_len_for_output(int output_count) {
+    int plan_len = (2 * output_count + 2) / 3;
+    if (plan_len < 4) plan_len = 4;
+    return (plan_len + 3) & ~3;
+}
+
+static int pswf43_output_len_for_plan(int plan_len) { return plan_len + (plan_len >> 1); }
+
 static void *checked_malloc(size_t count, size_t size) {
     if (count == 0 || size == 0) return NULL;
     if (count > SIZE_MAX / size) return NULL;
@@ -87,6 +98,7 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define SOLVE_ZOHAR tlsdd_solve_zohar
 #    define NUFFT_RANK 27
 #    define NUFFT_W 32
+#    define NUFFT_W43 36
 #    define CHI2_ALPHA DD_ALPHA
 #    define CHI2_LRA_BETA DD_LRA_BETA
 #    define CHI2_LRA_GAMMA DD_LRA_GAMMA
@@ -119,6 +131,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define SOLVE_ZOHAR tls_solve_zohar
 #        define NUFFT_RANK 16
 #        define NUFFT_W 16
+#        define NUFFT_W43 18
 #        define CHI2_ALPHA D_ALPHA
 #        define CHI2_LRA_BETA D_LRA_BETA
 #        define CHI2_LRA_GAMMA D_LRA_GAMMA
@@ -146,6 +159,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define SOLVE_ZOHAR tlsf_solve_zohar
 #        define NUFFT_RANK 9
 #        define NUFFT_W 8
+#        define NUFFT_W43 9
 #        define CHI2_ALPHA F_ALPHA
 #        define CHI2_LRA_BETA F_LRA_BETA
 #        define CHI2_LRA_GAMMA F_LRA_GAMMA
@@ -235,9 +249,9 @@ static inline FLOAT real_rhs_value(const FLOAT *Syw, const FLOAT *Cyw, int N, in
 }
 
 static int execute_nufft_block(void *plan, int backend, const FLOAT *src_r, const FLOAT *src_i, FLOAT *out_r, FLOAT *out_i, int freq_factor) {
-    if (backend == 0) {
+    if (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21) {
         NUFFT_PSWF_EXEC((PSWF_PLAN_T *)plan, src_r, src_i, out_r, out_i, freq_factor);
-    } else if (backend == 1) {
+    } else if (backend == CHI2PER_BACKEND_LRA) {
         NUFFT_LRA_EXEC((const LRA_PLAN_T *)plan, src_r, src_i, out_r, out_i, freq_factor);
     } else {
         return CHI2PER_ERR_BACKEND;
@@ -869,14 +883,18 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
 int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
                           FLOAT *power, FLOAT *cond) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
-    if (backend < 0 || backend >= 2) return CHI2PER_ERR_BACKEND;
+    if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
     if (solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS && solver != CHI2PER_SOLVER_LDLT)
         return CHI2PER_ERR_SOLVER;
     if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
 
-    double beta = (backend == 0) ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
-    double gamma = (backend == 0) ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;
+    bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
+    bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
+    double beta = use_pswf ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
+    double gamma = use_pswf ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;
     int block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma);
+    int plan_block = use_pswf43 ? pswf43_plan_len_for_output(block) : block;
+    int output_block = use_pswf43 ? pswf43_output_len_for_plan(plan_block) : block;
     int max_factor = 2 * degree;
 
     FLOAT *w = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
@@ -891,8 +909,8 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     FLOAT *src_i = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
     FLOAT *delta_r = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
     FLOAT *delta_i = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
-    FLOAT *out_r = (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
-    FLOAT *out_i = (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
+    FLOAT *out_r = (FLOAT *)checked_aligned_malloc((size_t)output_block, sizeof(FLOAT));
+    FLOAT *out_i = (FLOAT *)checked_aligned_malloc((size_t)output_block, sizeof(FLOAT));
     void *plan = NULL;
     int status = CHI2PER_OK;
 
@@ -945,8 +963,8 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         Syw[k] = FCAST(0.0);
     }
 
-    if (backend == 0) {
-        plan = NUFFT_PSWF_INIT(M, block, NUFFT_W, df, max_factor);
+    if (use_pswf) {
+        plan = NUFFT_PSWF_INIT(M, plan_block, use_pswf43 ? NUFFT_W43 : NUFFT_W, df, max_factor, use_pswf43 ? "43" : "21");
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
@@ -976,7 +994,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     }
 
 cleanup:
-    if (plan && backend == 0)
+    if (plan && use_pswf)
         NUFFT_PSWF_FREE((PSWF_PLAN_T *)plan);
     else if (plan)
         NUFFT_LRA_FREE((LRA_PLAN_T *)plan);
