@@ -330,7 +330,7 @@ static const FLOAT PFX(pswf43_coeffs)[19][24] = {
  * Aligned Allocation
  * ========================================================================= */
 
-static FLOAT *PFX(allocate_aligned)(uint32_t N) {
+static FLOAT *PFX(allocate_aligned)(size_t N) {
     size_t alloc_size = (sz_max(N * sizeof(FLOAT), 64) + 63) & ~63;
     FLOAT *ptr = (FLOAT *)aligned_alloc(64, alloc_size);
     if (!ptr) exit(EXIT_FAILURE);
@@ -726,18 +726,25 @@ void PFX(free_lra_plan)(struct PFX(lra_plan) * plan) {
 
 struct PFX(pswf_plan) {
     int Mpoints, N, Nout, Nfft, w;
+    int spread_stride, spread_pad, fft_alloc_len;
     int output_shift;
     char upsamp[2];
     FLOAT alpha;
     int num_factors;
     double df;
-    int *spread_idx;
+    int *spread_base_idx;
     FLOAT *spread_weight;
-    FLOAT *spread_comp_r, *spread_comp_i;
     FLOAT *deconv, *shift_r, *shift_i;
     NANOFFT_PLAN *nanofft_p;
     FLOAT *fft_real, *fft_imag;
 };
+
+static inline int PFX(positive_mod_int)(int value, int modulus) {
+    int result = value % modulus;
+    return result < 0 ? result + modulus : result;
+}
+
+static inline int PFX(round_up_int)(int value, int multiple) { return ((value + multiple - 1) / multiple) * multiple; }
 
 static inline bool PFX(pswf_lut_lookup)(int w, bool mode43, const FLOAT **coeffs, int *deg, FLOAT *c) {
 #ifdef DOUBLE
@@ -855,19 +862,20 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     plan->num_factors = freq_factor;
     plan->df = df;
     plan->Nfft = next_fast_len(2 * N);
+    plan->spread_stride = PFX(round_up_int)(plan->w + INTERNAL_VEC_LEN - 1, INTERNAL_VEC_LEN);
+    plan->spread_pad = plan->spread_stride;
+    plan->fft_alloc_len = plan->Nfft + plan->spread_pad;
     plan->alpha = DIV(MUL(FCAST(plan->w), FCONST(0.5)), FCAST(plan->Nfft));
 
-    plan->spread_idx = (int *)malloc((size_t)Mpoints * plan->w * freq_factor * sizeof(int));
-    plan->spread_weight = (FLOAT *)malloc((size_t)Mpoints * plan->w * freq_factor * sizeof(FLOAT));
-    plan->spread_comp_r = PFX(allocate_aligned)(plan->Nfft);
-    plan->spread_comp_i = PFX(allocate_aligned)(plan->Nfft);
+    plan->spread_base_idx = (int *)malloc((size_t)Mpoints * freq_factor * sizeof(int));
+    plan->spread_weight = PFX(allocate_aligned)((size_t)Mpoints * plan->spread_stride * freq_factor);
     plan->deconv = (FLOAT *)malloc((size_t)plan->Nout * sizeof(FLOAT));
 
     plan->shift_r = (FLOAT *)malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
     plan->shift_i = (FLOAT *)malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
 
-    plan->fft_real = PFX(allocate_aligned)(plan->Nfft);
-    plan->fft_imag = PFX(allocate_aligned)(plan->Nfft);
+    plan->fft_real = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
+    plan->fft_imag = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
     plan->nanofft_p = NANOFFT_MAKE_PLAN(plan->Nfft);
     return plan;
 }
@@ -905,11 +913,12 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     for (int f_idx = 0; f_idx < plan->num_factors; ++f_idx) {
         int k_factor = f_idx + 1;
         size_t offset_shift = (size_t)f_idx * plan->Mpoints;
-        size_t offset_spread = (size_t)f_idx * plan->Mpoints * plan->w;
+        size_t offset_base = (size_t)f_idx * plan->Mpoints;
+        size_t offset_spread = offset_base * plan->spread_stride;
 
         FLOAT *current_shift_r = plan->shift_r + offset_shift;
         FLOAT *current_shift_i = plan->shift_i + offset_shift;
-        int *current_spread_idx = plan->spread_idx + offset_spread;
+        int *current_spread_base_idx = plan->spread_base_idx + offset_base;
         FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
 
 #if defined(DOUBLE_DOUBLE)
@@ -943,13 +952,13 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
 
             PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
 
-            for (int l = 0; l < plan->w; ++l) {
-                int idx = m_left + l;
-                int wrap_idx = (idx % plan->Nfft + plan->Nfft) % plan->Nfft;
-                size_t w_idx = (size_t)m * plan->w + l;
-                current_spread_idx[w_idx] = wrap_idx;
-                current_spread_weight[w_idx] = kval_buf[l];
-            }
+            int first = PFX(positive_mod_int)(m_left, plan->Nfft);
+            int base = first - (first % INTERNAL_VEC_LEN);
+            int lane_offset = first - base;
+            size_t w_base = (size_t)m * plan->spread_stride;
+            current_spread_base_idx[m] = base;
+            for (int l = 0; l < plan->spread_stride; ++l) current_spread_weight[w_base + l] = FCAST(0.0);
+            for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + lane_offset + l] = kval_buf[l];
         }
 
 #else
@@ -977,13 +986,13 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
 
             PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
 
-            for (int l = 0; l < plan->w; ++l) {
-                int idx = m_left + l;
-                int wrap_idx = (idx % plan->Nfft + plan->Nfft) % plan->Nfft;
-                size_t w_idx = (size_t)m * plan->w + l;
-                current_spread_idx[w_idx] = wrap_idx;
-                current_spread_weight[w_idx] = kval_buf[l];
-            }
+            int first = PFX(positive_mod_int)(m_left, plan->Nfft);
+            int base = first - (first % INTERNAL_VEC_LEN);
+            int lane_offset = first - base;
+            size_t w_base = (size_t)m * plan->spread_stride;
+            current_spread_base_idx[m] = base;
+            for (int l = 0; l < plan->spread_stride; ++l) current_spread_weight[w_base + l] = FCAST(0.0);
+            for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + lane_offset + l] = kval_buf[l];
         }
 #endif
     }
@@ -994,30 +1003,52 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
     if (f_idx < 0 || f_idx >= plan->num_factors) return;
 
     size_t offset_shift = (size_t)f_idx * plan->Mpoints;
-    size_t offset_spread = (size_t)f_idx * plan->Mpoints * plan->w;
+    size_t offset_base = (size_t)f_idx * plan->Mpoints;
+    size_t offset_spread = offset_base * plan->spread_stride;
 
     FLOAT *current_shift_r = plan->shift_r + offset_shift;
     FLOAT *current_shift_i = plan->shift_i + offset_shift;
-    int *current_spread_idx = plan->spread_idx + offset_spread;
+    int *current_spread_base_idx = plan->spread_base_idx + offset_base;
     FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
 
-    memset(plan->fft_real, 0, plan->Nfft * sizeof(FLOAT));
-    memset(plan->fft_imag, 0, plan->Nfft * sizeof(FLOAT));
-    memset(plan->spread_comp_r, 0, plan->Nfft * sizeof(FLOAT));
-    memset(plan->spread_comp_i, 0, plan->Nfft * sizeof(FLOAT));
+    memset(plan->fft_real, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
+    memset(plan->fft_imag, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
 
     for (int m = 0; m < plan->Mpoints; ++m) {
         FLOAT yr = y_real[m], yi = y_imag[m];
         FLOAT sr = current_shift_r[m], si = current_shift_i[m];
         FLOAT sy_r = SUB(MUL(yr, sr), MUL(yi, si));
         FLOAT sy_i = ADD(MUL(yr, si), MUL(yi, sr));
-        for (int l = 0; l < plan->w; ++l) {
-            size_t w_idx = (size_t)m * plan->w + l;
-            int idx = current_spread_idx[w_idx];
-            FLOAT kval = current_spread_weight[w_idx];
-            PFX(kahan_add_soa)(&plan->fft_real[idx], &plan->fft_imag[idx], &plan->spread_comp_r[idx], &plan->spread_comp_i[idx], MUL(sy_r, kval),
-                               MUL(sy_i, kval));
+        int base = current_spread_base_idx[m];
+        size_t w_base = (size_t)m * plan->spread_stride;
+
+#if INTERNAL_VEC_LEN > 1
+        INTERNAL_VEC v_sy_r = (INTERNAL_VEC){} + sy_r;
+        INTERNAL_VEC v_sy_i = (INTERNAL_VEC){} + sy_i;
+
+        for (int l = 0; l < plan->spread_stride; l += INTERNAL_VEC_LEN) {
+            int idx = base + l;
+            INTERNAL_VEC kval = LOAD_VEC(&current_spread_weight[w_base + l]);
+            INTERNAL_VEC gr = LOAD_VEC(&plan->fft_real[idx]);
+            INTERNAL_VEC gi = LOAD_VEC(&plan->fft_imag[idx]);
+            STORE_VEC(&plan->fft_real[idx], ADD(gr, MUL(v_sy_r, kval)));
+            STORE_VEC(&plan->fft_imag[idx], ADD(gi, MUL(v_sy_i, kval)));
         }
+#else
+        for (int l = 0; l < plan->spread_stride; ++l) {
+            int idx = base + l;
+            FLOAT kval = current_spread_weight[w_base + l];
+            plan->fft_real[idx] = ADD(plan->fft_real[idx], MUL(sy_r, kval));
+            plan->fft_imag[idx] = ADD(plan->fft_imag[idx], MUL(sy_i, kval));
+        }
+#endif
+    }
+
+    for (int i = 0; i < plan->spread_pad; ++i) {
+        int src = plan->Nfft + i;
+        int dst = i % plan->Nfft;
+        plan->fft_real[dst] = ADD(plan->fft_real[dst], plan->fft_real[src]);
+        plan->fft_imag[dst] = ADD(plan->fft_imag[dst], plan->fft_imag[src]);
     }
 
     NANOFFT_EXECUTE(plan->nanofft_p, plan->fft_real, plan->fft_imag);
@@ -1032,10 +1063,8 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
 
 void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     if (!plan) return;
-    free(plan->spread_idx);
+    free(plan->spread_base_idx);
     free(plan->spread_weight);
-    free(plan->spread_comp_r);
-    free(plan->spread_comp_i);
     free(plan->deconv);
     free(plan->shift_r);
     free(plan->shift_i);
