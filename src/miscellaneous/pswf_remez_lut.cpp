@@ -142,19 +142,22 @@ float128 bisection(std::function<float128(float128)> f, float128 a, float128 b, 
 // ---------------------------------------------------------
 struct EpsContext {
     std::string name;
-    double eps;
-    int w;
+    double eps;    // Used only to choose coefficient print precision.
+    int w;         // Window width, supplied explicitly by the user.
+    double sigma;  // Oversampling factor, supplied explicitly by the user.
     float128 c_param;
     VectorXmp workdata;
     float128 xv0;
 };
 
-EpsContext build_context(std::string name, double eps) {
+EpsContext build_context(std::string name, double eps, int w, double sigma) {
     EpsContext ctx;
     ctx.name = name;
     ctx.eps = eps;
-    ctx.w = ceil(-log10(eps)) + 1;
-    ctx.c_param = boost::math::constants::pi<float128>() * ctx.w * 0.75 - 0.05;
+    ctx.w = w;
+    ctx.sigma = sigma;
+    ctx.c_param =
+        boost::math::constants::pi<float128>() * float128(ctx.w) * (float128(1.0) - (float128(1.0) / (float128(2.0) * float128(ctx.sigma)))) - float128(0.05);
     int n_terms = static_cast<int>(ctx.c_param) + 60;
     ctx.workdata = get_pswf0_coeffs(ctx.c_param, n_terms);
     ctx.xv0 = float128(1.0) / pswf0_eval(float128(0.0), ctx.workdata);
@@ -166,8 +169,9 @@ EpsContext build_context(std::string name, double eps) {
 // ---------------------------------------------------------
 VectorXmp run_regression_single(EpsContext& ctx, int degree_z, int reg_nodes, int eval_nodes) {
     std::cout << "--- 1. Regression Search (COD) for " << ctx.name << " ---\n";
-    std::cout << "Computed w : " << ctx.w << "\n";
-    std::cout << "Computed c : " << static_cast<double>(ctx.c_param) << "\n\n";
+    std::cout << "Input w     : " << ctx.w << "\n";
+    std::cout << "Input sigma : " << ctx.sigma << "\n";
+    std::cout << "Computed c  : " << static_cast<double>(ctx.c_param) << "\n\n";
 
     auto fx = [&](float128 x) { return pswf0_eval(x, ctx.workdata) * ctx.xv0; };
     auto Wx = [&](float128 x) { return exp(-ctx.c_param * x * x / 2.0); };
@@ -348,7 +352,11 @@ int main(int argc, char* argv[]) {
     Eigen::setNbThreads(16);
     Eigen::initParallel();
 
-    double cli_eps = 1e-16;
+    double cli_eps = 1e-16;  // Used only for coefficient print precision.
+    int cli_w = 0;
+    double cli_sigma = 0.0;
+    bool have_w = false;
+    bool have_sigma = false;
     int cli_deg = 26;  // Default to Double Precision bounds
     int cli_reg_nodes = 250;
     int cli_eval_nodes = 500;
@@ -357,17 +365,30 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg.find("-deg=") == 0) cli_deg = std::stoi(arg.substr(5));
         if (arg.find("-eps=") == 0) cli_eps = std::stod(arg.substr(5));
+        if (arg.find("-w=") == 0) {
+            cli_w = std::stoi(arg.substr(3));
+            have_w = true;
+        }
+        if (arg.find("-sigma=") == 0) {
+            cli_sigma = std::stod(arg.substr(7));
+            have_sigma = true;
+        }
         if (arg.find("-reg_nodes=") == 0) cli_reg_nodes = std::stoi(arg.substr(11));
         if (arg.find("-eval_nodes=") == 0) cli_eval_nodes = std::stoi(arg.substr(12));
+    }
+
+    if (!have_w || !have_sigma || cli_w <= 0 || cli_sigma <= 0.0) {
+        std::cerr << "Usage: " << argv[0] << " -w=<positive integer> -sigma=<positive value> [-deg=N] [-eps=E] [-reg_nodes=N] [-eval_nodes=N]\n";
+        return 1;
     }
 
     std::cout << "========================================================\n";
     std::cout << "=== Eigen/Float128 COD Weighted Minimax              ===\n";
     std::cout << "========================================================\n\n";
-    std::cout << "Running Custom Config: -deg=" << cli_deg << " -eps=" << cli_eps << " -reg_nodes=" << cli_reg_nodes << " -eval_nodes=" << cli_eval_nodes
-              << "\n\n";
+    std::cout << "Running Custom Config: -deg=" << cli_deg << " -w=" << cli_w << " -sigma=" << cli_sigma << " -eps=" << cli_eps
+              << " -reg_nodes=" << cli_reg_nodes << " -eval_nodes=" << cli_eval_nodes << "\n\n";
 
-    EpsContext ctx_custom = build_context("Custom CLI", cli_eps);
+    EpsContext ctx_custom = build_context("Custom CLI", cli_eps, cli_w, cli_sigma);
 
     VectorXmp initial_coeffs = run_regression_single(ctx_custom, cli_deg, cli_reg_nodes, cli_eval_nodes);
 

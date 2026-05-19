@@ -285,6 +285,47 @@ static const FLOAT PFX(pswf_coeffs)[19][24] = {
      FCONST(1.2845375935583203, 2.9466888110619039e-20)},
 };
 
+#ifdef DOUBLE
+static const int PFX(pswf43_degrees)[19] = {
+    [8] = 8,
+    [9] = 10,
+    [16] = 16,
+    [18] = 18,
+};
+
+static const FLOAT PFX(pswf43_c)[19] = {
+    [8] = FCONST(15.658),
+    [9] = FCONST(17.6215),
+    [16] = FCONST(31.3659),
+    [18] = FCONST(35.2929),
+};
+
+static const FLOAT PFX(pswf43_coeffs)[19][24] = {
+    /* 4/3 specialized double-precision PSWF LUT, w=8, c=15.658 */
+    [8] = {FCONST(1.000000159e+00), FCONST(3.814843807e-01), FCONST(-1.705772933e+00), FCONST(-1.574809829e+00), FCONST(8.972535502e-01),
+           FCONST(3.081707523e-01), FCONST(3.170650492e+00), FCONST(-3.077828580e+00), FCONST(6.059434412e-01)},
+
+    /* 4/3 specialized double-precision PSWF LUT, w=9, c=17.6215 */
+    [9] = {FCONST(9.999999963e-01), FCONST(3.807464487e-01), FCONST(-1.954514108e+00), FCONST(-1.748689243e+00), FCONST(8.940126727e-01),
+           FCONST(2.249806234e+00), FCONST(-2.729149505e-02), FCONST(9.313050829e-01), FCONST(-2.756708707e+00), FCONST(8.265223870e-01),
+           FCONST(2.070220289e-01)},
+
+    /* 4/3 specialized double-precision PSWF LUT, w=16, c=31.3659 */
+    [16] = {FCONST(1.0000000000001339e+00), FCONST(3.7811581234051489e-01), FCONST(-3.6752769217932180e+00), FCONST(-3.2570386355695962e+00),
+            FCONST(4.9086940673661745e+00), FCONST(8.1890620790437438e+00), FCONST(-6.2358453493817967e-01), FCONST(-9.2710446448475210e+00),
+            FCONST(-4.8016686948535714e+00), FCONST(4.3204916239116353e-01), FCONST(1.5243689642512440e+01), FCONST(-1.4536218990429497e+01),
+            FCONST(1.7764805508774899e+01), FCONST(-1.5898691650854410e+01), FCONST(-5.3046632079871514e-01), FCONST(7.1215110334374296e+00),
+            FCONST(-2.4439347353446412e+00)},
+
+    /* 4/3 specialized double-precision PSWF LUT, w=18, c=35.2929 */
+    [18] = {FCONST(9.9999999999999656e-01), FCONST(3.7775583480425901e-01), FCONST(-4.1665323666296548e+00), FCONST(-3.6868691349989500e+00),
+            FCONST(6.5891069175294641e+00), FCONST(1.0691132948304883e+01), FCONST(-2.1252720951508564e+00), FCONST(-1.4282131845918899e+01),
+            FCONST(-7.6530982991550429e+00), FCONST(8.7136941477823111e+00), FCONST(9.1243872186275823e+00), FCONST(8.2918839729832232e+00),
+            FCONST(-1.6306787738758960e+01), FCONST(2.8868238021460646e-01), FCONST(1.1338466753315100e+01), FCONST(-3.0628247597577907e+01),
+            FCONST(4.1663152766264226e+01), FCONST(-2.4408368708189325e+01), FCONST(5.1790454589192194e+00)},
+};
+#endif
+
 /* =========================================================================
  * Aligned Allocation
  * ========================================================================= */
@@ -698,19 +739,39 @@ struct PFX(pswf_plan) {
     FLOAT *fft_real, *fft_imag;
 };
 
+static inline bool PFX(pswf_lut_lookup)(int w, bool mode43, const FLOAT **coeffs, int *deg, FLOAT *c) {
+#ifdef DOUBLE
+    if (mode43 && (w == 8 || w == 9 || w == 16 || w == 18)) {
+        *coeffs = PFX(pswf43_coeffs)[w];
+        *deg = PFX(pswf43_degrees)[w];
+        *c = PFX(pswf43_c)[w];
+        return true;
+    }
+#endif
+
+    if (!mode43 && w < 19) {
+        *coeffs = PFX(pswf_coeffs)[w];
+        *deg = pswf_degrees[w];
+        *c = FCAST(M_PI * w * 0.75 - 0.05);
+        return true;
+    }
+
+    return false;
+}
+
 static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
     int safe_w = w;
     if (safe_w < 1) safe_w = 1;
     if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
 
     FLOAT Z = MUL(z, z);
+    const FLOAT *coeffs = NULL;
+    int deg = 0;
+    FLOAT c = FCAST(0.0);
 
-    if (!mode43 && safe_w < 19) {
-        FLOAT c = FCAST(M_PI * safe_w * 0.75 - 0.05);
-        int deg = pswf_degrees[safe_w];
-
-        FLOAT poly = PFX(pswf_coeffs)[safe_w][deg];
-        for (int i = deg - 1; i >= 0; --i) poly = M_FMA(poly, Z, PFX(pswf_coeffs)[safe_w][i]);
+    if (PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c)) {
+        FLOAT poly = coeffs[deg];
+        for (int i = deg - 1; i >= 0; --i) poly = M_FMA(poly, Z, coeffs[i]);
 
         return MUL(M_EXP(MUL(MUL(NEG(c), Z), FCAST(0.5))), poly);
     } else {
@@ -728,18 +789,22 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
     if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
 
 #if INTERNAL_VEC_LEN > 1
+    const FLOAT *coeffs = NULL;
+    int deg = 0;
+    FLOAT c = FCAST(0.0);
+    bool has_lut = PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c);
+
     int n_vec = n - (n % INTERNAL_VEC_LEN);
 
-    if (!mode43 && safe_w < 19) {
-        FLOAT neg_c_half = NEG(MUL(FCAST(M_PI * safe_w * 0.75 - 0.05), FCAST(0.5)));
-        int deg = pswf_degrees[safe_w];
+    if (has_lut) {
+        FLOAT neg_c_half = NEG(MUL(c, FCAST(0.5)));
 
         for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
             INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
             INTERNAL_VEC v_Z = MUL(v_z, v_z);
 
-            INTERNAL_VEC v_poly = (INTERNAL_VEC){} + PFX(pswf_coeffs)[safe_w][deg];
-            for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), (INTERNAL_VEC){} + PFX(pswf_coeffs)[safe_w][j]);
+            INTERNAL_VEC v_poly = (INTERNAL_VEC){} + coeffs[deg];
+            for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), (INTERNAL_VEC){} + coeffs[j]);
 
             INTERNAL_VEC v_result = MUL(M_EXP(MUL(v_Z, neg_c_half)), v_poly);
             STORE_VEC(&out_arr[i], v_result);
