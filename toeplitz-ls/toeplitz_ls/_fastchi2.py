@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import operator
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,7 @@ except ImportError:  # pragma: no cover - exercised only without mpmath
 HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / "tls.so"
 
-_BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3, "pswf": 1}
+_BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4}
 _NORMALIZATIONS = {"standard", "asymptotic"}
 _STATUS_MESSAGES = {
@@ -37,6 +38,7 @@ _STATUS_MESSAGES = {
     -4: "degenerate input",
     -5: "invalid solver",
 }
+_C_INT_MAX = 2**31 - 1
 _LIB = None
 
 
@@ -120,17 +122,15 @@ def _load_library():
 
 def _backend_id(backend):
     if isinstance(backend, str):
-        key = backend.lower()
+        key = backend.strip().lower()
         if key in _BACKENDS:
             return _BACKENDS[key]
-    if isinstance(backend, int) and backend in _BACKENDS.values():
-        return backend
     raise ValueError("backend must be 'pswf43', 'pswf21', or 'lra'")
 
 
 def _solver_id(solver):
     if isinstance(solver, str):
-        key = solver.lower()
+        key = solver.strip().lower()
         if key in _SOLVERS:
             return _SOLVERS[key]
     raise ValueError("solver must be 'levinson', 'zohar', 'bareiss', or 'ldlt'")
@@ -138,32 +138,49 @@ def _solver_id(solver):
 
 def _check_normalization(normalization):
     if isinstance(normalization, str):
-        key = normalization.lower()
+        key = normalization.strip().lower()
         if key in _NORMALIZATIONS:
             return key
     raise ValueError("normalization must be 'standard' or 'asymptotic'")
 
 
+def _check_int(name, value, min_value, max_value=_C_INT_MAX):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        result = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if result < min_value:
+        raise ValueError(f"{name} must be at least {min_value}")
+    if result > max_value:
+        raise ValueError(f"{name} must be at most {max_value}")
+    return result
+
+
+def _check_finite(name, value):
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
 def _check_grid(Nf, df, f0, nterms, min_Nf=1):
-    Nf = int(Nf)
-    nterms = int(nterms)
-    df = float(df)
-    f0 = float(f0)
-    if Nf < min_Nf:
-        raise ValueError(f"Nf must be at least {min_Nf}")
+    Nf = _check_int("Nf", Nf, min_Nf)
+    nterms = _check_int("nterms", nterms, 1)
+    df = _check_finite("df", df)
+    f0 = _check_finite("f0", f0)
     if df <= 0.0:
         raise ValueError("df must be positive")
     if f0 < 0.0:
         raise ValueError("f0 must be non-negative")
-    if nterms <= 0:
-        raise ValueError("nterms must be positive")
     return Nf, df, f0, nterms
 
 
 def _auto_grid(delta_t, fmin, fmax, oversampling, nterms):
-    delta_t = float(delta_t)
-    oversampling = float(oversampling)
-    fmax = float(fmax)
+    delta_t = _check_finite("x span", delta_t)
+    oversampling = _check_finite("oversampling", oversampling)
+    fmax = _check_finite("fmax", fmax)
 
     if delta_t <= 0.0:
         raise ValueError("x must span a positive interval")
@@ -178,7 +195,7 @@ def _auto_grid(delta_t, fmin, fmax, oversampling, nterms):
     if fmin is None:
         first_multiple = math.floor((1.0 / delta_t) / df) + 1
     else:
-        fmin = float(fmin)
+        fmin = _check_finite("fmin", fmin)
         if fmin < 0.0:
             raise ValueError("fmin must be non-negative")
         first_multiple = math.ceil((fmin / delta_t) / df)
@@ -187,6 +204,7 @@ def _auto_grid(delta_t, fmin, fmax, oversampling, nterms):
     Nf = math.floor((max_frequency - f0) / df) + 1
     if Nf <= 0:
         raise ValueError("automatic frequency grid is empty")
+    Nf = _check_int("Nf", Nf, 1)
 
     return Nf, df, f0
 
@@ -205,6 +223,12 @@ def _prepare_numpy_inputs(t, y, dy, y_dtype):
         raise ValueError("t, y, and dy must have the same length")
     if t_arr.size <= 0:
         raise ValueError("t, y, and dy must not be empty")
+    if not (
+        np.all(np.isfinite(t_arr))
+        and np.all(np.isfinite(y_arr))
+        and np.all(np.isfinite(dy_arr))
+    ):
+        raise ValueError("t, y, and dy entries must be finite")
     if np.any(dy_arr <= 0):
         raise ValueError("dy entries must be positive")
 
@@ -212,6 +236,8 @@ def _prepare_numpy_inputs(t, y, dy, y_dtype):
 
 
 def _check_observation_count(num_observations, nterms):
+    if num_observations > _C_INT_MAX:
+        raise ValueError(f"number of observations must be at most {_C_INT_MAX}")
     min_observations = 2 * nterms + 2
     if num_observations < min_observations:
         raise ValueError(
@@ -275,6 +301,8 @@ def _as_mpf_list(values, name):
         raise ValueError(f"{name} must be a one-dimensional iterable") from exc
     if not result:
         raise ValueError(f"{name} must not be empty")
+    if any(not mp.isfinite(value) for value in result):
+        raise ValueError(f"{name} entries must be finite")
     return result
 
 
@@ -385,9 +413,7 @@ class tlsf:
         autonan=True,
     ):
         """Return automatic frequency and power arrays."""
-        nterms = int(nterms)
-        if nterms <= 0:
-            raise ValueError("nterms must be positive")
+        nterms = _check_int("nterms", nterms, 1)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -486,9 +512,7 @@ class tls:
         autonan=True,
     ):
         """Return automatic double-precision frequency and power arrays."""
-        nterms = int(nterms)
-        if nterms <= 0:
-            raise ValueError("nterms must be positive")
+        nterms = _check_int("nterms", nterms, 1)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -534,18 +558,18 @@ class tlsdd:
         """Return high-precision periodogram power."""
         mp = _require_mpmath()
         normalization = _check_normalization(normalization)
-        Nf = int(Nf)
-        nterms = int(nterms)
+        Nf = _check_int("Nf", Nf, 1)
+        nterms = _check_int("nterms", nterms, 1)
         df_mpf = mp.mpf(df)
         f0_mpf = mp.mpf(f0)
-        if Nf <= 0:
-            raise ValueError("Nf must be positive")
+        if not mp.isfinite(df_mpf):
+            raise ValueError("df must be finite")
+        if not mp.isfinite(f0_mpf):
+            raise ValueError("f0 must be finite")
         if df_mpf <= 0:
             raise ValueError("df must be positive")
         if f0_mpf < 0:
             raise ValueError("f0 must be non-negative")
-        if nterms <= 0:
-            raise ValueError("nterms must be positive")
 
         backend = _backend_id(backend)
         solver = _solver_id(solver)
@@ -612,9 +636,7 @@ class tlsdd:
     ):
         """Return automatic high-precision frequency and power lists."""
         mp = _require_mpmath()
-        nterms = int(nterms)
-        if nterms <= 0:
-            raise ValueError("nterms must be positive")
+        nterms = _check_int("nterms", nterms, 1)
         t_mpf = _as_mpf_list(x, "x")
         y_mpf = _as_mpf_list(y, "y")
         if dy is None:
