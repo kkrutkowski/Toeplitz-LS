@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parent
 LIB_PATH = HERE / "tls.so"
 
 _BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
-_SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4}
+_SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4, "svd": 5}
 _NORMALIZATIONS = {"standard", "asymptotic"}
 _STATUS_MESSAGES = {
     -1: "invalid argument",
@@ -133,7 +133,17 @@ def _solver_id(solver):
         key = solver.strip().lower()
         if key in _SOLVERS:
             return _SOLVERS[key]
-    raise ValueError("solver must be 'levinson', 'zohar', 'bareiss', or 'ldlt'")
+    raise ValueError("solver must be 'levinson', 'zohar', 'bareiss', 'ldlt', or 'svd'")
+
+
+def _solver_id_for_nterms(solver, nterms):
+    if nterms == 1:
+        if solver is not None:
+            raise ValueError("solver must not be provided when nterms=1")
+        return _SOLVERS["levinson"]
+    if solver is None:
+        return _SOLVERS["levinson"]
+    return _solver_id(solver)
 
 
 def _check_normalization(normalization):
@@ -350,7 +360,7 @@ class tlsf:
         y,
         dy=None,
         backend="pswf43",
-        solver="levinson",
+        solver=None,
         nterms=3,
         normalization="standard",
         *,
@@ -359,9 +369,9 @@ class tlsf:
         """Return periodogram power on the grid ``f0 + df * arange(Nf)``."""
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
-        solver = _solver_id(solver)
         min_Nf = 32 if backend == _BACKENDS["lra"] else 16
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
+        solver = _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float32)
@@ -408,12 +418,13 @@ class tlsf:
         normalization="standard",
         nterms=3,
         backend="pswf43",
-        solver="levinson",
+        solver=None,
         *,
         autonan=True,
     ):
         """Return automatic frequency and power arrays."""
         nterms = _check_int("nterms", nterms, 1)
+        _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -450,7 +461,7 @@ class tls:
         y,
         dy=None,
         backend="pswf43",
-        solver="levinson",
+        solver=None,
         nterms=3,
         normalization="standard",
         *,
@@ -459,8 +470,8 @@ class tls:
         """Return periodogram power on the grid ``f0 + df * arange(Nf)``."""
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
-        solver = _solver_id(solver)
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=8)
+        solver = _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float64)
@@ -507,12 +518,13 @@ class tls:
         normalization="standard",
         nterms=3,
         backend="pswf43",
-        solver="levinson",
+        solver=None,
         *,
         autonan=True,
     ):
         """Return automatic double-precision frequency and power arrays."""
         nterms = _check_int("nterms", nterms, 1)
+        _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -549,7 +561,7 @@ class tlsdd:
         y,
         dy=None,
         backend="pswf43",
-        solver="levinson",
+        solver=None,
         nterms=3,
         normalization="standard",
         *,
@@ -572,7 +584,7 @@ class tlsdd:
             raise ValueError("f0 must be non-negative")
 
         backend = _backend_id(backend)
-        solver = _solver_id(solver)
+        solver = _solver_id_for_nterms(solver, nterms)
         t_mpf = _as_mpf_list(t, "t")
         y_mpf = _as_mpf_list(y, "y")
         if dy is None:
@@ -630,13 +642,14 @@ class tlsdd:
         normalization="standard",
         nterms=3,
         backend="pswf43",
-        solver="levinson",
+        solver=None,
         *,
         autonan=True,
     ):
         """Return automatic high-precision frequency and power lists."""
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)
+        _solver_id_for_nterms(solver, nterms)
         t_mpf = _as_mpf_list(x, "x")
         y_mpf = _as_mpf_list(y, "y")
         if dy is None:
