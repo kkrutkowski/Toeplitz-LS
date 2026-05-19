@@ -18,24 +18,34 @@ enum { CHI2PER_SOLVER_LEVINSON = 1, CHI2PER_SOLVER_ZOHAR = 2, CHI2PER_SOLVER_BAR
 
 static inline int bitceil(double x) { return x <= 1.0 ? 1 : 1 << (1 + (int)(log2(x))); }
 
-static double approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma) {
+static double approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma, int backend) {
+    int block_eff = block;
+    double beta_eff = beta;
+    // bitshift because of higher FFT grid usage efficiency
+    if (backend == 1) {
+        block_eff += block_eff >> 1;
+        beta_eff *= 1.5 * (9.0 / 8.0);
+    };
     // Include cost of zero-padding frequencies to the transform length
-    double N_eff = block * ceil((double)N / block);
+    double N_eff = block_eff * ceil((double)N / block_eff);
     // Reduction in the cost of precomputation caused by reusage of pre-generated
     // plans
     double gamma_eff = gamma * ((double)((2 * degree) + 1)) / (double)((3 * degree) + 1);
+    if (backend == 1) {
+        gamma_eff *= 1.5;
+    };
     // FFT execution cost
     double cost = N_eff * pow((double)block, alpha);
     // Frequency shift cost
-    cost += beta * (N_eff - (double)(block)) * (double)(M) / (double)(block);
+    cost += beta_eff * (N_eff - (double)(block_eff)) * (double)(M) / (double)(block_eff);
     // Precomputation cost per block size
-    cost += gamma_eff * block;
+    cost += gamma_eff * block_eff;
     return cost;
 }
 
 // start at block = bitceil(pow((beta * M / alpha), (1.0 / (alpha + 1.0))))
 // then bitshift downwards as long, as cost decreases with each bitshift
-static int optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma) {
+static int optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma, int backend) {
     double start = pow((beta * (double)M / alpha), 1.0 / (alpha + 1.0));
     int block = bitceil(start);
     int n_cap = bitceil((double)N);
@@ -43,10 +53,10 @@ static int optimize_plan_size(int N, int M, int degree, double alpha, double bet
     if (block > n_cap) block = n_cap;
     if (block < 1) block = 1;
 
-    double best = approximate_cost(N, M, block, degree, alpha, beta, gamma);
+    double best = approximate_cost(N, M, block, degree, alpha, beta, gamma, backend);
     while (block > 1) {
         int next = block >> 1;
-        double next_cost = approximate_cost(N, M, next, degree, alpha, beta, gamma);
+        double next_cost = approximate_cost(N, M, next, degree, alpha, beta, gamma, backend);
         if (next_cost >= best) break;
         block = next;
         best = next_cost;
@@ -97,16 +107,16 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define SOLVE_BAREISS tlsdd_solve_bareiss
 #    define SOLVE_ZOHAR tlsdd_solve_zohar
 #    define NUFFT_RANK 27
-#    define NUFFT_W 32
+#    define NUFFT_W21 32
 #    define NUFFT_W43 36
 #    define CHI2_ALPHA DD_ALPHA
 #    define CHI2_LRA_BETA DD_LRA_BETA
 #    define CHI2_LRA_GAMMA DD_LRA_GAMMA
 #    define CHI2_PSWF_BETA DD_PSWF_BETA
 #    define CHI2_PSWF_GAMMA DD_PSWF_GAMMA
-#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e24
-#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e24
-#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e24
+#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e22
+#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e22
+#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e22
 #    define COND_SINGULARITY_THRESHOLD_LDLT 1e10
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
@@ -130,16 +140,16 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define SOLVE_BAREISS tls_solve_bareiss
 #        define SOLVE_ZOHAR tls_solve_zohar
 #        define NUFFT_RANK 16
-#        define NUFFT_W 16
+#        define NUFFT_W21 16
 #        define NUFFT_W43 18
 #        define CHI2_ALPHA D_ALPHA
 #        define CHI2_LRA_BETA D_LRA_BETA
 #        define CHI2_LRA_GAMMA D_LRA_GAMMA
 #        define CHI2_PSWF_BETA D_PSWF_BETA
 #        define CHI2_PSWF_GAMMA D_PSWF_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e12
-#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e12
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e12
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e11
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e11
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e11
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e5
 #    else
 #        define CHI2_PREFIX(name) tlsf_##name
@@ -158,16 +168,16 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define SOLVE_BAREISS tlsf_solve_bareiss
 #        define SOLVE_ZOHAR tlsf_solve_zohar
 #        define NUFFT_RANK 9
-#        define NUFFT_W 8
+#        define NUFFT_W21 8
 #        define NUFFT_W43 9
 #        define CHI2_ALPHA F_ALPHA
 #        define CHI2_LRA_BETA F_LRA_BETA
 #        define CHI2_LRA_GAMMA F_LRA_GAMMA
 #        define CHI2_PSWF_BETA F_PSWF_BETA
 #        define CHI2_PSWF_GAMMA F_PSWF_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 2e5
-#        define COND_SINGULARITY_THRESHOLD_ZOHAR 2e5
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 2e5
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e4
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e4
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 5e4
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e2
 #    endif
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
@@ -892,7 +902,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
     double beta = use_pswf ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
     double gamma = use_pswf ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;
-    int plan_block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma);
+    int plan_block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
     if (use_pswf43) plan_block = pswf43_plan_len_from_base(plan_block);
     int block = use_pswf43 ? pswf43_output_len_for_plan(plan_block) : plan_block;
     int max_factor = 2 * degree;
@@ -971,7 +981,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         }
         NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
     } else if (backend == CHI2PER_BACKEND_PSWF21) {
-        plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W, df, max_factor, "21");
+        plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W21, df, max_factor, "21");
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
