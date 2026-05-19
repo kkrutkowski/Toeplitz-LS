@@ -1,4 +1,4 @@
-// linalg.c  —  Precision-generic LDLT, Levinson-Durbin, Bareiss, and Zohar Toeplitz solvers
+// linalg.c  —  Precision-generic LDLT, SVD, Levinson-Durbin, Bareiss, and Zohar Toeplitz solvers
 
 /* nanofft.h provides: dd_t and its arithmetic (dd_add/dd_sub/dd_mul/dd_div …),
  * VEC / VECF GCC vector types, VEC_LEN / VECF_LEN, and all the fast-trig
@@ -70,6 +70,44 @@ static inline INTERNAL_VEC TLS(ldlt_diag_condition)(size_t n, const INTERNAL_VEC
 #endif
 }
 
+static inline FLOAT TLS(scalar_abs)(FLOAT value) { return TO_DOUBLE(value) < 0.0 ? NEG(value) : value; }
+
+#if defined(DOUBLE_DOUBLE)
+static inline FLOAT TLS(lane_get)(INTERNAL_VEC value, int lane) {
+    (void)lane;
+    return value;
+}
+
+static inline void TLS(lane_set)(INTERNAL_VEC *value, int lane, FLOAT lane_value) {
+    (void)lane;
+    *value = lane_value;
+}
+#else
+static inline FLOAT TLS(lane_get)(INTERNAL_VEC value, int lane) { return value[lane]; }
+
+static inline void TLS(lane_set)(INTERNAL_VEC *value, int lane, FLOAT lane_value) { (*value)[lane] = lane_value; }
+#endif
+
+static inline double TLS(svd_tolerance)(void) {
+#if defined(DOUBLE_DOUBLE)
+    return 1e-24;
+#elif defined(DOUBLE)
+    return 1e-12;
+#else
+    return 1e-5;
+#endif
+}
+
+static inline int TLS(svd_max_sweeps)(void) {
+#if defined(DOUBLE_DOUBLE)
+    return 256;
+#elif defined(DOUBLE)
+    return 64;
+#else
+    return 32;
+#endif
+}
+
 /* =========================================================================
  * tlsf/tls/tlsdd_solve_ldlt
  *
@@ -125,6 +163,188 @@ INTERNAL_VEC TLS(solve_ldlt)(size_t n, const INTERNAL_VEC *restrict A, const INT
             sum = ADD(sum, MUL(L[j * n + i], x[j]));
         }
         x[i] = SUB(z[i], sum);
+    }
+
+    return condition;
+}
+
+/* =========================================================================
+ * tlsf/tls/tlsdd_solve_svd
+ *
+ * Symmetric Jacobi spectral solver for dense real symmetric systems A x = b.
+ * A is row-major, with one independent real system per lane.
+ *
+ * Workspace (caller-allocated)
+ *   Q       eigenvectors, length n*n
+ *   S       mutable copy of A, length n*n
+ *   D       eigenvalues, length n
+ *   y       projected right-hand side, length n
+ *
+ * If max_cond > 0, negative eigenvalues and eigenvalues below
+ * max_positive_eigenvalue / max_cond are filtered from the inverse.
+ * If max_cond <= 0, every nonzero signed eigenvalue is inverted.
+ *
+ * Returns lane-wise spectral condition estimates. A negative returned
+ * condition indicates that the Jacobi sweeps did not fully converge for that
+ * lane within the precision-specific sweep limit.
+ * ========================================================================= */
+INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTERNAL_VEC *restrict b, INTERNAL_VEC *restrict x, INTERNAL_VEC *restrict Q,
+                            INTERNAL_VEC *restrict S, INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict y, INTERNAL_VEC max_cond) {
+    for (size_t i = 0; i < n * n; i++) {
+        S[i] = A[i];
+        Q[i] = VCONST(0.0);
+    }
+    for (size_t i = 0; i < n; i++) Q[i * n + i] = VCONST(1.0);
+
+    double tol = TLS(svd_tolerance)();
+    int max_sweeps = TLS(svd_max_sweeps)();
+    int all_converged = 1;
+
+    for (int sweep = 0; sweep < max_sweeps; sweep++) {
+        all_converged = 1;
+
+        for (size_t p = 0; p < n; p++) {
+            for (size_t q = p + 1; q < n; q++) {
+                size_t pp = p * n + p;
+                size_t qq = q * n + q;
+                size_t pq = p * n + q;
+
+                for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+                    FLOAT app = TLS(lane_get)(S[pp], lane);
+                    FLOAT aqq = TLS(lane_get)(S[qq], lane);
+                    FLOAT apq = TLS(lane_get)(S[pq], lane);
+                    double app_d = TO_DOUBLE(app);
+                    double aqq_d = TO_DOUBLE(aqq);
+                    double apq_abs = fabs(TO_DOUBLE(apq));
+                    double scale = fabs(app_d) + fabs(aqq_d);
+                    if (scale == 0.0) scale = 1.0;
+                    if (apq_abs <= tol * scale) continue;
+
+                    all_converged = 0;
+
+                    FLOAT tau = DIV(SUB(aqq, app), MUL(FCAST(2.0), apq));
+                    FLOAT tau_abs = TLS(scalar_abs)(tau);
+                    FLOAT denom = ADD(tau_abs, M_SQRT(ADD(FCAST(1.0), MUL(tau, tau))));
+                    FLOAT t = DIV(FCAST(1.0), denom);
+                    if (TO_DOUBLE(tau) < 0.0) t = NEG(t);
+                    FLOAT c = DIV(FCAST(1.0), M_SQRT(ADD(FCAST(1.0), MUL(t, t))));
+                    FLOAT s = MUL(t, c);
+                    FLOAT c2 = MUL(c, c);
+                    FLOAT s2 = MUL(s, s);
+                    FLOAT cs = MUL(c, s);
+
+                    for (size_t k = 0; k < n; k++) {
+                        if (k == p || k == q) continue;
+
+                        size_t kp = k * n + p;
+                        size_t kq = k * n + q;
+                        size_t pk = p * n + k;
+                        size_t qk = q * n + k;
+                        FLOAT akp = TLS(lane_get)(S[kp], lane);
+                        FLOAT akq = TLS(lane_get)(S[kq], lane);
+                        FLOAT new_kp = SUB(MUL(c, akp), MUL(s, akq));
+                        FLOAT new_kq = ADD(MUL(s, akp), MUL(c, akq));
+                        TLS(lane_set)(&S[kp], lane, new_kp);
+                        TLS(lane_set)(&S[pk], lane, new_kp);
+                        TLS(lane_set)(&S[kq], lane, new_kq);
+                        TLS(lane_set)(&S[qk], lane, new_kq);
+                    }
+
+                    FLOAT two_cs_apq = MUL(FCAST(2.0), MUL(cs, apq));
+                    FLOAT new_app = ADD(SUB(MUL(c2, app), two_cs_apq), MUL(s2, aqq));
+                    FLOAT new_aqq = ADD(ADD(MUL(s2, app), two_cs_apq), MUL(c2, aqq));
+                    TLS(lane_set)(&S[pp], lane, new_app);
+                    TLS(lane_set)(&S[qq], lane, new_aqq);
+                    TLS(lane_set)(&S[pq], lane, FCAST(0.0));
+                    TLS(lane_set)(&S[q * n + p], lane, FCAST(0.0));
+
+                    for (size_t k = 0; k < n; k++) {
+                        size_t kp = k * n + p;
+                        size_t kq = k * n + q;
+                        FLOAT qkp = TLS(lane_get)(Q[kp], lane);
+                        FLOAT qkq = TLS(lane_get)(Q[kq], lane);
+                        TLS(lane_set)(&Q[kp], lane, SUB(MUL(c, qkp), MUL(s, qkq)));
+                        TLS(lane_set)(&Q[kq], lane, ADD(MUL(s, qkp), MUL(c, qkq)));
+                    }
+                }
+            }
+        }
+
+        if (all_converged) break;
+    }
+
+    int lane_converged[INTERNAL_VEC_LEN];
+    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) lane_converged[lane] = 1;
+
+    for (size_t p = 0; p < n; p++) {
+        for (size_t q = p + 1; q < n; q++) {
+            size_t pp = p * n + p;
+            size_t qq = q * n + q;
+            size_t pq = p * n + q;
+            for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+                FLOAT app = TLS(lane_get)(S[pp], lane);
+                FLOAT aqq = TLS(lane_get)(S[qq], lane);
+                FLOAT apq = TLS(lane_get)(S[pq], lane);
+                double scale = fabs(TO_DOUBLE(app)) + fabs(TO_DOUBLE(aqq));
+                if (scale == 0.0) scale = 1.0;
+                if (fabs(TO_DOUBLE(apq)) > tol * scale) lane_converged[lane] = 0;
+            }
+        }
+    }
+
+    INTERNAL_VEC condition = VCONST(0.0);
+
+    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+        FLOAT max_abs = FCAST(0.0);
+        FLOAT min_abs = FCAST(0.0);
+        FLOAT max_positive = FCAST(0.0);
+        int have_nonzero = 0;
+
+        for (size_t i = 0; i < n; i++) {
+            FLOAT lambda = TLS(lane_get)(S[i * n + i], lane);
+            FLOAT abs_lambda = TLS(scalar_abs)(lambda);
+            double abs_d = TO_DOUBLE(abs_lambda);
+            if (TO_DOUBLE(lambda) > TO_DOUBLE(max_positive)) max_positive = lambda;
+            if (abs_d > TO_DOUBLE(max_abs)) max_abs = abs_lambda;
+            if (abs_d > 0.0 && (!have_nonzero || abs_d < TO_DOUBLE(min_abs))) {
+                min_abs = abs_lambda;
+                have_nonzero = 1;
+            }
+            TLS(lane_set)(&D[i], lane, lambda);
+        }
+
+        FLOAT lane_condition = have_nonzero ? DIV(max_abs, min_abs) : FCAST(INFINITY);
+        if (!lane_converged[lane]) lane_condition = NEG(lane_condition);
+        TLS(lane_set)(&condition, lane, lane_condition);
+
+        FLOAT threshold = FCAST(0.0);
+        FLOAT lane_max_cond = TLS(lane_get)(max_cond, lane);
+        int filtered = TO_DOUBLE(lane_max_cond) > 0.0;
+        if (filtered && TO_DOUBLE(max_positive) > 0.0) threshold = DIV(max_positive, lane_max_cond);
+
+        for (size_t i = 0; i < n; i++) {
+            FLOAT dot = FCAST(0.0);
+            for (size_t j = 0; j < n; j++) {
+                dot = ADD(dot, MUL(TLS(lane_get)(Q[j * n + i], lane), TLS(lane_get)(b[j], lane)));
+            }
+
+            FLOAT lambda = TLS(lane_get)(D[i], lane);
+            FLOAT coeff = FCAST(0.0);
+            if (filtered) {
+                if (TO_DOUBLE(lambda) > 0.0 && TO_DOUBLE(lambda) >= TO_DOUBLE(threshold)) coeff = DIV(dot, lambda);
+            } else if (TO_DOUBLE(lambda) != 0.0) {
+                coeff = DIV(dot, lambda);
+            }
+            TLS(lane_set)(&y[i], lane, coeff);
+        }
+
+        for (size_t i = 0; i < n; i++) {
+            FLOAT sum = FCAST(0.0);
+            for (size_t j = 0; j < n; j++) {
+                sum = ADD(sum, MUL(TLS(lane_get)(Q[i * n + j], lane), TLS(lane_get)(y[j], lane)));
+            }
+            TLS(lane_set)(&x[i], lane, sum);
+        }
     }
 
     return condition;
