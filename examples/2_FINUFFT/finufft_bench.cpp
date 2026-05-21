@@ -65,7 +65,7 @@ static double compute_rel_err_complex(int N, const dd_t *ref_r,
 int main() {
   srand(1);
 
-  int Mpoints = 256;
+  int Mpoints = 256 * 64;
   int rank_f = 9;
   int w_f = 8;
   int rank_d = 16;
@@ -87,8 +87,9 @@ int main() {
             << " | max_ff=" << max_ff << "\n";
   std::cout << "==============================================================="
                "=========================================================\n";
-  std::cout << "      N | FIN Plan(s) FIN Exec(s)   FIN Err | LRA Plan(s) LRA "
-               "Exec(s)   LRA Err | PSW Plan(s) PSW Exec(s)   PSW Err\n";
+  std::cout << "      N | FIN Plan(s) FIN Exec(s)   FIN Err | PSW Plan(s) PSW "
+               "Exec(s)   PSW Err | LRA Plan(s) LRA "
+               "Exec(s)   LRA Err \n";
   std::cout << "---------------------------------------------------------------"
                "---------------------------------------------------------\n";
 
@@ -198,7 +199,8 @@ int main() {
 
     // --- Custom PSWF Float ---
     t0 = now_seconds();
-    auto plan_pswf_f = tlsf_nufft_pswf_initialize(Mpoints, N, w_f, df, max_ff, "21");
+    auto plan_pswf_f =
+        tlsf_nufft_pswf_initialize(Mpoints, N, w_f, df, max_ff, "21");
     tlsf_nufft_pswf_precompute(plan_pswf_f, x.data());
     double t_pswf_plan_f = now_seconds() - t0;
 
@@ -229,16 +231,16 @@ int main() {
                         out_pswf_r_f.data(), out_pswf_i_f.data());
 
     std::cout << std::setw(7) << N << " | " << std::scientific
-              << std::setprecision(2) << std::setw(9) << t_fin_plan_f << "   "
-              << std::setw(11) << t_fin_exec_f << " " << std::scientific
+              << std::setprecision(2) << std::setw(9) << t_fin_plan_f << "  "
+              << std::setw(11) << t_fin_exec_f << "  " << std::scientific
               << std::setprecision(1) << std::setw(9) << err_fin_f << " | "
               << std::scientific << std::setprecision(2) << std::setw(9)
-              << t_lra_plan_f << "   " << std::setw(11) << t_lra_exec_f << " "
+              << t_pswf_plan_f << " " << std::setw(11) << t_pswf_exec_f << "   "
               << std::scientific << std::setprecision(1) << std::setw(9)
-              << err_lra_f << " | " << std::scientific << std::setprecision(2)
-              << std::setw(9) << t_pswf_plan_f << "   " << std::setw(11)
-              << t_pswf_exec_f << " " << std::scientific << std::setprecision(1)
-              << std::setw(9) << err_pswf_f << "\n";
+              << err_pswf_f << " | " << std::scientific << std::setprecision(2)
+              << std::setw(9) << t_lra_plan_f << "  " << std::setw(11)
+              << t_lra_exec_f << "  " << std::scientific << std::setprecision(1)
+              << std::setw(9) << err_lra_f << "\n";
   }
 
   // =====================================================================================================
@@ -251,8 +253,9 @@ int main() {
             << " | max_ff=" << max_ff << "\n";
   std::cout << "==============================================================="
                "=========================================================\n";
-  std::cout << "      N | FIN Plan(s) FIN Exec(s)   FIN Err | LRA Plan(s) LRA "
-               "Exec(s)   LRA Err | PSW Plan(s) PSW Exec(s)   PSW Err\n";
+  std::cout << "      N | FIN Plan(s) FIN Exec(s)   FIN Err | PSW Plan(s) PSW "
+               "Exec(s)   PSW Err | LRA Plan(s) LRA "
+               "Exec(s)   LRA Err\n";
   std::cout << "---------------------------------------------------------------"
                "---------------------------------------------------------\n";
 
@@ -361,7 +364,8 @@ int main() {
 
     // --- Custom PSWF Double ---
     t0 = now_seconds();
-    auto plan_pswf_d = tls_nufft_pswf_initialize(Mpoints, N, w_d, df, max_ff, "21");
+    auto plan_pswf_d =
+        tls_nufft_pswf_initialize(Mpoints, N, w_d, df, max_ff, "21");
     tls_nufft_pswf_precompute(plan_pswf_d, x.data());
     double t_pswf_plan_d = now_seconds() - t0;
 
@@ -396,12 +400,12 @@ int main() {
               << std::setw(11) << t_fin_exec_d << "   " << std::scientific
               << std::setprecision(1) << std::setw(9) << err_fin_d << " | "
               << std::scientific << std::setprecision(2) << std::setw(9)
-              << t_lra_plan_d << " " << std::setw(11) << t_lra_exec_d << "   "
-              << std::scientific << std::setprecision(1) << std::setw(9)
-              << err_lra_d << " | " << std::scientific << std::setprecision(2)
-              << std::setw(9) << t_pswf_plan_d << " " << std::setw(11)
-              << t_pswf_exec_d << "   " << std::scientific
-              << std::setprecision(1) << std::setw(9) << err_pswf_d << "\n";
+              << t_pswf_plan_d << " " << std::setw(11) << t_pswf_exec_d
+              << std::scientific << "   " << std::setprecision(1)
+              << std::setw(9) << err_pswf_d << " | " << std::scientific
+              << std::setprecision(2) << std::setw(9) << t_lra_plan_d << "  "
+              << std::setw(11) << t_lra_exec_d << "   " << std::scientific
+              << std::setprecision(1) << std::setw(9) << err_lra_d << "\n";
   }
 
   return 0;
