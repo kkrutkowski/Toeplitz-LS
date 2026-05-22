@@ -74,7 +74,7 @@ from tempfile import TemporaryDirectory
 from urllib.request import urlretrieve
 
 import numpy as np
-from toeplitz_ls import get_peaks, tlsf
+from toeplitz_ls import tlsf, get_peaks
 
 url = "https://www.astrouw.edu.pl/ogle/ogle4/OCVS/BLAP/phot/phot_ogle4/I/OGLE-BLAP-035.dat"
 
