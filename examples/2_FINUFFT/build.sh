@@ -3,4 +3,4 @@
 cmake -B tmp -S .
 
 # Compile the code
-cmake --build tmp
+cmake --build tmp -j8
