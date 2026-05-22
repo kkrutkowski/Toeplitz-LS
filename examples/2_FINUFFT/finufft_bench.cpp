@@ -6,6 +6,8 @@
 #include <iostream>
 #include <vector>
 
+#include "finufft_bench_config.h"
+
 // FINUFFT header
 #include <finufft.h>
 
@@ -65,7 +67,7 @@ static double compute_rel_err_complex(int N, const dd_t *ref_r,
 int main() {
   srand(1);
 
-  int Mpoints = 256 * 64;
+  int Mpoints = kBenchmarkM;
   int rank_f = 9;
   int w_f = 8;
   int rank_d = 16;
@@ -93,7 +95,7 @@ int main() {
   std::cout << "---------------------------------------------------------------"
                "---------------------------------------------------------\n";
 
-  for (int N = 256; N <= 1048576; N *= 2) {
+  for (int N = kBenchmarkNMin; N <= kBenchmarkNMax; N *= 2) {
     int64_t N_modes[] = {(int64_t)N};
 
     std::vector<double> x(Mpoints);
@@ -259,7 +261,7 @@ int main() {
   std::cout << "---------------------------------------------------------------"
                "---------------------------------------------------------\n";
 
-  for (int N = 256; N <= 1048576; N *= 2) {
+  for (int N = kBenchmarkNMin; N <= kBenchmarkNMax; N *= 2) {
     int64_t N_modes[] = {(int64_t)N};
 
     std::vector<double> x(Mpoints);
