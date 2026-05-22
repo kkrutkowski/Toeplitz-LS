@@ -160,7 +160,7 @@ def benchmark(args):
         ("PSWF43", "pswf43"),
     ]
 
-    for nterms in (1, 3):  # , 8
+    for nterms in (1, 3, 8):  # , 8
         print_header(nterms, f0, df)
 
         # Build list of methods for this nterms
