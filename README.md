@@ -15,7 +15,7 @@ pip3 install .
 
 ## Usage
 
-The toeplitz-ls package exposes three submodules, each targeting a different precision level. The single-precision (tlsf) and double-precision (tls) submodules accept and return NumPy arrays. The double-double module (tlsdd) relies on compensated arithmetic and operates on a 106-bit mantissa; it uses Mpmath's mpf type to bridge the gap between the library's internal representation and Python's native numeric types.
+The toeplitz-ls package exposes three submodules, each targeting a different precision level. The single-precision (tlsf) and double-precision (tls) submodules accept and return NumPy arrays. The double-double module (tlsdd) relies on compensated arithmetic and operates on a 106-bit mantissa; it uses Mpmath's mpf type to bridge the gap between the library's internal representation and Python's native numeric types. The get_peaks helper can turn a periodogram into a sorted, interpolated peak list for printing or saving.
 
 ## [Free-threaded (GIL-free) Python](https://docs.python.org/3/howto/free-threading-python.html) support
 toeplitz-ls is compatible with free-threaded CPython (PEP 703, available as an optional build since Python 3.13). With the GIL disabled, ThreadPoolExecutor-based batch processing achieves true parallelism without the overhead of multiprocessing — no serialisation, no inter-process memory duplication. 
@@ -31,21 +31,20 @@ For manual filtering, call power() or autopower() with autonan=False to receive 
 ```python
 import numpy as np
 import matplotlib.pyplot as plt
-from toeplitz_ls import tlsf
+from toeplitz_ls import tls
 
 rng = np.random.default_rng(seed=123)
 N = 1000
 t = np.sort(rng.uniform(0, 1000, size=N))
 y = np.sin(50 * t) + 0.5 * np.sin(150 * t) + 1 + rng.poisson(size=N)
 
-# Compute default periodogram
-freq, r2 = tlsf.autopower(
+# Compute the generalized Scargle periodogram.
+freq, r2 = tls.autopower(
     t, y, dy=None,
     fmax=12, #default value
-    nterms=3, #default number of terms
+    nterms=1, # generalized Scargle periodogram
     oversampling=5, #frequency density, relative to a dense, uniform FFT
-    solver="levinson", # or "bareiss", "zohar", "ldlt"
-    backend="pswf", # or "lra"
+    backend="pswf43", # or "pswf21", "lra"
     normalization="standard" # or "asymptotic"
     )
 
@@ -57,7 +56,7 @@ print(f"Peak frequency: {best_freq:.6g} (R^2 = {best_power:.6g})")
 
 plt.figure(figsize=(12, 5))
 
-plt.plot(freq, r2, label='degree = 3', color='red')
+plt.plot(freq, r2, label='degree = 1', color='red')
 plt.axvline(best_freq, linestyle='--', color='black', alpha=0.7)
 plt.xlabel('Frequency')
 plt.ylabel('Coefficient of determination')
@@ -68,47 +67,35 @@ plt.show()
 ```
 
 
-### Example usage with a custom singularity threshold
+### Example usage with an OGLE-BLAP light curve
 ```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from urllib.request import urlretrieve
+
 import numpy as np
-import matplotlib.pyplot as plt
-from toeplitz_ls import tls
+from toeplitz_ls import get_peaks, tlsf
 
-rng = np.random.default_rng(seed=123)
-N = 1000
+url = "https://www.astrouw.edu.pl/ogle/ogle4/OCVS/BLAP/phot/phot_ogle4/I/OGLE-BLAP-035.dat"
 
-t = np.sort(rng.uniform(0, 1000, size=N))
-y = np.sin(50 * t) + 0.5 * np.sin(150 * t) + 1 + rng.poisson(size=N)
+with TemporaryDirectory() as tmpdir:
+    data_path = Path(tmpdir) / "OGLE-BLAP-035.dat"
+    urlretrieve(url, str(data_path))
+    t, y, _dy = np.loadtxt(data_path, unpack=True)
 
-# Ask for the raw power and LDLT conditionality estimates.
-freq, power, cond = tls.autopower(
+t = t - t.min()
+
+# BLAPs require high-frequency search. Ignore the photometric error estimates here.
+freq, power, cond = tlsf.autopower(
     t, y, dy=None,
-    fmax=20,
-    nterms=1, # mathematically equivalent to the generalized Scargle periodogram
+    fmax=100,
+    nterms=3,
     oversampling=5,
-    solver="ldlt", # LDLT condition estimates are on a different scale than Toeplitz bounds.
-    backend="pswf", # or "lra"
+    solver="levinson",
     normalization="asymptotic",
-    autonan=False
+    autonan=False,
 )
 
-threshold = 1e2
-
-# Mask numerically unreliable estimates so the peak search remains consistent.
-power[cond > threshold] = np.nan
-
-best_idx = np.nanargmax(power)
-best_freq = freq[best_idx]
-best_power = power[best_idx]
-
-print(f"Peak frequency: {best_freq:.6g} (R^2 = {best_power:.6g})")
-
-plt.figure(figsize=(12, 5))
-plt.plot(freq, power, label='degree = 1', color='blue')
-plt.axvline(best_freq, linestyle='--', color='black', alpha=0.7)
-plt.xlabel('Frequency')
-plt.ylabel('Negative log-likelihood')
-plt.legend()
-plt.tight_layout()
-plt.show()
+peaks = get_peaks(freq, power, cond, threshold=10)
+peaks.print(10)
 ```
