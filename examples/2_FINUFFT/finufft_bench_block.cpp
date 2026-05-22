@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -100,7 +101,7 @@ static double approximate_cost(int N, int M, int block, int degree,
 
 static int optimize_plan_size(int N, int M, int degree, double alpha,
                               double beta, double gamma, int backend) {
-  constexpr int min_block = 256;
+  constexpr int min_block = 128;
   double start = pow((beta * (double)M / alpha), 1.0 / (alpha + 1.0));
   int block = bitceil(start);
   int n_cap = bitceil((double)N);
@@ -192,27 +193,63 @@ static std::vector<dd_t> cast_dd(const std::vector<double> &in) {
   return out;
 }
 
+static int twiddle_ladder_levels(int N, int block) {
+  if (N <= 0 || block <= 0) {
+    return 1;
+  }
+
+  size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
+  if (num_blocks <= 1) {
+    return 1;
+  }
+
+  size_t max_advance = num_blocks - 1;
+  size_t stride = (size_t)kMaxTwiddleReuse;
+  int levels = 1;
+  while (max_advance >= stride) {
+    ++levels;
+    if (stride > SIZE_MAX / (size_t)kMaxTwiddleReuse) {
+      break;
+    }
+    stride *= (size_t)kMaxTwiddleReuse;
+  }
+  return levels;
+}
+
+static int twiddle_ladder_carry_level(size_t next_block, int levels) {
+  int level = 0;
+  size_t stride = (size_t)kMaxTwiddleReuse;
+  while (level + 1 < levels && next_block % stride == 0) {
+    ++level;
+    if (stride > SIZE_MAX / (size_t)kMaxTwiddleReuse) {
+      break;
+    }
+    stride *= (size_t)kMaxTwiddleReuse;
+  }
+  return level;
+}
+
 static void compute_block_delta(PswfMode mode, double x, double df,
-                                int output_block_len, float &delta_real,
+                                double advance_len, float &delta_real,
                                 float &delta_imag) {
   (void)mode;
-  double phase_delta = x * df * (double)output_block_len;
+  double phase_delta = x * df * advance_len;
   delta_real = (float)cos2pi(phase_delta);
   delta_imag = (float)sin2pi(phase_delta);
 }
 
 static void compute_block_delta(PswfMode mode, double x, double df,
-                                int output_block_len, double &delta_real,
+                                double advance_len, double &delta_real,
                                 double &delta_imag) {
   if (mode == PswfMode::k43) {
-    double phase_delta = x * df * (double)(output_block_len / 3);
+    double phase_delta = x * df * (advance_len / 3.0);
     double c = cos2pi(phase_delta);
     double s = sin2pi(phase_delta);
     nanofft_triple_angle(c, s, &delta_real, &delta_imag);
     return;
   }
 
-  double phase_delta = x * df * (double)output_block_len;
+  double phase_delta = x * df * advance_len;
   delta_real = cos2pi(phase_delta);
   delta_imag = sin2pi(phase_delta);
 }
@@ -427,33 +464,50 @@ static void execute_pswf_block_sweep(
     const std::vector<typename Traits::real_type> &input_real,
     const std::vector<typename Traits::real_type> &input_imag,
     const std::vector<typename Traits::real_type> &delta_real,
-    const std::vector<typename Traits::real_type> &delta_imag, int N,
-    int output_block_len, std::vector<typename Traits::real_type> &work_real,
+    const std::vector<typename Traits::real_type> &delta_imag,
+    int ladder_levels, int N, int output_block_len,
+    std::vector<typename Traits::real_type> &work_real,
     std::vector<typename Traits::real_type> &work_imag,
     std::vector<typename Traits::real_type> &block_real,
     std::vector<typename Traits::real_type> &block_imag,
     SplitOutput<typename Traits::real_type> &out) {
   using real_type = typename Traits::real_type;
 
-  work_real = input_real;
-  work_imag = input_imag;
+  size_t Mpoints = input_real.size();
+  for (int level = 0; level < ladder_levels; ++level) {
+    size_t offset = (size_t)level * Mpoints;
+    std::copy(input_real.begin(), input_real.end(), work_real.begin() + offset);
+    std::copy(input_imag.begin(), input_imag.end(), work_imag.begin() + offset);
+  }
 
-  for (int base = 0; base < N; base += output_block_len) {
+  size_t num_blocks =
+      ((size_t)N + (size_t)output_block_len - 1) / (size_t)output_block_len;
+
+  for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+    size_t base = block_idx * (size_t)output_block_len;
     Traits::pswf_execute(plan, work_real.data(), work_imag.data(),
                          block_real.data(), block_imag.data(), 1);
 
-    int count = std::min(output_block_len, N - base);
+    int count = std::min(output_block_len, N - (int)base);
     std::copy_n(block_real.data(), count, out.real.data() + base);
     std::copy_n(block_imag.data(), count, out.imag.data() + base);
 
-    if (base + output_block_len < N) {
-      for (size_t m = 0; m < work_real.size(); ++m) {
-        real_type yr = work_real[m];
-        real_type yi = work_imag[m];
-        real_type dr = delta_real[m];
-        real_type di = delta_imag[m];
-        work_real[m] = yr * dr - yi * di;
-        work_imag[m] = yr * di + yi * dr;
+    if (block_idx + 1 < num_blocks) {
+      int level = twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
+      size_t offset = (size_t)level * Mpoints;
+      for (size_t m = 0; m < Mpoints; ++m) {
+        real_type yr = work_real[offset + m];
+        real_type yi = work_imag[offset + m];
+        real_type dr = delta_real[offset + m];
+        real_type di = delta_imag[offset + m];
+        work_real[offset + m] = yr * dr - yi * di;
+        work_imag[offset + m] = yr * di + yi * dr;
+      }
+      for (int dst_level = level; dst_level > 0; --dst_level) {
+        size_t dst = (size_t)(dst_level - 1) * Mpoints;
+        size_t src = (size_t)dst_level * Mpoints;
+        std::copy_n(work_real.data() + src, Mpoints, work_real.data() + dst);
+        std::copy_n(work_imag.data() + src, Mpoints, work_imag.data() + dst);
       }
     }
   }
@@ -546,6 +600,7 @@ static PswfBlockedResult<Traits> run_pswf_blocked(PswfMode mode, int N,
   result.output_block_len = output_block_len_for_mode(mode, plan_len);
   result.out.real.resize(N);
   result.out.imag.resize(N);
+  int ladder_levels = twiddle_ladder_levels(N, result.output_block_len);
 
   double t0 = now_seconds();
   typename Traits::pswf_plan_type *plan = Traits::pswf_initialize(
@@ -556,29 +611,34 @@ static PswfBlockedResult<Traits> run_pswf_blocked(PswfMode mode, int N,
   }
   Traits::pswf_precompute(plan, base.x);
 
-  std::vector<real_type> delta_real(base.x.size());
-  std::vector<real_type> delta_imag(base.x.size());
-  for (size_t i = 0; i < base.x.size(); ++i) {
-    compute_block_delta(mode, base.x[i], df, result.output_block_len,
-                        delta_real[i], delta_imag[i]);
+  std::vector<real_type> delta_real((size_t)ladder_levels * base.x.size());
+  std::vector<real_type> delta_imag((size_t)ladder_levels * base.x.size());
+  double advance_len = (double)result.output_block_len;
+  for (int level = 0; level < ladder_levels; ++level) {
+    size_t offset = (size_t)level * base.x.size();
+    for (size_t i = 0; i < base.x.size(); ++i) {
+      compute_block_delta(mode, base.x[i], df, advance_len,
+                          delta_real[offset + i], delta_imag[offset + i]);
+    }
+    advance_len *= (double)kMaxTwiddleReuse;
   }
   result.plan_time = now_seconds() - t0;
 
-  std::vector<real_type> work_real(base.x.size());
-  std::vector<real_type> work_imag(base.x.size());
+  std::vector<real_type> work_real((size_t)ladder_levels * base.x.size());
+  std::vector<real_type> work_imag((size_t)ladder_levels * base.x.size());
   std::vector<real_type> block_real(result.output_block_len);
   std::vector<real_type> block_imag(result.output_block_len);
 
-  execute_pswf_block_sweep<Traits>(plan, input_real, input_imag, delta_real,
-                                   delta_imag, N, result.output_block_len,
-                                   work_real, work_imag, block_real, block_imag,
-                                   result.out);
+  execute_pswf_block_sweep<Traits>(
+      plan, input_real, input_imag, delta_real, delta_imag, ladder_levels, N,
+      result.output_block_len, work_real, work_imag, block_real, block_imag,
+      result.out);
 
   t0 = now_seconds();
-  execute_pswf_block_sweep<Traits>(plan, input_real, input_imag, delta_real,
-                                   delta_imag, N, result.output_block_len,
-                                   work_real, work_imag, block_real, block_imag,
-                                   result.out);
+  execute_pswf_block_sweep<Traits>(
+      plan, input_real, input_imag, delta_real, delta_imag, ladder_levels, N,
+      result.output_block_len, work_real, work_imag, block_real, block_imag,
+      result.out);
   result.exec_time = now_seconds() - t0;
 
   Traits::pswf_destroy(plan);
@@ -594,6 +654,7 @@ static SplitOutput<dd_t> run_dd_pswf21_reference(int N, const BaseSamples &base,
   int plan_len = optimized_plan_len_for_mode<BenchTraits<dd_t>>(
       PswfMode::k21, N, (int)base.x.size());
   int output_block_len = output_block_len_for_mode(PswfMode::k21, plan_len);
+  int ladder_levels = twiddle_ladder_levels(N, output_block_len);
 
   auto *plan = BenchTraits<dd_t>::pswf_initialize(
       (int)base.x.size(), plan_len,
@@ -604,43 +665,65 @@ static SplitOutput<dd_t> run_dd_pswf21_reference(int N, const BaseSamples &base,
   }
   BenchTraits<dd_t>::pswf_precompute(plan, x_dd);
 
-  std::vector<dd_t> delta_real(base.x.size());
-  std::vector<dd_t> delta_imag(base.x.size());
+  std::vector<dd_t> delta_real((size_t)ladder_levels * base.x.size());
+  std::vector<dd_t> delta_imag((size_t)ladder_levels * base.x.size());
   dd_t df_dd = dd_make(df, 0.0);
-  dd_t block_dd = dd_make((double)output_block_len, 0.0);
-  for (size_t i = 0; i < base.x.size(); ++i) {
-    dd_t phase_delta = dd_mul(dd_mul(x_dd[i], df_dd), block_dd);
-    delta_real[i] = cos2pidd(phase_delta);
-    delta_imag[i] = sin2pidd(phase_delta);
+  double advance_len = (double)output_block_len;
+  for (int level = 0; level < ladder_levels; ++level) {
+    size_t offset = (size_t)level * base.x.size();
+    dd_t advance_dd = dd_make(advance_len, 0.0);
+    for (size_t i = 0; i < base.x.size(); ++i) {
+      dd_t phase_delta = dd_mul(dd_mul(x_dd[i], df_dd), advance_dd);
+      delta_real[offset + i] = cos2pidd(phase_delta);
+      delta_imag[offset + i] = sin2pidd(phase_delta);
+    }
+    advance_len *= (double)kMaxTwiddleReuse;
   }
 
   std::vector<dd_t> block_real(output_block_len);
   std::vector<dd_t> block_imag(output_block_len);
-  std::vector<dd_t> work_real(base.x.size());
-  std::vector<dd_t> work_imag(base.x.size());
+  std::vector<dd_t> work_real((size_t)ladder_levels * base.x.size());
+  std::vector<dd_t> work_imag((size_t)ladder_levels * base.x.size());
 
   SplitOutput<dd_t> out;
   out.real.resize(N);
   out.imag.resize(N);
 
-  work_real = input_real;
-  work_imag = input_imag;
-  for (int base_idx = 0; base_idx < N; base_idx += output_block_len) {
+  for (int level = 0; level < ladder_levels; ++level) {
+    size_t offset = (size_t)level * base.x.size();
+    std::copy(input_real.begin(), input_real.end(), work_real.begin() + offset);
+    std::copy(input_imag.begin(), input_imag.end(), work_imag.begin() + offset);
+  }
+
+  size_t num_blocks =
+      ((size_t)N + (size_t)output_block_len - 1) / (size_t)output_block_len;
+  for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+    size_t base_idx = block_idx * (size_t)output_block_len;
     BenchTraits<dd_t>::pswf_execute(plan, work_real.data(), work_imag.data(),
                                     block_real.data(), block_imag.data(), 1);
 
-    int count = std::min(output_block_len, N - base_idx);
+    int count = std::min(output_block_len, N - (int)base_idx);
     std::copy_n(block_real.data(), count, out.real.data() + base_idx);
     std::copy_n(block_imag.data(), count, out.imag.data() + base_idx);
 
-    if (base_idx + output_block_len < N) {
-      for (size_t m = 0; m < work_real.size(); ++m) {
-        dd_t yr = work_real[m];
-        dd_t yi = work_imag[m];
-        dd_t dr = delta_real[m];
-        dd_t di = delta_imag[m];
-        work_real[m] = dd_sub(dd_mul(yr, dr), dd_mul(yi, di));
-        work_imag[m] = dd_add(dd_mul(yr, di), dd_mul(yi, dr));
+    if (block_idx + 1 < num_blocks) {
+      int level = twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
+      size_t offset = (size_t)level * base.x.size();
+      for (size_t m = 0; m < base.x.size(); ++m) {
+        dd_t yr = work_real[offset + m];
+        dd_t yi = work_imag[offset + m];
+        dd_t dr = delta_real[offset + m];
+        dd_t di = delta_imag[offset + m];
+        work_real[offset + m] = dd_sub(dd_mul(yr, dr), dd_mul(yi, di));
+        work_imag[offset + m] = dd_add(dd_mul(yr, di), dd_mul(yi, dr));
+      }
+      for (int dst_level = level; dst_level > 0; --dst_level) {
+        size_t dst = (size_t)(dst_level - 1) * base.x.size();
+        size_t src = (size_t)dst_level * base.x.size();
+        std::copy_n(work_real.data() + src, base.x.size(),
+                    work_real.data() + dst);
+        std::copy_n(work_imag.data() + src, base.x.size(),
+                    work_imag.data() + dst);
       }
     }
   }

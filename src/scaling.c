@@ -209,6 +209,11 @@ int main(int argc, char **argv) {
      * measurement methodology.  Run counts are adaptive.
      * ======================================================================= */
     const int N_gamma = 1 << 15; /* 32768 — N >> M */
+#if defined(DOUBLE_DOUBLE)
+    const int N_gamma_pswf = N_gamma / 16;
+#else
+    const int N_gamma_pswf = N_gamma;
+#endif
     const int M_gamma = 4;
 
     double *x_gamma = (double *)malloc(M_gamma * sizeof(double));
@@ -252,7 +257,7 @@ int main(int argc, char **argv) {
 
     /* --- PSWF21 gamma --- */
     {
-        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w21, df, freq_factor, "21");
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma_pswf, w21, df, freq_factor, "21");
 
         int wups = 4, reps = 32;
 
@@ -272,14 +277,14 @@ int main(int argc, char **argv) {
         double t_pre = total / reps;
 
         NUFFT_PSWF_FREE(plan);
-        gamma_pswf21 = t_pre / ((double)N_gamma * unit_pswf21);
+        gamma_pswf21 = t_pre / ((double)N_gamma_pswf * unit_pswf21);
         printf("[gamma PSWF21] precompute/run = %e s | gamma = %.6f\n", t_pre, gamma_pswf21);
     }
 
     /* --- PSWF43 gamma --- */
     {
-        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w43, df, freq_factor, "43");
-        int N_gamma_out43 = N_gamma + (N_gamma >> 1);
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma_pswf, w43, df, freq_factor, "43");
+        int N_gamma_out43 = N_gamma_pswf + (N_gamma_pswf >> 1);
 
         int wups = 4, reps = 32;
 
