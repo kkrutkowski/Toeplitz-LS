@@ -40,7 +40,8 @@ include(${CPM_DOWNLOAD_LOCATION})
 set(FINUFFT_USE_OPENMP OFF CACHE BOOL "Disable OpenMP in FINUFFT" FORCE)
 set(CMAKE_DISABLE_FIND_PACKAGE_OpenMP ON CACHE BOOL "Disable OpenMP globally" FORCE)
 
-CPMAddPackage("gh:flatironinstitute/finufft@2.5.0")
+#CPMAddPackage("gh:flatironinstitute/finufft@2.4.1")
+CPMAddPackage("gh:flatironinstitute/finufft@2.5.1")
 
 # ==============================================================================
 # 4. Compile Microlibrary Objects

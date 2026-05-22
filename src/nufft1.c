@@ -57,6 +57,7 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 
 #define NANOFFT_NEEDS_INTERNAL_VEC
 #include "nanofft_precision.h"
+#include "nanofft_trig.h"
 
 #ifdef DOUBLE_DOUBLE
 #    define PFX(name) tlsdd_nufft_##name
@@ -83,11 +84,6 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define LRA_BESSEL_TERMS 6
 #    define GL_NEWTON_TOL FCONST(1.0e-7)
 #endif
-
-static inline void PFX(triple_angle)(FLOAT c, FLOAT s, FLOAT *c3, FLOAT *s3) {
-    *c3 = SUB(MUL(FCAST(4.0), MUL(MUL(c, c), c)), MUL(FCAST(3.0), c));
-    *s3 = SUB(MUL(FCAST(3.0), s), MUL(FCAST(4.0), MUL(MUL(s, s), s)));
-}
 
 /* =========================================================================
  * Gauss-Legendre Quadrature
@@ -944,7 +940,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
             FLOAT phase_c = M_COS2PI(phase_frac);
             FLOAT phase_s = M_SIN2PI(phase_frac);
             if (mode43) {
-                PFX(triple_angle)(phase_c, phase_s, &current_shift_r[m], &current_shift_i[m]);
+                nanofft_triple_angle(phase_c, phase_s, &current_shift_r[m], &current_shift_i[m]);
             } else {
                 current_shift_r[m] = phase_c;
                 current_shift_i[m] = phase_s;
@@ -985,7 +981,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
                 double phase = xm * (double)(plan->output_shift / 3);
                 double c = cos2pi(phase);
                 double s = sin2pi(phase);
-                PFX(triple_angle)(c, s, &current_shift_r[m], &current_shift_i[m]);
+                nanofft_triple_angle(c, s, &current_shift_r[m], &current_shift_i[m]);
             } else {
 #    endif
                 double phase = xm * out_shift;

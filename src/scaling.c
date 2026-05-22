@@ -46,7 +46,8 @@ static double get_time_sec(void) {
 #    define LRA_PLAN_T tlsdd_nufft_lra_plan
 #    define PSWF_PLAN_T tlsdd_nufft_pswf_plan
 #    define NUFFT_RANK 27
-#    define NUFFT_W 32
+#    define NUFFT_W21 32
+#    define NUFFT_W43 36
 #elif defined(DOUBLE)
 #    define NUFFT_LRA_INIT tls_nufft_lra_initialize
 #    define NUFFT_LRA_PRE tls_nufft_lra_precompute
@@ -59,7 +60,8 @@ static double get_time_sec(void) {
 #    define LRA_PLAN_T tls_nufft_lra_plan
 #    define PSWF_PLAN_T tls_nufft_pswf_plan
 #    define NUFFT_RANK 16
-#    define NUFFT_W 16
+#    define NUFFT_W21 16
+#    define NUFFT_W43 18
 #else /* single (default) */
 #    define NUFFT_LRA_INIT tlsf_nufft_lra_initialize
 #    define NUFFT_LRA_PRE tlsf_nufft_lra_precompute
@@ -72,7 +74,8 @@ static double get_time_sec(void) {
 #    define LRA_PLAN_T tlsf_nufft_lra_plan
 #    define PSWF_PLAN_T tlsf_nufft_pswf_plan
 #    define NUFFT_RANK 9
-#    define NUFFT_W 8
+#    define NUFFT_W21 8
+#    define NUFFT_W43 9
 #endif
 
 int main(int argc, char **argv) {
@@ -95,7 +98,8 @@ int main(int argc, char **argv) {
     const double df = 1.0;
     const int freq_factor = 1;
     const int rank = NUFFT_RANK;
-    const int w = NUFFT_W;
+    const int w21 = NUFFT_W21;
+    const int w43 = NUFFT_W43;
 
     /* =========================================================================
      * Phase 1: FFT backend sweep → alpha, unit_fft
@@ -188,11 +192,12 @@ int main(int argc, char **argv) {
      * Phase 2: Derived NuFFT constant factors
      *
      * LRA:  rank independent size-N FFTs  → unit_lra  = rank * unit_fft
-     * PSWF: one size-2N FFT (2x oversampling) → unit_pswf = unit_fft *
-     * 2^(1+alpha)
+     * PSWF21: one size-2N FFT (2x oversampling)
+     * PSWF43: one size-4N/3 FFT, represented as 2/3 of the PSWF21 unit
      * ======================================================================= */
     double unit_lra = (double)rank * unit_fft;
-    double unit_pswf = unit_fft * pow(2.0, 1.0 + alpha);
+    double unit_pswf21 = unit_fft * pow(2.0, 1.0 + alpha);
+    double unit_pswf43 = unit_pswf21 * (2.0 / 3.0);
 
     /* =========================================================================
      * Phase 3: gamma — precompute scaling coefficient  (N >> M regime)
@@ -217,7 +222,7 @@ int main(int argc, char **argv) {
 #endif
     }
 
-    double gamma_lra, gamma_pswf;
+    double gamma_lra, gamma_pswf21, gamma_pswf43;
 
     /* --- LRA gamma --- */
     {
@@ -245,9 +250,9 @@ int main(int argc, char **argv) {
         printf("[gamma LRA ] precompute/run = %e s | gamma = %.6f\n", t_pre, gamma_lra);
     }
 
-    /* --- PSWF gamma --- */
+    /* --- PSWF21 gamma --- */
     {
-        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w, df, freq_factor, "21");
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w21, df, freq_factor, "21");
 
         int wups = 4, reps = 32;
 
@@ -267,8 +272,35 @@ int main(int argc, char **argv) {
         double t_pre = total / reps;
 
         NUFFT_PSWF_FREE(plan);
-        gamma_pswf = t_pre / ((double)N_gamma * unit_pswf);
-        printf("[gamma PSWF] precompute/run = %e s | gamma = %.6f\n", t_pre, gamma_pswf);
+        gamma_pswf21 = t_pre / ((double)N_gamma * unit_pswf21);
+        printf("[gamma PSWF21] precompute/run = %e s | gamma = %.6f\n", t_pre, gamma_pswf21);
+    }
+
+    /* --- PSWF43 gamma --- */
+    {
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_gamma, N_gamma, w43, df, freq_factor, "43");
+        int N_gamma_out43 = N_gamma + (N_gamma >> 1);
+
+        int wups = 4, reps = 32;
+
+#if defined(DOUBLE_DOUBLE)
+        for (int i = 0; i < wups; i++) NUFFT_PSWF_PRE(plan, x_gamma_dd);
+#else
+        for (int i = 0; i < wups; i++) NUFFT_PSWF_PRE(plan, x_gamma);
+#endif
+
+        double t0 = get_time_sec();
+#if defined(DOUBLE_DOUBLE)
+        for (int i = 0; i < reps; i++) NUFFT_PSWF_PRE(plan, x_gamma_dd);
+#else
+        for (int i = 0; i < reps; i++) NUFFT_PSWF_PRE(plan, x_gamma);
+#endif
+        double total = get_time_sec() - t0;
+        double t_pre = total / reps;
+
+        NUFFT_PSWF_FREE(plan);
+        gamma_pswf43 = t_pre / ((double)N_gamma_out43 * unit_pswf43);
+        printf("[gamma PSWF43] precompute/run = %e s | gamma = %.6f\n", t_pre, gamma_pswf43);
     }
 
     free(x_gamma);
@@ -294,6 +326,7 @@ int main(int argc, char **argv) {
      * beta_X = t_exec / (M_beta * unit_X)
      * ======================================================================= */
     const int N_beta = 64;
+    const int N_beta_out43 = N_beta + (N_beta >> 1);
     const int M_beta = 1 << 15; /* 32768 — M >> N */
 
     double *x_beta = (double *)malloc(M_beta * sizeof(double));
@@ -304,8 +337,8 @@ int main(int argc, char **argv) {
     FLOAT *y_im_src = (FLOAT *)aligned_alloc(64, M_beta * sizeof(FLOAT));
     FLOAT *y_re_run = (FLOAT *)aligned_alloc(64, M_beta * sizeof(FLOAT));
     FLOAT *y_im_run = (FLOAT *)aligned_alloc(64, M_beta * sizeof(FLOAT));
-    FLOAT *out_re = (FLOAT *)aligned_alloc(64, N_beta * sizeof(FLOAT));
-    FLOAT *out_im = (FLOAT *)aligned_alloc(64, N_beta * sizeof(FLOAT));
+    FLOAT *out_re = (FLOAT *)aligned_alloc(64, N_beta_out43 * sizeof(FLOAT));
+    FLOAT *out_im = (FLOAT *)aligned_alloc(64, N_beta_out43 * sizeof(FLOAT));
     FLOAT *dy_re = (FLOAT *)aligned_alloc(64, M_beta * sizeof(FLOAT));
     FLOAT *dy_im = (FLOAT *)aligned_alloc(64, M_beta * sizeof(FLOAT));
 
@@ -326,14 +359,14 @@ int main(int argc, char **argv) {
 #endif
     }
 
-    /* Precompute dy phase-twist vectors (not included in beta timing) */
+    /* Precompute PSWF21/LRA phase-twist vectors (not included in beta timing) */
     for (int i = 0; i < M_beta; i++) {
         FLOAT arg = MUL(MUL(FCAST(x_beta[i]), FCAST(df)), FCAST((double)N_beta));
         dy_re[i] = M_SIN2PI(arg);
         dy_im[i] = M_COS2PI(arg);
     }
 
-    double beta_lra, beta_pswf;
+    double beta_lra, beta_pswf21, beta_pswf43;
     int wups_b = 4, reps_b = 32;
 
     /* --- LRA beta --- */
@@ -378,9 +411,9 @@ int main(int argc, char **argv) {
         printf("[beta  LRA ] exec/run = %e s | beta  = %.6f\n", t_exec, beta_lra);
     }
 
-    /* --- PSWF beta --- */
+    /* --- PSWF21 beta --- */
     {
-        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_beta, N_beta, w, df, freq_factor, "21");
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_beta, N_beta, w21, df, freq_factor, "21");
 #if defined(DOUBLE_DOUBLE)
         NUFFT_PSWF_PRE(plan, x_beta_dd);
 #else
@@ -420,8 +453,61 @@ int main(int argc, char **argv) {
         double t_exec = t_total / reps_b;
 
         NUFFT_PSWF_FREE(plan);
-        beta_pswf = t_exec / ((double)M_beta * unit_pswf);
-        printf("[beta  PSWF] exec/run = %e s | beta  = %.6f\n", t_exec, beta_pswf);
+        beta_pswf21 = t_exec / ((double)M_beta * unit_pswf21);
+        printf("[beta  PSWF21] exec/run = %e s | beta  = %.6f\n", t_exec, beta_pswf21);
+    }
+
+    /* Precompute PSWF43 phase-twist vectors (not included in beta timing). */
+    for (int i = 0; i < M_beta; i++) {
+        FLOAT arg = MUL(MUL(FCAST(x_beta[i]), FCAST(df)), FCAST((double)N_beta_out43));
+        dy_re[i] = M_SIN2PI(arg);
+        dy_im[i] = M_COS2PI(arg);
+    }
+
+    /* --- PSWF43 beta --- */
+    {
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT(M_beta, N_beta, w43, df, freq_factor, "43");
+#if defined(DOUBLE_DOUBLE)
+        NUFFT_PSWF_PRE(plan, x_beta_dd);
+#else
+        NUFFT_PSWF_PRE(plan, x_beta);
+#endif
+
+        /* Warmup */
+        for (int i = 0; i < wups_b; i++) {
+            memcpy(y_re_run, y_re_src, M_beta * sizeof(FLOAT));
+            memcpy(y_im_run, y_im_src, M_beta * sizeof(FLOAT));
+            double t0 = get_time_sec();
+            for (int j = 0; j < M_beta; j++) {
+                FLOAT yr = y_re_run[j];
+                FLOAT yi = y_im_run[j];
+                y_re_run[j] = SUB(MUL(yr, dy_re[j]), MUL(yi, dy_im[j]));
+                y_im_run[j] = ADD(MUL(yr, dy_im[j]), MUL(yi, dy_re[j]));
+            }
+            NUFFT_PSWF_EXEC(plan, y_re_run, y_im_run, out_re, out_im, freq_factor);
+            (void)(get_time_sec() - t0);
+        }
+
+        /* Timed runs */
+        double t_total = 0.0;
+        for (int i = 0; i < reps_b; i++) {
+            memcpy(y_re_run, y_re_src, M_beta * sizeof(FLOAT));
+            memcpy(y_im_run, y_im_src, M_beta * sizeof(FLOAT));
+            double t0 = get_time_sec();
+            for (int j = 0; j < M_beta; j++) {
+                FLOAT yr = y_re_run[j];
+                FLOAT yi = y_im_run[j];
+                y_re_run[j] = SUB(MUL(yr, dy_re[j]), MUL(yi, dy_im[j]));
+                y_im_run[j] = ADD(MUL(yr, dy_im[j]), MUL(yi, dy_re[j]));
+            }
+            NUFFT_PSWF_EXEC(plan, y_re_run, y_im_run, out_re, out_im, freq_factor);
+            t_total += get_time_sec() - t0;
+        }
+        double t_exec = t_total / reps_b;
+
+        NUFFT_PSWF_FREE(plan);
+        beta_pswf43 = t_exec / ((double)M_beta * unit_pswf43);
+        printf("[beta  PSWF43] exec/run = %e s | beta  = %.6f\n", t_exec, beta_pswf43);
     }
 
     free(x_beta);
@@ -449,9 +535,12 @@ int main(int argc, char **argv) {
     printf("  LRA  (rank = %2d)\n", rank);
     printf("    unit     = %e s   alpha = %.6f\n", unit_lra, alpha);
     printf("    beta     = %.6f   gamma = %.6f\n\n", beta_lra, gamma_lra);
-    printf("  PSWF (w    = %2d)\n", w);
-    printf("    unit     = %e s   alpha = %.6f\n", unit_pswf, alpha);
-    printf("    beta     = %.6f   gamma = %.6f\n", beta_pswf, gamma_pswf);
+    printf("  PSWF21 (w  = %2d)\n", w21);
+    printf("    unit     = %e s   alpha = %.6f\n", unit_pswf21, alpha);
+    printf("    beta     = %.6f   gamma = %.6f\n\n", beta_pswf21, gamma_pswf21);
+    printf("  PSWF43 (w  = %2d)\n", w43);
+    printf("    unit     = %e s   alpha = %.6f\n", unit_pswf43, alpha);
+    printf("    beta     = %.6f   gamma = %.6f\n", beta_pswf43, gamma_pswf43);
     printf("================================================================\n");
 
 #ifdef SAVE
@@ -479,9 +568,13 @@ int main(int argc, char **argv) {
                 "#define " PFX
                 "_LRA_GAMMA %.10g\n"
                 "#define " PFX
-                "_PSWF_BETA %.10g\n"
-                "#define " PFX "_PSWF_GAMMA %.10g\n\n",
-                alpha, beta_lra, gamma_lra, beta_pswf, gamma_pswf);
+                "_PSWF21_BETA %.10g\n"
+                "#define " PFX
+                "_PSWF21_GAMMA %.10g\n"
+                "#define " PFX
+                "_PSWF43_BETA %.10g\n"
+                "#define " PFX "_PSWF43_GAMMA %.10g\n\n",
+                alpha, beta_lra, gamma_lra, beta_pswf21, gamma_pswf21, beta_pswf43, gamma_pswf43);
         fclose(f);
 
 #    undef PFX

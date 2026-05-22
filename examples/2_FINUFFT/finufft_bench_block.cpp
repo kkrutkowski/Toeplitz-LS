@@ -16,6 +16,10 @@
 extern "C" {
 #include <nanofft.h>
 #include <nufft1.h>
+#define DOUBLE
+#include <nanofft_precision.h>
+#include <nanofft_trig.h>
+#undef DOUBLE
 #include <scaling.h>
 }
 
@@ -79,41 +83,39 @@ static double approximate_cost(int N, int M, int block, int degree,
                                double alpha, double beta, double gamma,
                                int backend) {
   int block_eff = block;
-  double beta_eff = beta;
   if (backend == kBackendPswf43) {
     block_eff += block_eff >> 1;
-    beta_eff *= 1.5 * (9.0 / 8.0);
   }
 
   double N_eff = block_eff * ceil((double)N / block_eff);
   double gamma_eff =
       gamma * ((double)((2 * degree) + 1)) / (double)((3 * degree) + 1);
-  if (backend == kBackendPswf43) {
-    gamma_eff *= 1.5;
-  }
 
   double cost = N_eff * pow((double)block, alpha);
-  cost += beta_eff * (N_eff - (double)(block_eff)) * (double)(M) /
-          (double)(block_eff);
+  cost +=
+      beta * (N_eff - (double)(block_eff)) * (double)(M) / (double)(block_eff);
   cost += gamma_eff * block_eff;
   return cost;
 }
 
 static int optimize_plan_size(int N, int M, int degree, double alpha,
                               double beta, double gamma, int backend) {
+  constexpr int min_block = 256;
   double start = pow((beta * (double)M / alpha), 1.0 / (alpha + 1.0));
   int block = bitceil(start);
   int n_cap = bitceil((double)N);
 
   if (block > n_cap)
     block = n_cap;
-  if (block < 1)
-    block = 1;
+  if (block < min_block)
+    block = min_block;
 
   double best =
       approximate_cost(N, M, block, degree, alpha, beta, gamma, backend);
-  while (block > 1) {
+  while (block > min_block) {
     int next = block >> 1;
+    if (next < min_block)
+      next = min_block;
     double next_cost =
         approximate_cost(N, M, next, degree, alpha, beta, gamma, backend);
     if (next_cost >= best)
@@ -190,11 +192,6 @@ static std::vector<dd_t> cast_dd(const std::vector<double> &in) {
   return out;
 }
 
-static void triple_angle(double c, double s, double &c3, double &s3) {
-  c3 = (4.0 * c * c * c) - (3.0 * c);
-  s3 = (3.0 * s) - (4.0 * s * s * s);
-}
-
 static void compute_block_delta(PswfMode mode, double x, double df,
                                 int output_block_len, float &delta_real,
                                 float &delta_imag) {
@@ -211,7 +208,7 @@ static void compute_block_delta(PswfMode mode, double x, double df,
     double phase_delta = x * df * (double)(output_block_len / 3);
     double c = cos2pi(phase_delta);
     double s = sin2pi(phase_delta);
-    triple_angle(c, s, delta_real, delta_imag);
+    nanofft_triple_angle(c, s, &delta_real, &delta_imag);
     return;
   }
 
@@ -253,8 +250,10 @@ template <> struct BenchTraits<float> {
   static constexpr int width21 = 8;
   static constexpr int width43 = 9;
   static constexpr double alpha = F_ALPHA;
-  static constexpr double beta = F_PSWF_BETA;
-  static constexpr double gamma = F_PSWF_GAMMA;
+  static constexpr double beta21 = F_PSWF21_BETA;
+  static constexpr double gamma21 = F_PSWF21_GAMMA;
+  static constexpr double beta43 = F_PSWF43_BETA;
+  static constexpr double gamma43 = F_PSWF43_GAMMA;
   static constexpr float tolerance = 1.2e-7f;
 
   static int makeplan(int64_t *n_modes, int iflag, finufft_plan_type *plan,
@@ -309,8 +308,10 @@ template <> struct BenchTraits<double> {
   static constexpr int width21 = 16;
   static constexpr int width43 = 18;
   static constexpr double alpha = D_ALPHA;
-  static constexpr double beta = D_PSWF_BETA;
-  static constexpr double gamma = D_PSWF_GAMMA;
+  static constexpr double beta21 = D_PSWF21_BETA;
+  static constexpr double gamma21 = D_PSWF21_GAMMA;
+  static constexpr double beta43 = D_PSWF43_BETA;
+  static constexpr double gamma43 = D_PSWF43_GAMMA;
   static constexpr double tolerance = 8e-16;
 
   static int makeplan(int64_t *n_modes, int iflag, finufft_plan_type *plan,
@@ -361,8 +362,10 @@ template <> struct BenchTraits<dd_t> {
   static constexpr int width21 = 32;
   static constexpr int width43 = 36;
   static constexpr double alpha = DD_ALPHA;
-  static constexpr double beta = DD_PSWF_BETA;
-  static constexpr double gamma = DD_PSWF_GAMMA;
+  static constexpr double beta21 = DD_PSWF21_BETA;
+  static constexpr double gamma21 = DD_PSWF21_GAMMA;
+  static constexpr double beta43 = DD_PSWF43_BETA;
+  static constexpr double gamma43 = DD_PSWF43_GAMMA;
 
   static pswf_plan_type *pswf_initialize(int Mpoints, int plan_len, int width,
                                          double df, int max_ff,
@@ -401,8 +404,10 @@ template <typename Traits> static int width_for_mode(PswfMode mode) {
 
 template <typename Traits>
 static int optimized_plan_len_for_mode(PswfMode mode, int N, int Mpoints) {
-  int base_len = optimize_plan_size(N, Mpoints, 0, Traits::alpha, Traits::beta,
-                                    Traits::gamma, pswf_backend(mode));
+  double beta = mode == PswfMode::k21 ? Traits::beta21 : Traits::beta43;
+  double gamma = mode == PswfMode::k21 ? Traits::gamma21 : Traits::gamma43;
+  int base_len = optimize_plan_size(N, Mpoints, 0, Traits::alpha, beta, gamma,
+                                    pswf_backend(mode));
   if (mode == PswfMode::k21) {
     return base_len;
   }
