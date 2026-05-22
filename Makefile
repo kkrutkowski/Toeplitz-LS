@@ -25,6 +25,7 @@ SCALING_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/scaling.c
 PUBLIC_HEADERS := \
 	$(INC_DIR)/nanofft.h \
 	$(INC_DIR)/nanofft_precision.h \
+	$(INC_DIR)/nanofft_trig.h \
 	$(INC_DIR)/nufft1.h \
 	$(INC_DIR)/linalg.h \
 	$(INC_DIR)/tls.h \

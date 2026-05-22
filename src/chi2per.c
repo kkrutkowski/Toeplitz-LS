@@ -2,6 +2,7 @@
 #define NANOFFT_NEEDS_INTERNAL_VEC
 #include <math.h>
 #include <nanofft_precision.h>
+#include <nanofft_trig.h>
 #include <nufft1.h>
 #include <scaling.h>
 #include <stdbool.h>
@@ -20,24 +21,18 @@ static inline int bitceil(double x) { return x <= 1.0 ? 1 : 1 << (1 + (int)(log2
 
 static double approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma, int backend) {
     int block_eff = block;
-    double beta_eff = beta;
-    // bitshift because of higher FFT grid usage efficiency
     if (backend == 1) {
         block_eff += block_eff >> 1;
-        beta_eff *= 1.5 * (9.0 / 8.0);
     };
     // Include cost of zero-padding frequencies to the transform length
     double N_eff = block_eff * ceil((double)N / block_eff);
     // Reduction in the cost of precomputation caused by reusage of pre-generated
     // plans
     double gamma_eff = gamma * ((double)((2 * degree) + 1)) / (double)((3 * degree) + 1);
-    if (backend == 1) {
-        gamma_eff *= 1.5;
-    };
     // FFT execution cost
     double cost = N_eff * pow((double)block, alpha);
     // Frequency shift cost
-    cost += beta_eff * (N_eff - (double)(block_eff)) * (double)(M) / (double)(block_eff);
+    cost += beta * (N_eff - (double)(block_eff)) * (double)(M) / (double)(block_eff);
     // Precomputation cost per block size
     cost += gamma_eff * block_eff;
     return cost;
@@ -46,16 +41,18 @@ static double approximate_cost(int N, int M, int block, int degree, double alpha
 // start at block = bitceil(pow((beta * M / alpha), (1.0 / (alpha + 1.0))))
 // then bitshift downwards as long, as cost decreases with each bitshift
 static int optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma, int backend) {
+    const int min_block = 256;
     double start = pow((beta * (double)M / alpha), 1.0 / (alpha + 1.0));
     int block = bitceil(start);
     int n_cap = bitceil((double)N);
 
     if (block > n_cap) block = n_cap;
-    if (block < 1) block = 1;
+    if (block < min_block) block = min_block;
 
     double best = approximate_cost(N, M, block, degree, alpha, beta, gamma, backend);
-    while (block > 1) {
+    while (block > min_block) {
         int next = block >> 1;
+        if (next < min_block) next = min_block;
         double next_cost = approximate_cost(N, M, next, degree, alpha, beta, gamma, backend);
         if (next_cost >= best) break;
         block = next;
@@ -113,8 +110,10 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define CHI2_ALPHA DD_ALPHA
 #    define CHI2_LRA_BETA DD_LRA_BETA
 #    define CHI2_LRA_GAMMA DD_LRA_GAMMA
-#    define CHI2_PSWF_BETA DD_PSWF_BETA
-#    define CHI2_PSWF_GAMMA DD_PSWF_GAMMA
+#    define CHI2_PSWF21_BETA DD_PSWF21_BETA
+#    define CHI2_PSWF21_GAMMA DD_PSWF21_GAMMA
+#    define CHI2_PSWF43_BETA DD_PSWF43_BETA
+#    define CHI2_PSWF43_GAMMA DD_PSWF43_GAMMA
 #    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e22
 #    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e22
 #    define COND_SINGULARITY_THRESHOLD_BAREISS 1e22
@@ -148,8 +147,10 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_ALPHA D_ALPHA
 #        define CHI2_LRA_BETA D_LRA_BETA
 #        define CHI2_LRA_GAMMA D_LRA_GAMMA
-#        define CHI2_PSWF_BETA D_PSWF_BETA
-#        define CHI2_PSWF_GAMMA D_PSWF_GAMMA
+#        define CHI2_PSWF21_BETA D_PSWF21_BETA
+#        define CHI2_PSWF21_GAMMA D_PSWF21_GAMMA
+#        define CHI2_PSWF43_BETA D_PSWF43_BETA
+#        define CHI2_PSWF43_GAMMA D_PSWF43_GAMMA
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e11
 #        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e11
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 1e11
@@ -178,8 +179,10 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_ALPHA F_ALPHA
 #        define CHI2_LRA_BETA F_LRA_BETA
 #        define CHI2_LRA_GAMMA F_LRA_GAMMA
-#        define CHI2_PSWF_BETA F_PSWF_BETA
-#        define CHI2_PSWF_GAMMA F_PSWF_GAMMA
+#        define CHI2_PSWF21_BETA F_PSWF21_BETA
+#        define CHI2_PSWF21_GAMMA F_PSWF21_GAMMA
+#        define CHI2_PSWF43_BETA F_PSWF43_BETA
+#        define CHI2_PSWF43_GAMMA F_PSWF43_GAMMA
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e4
 #        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e4
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 5e4
@@ -189,11 +192,6 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #endif
-
-static inline void CHI2_PREFIX(triple_angle)(FLOAT c, FLOAT s, FLOAT *c3, FLOAT *s3) {
-    *c3 = SUB(MUL(FCAST(4.0), MUL(MUL(c, c), c)), MUL(FCAST(3.0), c));
-    *s3 = SUB(MUL(FCAST(3.0), s), MUL(FCAST(4.0), MUL(MUL(s, s), s)));
-}
 
 static inline int double_is_nan_bits(double value) {
     union {
@@ -316,14 +314,14 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
                 FLOAT phase_delta = MUL(MUL(tm, FCAST((double)q * df)), FCAST((double)(block / 3)));
                 FLOAT c = M_COS2PI(phase_delta);
                 FLOAT s = M_SIN2PI(phase_delta);
-                CHI2_PREFIX(triple_angle)(c, s, &delta_r[m], &delta_i[m]);
+                nanofft_triple_angle(c, s, &delta_r[m], &delta_i[m]);
             } else
 #elif defined(DOUBLE)
             if (backend == CHI2PER_BACKEND_PSWF43) {
                 double phase_delta = tm * (double)q * df * (double)(block / 3);
                 double c = cos2pi(phase_delta);
                 double s = sin2pi(phase_delta);
-                CHI2_PREFIX(triple_angle)(c, s, &delta_r[m], &delta_i[m]);
+                nanofft_triple_angle(c, s, &delta_r[m], &delta_i[m]);
             } else
 #endif
             {
@@ -1084,8 +1082,15 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
 
     bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
     bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
-    double beta = use_pswf ? CHI2_PSWF_BETA : CHI2_LRA_BETA;
-    double gamma = use_pswf ? CHI2_PSWF_GAMMA : CHI2_LRA_GAMMA;
+    double beta = CHI2_LRA_BETA;
+    double gamma = CHI2_LRA_GAMMA;
+    if (use_pswf43) {
+        beta = CHI2_PSWF43_BETA;
+        gamma = CHI2_PSWF43_GAMMA;
+    } else if (use_pswf) {
+        beta = CHI2_PSWF21_BETA;
+        gamma = CHI2_PSWF21_GAMMA;
+    }
     int plan_block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
     if (use_pswf43) plan_block = pswf43_plan_len_from_base(plan_block);
     int block = use_pswf43 ? pswf43_output_len_for_plan(plan_block) : plan_block;
