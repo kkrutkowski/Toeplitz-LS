@@ -167,11 +167,6 @@ __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-ma
 
 static inline double dd_to_double(dd_t a) { return a.hi + a.lo; }
 
-static inline double dd_frac_to_double(dd_t x) {
-    double int_part = (double)((int64_t)x.hi);
-    return dd_to_double(dd_sub(x, dd_make(int_part, 0.0)));
-}
-
 __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_div(dd_t a,
                                                                                                                                                  dd_t b) {
     double q1 = a.hi / b.hi;

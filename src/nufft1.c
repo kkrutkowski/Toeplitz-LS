@@ -84,6 +84,11 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define GL_NEWTON_TOL FCONST(1.0e-7)
 #endif
 
+static inline void PFX(triple_angle)(FLOAT c, FLOAT s, FLOAT *c3, FLOAT *s3) {
+    *c3 = SUB(MUL(FCAST(4.0), MUL(MUL(c, c), c)), MUL(FCAST(3.0), c));
+    *s3 = SUB(MUL(FCAST(3.0), s), MUL(FCAST(4.0), MUL(MUL(s, s), s)));
+}
+
 /* =========================================================================
  * Gauss-Legendre Quadrature
  * ========================================================================= */
@@ -922,7 +927,8 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
 
 #if defined(DOUBLE_DOUBLE)
-        PFX(ff_t) out_shift_ff = PFX(ff_make)(FCAST(plan->output_shift), FCAST(0.0));
+        int phase_shift = mode43 ? plan->output_shift / 3 : plan->output_shift;
+        PFX(ff_t) out_shift_ff = PFX(ff_make)(FCAST(phase_shift), FCAST(0.0));
         PFX(ff_t) n_ff = PFX(ff_make)(FCAST(plan->Nfft), FCAST(0.0));
         PFX(ff_t) scale_ff = PFX(ff_make)(FCAST(plan->df * k_factor), FCAST(0.0));
 
@@ -935,8 +941,14 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
             PFX(ff_t) phase_frac_ff = PFX(ff_sub)(phase_ff, PFX(ff_make)(p_int, FCAST(0.0)));
             FLOAT phase_frac = ADD(phase_frac_ff.hi, phase_frac_ff.lo);
 
-            current_shift_r[m] = M_COS2PI(phase_frac);
-            current_shift_i[m] = M_SIN2PI(phase_frac);
+            FLOAT phase_c = M_COS2PI(phase_frac);
+            FLOAT phase_s = M_SIN2PI(phase_frac);
+            if (mode43) {
+                PFX(triple_angle)(phase_c, phase_s, &current_shift_r[m], &current_shift_i[m]);
+            } else {
+                current_shift_r[m] = phase_c;
+                current_shift_i[m] = phase_s;
+            }
 
             PFX(ff_t) x_n_ff = PFX(ff_mul)(x_ff, n_ff);
             FLOAT x_n_approx = ADD(x_n_ff.hi, x_n_ff.lo);
@@ -968,22 +980,22 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         for (int m = 0; m < plan->Mpoints; ++m) {
             double xm = x[m] * plan->df * k_factor;
 
-            double phase_frac;
 #    if defined(DOUBLE)
             if (mode43) {
-                dd_t phase_dd = dd_mul(dd_mul(dd_make(x[m], 0.0), dd_make(plan->df * k_factor, 0.0)), dd_make(out_shift, 0.0));
-                phase_frac = dd_frac_to_double(phase_dd);
+                double phase = xm * (double)(plan->output_shift / 3);
+                double c = cos2pi(phase);
+                double s = sin2pi(phase);
+                PFX(triple_angle)(c, s, &current_shift_r[m], &current_shift_i[m]);
             } else {
 #    endif
                 double phase = xm * out_shift;
                 double p_int = (double)((int)phase);
-                phase_frac = phase - p_int;
+                double phase_frac = phase - p_int;
+                current_shift_r[m] = M_COS2PI(FCAST(phase_frac));
+                current_shift_i[m] = M_SIN2PI(FCAST(phase_frac));
 #    if defined(DOUBLE)
             }
 #    endif
-
-            current_shift_r[m] = M_COS2PI(FCAST(phase_frac));
-            current_shift_i[m] = M_SIN2PI(FCAST(phase_frac));
 
             double x_n = xm * n_fft;
             int m_left = (int)ceil(x_n - (double)plan->w * 0.5);
