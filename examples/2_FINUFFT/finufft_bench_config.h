@@ -3,6 +3,6 @@
 
 constexpr int kBenchmarkM = 1000;
 constexpr int kBenchmarkNMin = 1 << 8;
-constexpr int kBenchmarkNMax = 1 << 23;
-
+constexpr int kBenchmarkNMax = 1 << 20;
+// constexpr int kBenchmarkNMax = 1 << 23;
 #endif

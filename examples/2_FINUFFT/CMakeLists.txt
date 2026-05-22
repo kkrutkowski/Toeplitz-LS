@@ -62,6 +62,57 @@ target_include_directories(tls_nufft1 PRIVATE ../../include)
 add_library(tlsf_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c)
 target_include_directories(tlsf_nufft1 PRIVATE ../../include)
 
+# Native scaling generators. These mirror the root Makefile flow: build one
+# scaling executable per precision and run them in sequence so each appends its
+# macro group to a build-directory scaling.h.
+add_executable(tlsf_nufft_scaling EXCLUDE_FROM_ALL
+    ${TLS_SRC_DIR}/scaling.c
+    $<TARGET_OBJECTS:tlsf_nufft1>
+)
+target_compile_definitions(tlsf_nufft_scaling PRIVATE SAVE)
+target_include_directories(tlsf_nufft_scaling PRIVATE ../../include)
+target_link_libraries(tlsf_nufft_scaling PRIVATE m)
+
+add_executable(tls_nufft_scaling EXCLUDE_FROM_ALL
+    ${TLS_SRC_DIR}/scaling.c
+    $<TARGET_OBJECTS:tls_nufft1>
+)
+target_compile_definitions(tls_nufft_scaling PRIVATE DOUBLE SAVE)
+target_include_directories(tls_nufft_scaling PRIVATE ../../include)
+target_link_libraries(tls_nufft_scaling PRIVATE m)
+
+add_executable(tlsdd_nufft_scaling EXCLUDE_FROM_ALL
+    ${TLS_SRC_DIR}/scaling.c
+    $<TARGET_OBJECTS:tlsdd_nufft1>
+)
+target_compile_definitions(tlsdd_nufft_scaling PRIVATE DOUBLE_DOUBLE SAVE)
+target_include_directories(tlsdd_nufft_scaling PRIVATE ../../include)
+target_link_libraries(tlsdd_nufft_scaling PRIVATE m)
+
+set_target_properties(
+    tlsf_nufft_scaling
+    tls_nufft_scaling
+    tlsdd_nufft_scaling
+    PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+set(NATIVE_SCALING_HEADER "${CMAKE_BINARY_DIR}/scaling.h")
+add_custom_command(
+    OUTPUT "${NATIVE_SCALING_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${NATIVE_SCALING_HEADER}"
+    COMMAND tlsf_nufft_scaling
+    COMMAND tls_nufft_scaling
+    COMMAND tlsdd_nufft_scaling
+    DEPENDS tlsf_nufft_scaling tls_nufft_scaling tlsdd_nufft_scaling
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Generating native scaling.h"
+    VERBATIM
+)
+add_custom_target(generate_native_scaling_header
+    DEPENDS "${NATIVE_SCALING_HEADER}"
+)
+
 # ==============================================================================
 # 5. Setup Benchmark Executable
 # ==============================================================================
@@ -73,12 +124,29 @@ add_executable(finufft_bench
     $<TARGET_OBJECTS:tlsf_nufft1>
 )
 
+add_executable(finufft_bench_block
+    finufft_bench_block.cpp
+    $<TARGET_OBJECTS:tlsdd_nufft1>
+    $<TARGET_OBJECTS:tls_nufft1>
+    $<TARGET_OBJECTS:tlsf_nufft1>
+)
+
 # Include your microlibrary headers
 target_include_directories(finufft_bench PRIVATE ../../include)
+target_include_directories(finufft_bench_block PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    ../../include
+)
+add_dependencies(finufft_bench_block generate_native_scaling_header)
 
 # Link FINUFFT and math libraries
 target_link_libraries(finufft_bench PRIVATE
     finufft
     quadmath
+    m
+)
+
+target_link_libraries(finufft_bench_block PRIVATE
+    finufft
     m
 )
