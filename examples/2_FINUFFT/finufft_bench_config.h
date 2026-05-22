@@ -1,9 +1,9 @@
 #ifndef FINUFFT_BENCH_CONFIG_H
 #define FINUFFT_BENCH_CONFIG_H
 
-constexpr int kBenchmarkM = 1e5;
+constexpr int kBenchmarkM = 1e3;
 constexpr int kBenchmarkNMin = 1 << 8;
-constexpr int kBenchmarkNMax = 1 << 26;
+constexpr int kBenchmarkNMax = 1 << 20;
 // constexpr int kBenchmarkNMax = 1 << 23;
 
 #ifndef MAX_TWIDDLE_REUSE
