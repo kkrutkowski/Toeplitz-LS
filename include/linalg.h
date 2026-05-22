@@ -49,6 +49,12 @@ VECF tlsf_solve_bareiss(size_t n, const VECF *R_r, const VECF *R_i, const VECF *
 VECF tlsf_solve_zohar(size_t n, const VECF *R_r, const VECF *R_i, const VECF *y_r, const VECF *y_i, VECF *s_r, VECF *s_i, VECF *e_hat_r, VECF *e_hat_i,
                       VECF *e_hat_prev_r, VECF *e_hat_prev_i);
 
+/** Symmetric Jacobi spectral solver, single precision vector batch.
+ *  Solves full row-major symmetric systems A x = b.
+ *  Returns lane-wise spectral condition estimates.
+ *  Workspace: Q, S length n*n; D, y length n each. */
+VECF tlsf_solve_svd(size_t n, const VECF *A, const VECF *b, VECF *x, VECF *Q, VECF *S, VECF *D, VECF *y, VECF max_cond);
+
 /* =========================================================================
  * double  (tls_)
  * ========================================================================= */
@@ -64,6 +70,8 @@ VEC tls_solve_bareiss(size_t n, const VEC *R_r, const VEC *R_i, const VEC *y_r, 
 VEC tls_solve_zohar(size_t n, const VEC *R_r, const VEC *R_i, const VEC *y_r, const VEC *y_i, VEC *s_r, VEC *s_i, VEC *e_hat_r, VEC *e_hat_i, VEC *e_hat_prev_r,
                     VEC *e_hat_prev_i);
 
+VEC tls_solve_svd(size_t n, const VEC *A, const VEC *b, VEC *x, VEC *Q, VEC *S, VEC *D, VEC *y, VEC max_cond);
+
 /* =========================================================================
  * double-double  (tlsdd_)
  * ========================================================================= */
@@ -78,6 +86,8 @@ dd_t tlsdd_solve_bareiss(size_t n, const dd_t *R_r, const dd_t *R_i, const dd_t 
 
 dd_t tlsdd_solve_zohar(size_t n, const dd_t *R_r, const dd_t *R_i, const dd_t *y_r, const dd_t *y_i, dd_t *s_r, dd_t *s_i, dd_t *e_hat_r, dd_t *e_hat_i,
                        dd_t *e_hat_prev_r, dd_t *e_hat_prev_i);
+
+dd_t tlsdd_solve_svd(size_t n, const dd_t *A, const dd_t *b, dd_t *x, dd_t *Q, dd_t *S, dd_t *D, dd_t *y, dd_t max_cond);
 
 #ifdef __cplusplus
 }

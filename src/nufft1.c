@@ -968,9 +968,19 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         for (int m = 0; m < plan->Mpoints; ++m) {
             double xm = x[m] * plan->df * k_factor;
 
-            double phase = xm * out_shift;
-            double p_int = (double)((int)phase);
-            double phase_frac = phase - p_int;
+            double phase_frac;
+#    if defined(DOUBLE)
+            if (mode43) {
+                dd_t phase_dd = dd_mul(dd_mul(dd_make(x[m], 0.0), dd_make(plan->df * k_factor, 0.0)), dd_make(out_shift, 0.0));
+                phase_frac = dd_frac_to_double(phase_dd);
+            } else {
+#    endif
+                double phase = xm * out_shift;
+                double p_int = (double)((int)phase);
+                phase_frac = phase - p_int;
+#    if defined(DOUBLE)
+            }
+#    endif
 
             current_shift_r[m] = M_COS2PI(FCAST(phase_frac));
             current_shift_i[m] = M_SIN2PI(FCAST(phase_frac));

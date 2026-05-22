@@ -306,9 +306,19 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
             src_r[m] = MUL(h[m], c0);
             src_i[m] = MUL(h[m], s0);
 
-            FLOAT phase_delta = MUL(q_delta, tm);
-            delta_r[m] = M_COS2PI(phase_delta);
-            delta_i[m] = M_SIN2PI(phase_delta);
+#if defined(DOUBLE)
+            if (backend == CHI2PER_BACKEND_PSWF43) {
+                dd_t phase_delta_dd = dd_mul(dd_mul(dd_make(tm, 0.0), dd_make((double)q * df, 0.0)), dd_make((double)block, 0.0));
+                double phase_delta = dd_frac_to_double(phase_delta_dd);
+                delta_r[m] = cos2pi(phase_delta);
+                delta_i[m] = sin2pi(phase_delta);
+            } else
+#endif
+            {
+                FLOAT phase_delta = MUL(q_delta, tm);
+                delta_r[m] = M_COS2PI(phase_delta);
+                delta_i[m] = M_SIN2PI(phase_delta);
+            }
         }
 
         for (int base = 0; base < N; base += block) {
