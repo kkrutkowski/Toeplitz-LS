@@ -12,7 +12,6 @@ sys.path.insert(0, str(ROOT / "toeplitz-ls"))
 
 from toeplitz_ls import tls, tlsdd, tlsf
 
-
 mp.prec = 106
 MPF_TYPE = type(mp.mpf(0))
 MEDIAN_DIFF_MAX_POINTS = 1 << 16
@@ -74,22 +73,29 @@ def as_mpf_power(power):
     ]
 
 
+# Helper that calls the right power method without solver when nterms == 1
+def _call_power(func, t, y, dy, f0, df, nf, nterms, backend, solver):
+    if nterms == 1:
+        return func(
+            nf, df, f0, t, y, dy, backend=backend, nterms=nterms
+        )
+    else:
+        return func(
+            nf, df, f0, t, y, dy, backend=backend, solver=solver, nterms=nterms
+        )
+
+
 def call_tlsf(t, y, dy, f0, df, nf, nterms, backend, solver):
-    return tlsf.power(
-        nf, df, f0, t, y, dy, backend=backend, solver=solver, nterms=nterms
-    ).astype(np.float64)
+    return _call_power(tlsf.power, t, y, dy, f0, df, nf, nterms, backend, solver
+                      ).astype(np.float64)
 
 
 def call_tls(t, y, dy, f0, df, nf, nterms, backend, solver):
-    return tls.power(
-        nf, df, f0, t, y, dy, backend=backend, solver=solver, nterms=nterms
-    )
+    return _call_power(tls.power, t, y, dy, f0, df, nf, nterms, backend, solver)
 
 
 def call_tlsdd(t, y, dy, f0, df, nf, nterms, backend, solver):
-    return tlsdd.power(
-        nf, df, f0, t, y, dy, backend=backend, solver=solver, nterms=nterms
-    )
+    return _call_power(tlsdd.power, t, y, dy, f0, df, nf, nterms, backend, solver)
 
 
 def run_nifty(t, y, dy, f0, df, nf, nterms):
@@ -139,41 +145,52 @@ def print_row(nf, method, elapsed, candidate, reference):
 def benchmark(args):
     t, y, dy = make_signal(M=args.M)
 
-    # Both f0 and df are binary fractions; df is exactly a power of two.
     f0 = 2.0**-7
     df = 2.0**-15
 
-    c_methods = []
-    for precision, caller in (
+    # All precision/backend combinations
+    precisions = [
         ("tlsdd", call_tlsdd),
         ("tls", call_tls),
         ("tlsf", call_tlsf),
-    ):
-        for backend_label, backend in (
-            ("LRA", "lra"),
-            ("PSWF21", "pswf21"),
-            ("PSWF43", "pswf43"),
-        ):
-            for solver_label, solver in (("L", "levinson"), ("LDLT", "ldlt")):
-                if precision == "tlsdd" and backend == "lra" and solver == "levinson":
-                    continue
-                c_methods.append(
-                    (
-                        f"{precision}-{backend_label}-{solver_label}",
-                        lambda nf, nt, caller=caller, backend=backend, solver=solver: caller(
-                            t, y, dy, f0, df, nf, nt, backend, solver
-                        ),
-                    )
-                )
+    ]
+    backends = [
+        ("LRA", "lra"),
+        ("PSWF21", "pswf21"),
+        ("PSWF43", "pswf43"),
+    ]
 
     for nterms in (1, 3):  # , 8
         print_header(nterms, f0, df)
 
+        # Build list of methods for this nterms
+        c_methods = []
+        for prec_label, caller in precisions:
+            for backend_label, backend in backends:
+                # For nterms==1, solver is irrelevant → only test one solver
+                solvers_to_test = (
+                    [("L", "levinson")] if nterms == 1
+                    else [("L", "levinson"), ("LDLT", "ldlt")]
+                )
+                for solver_label, solver in solvers_to_test:
+                    # Skip the exact combination used as reference (tlsdd-LRA-L)
+                    if prec_label == "tlsdd" and backend_label == "LRA" and solver_label == "L":
+                        continue
+                    method_name = f"{prec_label}-{backend_label}-{solver_label}"
+                    c_methods.append(
+                        (
+                            method_name,
+                            lambda nf, nt, c=caller, b=backend, s=solver: c(
+                                t, y, dy, f0, df, nf, nt, b, s
+                            ),
+                        )
+                    )
+
         for k in range(args.min_power, args.max_power + 1):
             nf = 1 << k
-
             print()
 
+            # Reference: tlsdd-LRA-L (always uses levinson, works for any nterms)
             ref_label, ref_time, reference = timed(
                 "tlsdd-LRA-L",
                 lambda nf=nf, nterms=nterms: call_tlsdd(
@@ -182,14 +199,16 @@ def benchmark(args):
             )
             print_row(nf, ref_label, ref_time, reference, reference)
 
+            # Other C methods
             for method, runner in c_methods:
                 label, elapsed, candidate = timed(
                     method,
-                    lambda runner=runner, nf=nf, nterms=nterms: runner(nf, nterms),
+                    lambda r=runner, nf=nf, nterms=nterms: r(nf, nterms),
                 )
                 candidate = as_mpf_power(candidate)
                 print_row(nf, label, elapsed, candidate, reference)
 
+            # Nifty
             label, elapsed, candidate = timed(
                 "nifty",
                 lambda nf=nf, nterms=nterms: run_nifty(t, y, dy, f0, df, nf, nterms),
