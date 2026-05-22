@@ -190,6 +190,11 @@ static std::vector<dd_t> cast_dd(const std::vector<double> &in) {
   return out;
 }
 
+static void triple_angle(double c, double s, double &c3, double &s3) {
+  c3 = (4.0 * c * c * c) - (3.0 * c);
+  s3 = (3.0 * s) - (4.0 * s * s * s);
+}
+
 static void compute_block_delta(PswfMode mode, double x, double df,
                                 int output_block_len, float &delta_real,
                                 float &delta_imag) {
@@ -203,11 +208,10 @@ static void compute_block_delta(PswfMode mode, double x, double df,
                                 int output_block_len, double &delta_real,
                                 double &delta_imag) {
   if (mode == PswfMode::k43) {
-    dd_t phase_delta = dd_mul(dd_mul(dd_make(x, 0.0), dd_make(df, 0.0)),
-                              dd_make((double)output_block_len, 0.0));
-    double phase_frac = dd_frac_to_double(phase_delta);
-    delta_real = cos2pi(phase_frac);
-    delta_imag = sin2pi(phase_frac);
+    double phase_delta = x * df * (double)(output_block_len / 3);
+    double c = cos2pi(phase_delta);
+    double s = sin2pi(phase_delta);
+    triple_angle(c, s, delta_real, delta_imag);
     return;
   }
 

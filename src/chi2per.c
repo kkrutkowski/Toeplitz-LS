@@ -190,6 +190,11 @@ static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #endif
 
+static inline void CHI2_PREFIX(triple_angle)(FLOAT c, FLOAT s, FLOAT *c3, FLOAT *s3) {
+    *c3 = SUB(MUL(FCAST(4.0), MUL(MUL(c, c), c)), MUL(FCAST(3.0), c));
+    *s3 = SUB(MUL(FCAST(3.0), s), MUL(FCAST(4.0), MUL(MUL(s, s), s)));
+}
+
 static inline int double_is_nan_bits(double value) {
     union {
         double f;
@@ -306,12 +311,19 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
             src_r[m] = MUL(h[m], c0);
             src_i[m] = MUL(h[m], s0);
 
-#if defined(DOUBLE)
+#if defined(DOUBLE_DOUBLE)
             if (backend == CHI2PER_BACKEND_PSWF43) {
-                dd_t phase_delta_dd = dd_mul(dd_mul(dd_make(tm, 0.0), dd_make((double)q * df, 0.0)), dd_make((double)block, 0.0));
-                double phase_delta = dd_frac_to_double(phase_delta_dd);
-                delta_r[m] = cos2pi(phase_delta);
-                delta_i[m] = sin2pi(phase_delta);
+                FLOAT phase_delta = MUL(MUL(tm, FCAST((double)q * df)), FCAST((double)(block / 3)));
+                FLOAT c = M_COS2PI(phase_delta);
+                FLOAT s = M_SIN2PI(phase_delta);
+                CHI2_PREFIX(triple_angle)(c, s, &delta_r[m], &delta_i[m]);
+            } else
+#elif defined(DOUBLE)
+            if (backend == CHI2PER_BACKEND_PSWF43) {
+                double phase_delta = tm * (double)q * df * (double)(block / 3);
+                double c = cos2pi(phase_delta);
+                double s = sin2pi(phase_delta);
+                CHI2_PREFIX(triple_angle)(c, s, &delta_r[m], &delta_i[m]);
             } else
 #endif
             {
