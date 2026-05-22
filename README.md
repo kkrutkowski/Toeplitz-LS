@@ -91,7 +91,7 @@ freq, power, cond = tlsf.autopower(
     fmax=100,
     nterms=3,
     oversampling=5,
-    solver="levinson",
+    solver="levinson", # or 'zohar', 'bareiss', 'ldlt', 'svd'
     normalization="asymptotic",
     autonan=False,
 )
