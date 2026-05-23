@@ -53,12 +53,14 @@ def make_args(phot_dir, output_dir, methods, **overrides):
         index_path=str(phot_dir / "index.tsv"),
         methods=methods,
         dataset_limit=0,
+        nterms=None,
         nterms_max=1,
         compute_limit=0.0,
         max_workers=1,
         fmax=1.0,
         oversampling=5.0,
         use_dy=False,
+        no_progress=True,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -89,7 +91,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(metadata["failed_spectra"], "2")
             self.assertTrue(all(frequency == 0.0 for _name, frequency in rows))
 
-    def test_cpu_limit_keeps_partial_pass(self):
+    def test_nterms_one_ignores_limit_and_stops_after_valid_sample(self):
         with TemporaryDirectory() as tmp:
             directory = Path(tmp)
             out = directory / "out"
@@ -104,10 +106,47 @@ class RunnerTests(unittest.TestCase):
             )
             written = run_benchmark(args, registry=registry)
             metadata, rows = read_result(out / "busy_nterms1.tsv")
+            self.assertEqual(metadata["status"], "complete")
+            self.assertEqual(len(rows), 4)
+            self.assertEqual([path.name for path in written], ["busy_nterms1.tsv"])
+
+    def test_fixed_nterms_can_budget_limit_partial_pass(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            out = directory / "out"
+            self.write_curves(directory, count=4)
+            registry = {"busy": BusyMethod()}
+            args = make_args(
+                directory,
+                out,
+                "busy",
+                nterms=2,
+                compute_limit=0.000001,
+            )
+            written = run_benchmark(args, registry=registry)
+            metadata, rows = read_result(out / "busy_nterms2.tsv")
             self.assertEqual(metadata["status"], "compute_limit_reached")
             self.assertGreaterEqual(len(rows), 1)
             self.assertLess(len(rows), 4)
-            self.assertEqual([path.name for path in written], ["busy_nterms1.tsv"])
+            self.assertEqual([path.name for path in written], ["busy_nterms2.tsv"])
+
+    def test_sweep_runs_all_methods_for_each_nterms_before_next_order(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            out = directory / "out"
+            self.write_curves(directory, count=1)
+            registry = {"peak": PeakMethod(), "busy": BusyMethod()}
+            args = make_args(directory, out, "peak,busy", nterms_max=2)
+            written = run_benchmark(args, registry=registry)
+            self.assertEqual(
+                [path.name for path in written],
+                [
+                    "peak_nterms1.tsv",
+                    "busy_nterms1.tsv",
+                    "peak_nterms2.tsv",
+                    "busy_nterms2.tsv",
+                ],
+            )
 
 
 if __name__ == "__main__":

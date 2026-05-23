@@ -1,6 +1,6 @@
 CC ?= cc
 PYTHON ?= python3
-CFLAGS ?= -O3 -march=native -fPIC -Wall -Wextra
+CFLAGS ?= -O3 -ffast-math -march=native -flto -fPIC -Wall -Wextra
 LDFLAGS_SHARED ?= -shared
 
 ROOT := ../..
