@@ -2,7 +2,13 @@ import unittest
 
 import numpy as np
 
-from methods import METHODS, UnsupportedMethodError, make_frequency_grid
+from methods import (
+    AstropyFastMethod,
+    AstropySlowMethod,
+    METHODS,
+    UnsupportedMethodError,
+    make_frequency_grid,
+)
 
 
 class ComparisonMethodTests(unittest.TestCase):
@@ -61,6 +67,47 @@ class ComparisonMethodTests(unittest.TestCase):
             METHODS["fastchi2_103"].power(
                 grid.Nf, grid.df, grid.f0, self.t, self.y, nterms=16
             )
+
+    def test_astropy_fast_splits_large_frequency_requests(self):
+        method = AstropyFastMethod("test-fast", "lra")
+        calls = []
+
+        def fake_power_chunk(Nf, df, f0, t, y, dy, nterms, normalization):
+            calls.append((Nf, f0))
+            return np.full(Nf, f0)
+
+        method._max_chunk_size = lambda nterms: 2
+        method._power_chunk = fake_power_chunk
+        result = method.power(5, 0.25, 1.0, self.t, self.y, nterms=3)
+
+        self.assertEqual(calls, [(2, 1.0), (2, 1.5), (1, 2.0)])
+        np.testing.assert_allclose(result, [1.0, 1.0, 1.5, 1.5, 2.0])
+        self.assertEqual(
+            AstropyFastMethod("test-fast", "lra")._max_chunk_size(8),
+            ((1 << 26) - 1) // 8,
+        )
+
+    def test_astropy_slow_splits_single_term_by_measurement_frequency_work(self):
+        method = AstropySlowMethod()
+        calls = []
+
+        def fake_slow_power_chunk(t, y, dy, frequency, normalization):
+            calls.append(frequency.copy())
+            return frequency
+
+        method._max_chunk_size = lambda measurement_count: 2
+        method._slow_power_chunk = fake_slow_power_chunk
+        result = method.power(5, 0.25, 1.0, self.t, self.y, nterms=1)
+
+        self.assertEqual([len(call) for call in calls], [2, 2, 1])
+        np.testing.assert_allclose(calls[0], [1.0, 1.25])
+        np.testing.assert_allclose(calls[1], [1.5, 1.75])
+        np.testing.assert_allclose(calls[2], [2.0])
+        np.testing.assert_allclose(result, [1.0, 1.25, 1.5, 1.75, 2.0])
+        self.assertEqual(
+            AstropySlowMethod()._max_chunk_size(220),
+            ((1 << 24) - 1) // 220,
+        )
 
 
 if __name__ == "__main__":

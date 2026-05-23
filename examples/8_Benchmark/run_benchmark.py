@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from methods import METHODS, Method, make_frequency_grid  # noqa: E402
 
@@ -163,12 +164,21 @@ def run_pass(
     use_dy: bool,
     prior_user_cpu_seconds: float,
     compute_limit_seconds: float,
+    progress_label: str,
+    show_progress: bool,
 ) -> PassResult:
     rows = []
     pass_cpu_seconds = 0.0
     budget_reached = False
     iterator = iter(curves)
     pending = set()
+    progress = tqdm(
+        total=len(curves),
+        desc=progress_label,
+        unit="file",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
 
     def submit_available(executor):
         nonlocal budget_reached
@@ -189,20 +199,28 @@ def run_pass(
                 )
             )
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        submit_available(executor)
-        while pending:
-            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in finished:
-                result = future.result()
-                rows.append(result)
-                pass_cpu_seconds += result.user_cpu_seconds
-            if (
-                compute_limit_seconds > 0.0
-                and prior_user_cpu_seconds + pass_cpu_seconds >= compute_limit_seconds
-            ):
-                budget_reached = True
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             submit_available(executor)
+            while pending:
+                finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    result = future.result()
+                    rows.append(result)
+                    pass_cpu_seconds += result.user_cpu_seconds
+                progress.update(len(finished))
+                progress.set_postfix(
+                    cpu_h=f"{pass_cpu_seconds / 3600.0:.4g}", refresh=False
+                )
+                if (
+                    compute_limit_seconds > 0.0
+                    and prior_user_cpu_seconds + pass_cpu_seconds
+                    >= compute_limit_seconds
+                ):
+                    budget_reached = True
+                submit_available(executor)
+    finally:
+        progress.close()
 
     rows.sort(key=lambda row: row.filename)
     status = "compute_limit_reached" if budget_reached else "complete"
@@ -262,19 +280,23 @@ def run_benchmark(args, registry=METHODS):
     selected_paths, curves, skipped_short = load_curves(phot_dir, args.dataset_limit)
     method_names = parse_methods(args.methods, registry)
     compute_limit_seconds = args.compute_limit * 3600.0
+    nterms_values = (
+        [args.nterms] if args.nterms is not None else range(1, args.nterms_max + 1)
+    )
 
     print(
         f"Loaded {len(curves)} eligible curves from {len(selected_paths)} selected files "
         f"({skipped_short} shorter than {MIN_MEASUREMENTS} measurements)."
     )
     written = []
-    for method_name in method_names:
-        method = registry[method_name]
-        cumulative_seconds = 0.0
-        stopped = False
-        for nterms in range(1, args.nterms_max + 1):
-            if stopped:
-                break
+    cumulative_seconds = dict.fromkeys(method_names, 0.0)
+    stopped_methods = set()
+
+    for nterms in nterms_values:
+        for method_name in method_names:
+            if method_name in stopped_methods:
+                continue
+            method = registry[method_name]
             output_path = output_dir / f"{method_name}_nterms{nterms}.tsv"
             if not method.supports(nterms):
                 write_output(
@@ -287,12 +309,16 @@ def run_benchmark(args, registry=METHODS):
                     rows=[],
                     use_dy=args.use_dy,
                     pass_user_cpu_seconds=0.0,
-                    cumulative_user_cpu_seconds=cumulative_seconds,
+                    cumulative_user_cpu_seconds=cumulative_seconds[method_name],
                 )
                 written.append(output_path)
                 print(f"{method_name} nterms={nterms}: unsupported")
                 continue
 
+            # Always finish the baseline order so every selected method has data.
+            effective_compute_limit_seconds = (
+                0.0 if nterms == 1 else compute_limit_seconds
+            )
             result = run_pass(
                 method,
                 nterms,
@@ -301,10 +327,12 @@ def run_benchmark(args, registry=METHODS):
                 fmax=args.fmax,
                 oversampling=args.oversampling,
                 use_dy=args.use_dy,
-                prior_user_cpu_seconds=cumulative_seconds,
-                compute_limit_seconds=compute_limit_seconds,
+                prior_user_cpu_seconds=cumulative_seconds[method_name],
+                compute_limit_seconds=effective_compute_limit_seconds,
+                progress_label=f"{method_name} nterms={nterms}",
+                show_progress=not args.no_progress,
             )
-            cumulative_seconds += result.user_cpu_seconds
+            cumulative_seconds[method_name] += result.user_cpu_seconds
             write_output(
                 output_path,
                 method_name=method_name,
@@ -315,16 +343,20 @@ def run_benchmark(args, registry=METHODS):
                 rows=result.rows,
                 use_dy=args.use_dy,
                 pass_user_cpu_seconds=result.user_cpu_seconds,
-                cumulative_user_cpu_seconds=cumulative_seconds,
+                cumulative_user_cpu_seconds=cumulative_seconds[method_name],
             )
             written.append(output_path)
             print(
                 f"{method_name} nterms={nterms}: {result.status}, "
                 f"{len(result.rows)}/{len(curves)} curves, "
                 f"{result.user_cpu_seconds / 3600.0:.6g} CPU-hours "
-                f"({cumulative_seconds / 3600.0:.6g} cumulative)"
+                f"({cumulative_seconds[method_name] / 3600.0:.6g} cumulative)"
             )
-            stopped = result.status == "compute_limit_reached"
+            if (
+                compute_limit_seconds > 0.0
+                and cumulative_seconds[method_name] >= compute_limit_seconds
+            ):
+                stopped_methods.add(method_name)
     return written
 
 
@@ -337,17 +369,26 @@ def parse_args(argv=None):
     parser.add_argument("--index-path", default="./index.tsv")
     parser.add_argument("--output-dir", default="./out")
     parser.add_argument("--dataset-limit", type=int, default=0)
+    parser.add_argument(
+        "--nterms",
+        type=int,
+        default=None,
+        help="Run only this harmonic order instead of sweeping 1..--nterms-max.",
+    )
     parser.add_argument("--nterms-max", type=int, default=12)
     parser.add_argument("--compute-limit", type=float, default=0.2)
     parser.add_argument("--max-workers", type=int, default=15)
     parser.add_argument("--fmax", type=float, default=4.0)
     parser.add_argument("--oversampling", type=float, default=5.0)
     parser.add_argument("--use-dy", action="store_true")
+    parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)
     if args.dataset_limit < 0:
         parser.error("--dataset-limit must be non-negative")
     if args.nterms_max < 1:
         parser.error("--nterms-max must be positive")
+    if args.nterms is not None and args.nterms < 1:
+        parser.error("--nterms must be positive")
     if args.compute_limit < 0.0:
         parser.error("--compute-limit must be non-negative")
     if args.max_workers < 1:

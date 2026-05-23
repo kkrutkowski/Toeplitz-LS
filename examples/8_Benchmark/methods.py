@@ -29,6 +29,8 @@ BUILD_DIR = HERE / "build"
 AOVDIST_LIBRARY = BUILD_DIR / "libaovdist.so"
 FASTCHI2_LIBRARY = BUILD_DIR / "libfastchi2_103.so"
 _C_INT_MAX = 2**31 - 1
+ASTROPY_SLOW_MAX_MEASUREMENT_FREQUENCY_WORK = 1 << 24
+ASTROPY_FAST_MAX_FREQUENCY_TERM_WORK = 1 << 26
 
 
 class UnsupportedMethodError(ValueError):
@@ -232,13 +234,34 @@ class TLSFMethod(Method):
 class AstropySlowMethod(Method):
     name = "astropy-slow"
 
+    def _max_chunk_size(self, measurement_count: int) -> int:
+        measurement_count = max(1, int(measurement_count))
+        return max(
+            1,
+            (ASTROPY_SLOW_MAX_MEASUREMENT_FREQUENCY_WORK - 1) // measurement_count,
+        )
+
+    def _slow_power_chunk(self, t, y, dy, frequency, normalization):
+        return lombscargle_slow(t, y, dy, frequency, normalization=normalization)
+
     def power(
         self, Nf, df, f0, t, y, dy=None, nterms=1, normalization="standard", *, frequency=None
     ):
         Nf, df, f0, nterms = _check_power_request(Nf, df, f0, nterms, normalization)
         freq = _as_frequency(Nf, df, f0, frequency)
         if nterms == 1:
-            return lombscargle_slow(t, y, dy, freq, normalization=normalization)
+            measurement_count = np.asarray(t).size
+            max_chunk = self._max_chunk_size(measurement_count)
+            if Nf <= max_chunk:
+                return self._slow_power_chunk(t, y, dy, freq, normalization)
+
+            result = np.empty(Nf, dtype=np.float64)
+            for start in range(0, Nf, max_chunk):
+                chunk_Nf = min(max_chunk, Nf - start)
+                result[start : start + chunk_Nf] = self._slow_power_chunk(
+                    t, y, dy, freq[start : start + chunk_Nf], normalization
+                )
+            return result
         return lombscargle_chi2(
             t, y, dy, freq, normalization=normalization, nterms=nterms
         )
@@ -249,13 +272,20 @@ class AstropyFastMethod(Method):
         self.name = name
         self.algorithm = algorithm
 
-    def power(
-        self, Nf, df, f0, t, y, dy=None, nterms=1, normalization="standard", *, frequency=None
-    ):
-        Nf, df, f0, nterms = _check_power_request(Nf, df, f0, nterms, normalization)
+    def _max_chunk_size(self, nterms: int) -> int:
+        return max(1, (ASTROPY_FAST_MAX_FREQUENCY_TERM_WORK - 1) // nterms)
+
+    def _power_chunk(self, Nf, df, f0, t, y, dy, nterms, normalization):
         if nterms == 1:
             return lombscargle_fast(
-                t, y, dy, f0, df, Nf, normalization=normalization, algorithm=self.algorithm
+                t,
+                y,
+                dy,
+                f0,
+                df,
+                Nf,
+                normalization=normalization,
+                algorithm=self.algorithm,
             )
         return lombscargle_fastchi2(
             t,
@@ -268,6 +298,23 @@ class AstropyFastMethod(Method):
             nterms=nterms,
             algorithm=self.algorithm,
         )
+
+    def power(
+        self, Nf, df, f0, t, y, dy=None, nterms=1, normalization="standard", *, frequency=None
+    ):
+        Nf, df, f0, nterms = _check_power_request(Nf, df, f0, nterms, normalization)
+        max_chunk = self._max_chunk_size(nterms)
+        if Nf <= max_chunk:
+            return self._power_chunk(Nf, df, f0, t, y, dy, nterms, normalization)
+
+        result = np.empty(Nf, dtype=np.float64)
+        for start in range(0, Nf, max_chunk):
+            chunk_Nf = min(max_chunk, Nf - start)
+            chunk_f0 = f0 + start * df
+            result[start : start + chunk_Nf] = self._power_chunk(
+                chunk_Nf, df, chunk_f0, t, y, dy, nterms, normalization
+            )
+        return result
 
 
 class _Spec(ctypes.Structure):
