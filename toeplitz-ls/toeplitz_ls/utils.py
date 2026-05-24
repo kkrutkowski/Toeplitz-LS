@@ -172,6 +172,7 @@ def _load_utils_library():
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
         ctypes.c_int,
+        ctypes.c_int,
         ctypes.c_float,
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
@@ -185,6 +186,7 @@ def _load_utils_library():
         ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
         ctypes.c_int,
+        ctypes.c_int,
         ctypes.c_double,
         ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
@@ -197,6 +199,7 @@ def _load_utils_library():
         ctypes.POINTER(DD),
         ctypes.POINTER(DD),
         ctypes.POINTER(DD),
+        ctypes.c_int,
         ctypes.c_int,
         DD,
         ctypes.POINTER(DD),
@@ -226,20 +229,38 @@ def _check_c_length(name: str, n: int) -> int:
     return int(n)
 
 
-def get_peaks(freq, power, cond=None, threshold=0, *, x=None, nterms=None) -> Peaks:
+def _peak_capacity(num_samples: int, num_peaks) -> int:
+    max_possible = max(0, num_samples - 2)
+    if num_peaks is None:
+        return _check_c_length("num_peaks", max_possible)
+    requested = _check_nonnegative_int("num_peaks", num_peaks)
+    if requested > _C_INT_MAX:
+        raise ValueError(f"num_peaks must be at most {_C_INT_MAX}")
+    return min(requested, max_possible)
+
+
+def get_peaks(
+    freq, power, cond=None, threshold=0, num_peaks=25, *, x=None, nterms=None
+) -> Peaks:
     """Return strict local maxima refined by quadratic interpolation.
 
     A sample at index ``i`` is considered a peak when all three neighboring
     power samples are finite, ``power[i] > power[i - 1]``,
     ``power[i] > power[i + 1]``, and ``power[i] > threshold``. NaN samples
     are ignored for peak detection. The returned peaks are sorted by
-    interpolated power in descending order.
+    interpolated power in descending order. By default only the strongest
+    25 peaks are returned; pass ``num_peaks=None`` to return all peaks.
     """
 
     freq_decimals = _infer_freq_decimals(freq, x=x, nterms=nterms)
     if _can_use_numpy_fast_path(freq, power, cond):
         return _get_peaks_numpy_native(
-            freq, power, cond, threshold=threshold, freq_decimals=freq_decimals
+            freq,
+            power,
+            cond,
+            threshold=threshold,
+            num_peaks=num_peaks,
+            freq_decimals=freq_decimals,
         )
 
     freq_values = _as_sequence(freq, "freq")
@@ -260,6 +281,7 @@ def get_peaks(freq, power, cond=None, threshold=0, *, x=None, nterms=None) -> Pe
             power_values,
             cond_values,
             threshold=threshold,
+            num_peaks=num_peaks,
             freq_decimals=freq_decimals,
         )
 
@@ -268,11 +290,14 @@ def get_peaks(freq, power, cond=None, threshold=0, *, x=None, nterms=None) -> Pe
         power_values,
         cond_values,
         threshold=threshold,
+        num_peaks=num_peaks,
         freq_decimals=freq_decimals,
     )
 
 
-def _get_peaks_numpy_native(freq, power, cond, *, threshold, freq_decimals: int) -> Peaks:
+def _get_peaks_numpy_native(
+    freq, power, cond, *, threshold, num_peaks, freq_decimals: int
+) -> Peaks:
     freq_arr = np.asarray(freq)
     power_arr = np.asarray(power)
     cond_arr = None if cond is None else np.asarray(cond)
@@ -312,6 +337,7 @@ def _get_peaks_numpy_native(freq, power, cond, *, threshold, freq_decimals: int)
             freq_arr,
             power_arr,
             cond_arr,
+            max_peaks=_peak_capacity(freq_arr.size, num_peaks),
             threshold=np.float32(threshold),
             freq_decimals=freq_decimals,
         )
@@ -319,13 +345,14 @@ def _get_peaks_numpy_native(freq, power, cond, *, threshold, freq_decimals: int)
         freq_arr,
         power_arr,
         cond_arr,
+        max_peaks=_peak_capacity(freq_arr.size, num_peaks),
         threshold=threshold,
         freq_decimals=freq_decimals,
     )
 
 
 def _get_peaks_double_native(
-    freq_values, power_values, cond_values, *, threshold, freq_decimals: int
+    freq_values, power_values, cond_values, *, threshold, num_peaks, freq_decimals: int
 ) -> Peaks:
     freq_arr = np.ascontiguousarray(freq_values, dtype=np.float64)
     power_arr = np.ascontiguousarray(power_values, dtype=np.float64)
@@ -338,16 +365,16 @@ def _get_peaks_double_native(
         freq_arr,
         power_arr,
         cond_arr,
+        max_peaks=_peak_capacity(freq_arr.size, num_peaks),
         threshold=float(threshold),
         freq_decimals=freq_decimals,
     )
 
 
 def _call_tlsf_get_peaks(
-    freq_arr, power_arr, cond_arr, *, threshold, freq_decimals: int
+    freq_arr, power_arr, cond_arr, *, max_peaks: int, threshold, freq_decimals: int
 ) -> Peaks:
     n_input = _check_c_length("freq", freq_arr.size)
-    max_peaks = max(0, freq_arr.size - 2)
     out_freq = np.empty(max_peaks, dtype=np.float32)
     out_power = np.empty(max_peaks, dtype=np.float32)
     out_cond = None if cond_arr is None else np.empty(max_peaks, dtype=np.float32)
@@ -367,6 +394,7 @@ def _call_tlsf_get_peaks(
         power_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         cond_ptr,
         n_input,
+        max_peaks,
         threshold,
         out_freq.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         out_power.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -384,10 +412,9 @@ def _call_tlsf_get_peaks(
 
 
 def _call_tls_get_peaks(
-    freq_arr, power_arr, cond_arr, *, threshold, freq_decimals: int
+    freq_arr, power_arr, cond_arr, *, max_peaks: int, threshold, freq_decimals: int
 ) -> Peaks:
     n_input = _check_c_length("freq", freq_arr.size)
-    max_peaks = max(0, freq_arr.size - 2)
     out_freq = np.empty(max_peaks, dtype=np.float64)
     out_power = np.empty(max_peaks, dtype=np.float64)
     out_cond = None if cond_arr is None else np.empty(max_peaks, dtype=np.float64)
@@ -407,6 +434,7 @@ def _call_tls_get_peaks(
         power_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         cond_ptr,
         n_input,
+        max_peaks,
         threshold,
         out_freq.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         out_power.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -436,7 +464,7 @@ def _should_use_mpmath_peak_path(freq_values, power_values, cond_values, thresho
 
 
 def _get_peaks_mpmath_native(
-    freq_values, power_values, cond_values, *, threshold, freq_decimals: int
+    freq_values, power_values, cond_values, *, threshold, num_peaks, freq_decimals: int
 ) -> Peaks:
     mp = _mp
     freq_mpf = _mpf_values(freq_values)
@@ -445,7 +473,7 @@ def _get_peaks_mpmath_native(
     threshold_dd = _mpf_to_dd_value(mp.mpf(threshold))
 
     n = _check_c_length("freq", len(freq_mpf))
-    max_peaks = max(0, n - 2)
+    max_peaks = _peak_capacity(n, num_peaks)
     freq_dd = (DD * n)(*(_mpf_to_dd_value(value) for value in freq_mpf))
     power_dd = (DD * n)(*(_mpf_to_dd_value(value) for value in power_mpf))
     cond_dd = None if cond_mpf is None else (DD * n)(*(_mpf_to_dd_value(value) for value in cond_mpf))
@@ -461,6 +489,7 @@ def _get_peaks_mpmath_native(
         power_dd,
         cond_ptr,
         n,
+        max_peaks,
         threshold_dd,
         out_freq,
         out_power,
