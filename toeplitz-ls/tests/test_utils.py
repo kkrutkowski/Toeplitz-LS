@@ -190,7 +190,7 @@ class PeakUtilityTests(unittest.TestCase):
                 cond = (dtype(1.0) + freq * dtype(0.25) + freq * freq * dtype(0.01)).astype(dtype)
                 cond[1000] = np.nan
 
-                native = get_peaks(freq, power, cond=cond, threshold=1.9)
+                native = get_peaks(freq, power, cond=cond, threshold=1.9, num_peaks=None)
                 reference = _reference_get_peaks(
                     list(freq), list(power), cond=list(cond), threshold=dtype(1.9)
                 )
@@ -211,7 +211,7 @@ class PeakUtilityTests(unittest.TestCase):
         power[44] = math.inf
         cond = [1.0 + x * x for x in freq]
 
-        native = get_peaks(freq, power, cond=cond, threshold=0.7)
+        native = get_peaks(freq, power, cond=cond, threshold=0.7, num_peaks=None)
         reference = _reference_get_peaks(freq, power, cond=cond, threshold=0.7)
 
         self.assertEqual(len(native), len(reference))
@@ -219,6 +219,29 @@ class PeakUtilityTests(unittest.TestCase):
             self.assertAlmostEqual(float(native_peak.freq), float(ref_peak.freq))
             self.assertAlmostEqual(float(native_peak.power), float(ref_peak.power))
             self.assertAlmostEqual(float(native_peak.cond), float(ref_peak.cond))
+
+    def test_num_peaks_limits_returned_peaks(self):
+        freq = list(range(101))
+        power = [0.0] * len(freq)
+        for idx in range(1, 100, 2):
+            power[idx] = float(idx)
+
+        default_limited = get_peaks(freq, power)
+        explicit_limited = get_peaks(freq, power, num_peaks=7)
+        unlimited = get_peaks(freq, power, num_peaks=None)
+
+        self.assertEqual(len(default_limited), 25)
+        self.assertEqual(len(explicit_limited), 7)
+        self.assertEqual(len(unlimited), 50)
+        self.assertEqual(
+            [peak.power for peak in explicit_limited],
+            [99.0, 97.0, 95.0, 93.0, 91.0, 89.0, 87.0],
+        )
+
+    def test_zero_num_peaks_returns_empty_collection(self):
+        peaks = get_peaks([0.0, 1.0, 2.0], [0.0, 1.0, 0.0], num_peaks=0)
+
+        self.assertEqual(len(peaks), 0)
 
     def test_peaks_collection_is_mutable_and_list_like(self):
         peaks = Peaks([Peak(1.0, 2.0), Peak(3.0, 4.0)])
@@ -355,7 +378,9 @@ class MpmathPeakUtilityTests(unittest.TestCase):
             cond = [mp.mpf(2) + x + x * x for x in freq]
             cond[120] = mp.nan
 
-            native = get_peaks(freq, power, cond=cond, threshold=mp.mpf("0.8"))
+            native = get_peaks(
+                freq, power, cond=cond, threshold=mp.mpf("0.8"), num_peaks=None
+            )
             reference = _reference_get_peaks(
                 freq, power, cond=cond, threshold=mp.mpf("0.8")
             )

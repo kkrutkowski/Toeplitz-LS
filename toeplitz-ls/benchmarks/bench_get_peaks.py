@@ -30,7 +30,7 @@ def _evaluate_quadratic(x, x0, y0, x1, slope01, curvature):
     return y0 + slope01 * (x - x0) + curvature * (x - x0) * (x - x1)
 
 
-def old_numpy_get_peaks(freq, power, cond=None, threshold=0):
+def old_numpy_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
     freq_arr = np.asarray(freq)
     power_arr = np.asarray(power)
     cond_arr = None if cond is None else np.asarray(cond)
@@ -64,7 +64,8 @@ def old_numpy_get_peaks(freq, power, cond=None, threshold=0):
     order = np.argsort(vertex_power)[::-1]
 
     if cond_arr is None:
-        return [Peak(vertex_freq[i], vertex_power[i]) for i in order]
+        peaks = [Peak(vertex_freq[i], vertex_power[i]) for i in order]
+        return peaks if num_peaks is None else peaks[:num_peaks]
 
     vertex_cond = np.full(vertex_power.shape, np.nan, dtype=np.float64)
     cond_finite = (
@@ -83,10 +84,11 @@ def old_numpy_get_peaks(freq, power, cond=None, threshold=0):
         vertex_cond[cond_finite] = _evaluate_quadratic(
             vertex_freq[cond_finite], cx0, c0, cx1, cslope01, ccurvature
         )
-    return [Peak(vertex_freq[i], vertex_power[i], vertex_cond[i]) for i in order]
+    peaks = [Peak(vertex_freq[i], vertex_power[i], vertex_cond[i]) for i in order]
+    return peaks if num_peaks is None else peaks[:num_peaks]
 
 
-def old_mpmath_get_peaks(freq, power, cond=None, threshold=0):
+def old_mpmath_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
     peaks = []
     for idx in range(1, len(power) - 1):
         if not all(mp.isfinite(value) for value in power[idx - 1 : idx + 2]):
@@ -125,7 +127,7 @@ def old_mpmath_get_peaks(freq, power, cond=None, threshold=0):
         else:
             peaks.append(Peak(vertex_freq, vertex_power, mp.nan))
     peaks.sort(key=lambda peak: peak.power, reverse=True)
-    return peaks
+    return peaks if num_peaks is None else peaks[:num_peaks]
 
 
 def median_seconds(fn, repeat=7):
