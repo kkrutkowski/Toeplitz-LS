@@ -16,6 +16,83 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 from toeplitz_ls import Peak, Peaks, get_peaks  # noqa: E402
 
 
+def _reference_get_peaks(freq, power, cond=None, threshold=0):
+    peaks = []
+    for idx in range(1, len(power) - 1):
+        power_window = power[idx - 1 : idx + 2]
+        if not all(_reference_is_finite(value) for value in power_window):
+            continue
+        if not (
+            power[idx] > power[idx - 1]
+            and power[idx] > power[idx + 1]
+            and power[idx] > threshold
+        ):
+            continue
+
+        vertex_freq, vertex_power = _reference_quadratic_vertex(
+            freq[idx - 1],
+            power[idx - 1],
+            freq[idx],
+            power[idx],
+            freq[idx + 1],
+            power[idx + 1],
+        )
+        if cond is None:
+            peaks.append(Peak(vertex_freq, vertex_power))
+        else:
+            cond_window = cond[idx - 1 : idx + 2]
+            if all(_reference_is_finite(value) for value in cond_window):
+                vertex_cond = _reference_quadratic_value(
+                    vertex_freq,
+                    freq[idx - 1],
+                    cond[idx - 1],
+                    freq[idx],
+                    cond[idx],
+                    freq[idx + 1],
+                    cond[idx + 1],
+                )
+            else:
+                vertex_cond = math.nan if mp is None else mp.nan
+            peaks.append(Peak(vertex_freq, vertex_power, vertex_cond))
+
+    peaks.sort(key=lambda peak: peak.power, reverse=True)
+    return peaks
+
+
+def _reference_is_finite(value):
+    if mp is not None and isinstance(value, mp.mpf):
+        return bool(mp.isfinite(value))
+    return math.isfinite(float(value))
+
+
+def _reference_quadratic_vertex(x0, y0, x1, y1, x2, y2):
+    slope01, curvature = _reference_quadratic_terms(x0, y0, x1, y1, x2, y2)
+    if curvature == 0:
+        return x1, y1
+    linear = slope01 - curvature * (x0 + x1)
+    vertex_x = -linear / (2 * curvature)
+    vertex_y = _reference_evaluate_quadratic(
+        vertex_x, x0, y0, x1, slope01, curvature
+    )
+    return vertex_x, vertex_y
+
+
+def _reference_quadratic_value(x, x0, y0, x1, y1, x2, y2):
+    slope01, curvature = _reference_quadratic_terms(x0, y0, x1, y1, x2, y2)
+    return _reference_evaluate_quadratic(x, x0, y0, x1, slope01, curvature)
+
+
+def _reference_quadratic_terms(x0, y0, x1, y1, x2, y2):
+    slope01 = (y1 - y0) / (x1 - x0)
+    slope12 = (y2 - y1) / (x2 - x1)
+    curvature = (slope12 - slope01) / (x2 - x0)
+    return slope01, curvature
+
+
+def _reference_evaluate_quadratic(x, x0, y0, x1, slope01, curvature):
+    return y0 + slope01 * (x - x0) + curvature * (x - x0) * (x - x1)
+
+
 class PeakUtilityTests(unittest.TestCase):
     def test_quadratic_peak_is_refined_exactly(self):
         freq = [1.0, 2.0, 3.0, 4.0]
@@ -89,7 +166,7 @@ class PeakUtilityTests(unittest.TestCase):
         cond = np.array([1.0, 2.0, 3.0, 4.0, 2.0, 3.0, 2.0, math.nan, 5.0, 6.0, 7.0])
 
         fast = get_peaks(freq, power, cond=cond)
-        scalar = get_peaks(list(freq), list(power), cond=list(cond))
+        scalar = _reference_get_peaks(list(freq), list(power), cond=list(cond))
 
         self.assertEqual(len(fast), len(scalar))
         for fast_peak, scalar_peak in zip(fast, scalar):
@@ -99,6 +176,49 @@ class PeakUtilityTests(unittest.TestCase):
                 self.assertTrue(math.isnan(float(fast_peak.cond)))
             else:
                 self.assertAlmostEqual(float(fast_peak.cond), float(scalar_peak.cond))
+
+    def test_native_numpy_matches_reference_for_float32_and_float64(self):
+        for dtype in (np.float32, np.float64):
+            with self.subTest(dtype=dtype):
+                freq = np.linspace(0.0, 25.0, 4097, dtype=dtype)
+                power = (
+                    np.sin(freq * dtype(1.7))
+                    + dtype(0.15) * np.sin(freq * dtype(11.0))
+                    + dtype(2.0)
+                ).astype(dtype)
+                power[111] = np.nan
+                cond = (dtype(1.0) + freq * dtype(0.25) + freq * freq * dtype(0.01)).astype(dtype)
+                cond[1000] = np.nan
+
+                native = get_peaks(freq, power, cond=cond, threshold=1.9)
+                reference = _reference_get_peaks(
+                    list(freq), list(power), cond=list(cond), threshold=dtype(1.9)
+                )
+
+                self.assertEqual(len(native), len(reference))
+                for native_peak, ref_peak in zip(native, reference):
+                    places = 4 if dtype == np.float32 else 11
+                    self.assertAlmostEqual(float(native_peak.freq), float(ref_peak.freq), places=places)
+                    self.assertAlmostEqual(float(native_peak.power), float(ref_peak.power), places=places)
+                    if math.isnan(float(ref_peak.cond)):
+                        self.assertTrue(math.isnan(float(native_peak.cond)))
+                    else:
+                        self.assertAlmostEqual(float(native_peak.cond), float(ref_peak.cond), places=places)
+
+    def test_python_sequences_use_native_double_and_match_reference(self):
+        freq = [i * 0.05 for i in range(300)]
+        power = [math.sin(3.2 * x) + 0.2 * math.cos(14.0 * x) for x in freq]
+        power[44] = math.inf
+        cond = [1.0 + x * x for x in freq]
+
+        native = get_peaks(freq, power, cond=cond, threshold=0.7)
+        reference = _reference_get_peaks(freq, power, cond=cond, threshold=0.7)
+
+        self.assertEqual(len(native), len(reference))
+        for native_peak, ref_peak in zip(native, reference):
+            self.assertAlmostEqual(float(native_peak.freq), float(ref_peak.freq))
+            self.assertAlmostEqual(float(native_peak.power), float(ref_peak.power))
+            self.assertAlmostEqual(float(native_peak.cond), float(ref_peak.cond))
 
     def test_peaks_collection_is_mutable_and_list_like(self):
         peaks = Peaks([Peak(1.0, 2.0), Peak(3.0, 4.0)])
@@ -222,6 +342,32 @@ class MpmathPeakUtilityTests(unittest.TestCase):
         self.assertIsInstance(peaks[0].freq, type(mp.mpf(0)))
         self.assertEqual(peaks[0].freq, mp.mpf("2.25"))
         self.assertEqual(peaks[0].power, mp.mpf(10))
+
+    def test_mpmath_native_path_matches_reference(self):
+        with mp.workprec(106):
+            freq = [mp.mpf(i) / 16 for i in range(256)]
+            power = [
+                mp.sin(mp.mpf("2.7") * x)
+                + mp.mpf("0.25") * mp.cos(mp.mpf("13.0") * x)
+                for x in freq
+            ]
+            power[77] = mp.nan
+            cond = [mp.mpf(2) + x + x * x for x in freq]
+            cond[120] = mp.nan
+
+            native = get_peaks(freq, power, cond=cond, threshold=mp.mpf("0.8"))
+            reference = _reference_get_peaks(
+                freq, power, cond=cond, threshold=mp.mpf("0.8")
+            )
+
+            self.assertEqual(len(native), len(reference))
+            for native_peak, ref_peak in zip(native, reference):
+                self.assertLess(abs(native_peak.freq - ref_peak.freq), mp.mpf("1e-25"))
+                self.assertLess(abs(native_peak.power - ref_peak.power), mp.mpf("1e-25"))
+                if mp.isnan(ref_peak.cond):
+                    self.assertTrue(mp.isnan(native_peak.cond))
+                else:
+                    self.assertLess(abs(native_peak.cond - ref_peak.cond), mp.mpf("1e-25"))
 
 
 if __name__ == "__main__":

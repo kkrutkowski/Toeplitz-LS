@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import operator
+import ctypes
 from collections.abc import MutableSequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,10 +12,20 @@ from typing import Iterable, Iterator, List, Optional, Sequence
 
 import numpy as np
 
+from ._fastchi2 import DD, _dd_to_mpf, _load_library
+
 try:
     from mpmath import mp as _mp
 except ImportError:  # pragma: no cover - exercised only without mpmath
     _mp = None
+
+
+_C_INT_MAX = 2**31 - 1
+_UTILS_ARGTYPES_CONFIGURED = False
+_UTILS_STATUS_MESSAGES = {
+    -1: "invalid argument",
+    -3: "allocation failure",
+}
 
 
 @dataclass(eq=False)
@@ -150,6 +161,71 @@ class Peaks(MutableSequence):
         Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _load_utils_library():
+    global _UTILS_ARGTYPES_CONFIGURED
+    lib = _load_library()
+    if _UTILS_ARGTYPES_CONFIGURED:
+        return lib
+
+    lib.tlsf_get_peaks.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lib.tlsf_get_peaks.restype = ctypes.c_int
+
+    lib.tls_get_peaks.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lib.tls_get_peaks.restype = ctypes.c_int
+
+    lib.tlsdd_get_peaks.argtypes = [
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.c_int,
+        DD,
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lib.tlsdd_get_peaks.restype = ctypes.c_int
+
+    _UTILS_ARGTYPES_CONFIGURED = True
+    return lib
+
+
+def _raise_utils_status(name: str, status: int) -> None:
+    if status == -1:
+        raise ValueError(f"{name} failed: invalid argument")
+    if status == -3:
+        raise MemoryError(f"{name} failed: allocation failure")
+    if status < 0:
+        message = _UTILS_STATUS_MESSAGES.get(status, f"status {status}")
+        raise RuntimeError(f"{name} failed: {message}")
+
+
+def _check_c_length(name: str, n: int) -> int:
+    if n > _C_INT_MAX:
+        raise ValueError(f"{name} length must be at most {_C_INT_MAX}")
+    return int(n)
+
+
 def get_peaks(freq, power, cond=None, threshold=0, *, x=None, nterms=None) -> Peaks:
     """Return strict local maxima refined by quadratic interpolation.
 
@@ -162,7 +238,7 @@ def get_peaks(freq, power, cond=None, threshold=0, *, x=None, nterms=None) -> Pe
 
     freq_decimals = _infer_freq_decimals(freq, x=x, nterms=nterms)
     if _can_use_numpy_fast_path(freq, power, cond):
-        return _get_peaks_numpy(
+        return _get_peaks_numpy_native(
             freq, power, cond, threshold=threshold, freq_decimals=freq_decimals
         )
 
@@ -178,51 +254,25 @@ def get_peaks(freq, power, cond=None, threshold=0, *, x=None, nterms=None) -> Pe
         _check_numeric_sequence(cond_values, "cond")
     _check_increasing(freq_values)
 
-    peaks = []
-    for idx in range(1, len(power_values) - 1):
-        power_window = power_values[idx - 1 : idx + 2]
-        if not _all_finite(power_window):
-            continue
-        if not (
-            power_values[idx] > power_values[idx - 1]
-            and power_values[idx] > power_values[idx + 1]
-            and power_values[idx] > threshold
-        ):
-            continue
-
-        vertex_freq, vertex_power = _quadratic_vertex(
-            freq_values[idx - 1],
-            power_values[idx - 1],
-            freq_values[idx],
-            power_values[idx],
-            freq_values[idx + 1],
-            power_values[idx + 1],
+    if _should_use_mpmath_peak_path(freq_values, power_values, cond_values, threshold):
+        return _get_peaks_mpmath_native(
+            freq_values,
+            power_values,
+            cond_values,
+            threshold=threshold,
+            freq_decimals=freq_decimals,
         )
-        if cond_values is None:
-            peaks.append(Peak(vertex_freq, vertex_power))
-        else:
-            cond_window = cond_values[idx - 1 : idx + 2]
-            if _all_finite(cond_window):
-                vertex_cond = _quadratic_value(
-                    vertex_freq,
-                    freq_values[idx - 1],
-                    cond_values[idx - 1],
-                    freq_values[idx],
-                    cond_values[idx],
-                    freq_values[idx + 1],
-                    cond_values[idx + 1],
-                )
-            else:
-                vertex_cond = math.nan
-            peaks.append(Peak(vertex_freq, vertex_power, vertex_cond))
 
-    peaks.sort(key=lambda peak: peak.power, reverse=True)
-    return Peaks(
-        peaks, has_cond=cond_values is not None, freq_decimals=freq_decimals
+    return _get_peaks_double_native(
+        freq_values,
+        power_values,
+        cond_values,
+        threshold=threshold,
+        freq_decimals=freq_decimals,
     )
 
 
-def _get_peaks_numpy(freq, power, cond, *, threshold, freq_decimals: int) -> Peaks:
+def _get_peaks_numpy_native(freq, power, cond, *, threshold, freq_decimals: int) -> Peaks:
     freq_arr = np.asarray(freq)
     power_arr = np.asarray(power)
     cond_arr = None if cond is None else np.asarray(cond)
@@ -243,65 +293,206 @@ def _get_peaks_numpy(freq, power, cond, *, threshold, freq_decimals: int) -> Pea
         raise ValueError("freq entries must be finite")
     if np.any(freq_arr[1:] <= freq_arr[:-1]):
         raise ValueError("freq must be strictly increasing")
-    if freq_arr.size < 3:
-        return Peaks(
-            (),
-            has_cond=cond_arr is not None,
-            freq_decimals=freq_decimals,
-        )
 
-    p0 = power_arr[:-2]
-    p1 = power_arr[1:-1]
-    p2 = power_arr[2:]
-    mask = (
-        np.isfinite(p0)
-        & np.isfinite(p1)
-        & np.isfinite(p2)
-        & (p1 > p0)
-        & (p1 > p2)
-        & (p1 > threshold)
+    float_threshold_ok = abs(threshold) <= float(np.finfo(np.float32).max)
+    use_float = (
+        freq_arr.dtype == np.dtype(np.float32)
+        and power_arr.dtype == np.dtype(np.float32)
+        and (cond_arr is None or cond_arr.dtype == np.dtype(np.float32))
+        and float_threshold_ok
     )
-    idx = np.nonzero(mask)[0] + 1
-    if idx.size == 0:
-        return Peaks(
-            (),
-            has_cond=cond_arr is not None,
+    dtype = np.float32 if use_float else np.float64
+    freq_arr = np.ascontiguousarray(freq_arr, dtype=dtype)
+    power_arr = np.ascontiguousarray(power_arr, dtype=dtype)
+    if cond_arr is not None:
+        cond_arr = np.ascontiguousarray(cond_arr, dtype=dtype)
+
+    if dtype == np.float32:
+        return _call_tlsf_get_peaks(
+            freq_arr,
+            power_arr,
+            cond_arr,
+            threshold=np.float32(threshold),
             freq_decimals=freq_decimals,
         )
+    return _call_tls_get_peaks(
+        freq_arr,
+        power_arr,
+        cond_arr,
+        threshold=threshold,
+        freq_decimals=freq_decimals,
+    )
 
-    x0 = freq_arr[idx - 1]
-    x1 = freq_arr[idx]
-    x2 = freq_arr[idx + 1]
-    y0 = power_arr[idx - 1]
-    y1 = power_arr[idx]
-    y2 = power_arr[idx + 1]
-    vertex_freq, vertex_power = _quadratic_vertex_numpy(x0, y0, x1, y1, x2, y2)
 
-    if cond_arr is None:
-        order = np.argsort(vertex_power)[::-1]
-        peaks = [Peak(vertex_freq[i], vertex_power[i]) for i in order]
+def _get_peaks_double_native(
+    freq_values, power_values, cond_values, *, threshold, freq_decimals: int
+) -> Peaks:
+    freq_arr = np.ascontiguousarray(freq_values, dtype=np.float64)
+    power_arr = np.ascontiguousarray(power_values, dtype=np.float64)
+    cond_arr = (
+        None
+        if cond_values is None
+        else np.ascontiguousarray(cond_values, dtype=np.float64)
+    )
+    return _call_tls_get_peaks(
+        freq_arr,
+        power_arr,
+        cond_arr,
+        threshold=float(threshold),
+        freq_decimals=freq_decimals,
+    )
+
+
+def _call_tlsf_get_peaks(
+    freq_arr, power_arr, cond_arr, *, threshold, freq_decimals: int
+) -> Peaks:
+    n_input = _check_c_length("freq", freq_arr.size)
+    max_peaks = max(0, freq_arr.size - 2)
+    out_freq = np.empty(max_peaks, dtype=np.float32)
+    out_power = np.empty(max_peaks, dtype=np.float32)
+    out_cond = None if cond_arr is None else np.empty(max_peaks, dtype=np.float32)
+    count = ctypes.c_int()
+    cond_ptr = (
+        ctypes.POINTER(ctypes.c_float)()
+        if cond_arr is None
+        else cond_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    out_cond_ptr = (
+        ctypes.POINTER(ctypes.c_float)()
+        if out_cond is None
+        else out_cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    )
+    status = _load_utils_library().tlsf_get_peaks(
+        freq_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        power_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        cond_ptr,
+        n_input,
+        threshold,
+        out_freq.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out_power.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        out_cond_ptr,
+        ctypes.byref(count),
+    )
+    _raise_utils_status("tlsf_get_peaks", status)
+
+    n = count.value
+    if out_cond is None:
+        peaks = [Peak(out_freq[i], out_power[i]) for i in range(n)]
     else:
-        vertex_cond = np.full(vertex_power.shape, np.nan, dtype=np.float64)
-        cond_finite = (
-            np.isfinite(cond_arr[idx - 1])
-            & np.isfinite(cond_arr[idx])
-            & np.isfinite(cond_arr[idx + 1])
-        )
-        if np.any(cond_finite):
-            vertex_cond[cond_finite] = _quadratic_value_numpy(
-                vertex_freq[cond_finite],
-                x0[cond_finite],
-                cond_arr[idx[cond_finite] - 1],
-                x1[cond_finite],
-                cond_arr[idx[cond_finite]],
-                x2[cond_finite],
-                cond_arr[idx[cond_finite] + 1],
-            )
-        order = np.argsort(vertex_power)[::-1]
+        peaks = [Peak(out_freq[i], out_power[i], out_cond[i]) for i in range(n)]
+    return Peaks(peaks, has_cond=out_cond is not None, freq_decimals=freq_decimals)
+
+
+def _call_tls_get_peaks(
+    freq_arr, power_arr, cond_arr, *, threshold, freq_decimals: int
+) -> Peaks:
+    n_input = _check_c_length("freq", freq_arr.size)
+    max_peaks = max(0, freq_arr.size - 2)
+    out_freq = np.empty(max_peaks, dtype=np.float64)
+    out_power = np.empty(max_peaks, dtype=np.float64)
+    out_cond = None if cond_arr is None else np.empty(max_peaks, dtype=np.float64)
+    count = ctypes.c_int()
+    cond_ptr = (
+        ctypes.POINTER(ctypes.c_double)()
+        if cond_arr is None
+        else cond_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    )
+    out_cond_ptr = (
+        ctypes.POINTER(ctypes.c_double)()
+        if out_cond is None
+        else out_cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    )
+    status = _load_utils_library().tls_get_peaks(
+        freq_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        power_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        cond_ptr,
+        n_input,
+        threshold,
+        out_freq.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        out_power.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        out_cond_ptr,
+        ctypes.byref(count),
+    )
+    _raise_utils_status("tls_get_peaks", status)
+
+    n = count.value
+    if out_cond is None:
+        peaks = [Peak(out_freq[i], out_power[i]) for i in range(n)]
+    else:
+        peaks = [Peak(out_freq[i], out_power[i], out_cond[i]) for i in range(n)]
+    return Peaks(peaks, has_cond=out_cond is not None, freq_decimals=freq_decimals)
+
+
+def _should_use_mpmath_peak_path(freq_values, power_values, cond_values, threshold) -> bool:
+    if _mp is None:
+        return False
+    if isinstance(threshold, _mp.mpf):
+        return True
+    if any(isinstance(value, _mp.mpf) for value in freq_values):
+        return True
+    if any(isinstance(value, _mp.mpf) for value in power_values):
+        return True
+    return cond_values is not None and any(isinstance(value, _mp.mpf) for value in cond_values)
+
+
+def _get_peaks_mpmath_native(
+    freq_values, power_values, cond_values, *, threshold, freq_decimals: int
+) -> Peaks:
+    mp = _mp
+    freq_mpf = _mpf_values(freq_values)
+    power_mpf = _mpf_values(power_values)
+    cond_mpf = None if cond_values is None else _mpf_values(cond_values)
+    threshold_dd = _mpf_to_dd_value(mp.mpf(threshold))
+
+    n = _check_c_length("freq", len(freq_mpf))
+    max_peaks = max(0, n - 2)
+    freq_dd = (DD * n)(*(_mpf_to_dd_value(value) for value in freq_mpf))
+    power_dd = (DD * n)(*(_mpf_to_dd_value(value) for value in power_mpf))
+    cond_dd = None if cond_mpf is None else (DD * n)(*(_mpf_to_dd_value(value) for value in cond_mpf))
+    out_freq = (DD * max_peaks)()
+    out_power = (DD * max_peaks)()
+    out_cond = None if cond_dd is None else (DD * max_peaks)()
+    count = ctypes.c_int()
+    cond_ptr = ctypes.POINTER(DD)() if cond_dd is None else cond_dd
+    out_cond_ptr = ctypes.POINTER(DD)() if out_cond is None else out_cond
+
+    status = _load_utils_library().tlsdd_get_peaks(
+        freq_dd,
+        power_dd,
+        cond_ptr,
+        n,
+        threshold_dd,
+        out_freq,
+        out_power,
+        out_cond_ptr,
+        ctypes.byref(count),
+    )
+    _raise_utils_status("tlsdd_get_peaks", status)
+
+    n_peaks = count.value
+    if out_cond is None:
+        peaks = [Peak(_dd_to_mpf(out_freq[i]), _dd_to_mpf(out_power[i])) for i in range(n_peaks)]
+    else:
         peaks = [
-            Peak(vertex_freq[i], vertex_power[i], vertex_cond[i]) for i in order
+            Peak(_dd_to_mpf(out_freq[i]), _dd_to_mpf(out_power[i]), _dd_to_mpf(out_cond[i]))
+            for i in range(n_peaks)
         ]
-    return Peaks(peaks, has_cond=cond_arr is not None, freq_decimals=freq_decimals)
+    return Peaks(peaks, has_cond=out_cond is not None, freq_decimals=freq_decimals)
+
+
+def _mpf_to_dd_value(value):
+    mp = _mp
+    value = value if isinstance(value, mp.mpf) else mp.mpf(value)
+    hi = float(value)
+    lo = float(value - mp.mpf(hi))
+    return DD(hi, lo)
+
+
+def _mpf_values(values):
+    mp = _mp
+    if all(isinstance(value, mp.mpf) for value in values):
+        return list(values)
+    return [mp.mpf(value) for value in values]
 
 
 def _can_use_numpy_fast_path(freq, power, cond) -> bool:

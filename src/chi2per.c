@@ -2,7 +2,6 @@
 #define NANOFFT_NEEDS_INTERNAL_VEC
 #include <math.h>
 #include <nanofft_precision.h>
-#include <nanofft_trig.h>
 #include <nufft1.h>
 #include <scaling.h>
 #include <stdbool.h>
@@ -10,14 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifndef MAX_TWIDDLE_REUSE
-#    define MAX_TWIDDLE_REUSE 16
-#endif
-
-#if MAX_TWIDDLE_REUSE < 2 || (MAX_TWIDDLE_REUSE & (MAX_TWIDDLE_REUSE - 1)) != 0
-#    error "MAX_TWIDDLE_REUSE must be a power of two greater than or equal to 2"
-#endif
+#include <utils.h>
 
 /* Return codes from the public fastchi2 entry points. */
 enum { CHI2PER_OK = 0, CHI2PER_ERR_ARGUMENT = -1, CHI2PER_ERR_BACKEND = -2, CHI2PER_ERR_ALLOC = -3, CHI2PER_ERR_DEGENERATE = -4, CHI2PER_ERR_SOLVER = -5 };
@@ -25,58 +17,6 @@ enum { CHI2PER_OK = 0, CHI2PER_ERR_ARGUMENT = -1, CHI2PER_ERR_BACKEND = -2, CHI2
 enum { CHI2PER_BACKEND_PSWF43 = 1, CHI2PER_BACKEND_PSWF21 = 2, CHI2PER_BACKEND_LRA = 3 };
 
 enum { CHI2PER_SOLVER_LEVINSON = 1, CHI2PER_SOLVER_ZOHAR = 2, CHI2PER_SOLVER_BAREISS = 3, CHI2PER_SOLVER_LDLT = 4, CHI2PER_SOLVER_SVD = 5 };
-
-static inline int bitceil(double x) { return x <= 1.0 ? 1 : 1 << (1 + (int)(log2(x))); }
-
-static double approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma, int backend) {
-    int block_eff = block;
-    if (backend == 1) {
-        block_eff += block_eff >> 1;
-    };
-    // Include cost of zero-padding frequencies to the transform length
-    double N_eff = block_eff * ceil((double)N / block_eff);
-    // Reduction in the cost of precomputation caused by reusage of pre-generated
-    // plans
-    double gamma_eff = gamma * ((double)((2 * degree) + 1)) / (double)((3 * degree) + 1);
-    // FFT execution cost
-    double cost = N_eff * pow((double)block, alpha);
-    // Frequency shift cost
-    cost += beta * (N_eff - (double)(block_eff)) * (double)(M) / (double)(block_eff);
-    // Precomputation cost per block size
-    cost += gamma_eff * block_eff;
-    return cost;
-}
-
-// start at block = bitceil(pow((beta * M / alpha), (1.0 / (alpha + 1.0))))
-// then bitshift downwards as long, as cost decreases with each bitshift
-static int optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma, int backend) {
-    const int min_block = 128;
-    double start = pow((beta * (double)M / alpha), 1.0 / (alpha + 1.0));
-    int block = bitceil(start);
-    int n_cap = bitceil((double)N);
-
-    if (block > n_cap) block = n_cap;
-    if (block < min_block) block = min_block;
-
-    double best = approximate_cost(N, M, block, degree, alpha, beta, gamma, backend);
-    while (block > min_block) {
-        int next = block >> 1;
-        if (next < min_block) next = min_block;
-        double next_cost = approximate_cost(N, M, next, degree, alpha, beta, gamma, backend);
-        if (next_cost >= best) break;
-        block = next;
-        best = next_cost;
-    }
-    return block;
-}
-
-static int pswf43_plan_len_from_base(int base_len) {
-    int plan_len = base_len;
-    if (plan_len < 4) plan_len = 4;
-    return (plan_len + 3) & ~3;
-}
-
-static int pswf43_output_len_for_plan(int plan_len) { return plan_len + (plan_len >> 1); }
 
 static void *checked_malloc(size_t count, size_t size) {
     if (count == 0 || size == 0) return NULL;
@@ -303,34 +243,6 @@ static int execute_nufft_block(void *plan, int backend, const FLOAT *src_r, cons
     return CHI2PER_OK;
 }
 
-static int twiddle_ladder_levels(int N, int block) {
-    if (N <= 0 || block <= 0) return 1;
-
-    size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
-    if (num_blocks <= 1) return 1;
-
-    size_t max_advance = num_blocks - 1;
-    size_t stride = (size_t)MAX_TWIDDLE_REUSE;
-    int levels = 1;
-    while (max_advance >= stride) {
-        ++levels;
-        if (stride > SIZE_MAX / (size_t)MAX_TWIDDLE_REUSE) break;
-        stride *= (size_t)MAX_TWIDDLE_REUSE;
-    }
-    return levels;
-}
-
-static int twiddle_ladder_carry_level(size_t next_block, int levels) {
-    int level = 0;
-    size_t stride = (size_t)MAX_TWIDDLE_REUSE;
-    while (level + 1 < levels && next_block % stride == 0) {
-        ++level;
-        if (stride > SIZE_MAX / (size_t)MAX_TWIDDLE_REUSE) break;
-        stride *= (size_t)MAX_TWIDDLE_REUSE;
-    }
-    return level;
-}
-
 static void compute_twiddle_delta(int backend, FLOAT tm, double qdf, double advance, FLOAT *delta_r, FLOAT *delta_i) {
     (void)backend;
 #if defined(DOUBLE_DOUBLE)
@@ -393,13 +305,12 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
             FLOAT src_r0 = MUL(h[m], c0);
             FLOAT src_i0 = MUL(h[m], s0);
 
-            double advance = (double)block;
             for (int level = 0; level < ladder_levels; ++level) {
                 size_t idx = (size_t)level * (size_t)M + (size_t)m;
                 src_r_levels[idx] = src_r0;
                 src_i_levels[idx] = src_i0;
+                double advance = tls_twiddle_ladder_advance(block, level);
                 compute_twiddle_delta(backend, tm, qdf, advance, &delta_r_levels[idx], &delta_i_levels[idx]);
-                advance *= (double)MAX_TWIDDLE_REUSE;
             }
         }
 
@@ -417,7 +328,7 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
             }
 
             if (block_idx + 1 < num_blocks) {
-                int level = twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
+                int level = tls_twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
                 size_t offset = (size_t)level * (size_t)M;
                 rotate_source_level(src_r_levels + offset, src_i_levels + offset, delta_r_levels + offset, delta_i_levels + offset, M);
                 copy_twiddle_level_down(src_r_levels, src_i_levels, M, level);
@@ -1160,10 +1071,10 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         beta = CHI2_PSWF21_BETA;
         gamma = CHI2_PSWF21_GAMMA;
     }
-    int plan_block = optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
-    if (use_pswf43) plan_block = pswf43_plan_len_from_base(plan_block);
-    int block = use_pswf43 ? pswf43_output_len_for_plan(plan_block) : plan_block;
-    int ladder_levels = twiddle_ladder_levels(N, block);
+    int plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
+    if (use_pswf43) plan_block = tls_pswf43_plan_len_from_base(plan_block);
+    int block = use_pswf43 ? tls_pswf43_output_len_for_plan(plan_block) : plan_block;
+    int ladder_levels = tls_twiddle_ladder_levels(N, block);
     int max_factor = 2 * degree;
 
     FLOAT *w = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));

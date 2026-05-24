@@ -19,9 +19,9 @@ extern "C" {
 #include <nufft1.h>
 #define DOUBLE
 #include <nanofft_precision.h>
-#include <nanofft_trig.h>
 #undef DOUBLE
 #include <scaling.h>
+#include <utils.h>
 }
 
 static double now_seconds() {
@@ -76,68 +76,6 @@ enum class PswfMode {
   k43,
 };
 
-static inline int bitceil(double x) {
-  return x <= 1.0 ? 1 : 1 << (1 + (int)(log2(x)));
-}
-
-static double approximate_cost(int N, int M, int block, int degree,
-                               double alpha, double beta, double gamma,
-                               int backend) {
-  int block_eff = block;
-  if (backend == kBackendPswf43) {
-    block_eff += block_eff >> 1;
-  }
-
-  double N_eff = block_eff * ceil((double)N / block_eff);
-  double gamma_eff =
-      gamma * ((double)((2 * degree) + 1)) / (double)((3 * degree) + 1);
-
-  double cost = N_eff * pow((double)block, alpha);
-  cost +=
-      beta * (N_eff - (double)(block_eff)) * (double)(M) / (double)(block_eff);
-  cost += gamma_eff * block_eff;
-  return cost;
-}
-
-static int optimize_plan_size(int N, int M, int degree, double alpha,
-                              double beta, double gamma, int backend) {
-  constexpr int min_block = 128;
-  double start = pow((beta * (double)M / alpha), 1.0 / (alpha + 1.0));
-  int block = bitceil(start);
-  int n_cap = bitceil((double)N);
-
-  if (block > n_cap)
-    block = n_cap;
-  if (block < min_block)
-    block = min_block;
-
-  double best =
-      approximate_cost(N, M, block, degree, alpha, beta, gamma, backend);
-  while (block > min_block) {
-    int next = block >> 1;
-    if (next < min_block)
-      next = min_block;
-    double next_cost =
-        approximate_cost(N, M, next, degree, alpha, beta, gamma, backend);
-    if (next_cost >= best)
-      break;
-    block = next;
-    best = next_cost;
-  }
-  return block;
-}
-
-static int pswf43_plan_len_from_base(int base_len) {
-  int plan_len = base_len;
-  if (plan_len < 4)
-    plan_len = 4;
-  return (plan_len + 3) & ~3;
-}
-
-static int pswf43_output_len_for_plan(int plan_len) {
-  return plan_len + (plan_len >> 1);
-}
-
 static int pswf_backend(PswfMode mode) {
   return mode == PswfMode::k21 ? kBackendPswf21 : kBackendPswf43;
 }
@@ -191,42 +129,6 @@ static std::vector<dd_t> cast_dd(const std::vector<double> &in) {
     out[i] = dd_make(in[i], 0.0);
   }
   return out;
-}
-
-static int twiddle_ladder_levels(int N, int block) {
-  if (N <= 0 || block <= 0) {
-    return 1;
-  }
-
-  size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
-  if (num_blocks <= 1) {
-    return 1;
-  }
-
-  size_t max_advance = num_blocks - 1;
-  size_t stride = (size_t)kMaxTwiddleReuse;
-  int levels = 1;
-  while (max_advance >= stride) {
-    ++levels;
-    if (stride > SIZE_MAX / (size_t)kMaxTwiddleReuse) {
-      break;
-    }
-    stride *= (size_t)kMaxTwiddleReuse;
-  }
-  return levels;
-}
-
-static int twiddle_ladder_carry_level(size_t next_block, int levels) {
-  int level = 0;
-  size_t stride = (size_t)kMaxTwiddleReuse;
-  while (level + 1 < levels && next_block % stride == 0) {
-    ++level;
-    if (stride > SIZE_MAX / (size_t)kMaxTwiddleReuse) {
-      break;
-    }
-    stride *= (size_t)kMaxTwiddleReuse;
-  }
-  return level;
 }
 
 static void compute_block_delta(PswfMode mode, double x, double df,
@@ -443,19 +345,19 @@ template <typename Traits>
 static int optimized_plan_len_for_mode(PswfMode mode, int N, int Mpoints) {
   double beta = mode == PswfMode::k21 ? Traits::beta21 : Traits::beta43;
   double gamma = mode == PswfMode::k21 ? Traits::gamma21 : Traits::gamma43;
-  int base_len = optimize_plan_size(N, Mpoints, 0, Traits::alpha, beta, gamma,
-                                    pswf_backend(mode));
+  int base_len = tls_optimize_plan_size(N, Mpoints, 0, Traits::alpha, beta,
+                                        gamma, pswf_backend(mode));
   if (mode == PswfMode::k21) {
     return base_len;
   }
-  return pswf43_plan_len_from_base(base_len);
+  return tls_pswf43_plan_len_from_base(base_len);
 }
 
 static int output_block_len_for_mode(PswfMode mode, int plan_len) {
   if (mode == PswfMode::k21) {
     return plan_len;
   }
-  return pswf43_output_len_for_plan(plan_len);
+  return tls_pswf43_output_len_for_plan(plan_len);
 }
 
 template <typename Traits>
@@ -493,7 +395,7 @@ static void execute_pswf_block_sweep(
     std::copy_n(block_imag.data(), count, out.imag.data() + base);
 
     if (block_idx + 1 < num_blocks) {
-      int level = twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
+      int level = tls_twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
       size_t offset = (size_t)level * Mpoints;
       for (size_t m = 0; m < Mpoints; ++m) {
         real_type yr = work_real[offset + m];
@@ -600,7 +502,7 @@ static PswfBlockedResult<Traits> run_pswf_blocked(PswfMode mode, int N,
   result.output_block_len = output_block_len_for_mode(mode, plan_len);
   result.out.real.resize(N);
   result.out.imag.resize(N);
-  int ladder_levels = twiddle_ladder_levels(N, result.output_block_len);
+  int ladder_levels = tls_twiddle_ladder_levels(N, result.output_block_len);
 
   double t0 = now_seconds();
   typename Traits::pswf_plan_type *plan = Traits::pswf_initialize(
@@ -613,14 +515,14 @@ static PswfBlockedResult<Traits> run_pswf_blocked(PswfMode mode, int N,
 
   std::vector<real_type> delta_real((size_t)ladder_levels * base.x.size());
   std::vector<real_type> delta_imag((size_t)ladder_levels * base.x.size());
-  double advance_len = (double)result.output_block_len;
   for (int level = 0; level < ladder_levels; ++level) {
     size_t offset = (size_t)level * base.x.size();
+    double advance_len =
+        tls_twiddle_ladder_advance(result.output_block_len, level);
     for (size_t i = 0; i < base.x.size(); ++i) {
       compute_block_delta(mode, base.x[i], df, advance_len,
                           delta_real[offset + i], delta_imag[offset + i]);
     }
-    advance_len *= (double)kMaxTwiddleReuse;
   }
   result.plan_time = now_seconds() - t0;
 
@@ -654,7 +556,7 @@ static SplitOutput<dd_t> run_dd_pswf21_reference(int N, const BaseSamples &base,
   int plan_len = optimized_plan_len_for_mode<BenchTraits<dd_t>>(
       PswfMode::k21, N, (int)base.x.size());
   int output_block_len = output_block_len_for_mode(PswfMode::k21, plan_len);
-  int ladder_levels = twiddle_ladder_levels(N, output_block_len);
+  int ladder_levels = tls_twiddle_ladder_levels(N, output_block_len);
 
   auto *plan = BenchTraits<dd_t>::pswf_initialize(
       (int)base.x.size(), plan_len,
@@ -668,16 +570,15 @@ static SplitOutput<dd_t> run_dd_pswf21_reference(int N, const BaseSamples &base,
   std::vector<dd_t> delta_real((size_t)ladder_levels * base.x.size());
   std::vector<dd_t> delta_imag((size_t)ladder_levels * base.x.size());
   dd_t df_dd = dd_make(df, 0.0);
-  double advance_len = (double)output_block_len;
   for (int level = 0; level < ladder_levels; ++level) {
     size_t offset = (size_t)level * base.x.size();
+    double advance_len = tls_twiddle_ladder_advance(output_block_len, level);
     dd_t advance_dd = dd_make(advance_len, 0.0);
     for (size_t i = 0; i < base.x.size(); ++i) {
       dd_t phase_delta = dd_mul(dd_mul(x_dd[i], df_dd), advance_dd);
       delta_real[offset + i] = cos2pidd(phase_delta);
       delta_imag[offset + i] = sin2pidd(phase_delta);
     }
-    advance_len *= (double)kMaxTwiddleReuse;
   }
 
   std::vector<dd_t> block_real(output_block_len);
@@ -707,7 +608,7 @@ static SplitOutput<dd_t> run_dd_pswf21_reference(int N, const BaseSamples &base,
     std::copy_n(block_imag.data(), count, out.imag.data() + base_idx);
 
     if (block_idx + 1 < num_blocks) {
-      int level = twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
+      int level = tls_twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
       size_t offset = (size_t)level * base.x.size();
       for (size_t m = 0; m < base.x.size(); ++m) {
         dd_t yr = work_real[offset + m];

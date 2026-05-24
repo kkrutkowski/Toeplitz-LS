@@ -57,7 +57,7 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 
 #define NANOFFT_NEEDS_INTERNAL_VEC
 #include "nanofft_precision.h"
-#include "nanofft_trig.h"
+#include "utils.h"
 
 #ifdef DOUBLE_DOUBLE
 #    define PFX(name) tlsdd_nufft_##name
