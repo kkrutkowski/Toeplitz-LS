@@ -17,7 +17,8 @@ NANOFFT_OBJS := nanofftf.o nanofft.o nanofftdd.o
 NUFFT_OBJS := tlsf_nufft1.o tls_nufft1.o tlsdd_nufft1.o
 LINALG_OBJS := tlsf_linalg.o tls_linalg.o tlsdd_linalg.o
 CHI2_OBJS := tlsf_chi2per.o tls_chi2per.o tlsdd_chi2per.o
-OBJS := $(NANOFFT_OBJS) $(NUFFT_OBJS) $(LINALG_OBJS) $(CHI2_OBJS)
+UTIL_OBJS := utils.o
+OBJS := $(NANOFFT_OBJS) $(NUFFT_OBJS) $(LINALG_OBJS) $(CHI2_OBJS) $(UTIL_OBJS)
 
 .PHONY: all static shared clean
 
@@ -75,6 +76,9 @@ tls_chi2per.o: $(ROOT)/src/chi2per.c $(SCALING_HEADER)
 
 tlsdd_chi2per.o: $(ROOT)/src/chi2per.c $(SCALING_HEADER)
 	$(CC) $(COMMON_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+utils.o: $(ROOT)/src/utils.c
+	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(OBJS) tls.a tls.so

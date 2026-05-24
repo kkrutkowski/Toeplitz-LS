@@ -49,6 +49,12 @@ CPMAddPackage("gh:flatironinstitute/finufft@2.5.1")
 # Setting the path to your source files
 set(TLS_SRC_DIR "../../src")
 
+set(TLS_MAX_TWIDDLE_REUSE 16 CACHE STRING "Twiddle ladder reuse factor")
+
+add_library(tls_utils OBJECT ${TLS_SRC_DIR}/utils.c)
+target_compile_definitions(tls_utils PRIVATE MAX_TWIDDLE_REUSE=${TLS_MAX_TWIDDLE_REUSE})
+target_include_directories(tls_utils PRIVATE ../../include)
+
 # Variant 1: DOUBLE_DOUBLE (-D DOUBLE_DOUBLE)
 add_library(tlsdd_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c)
 target_compile_definitions(tlsdd_nufft1 PRIVATE DOUBLE_DOUBLE)
@@ -127,6 +133,7 @@ add_executable(finufft_bench
 
 add_executable(finufft_bench_block
     finufft_bench_block.cpp
+    $<TARGET_OBJECTS:tls_utils>
     $<TARGET_OBJECTS:tlsdd_nufft1>
     $<TARGET_OBJECTS:tls_nufft1>
     $<TARGET_OBJECTS:tlsf_nufft1>
@@ -138,6 +145,7 @@ target_include_directories(finufft_bench_block PRIVATE
     "${CMAKE_BINARY_DIR}"
     ../../include
 )
+target_compile_definitions(finufft_bench_block PRIVATE MAX_TWIDDLE_REUSE=${TLS_MAX_TWIDDLE_REUSE})
 add_dependencies(finufft_bench_block generate_native_scaling_header)
 
 # Link FINUFFT and math libraries

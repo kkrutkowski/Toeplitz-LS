@@ -22,15 +22,15 @@ MAX_TWIDDLE_REUSE ?= 16
 TWIDDLE_CFLAGS := -DMAX_TWIDDLE_REUSE=$(MAX_TWIDDLE_REUSE)
 
 SCALING_GENERIC := $(INC_DIR)/scaling_generic.h
-LIB_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/linalg.c $(SRC_DIR)/chi2per.c
+LIB_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/linalg.c $(SRC_DIR)/chi2per.c $(SRC_DIR)/utils.c
 SCALING_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/scaling.c
 PUBLIC_HEADERS := \
 	$(INC_DIR)/nanofft.h \
 	$(INC_DIR)/nanofft_precision.h \
-	$(INC_DIR)/nanofft_trig.h \
 	$(INC_DIR)/nufft1.h \
 	$(INC_DIR)/linalg.h \
 	$(INC_DIR)/tls.h \
+	$(INC_DIR)/utils.h \
 	$(SCALING_GENERIC)
 
 GENERIC_DIR := $(TMP_DIR)/generic
@@ -55,7 +55,8 @@ GENERIC_OBJS := \
 	$(GENERIC_DIR)/tlsdd_linalg.o \
 	$(GENERIC_DIR)/tlsf_chi2per.o \
 	$(GENERIC_DIR)/tls_chi2per.o \
-	$(GENERIC_DIR)/tlsdd_chi2per.o
+	$(GENERIC_DIR)/tlsdd_chi2per.o \
+	$(GENERIC_DIR)/utils.o
 
 NATIVE_OBJS := \
 	$(NATIVE_DIR)/nanofftf.o \
@@ -69,7 +70,8 @@ NATIVE_OBJS := \
 	$(NATIVE_DIR)/tlsdd_linalg.o \
 	$(NATIVE_DIR)/tlsf_chi2per.o \
 	$(NATIVE_DIR)/tls_chi2per.o \
-	$(NATIVE_DIR)/tlsdd_chi2per.o
+	$(NATIVE_DIR)/tlsdd_chi2per.o \
+	$(NATIVE_DIR)/utils.o
 
 .PHONY: all generic native clean
 .DELETE_ON_ERROR:
@@ -147,6 +149,9 @@ $(GENERIC_DIR)/tls_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 $(GENERIC_DIR)/tlsdd_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 	$(CC) $(GENERIC_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
+$(GENERIC_DIR)/utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
+
 $(NATIVE_DIR)/nanofftf.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
 
@@ -182,6 +187,9 @@ $(NATIVE_DIR)/tls_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 
 $(NATIVE_DIR)/tlsdd_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 	$(CC) $(NATIVE_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+$(NATIVE_DIR)/utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
 
 $(LIB_DIR) $(PY_PACKAGE_DIR) $(GENERIC_DIR) $(NATIVE_DIR) $(NATIVE_SCALING_DIR):
 	mkdir -p $@
