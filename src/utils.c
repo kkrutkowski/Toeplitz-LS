@@ -1,4 +1,14 @@
-#include <math.h>
+// utils.c  —  Precision-generic peak-detection + precision-agnostic helpers
+//
+// Compiled 3× with different -D flags:
+//   no -D         → FLOAT=float          → tlsf_* symbols
+//   -D DOUBLE     → FLOAT=double         → tls_* symbols
+//   -D DOUBLE_DOUBLE → FLOAT=dd_t        → tlsdd_* symbols
+//
+// Precision-agnostic functions (cost model, twiddle ladder) are emitted
+// only once, when neither DOUBLE nor DOUBLE_DOUBLE is defined.
+
+#include <nanofft.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <utils.h>
@@ -10,6 +20,23 @@
 #if MAX_TWIDDLE_REUSE < 2 || (MAX_TWIDDLE_REUSE & (MAX_TWIDDLE_REUSE - 1)) != 0
 #    error "MAX_TWIDDLE_REUSE must be a power of two greater than or equal to 2"
 #endif
+
+// Precision macro layer
+#include <nanofft_precision.h>
+
+// Symbol prefix per precision pass
+#if defined(DOUBLE_DOUBLE)
+#    define TLS(name) tlsdd_##name
+#elif defined(DOUBLE)
+#    define TLS(name) tls_##name
+#else
+#    define TLS(name) tlsf_##name
+#endif
+
+// --------------------------------------------------------------------------
+// Precision-agnostic helpers — compiled once (float pass only)
+// --------------------------------------------------------------------------
+#if !defined(DOUBLE) && !defined(DOUBLE_DOUBLE)
 
 static inline int bitceil(double x) { return x <= 1.0 ? 1 : 1 << (1 + (int)(log2(x))); }
 
@@ -90,85 +117,98 @@ double tls_twiddle_ladder_advance(int block, int level) {
     return advance;
 }
 
-static inline int double_is_finite_bits(double value) {
+#endif /* agnostic block */
+
+// --------------------------------------------------------------------------
+// Local divergence helpers — defined in every precision pass
+// --------------------------------------------------------------------------
+
+#if defined(DOUBLE_DOUBLE)
+
+static inline int FLOAT_IS_FINITE(FLOAT v) {
     union {
         double f;
         uint64_t u;
-    } bits = {value};
+    } hi_bits = {v.hi};
+    union {
+        double f;
+        uint64_t u;
+    } lo_bits = {v.lo};
+    return (hi_bits.u & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000) &&
+           (lo_bits.u & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+static inline int FLOAT_IS_ZERO(FLOAT v) { return v.hi == 0.0 && v.lo == 0.0; }
+static inline int FLOAT_CMP(FLOAT a, FLOAT b) {
+    if (a.hi < b.hi) return -1;
+    if (a.hi > b.hi) return 1;
+    if (a.lo < b.lo) return -1;
+    if (a.lo > b.lo) return 1;
+    return 0;
+}
+#    define FLOAT_NAN dd_make(NAN, NAN)
+
+#elif defined(DOUBLE)
+
+static inline int FLOAT_IS_FINITE(FLOAT v) {
+    union {
+        double f;
+        uint64_t u;
+    } bits = {v};
     return (bits.u & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
+#    define FLOAT_IS_ZERO(v) ((v) == FCONST(0))
+#    define FLOAT_CMP(a, b) (((a) > (b)) - ((a) < (b)))
+#    define FLOAT_NAN NAN
 
-static inline int float_is_finite_bits(float value) {
+#else /* float (default) */
+
+static inline int FLOAT_IS_FINITE(FLOAT v) {
     union {
         float f;
         uint32_t u;
-    } bits = {value};
+    } bits = {v};
     return (bits.u & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
+#    define FLOAT_IS_ZERO(v) ((v) == FCONST(0))
+#    define FLOAT_CMP(a, b) (((a) > (b)) - ((a) < (b)))
+#    define FLOAT_NAN NAN
+
+#endif
+
+// --------------------------------------------------------------------------
+// Precision-generic peak detection
+// --------------------------------------------------------------------------
 
 typedef struct {
-    float freq;
-    float power;
-    float cond;
-} tlsf_peak;
+    FLOAT freq;
+    FLOAT power;
+    FLOAT cond;
+} TLS(peak);
 
-typedef struct {
-    double freq;
-    double power;
-    double cond;
-} tls_peak;
-
-typedef struct {
-    dd_t freq;
-    dd_t power;
-    dd_t cond;
-} tlsdd_peak;
-
-static inline void quadratic_vertex_float(float x0, float y0, float x1, float y1, float x2, float y2, float *vx, float *vy) {
-    float slope01 = (y1 - y0) / (x1 - x0);
-    float slope12 = (y2 - y1) / (x2 - x1);
-    float curvature = (slope12 - slope01) / (x2 - x0);
-    if (curvature == 0.0f) {
+static inline void TLS(quadratic_vertex)(FLOAT x0, FLOAT y0, FLOAT x1, FLOAT y1, FLOAT x2, FLOAT y2, FLOAT *vx, FLOAT *vy) {
+    FLOAT slope01 = DIV(SUB(y1, y0), SUB(x1, x0));
+    FLOAT slope12 = DIV(SUB(y2, y1), SUB(x2, x1));
+    FLOAT curvature = DIV(SUB(slope12, slope01), SUB(x2, x0));
+    if (FLOAT_IS_ZERO(curvature)) {
         *vx = x1;
         *vy = y1;
         return;
     }
-    float linear = slope01 - curvature * (x0 + x1);
-    *vx = -linear / (2.0f * curvature);
-    *vy = y0 + slope01 * (*vx - x0) + curvature * (*vx - x0) * (*vx - x1);
+    FLOAT linear = SUB(slope01, MUL(curvature, ADD(x0, x1)));
+    *vx = DIV(NEG(linear), MUL(FCONST(2.0), curvature));
+    *vy = ADD(y0, ADD(MUL(slope01, SUB(*vx, x0)), MUL(MUL(curvature, SUB(*vx, x0)), SUB(*vx, x1))));
 }
 
-static inline float quadratic_value_float(float x, float x0, float y0, float x1, float y1, float x2, float y2) {
-    float slope01 = (y1 - y0) / (x1 - x0);
-    float slope12 = (y2 - y1) / (x2 - x1);
-    float curvature = (slope12 - slope01) / (x2 - x0);
-    return y0 + slope01 * (x - x0) + curvature * (x - x0) * (x - x1);
+static inline FLOAT TLS(quadratic_value)(FLOAT x, FLOAT x0, FLOAT y0, FLOAT x1, FLOAT y1, FLOAT x2, FLOAT y2) {
+    FLOAT slope01 = DIV(SUB(y1, y0), SUB(x1, x0));
+    FLOAT slope12 = DIV(SUB(y2, y1), SUB(x2, x1));
+    FLOAT curvature = DIV(SUB(slope12, slope01), SUB(x2, x0));
+    return ADD(y0, ADD(MUL(slope01, SUB(x, x0)), MUL(MUL(curvature, SUB(x, x0)), SUB(x, x1))));
 }
 
-static inline void quadratic_vertex_double(double x0, double y0, double x1, double y1, double x2, double y2, double *vx, double *vy) {
-    double slope01 = (y1 - y0) / (x1 - x0);
-    double slope12 = (y2 - y1) / (x2 - x1);
-    double curvature = (slope12 - slope01) / (x2 - x0);
-    if (curvature == 0.0) {
-        *vx = x1;
-        *vy = y1;
-        return;
-    }
-    double linear = slope01 - curvature * (x0 + x1);
-    *vx = -linear / (2.0 * curvature);
-    *vy = y0 + slope01 * (*vx - x0) + curvature * (*vx - x0) * (*vx - x1);
-}
-
-static inline double quadratic_value_double(double x, double x0, double y0, double x1, double y1, double x2, double y2) {
-    double slope01 = (y1 - y0) / (x1 - x0);
-    double slope12 = (y2 - y1) / (x2 - x1);
-    double curvature = (slope12 - slope01) / (x2 - x0);
-    return y0 + slope01 * (x - x0) + curvature * (x - x0) * (x - x1);
-}
-
-static void insert_tlsf_peak(tlsf_peak peak, float *out_freq, float *out_power, float *out_cond, int has_cond, int *count, int max_peaks) {
+static void TLS(insert_peak)(TLS(peak) peak, FLOAT *out_freq, FLOAT *out_power, FLOAT *out_cond, int has_cond, int *count, int max_peaks) {
     if (max_peaks <= 0) return;
-    if (*count == max_peaks && peak.power <= out_power[max_peaks - 1]) return;
+    if (*count == max_peaks && FLOAT_CMP(peak.power, out_power[max_peaks - 1]) <= 0) return;
 
     int pos = *count;
     if (pos == max_peaks) {
@@ -176,7 +216,7 @@ static void insert_tlsf_peak(tlsf_peak peak, float *out_freq, float *out_power, 
     } else {
         ++(*count);
     }
-    while (pos > 0 && peak.power > out_power[pos - 1]) {
+    while (pos > 0 && FLOAT_CMP(peak.power, out_power[pos - 1]) > 0) {
         out_freq[pos] = out_freq[pos - 1];
         out_power[pos] = out_power[pos - 1];
         if (has_cond) out_cond[pos] = out_cond[pos - 1];
@@ -187,206 +227,43 @@ static void insert_tlsf_peak(tlsf_peak peak, float *out_freq, float *out_power, 
     if (has_cond) out_cond[pos] = peak.cond;
 }
 
-static void insert_tls_peak(tls_peak peak, double *out_freq, double *out_power, double *out_cond, int has_cond, int *count, int max_peaks) {
-    if (max_peaks <= 0) return;
-    if (*count == max_peaks && peak.power <= out_power[max_peaks - 1]) return;
-
-    int pos = *count;
-    if (pos == max_peaks) {
-        pos = max_peaks - 1;
-    } else {
-        ++(*count);
-    }
-    while (pos > 0 && peak.power > out_power[pos - 1]) {
-        out_freq[pos] = out_freq[pos - 1];
-        out_power[pos] = out_power[pos - 1];
-        if (has_cond) out_cond[pos] = out_cond[pos - 1];
-        --pos;
-    }
-    out_freq[pos] = peak.freq;
-    out_power[pos] = peak.power;
-    if (has_cond) out_cond[pos] = peak.cond;
-}
-
-int tlsf_get_peaks(const float *freq, const float *power, const float *cond, int n, int max_peaks, float threshold, float *out_freq, float *out_power,
-                   float *out_cond, int *out_count) {
-    if (!out_count || n < 0 || max_peaks < 0 || !float_is_finite_bits(threshold)) return TLS_UTIL_ERR_ARGUMENT;
+int TLS(get_peaks)(const FLOAT *freq, const FLOAT *power, const FLOAT *cond, int n, int max_peaks, FLOAT threshold, FLOAT *out_freq, FLOAT *out_power,
+                   FLOAT *out_cond, int *out_count) {
+    if (!out_count || n < 0 || max_peaks < 0 || !FLOAT_IS_FINITE(threshold)) return TLS_UTIL_ERR_ARGUMENT;
     *out_count = 0;
     if (n > 0 && (!freq || !power)) return TLS_UTIL_ERR_ARGUMENT;
     if (max_peaks > 0 && (!out_freq || !out_power || (cond && !out_cond))) return TLS_UTIL_ERR_ARGUMENT;
 
     for (int i = 0; i < n; ++i) {
-        if (!float_is_finite_bits(freq[i])) return TLS_UTIL_ERR_ARGUMENT;
-        if (i > 0 && freq[i] <= freq[i - 1]) return TLS_UTIL_ERR_ARGUMENT;
+        if (!FLOAT_IS_FINITE(freq[i])) return TLS_UTIL_ERR_ARGUMENT;
+        if (i > 0 && FLOAT_CMP(freq[i], freq[i - 1]) <= 0) return TLS_UTIL_ERR_ARGUMENT;
     }
     if (n < 3 || max_peaks == 0) return TLS_UTIL_OK;
 
     int count = 0;
     for (int idx = 1; idx < n - 1; ++idx) {
-        float p0 = power[idx - 1];
-        float p1 = power[idx];
-        float p2 = power[idx + 1];
-        if (!float_is_finite_bits(p0) || !float_is_finite_bits(p1) || !float_is_finite_bits(p2)) continue;
-        if (!(p1 > p0 && p1 > p2 && p1 > threshold)) continue;
+        FLOAT p0 = power[idx - 1];
+        FLOAT p1 = power[idx];
+        FLOAT p2 = power[idx + 1];
+        if (!FLOAT_IS_FINITE(p0) || !FLOAT_IS_FINITE(p1) || !FLOAT_IS_FINITE(p2)) continue;
+        if (!(FLOAT_CMP(p1, p0) > 0 && FLOAT_CMP(p1, p2) > 0 && FLOAT_CMP(p1, threshold) > 0)) continue;
 
-        float vertex_freq;
-        float vertex_power;
-        quadratic_vertex_float(freq[idx - 1], p0, freq[idx], p1, freq[idx + 1], p2, &vertex_freq, &vertex_power);
-        tlsf_peak peak;
+        FLOAT vertex_freq;
+        FLOAT vertex_power;
+        TLS(quadratic_vertex)(freq[idx - 1], p0, freq[idx], p1, freq[idx + 1], p2, &vertex_freq, &vertex_power);
+        TLS(peak) peak;
         peak.freq = vertex_freq;
         peak.power = vertex_power;
-        peak.cond = NAN;
+        peak.cond = FLOAT_NAN;
         if (cond) {
-            float c0 = cond[idx - 1];
-            float c1 = cond[idx];
-            float c2 = cond[idx + 1];
-            if (float_is_finite_bits(c0) && float_is_finite_bits(c1) && float_is_finite_bits(c2)) {
-                peak.cond = quadratic_value_float(vertex_freq, freq[idx - 1], c0, freq[idx], c1, freq[idx + 1], c2);
+            FLOAT c0 = cond[idx - 1];
+            FLOAT c1 = cond[idx];
+            FLOAT c2 = cond[idx + 1];
+            if (FLOAT_IS_FINITE(c0) && FLOAT_IS_FINITE(c1) && FLOAT_IS_FINITE(c2)) {
+                peak.cond = TLS(quadratic_value)(vertex_freq, freq[idx - 1], c0, freq[idx], c1, freq[idx + 1], c2);
             }
         }
-        insert_tlsf_peak(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
-    }
-
-    *out_count = count;
-    return TLS_UTIL_OK;
-}
-
-int tls_get_peaks(const double *freq, const double *power, const double *cond, int n, int max_peaks, double threshold, double *out_freq, double *out_power,
-                  double *out_cond, int *out_count) {
-    if (!out_count || n < 0 || max_peaks < 0 || !double_is_finite_bits(threshold)) return TLS_UTIL_ERR_ARGUMENT;
-    *out_count = 0;
-    if (n > 0 && (!freq || !power)) return TLS_UTIL_ERR_ARGUMENT;
-    if (max_peaks > 0 && (!out_freq || !out_power || (cond && !out_cond))) return TLS_UTIL_ERR_ARGUMENT;
-
-    for (int i = 0; i < n; ++i) {
-        if (!double_is_finite_bits(freq[i])) return TLS_UTIL_ERR_ARGUMENT;
-        if (i > 0 && freq[i] <= freq[i - 1]) return TLS_UTIL_ERR_ARGUMENT;
-    }
-    if (n < 3 || max_peaks == 0) return TLS_UTIL_OK;
-
-    int count = 0;
-    for (int idx = 1; idx < n - 1; ++idx) {
-        double p0 = power[idx - 1];
-        double p1 = power[idx];
-        double p2 = power[idx + 1];
-        if (!double_is_finite_bits(p0) || !double_is_finite_bits(p1) || !double_is_finite_bits(p2)) continue;
-        if (!(p1 > p0 && p1 > p2 && p1 > threshold)) continue;
-
-        double vertex_freq;
-        double vertex_power;
-        quadratic_vertex_double(freq[idx - 1], p0, freq[idx], p1, freq[idx + 1], p2, &vertex_freq, &vertex_power);
-        tls_peak peak;
-        peak.freq = vertex_freq;
-        peak.power = vertex_power;
-        peak.cond = NAN;
-        if (cond) {
-            double c0 = cond[idx - 1];
-            double c1 = cond[idx];
-            double c2 = cond[idx + 1];
-            if (double_is_finite_bits(c0) && double_is_finite_bits(c1) && double_is_finite_bits(c2)) {
-                peak.cond = quadratic_value_double(vertex_freq, freq[idx - 1], c0, freq[idx], c1, freq[idx + 1], c2);
-            }
-        }
-        insert_tls_peak(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
-    }
-
-    *out_count = count;
-    return TLS_UTIL_OK;
-}
-
-static inline int dd_is_finite_bits(dd_t value) { return double_is_finite_bits(value.hi) && double_is_finite_bits(value.lo); }
-
-static inline int dd_cmp(dd_t left, dd_t right) {
-    if (left.hi < right.hi) return -1;
-    if (left.hi > right.hi) return 1;
-    if (left.lo < right.lo) return -1;
-    if (left.lo > right.lo) return 1;
-    return 0;
-}
-
-static inline int dd_is_zero(dd_t value) { return value.hi == 0.0 && value.lo == 0.0; }
-
-static inline dd_t dd_neg(dd_t value) { return dd_make(-value.hi, -value.lo); }
-
-static inline void quadratic_vertex_dd(dd_t x0, dd_t y0, dd_t x1, dd_t y1, dd_t x2, dd_t y2, dd_t *vx, dd_t *vy) {
-    dd_t slope01 = dd_div(dd_sub(y1, y0), dd_sub(x1, x0));
-    dd_t slope12 = dd_div(dd_sub(y2, y1), dd_sub(x2, x1));
-    dd_t curvature = dd_div(dd_sub(slope12, slope01), dd_sub(x2, x0));
-    if (dd_is_zero(curvature)) {
-        *vx = x1;
-        *vy = y1;
-        return;
-    }
-    dd_t linear = dd_sub(slope01, dd_mul(curvature, dd_add(x0, x1)));
-    *vx = dd_div(dd_neg(linear), dd_mul(dd_make(2.0, 0.0), curvature));
-    *vy = dd_add(y0, dd_add(dd_mul(slope01, dd_sub(*vx, x0)), dd_mul(dd_mul(curvature, dd_sub(*vx, x0)), dd_sub(*vx, x1))));
-}
-
-static inline dd_t quadratic_value_dd(dd_t x, dd_t x0, dd_t y0, dd_t x1, dd_t y1, dd_t x2, dd_t y2) {
-    dd_t slope01 = dd_div(dd_sub(y1, y0), dd_sub(x1, x0));
-    dd_t slope12 = dd_div(dd_sub(y2, y1), dd_sub(x2, x1));
-    dd_t curvature = dd_div(dd_sub(slope12, slope01), dd_sub(x2, x0));
-    return dd_add(y0, dd_add(dd_mul(slope01, dd_sub(x, x0)), dd_mul(dd_mul(curvature, dd_sub(x, x0)), dd_sub(x, x1))));
-}
-
-static void insert_tlsdd_peak(tlsdd_peak peak, dd_t *out_freq, dd_t *out_power, dd_t *out_cond, int has_cond, int *count, int max_peaks) {
-    if (max_peaks <= 0) return;
-    if (*count == max_peaks && dd_cmp(peak.power, out_power[max_peaks - 1]) <= 0) return;
-
-    int pos = *count;
-    if (pos == max_peaks) {
-        pos = max_peaks - 1;
-    } else {
-        ++(*count);
-    }
-    while (pos > 0 && dd_cmp(peak.power, out_power[pos - 1]) > 0) {
-        out_freq[pos] = out_freq[pos - 1];
-        out_power[pos] = out_power[pos - 1];
-        if (has_cond) out_cond[pos] = out_cond[pos - 1];
-        --pos;
-    }
-    out_freq[pos] = peak.freq;
-    out_power[pos] = peak.power;
-    if (has_cond) out_cond[pos] = peak.cond;
-}
-
-int tlsdd_get_peaks(const dd_t *freq, const dd_t *power, const dd_t *cond, int n, int max_peaks, dd_t threshold, dd_t *out_freq, dd_t *out_power,
-                    dd_t *out_cond, int *out_count) {
-    if (!out_count || n < 0 || max_peaks < 0 || !dd_is_finite_bits(threshold)) return TLS_UTIL_ERR_ARGUMENT;
-    *out_count = 0;
-    if (n > 0 && (!freq || !power)) return TLS_UTIL_ERR_ARGUMENT;
-    if (max_peaks > 0 && (!out_freq || !out_power || (cond && !out_cond))) return TLS_UTIL_ERR_ARGUMENT;
-
-    for (int i = 0; i < n; ++i) {
-        if (!dd_is_finite_bits(freq[i])) return TLS_UTIL_ERR_ARGUMENT;
-        if (i > 0 && dd_cmp(freq[i], freq[i - 1]) <= 0) return TLS_UTIL_ERR_ARGUMENT;
-    }
-    if (n < 3 || max_peaks == 0) return TLS_UTIL_OK;
-
-    int count = 0;
-    for (int idx = 1; idx < n - 1; ++idx) {
-        dd_t p0 = power[idx - 1];
-        dd_t p1 = power[idx];
-        dd_t p2 = power[idx + 1];
-        if (!dd_is_finite_bits(p0) || !dd_is_finite_bits(p1) || !dd_is_finite_bits(p2)) continue;
-        if (!(dd_cmp(p1, p0) > 0 && dd_cmp(p1, p2) > 0 && dd_cmp(p1, threshold) > 0)) continue;
-
-        dd_t vertex_freq;
-        dd_t vertex_power;
-        quadratic_vertex_dd(freq[idx - 1], p0, freq[idx], p1, freq[idx + 1], p2, &vertex_freq, &vertex_power);
-        tlsdd_peak peak;
-        peak.freq = vertex_freq;
-        peak.power = vertex_power;
-        peak.cond = dd_make(NAN, NAN);
-        if (cond) {
-            dd_t c0 = cond[idx - 1];
-            dd_t c1 = cond[idx];
-            dd_t c2 = cond[idx + 1];
-            if (dd_is_finite_bits(c0) && dd_is_finite_bits(c1) && dd_is_finite_bits(c2)) {
-                peak.cond = quadratic_value_dd(vertex_freq, freq[idx - 1], c0, freq[idx], c1, freq[idx + 1], c2);
-            }
-        }
-        insert_tlsdd_peak(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
+        TLS(insert_peak)(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
     }
 
     *out_count = count;
