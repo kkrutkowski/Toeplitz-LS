@@ -56,7 +56,9 @@ GENERIC_OBJS := \
 	$(GENERIC_DIR)/tlsf_chi2per.o \
 	$(GENERIC_DIR)/tls_chi2per.o \
 	$(GENERIC_DIR)/tlsdd_chi2per.o \
-	$(GENERIC_DIR)/utils.o
+	$(GENERIC_DIR)/tlsf_utils.o \
+	$(GENERIC_DIR)/tls_utils.o \
+	$(GENERIC_DIR)/tlsdd_utils.o
 
 NATIVE_OBJS := \
 	$(NATIVE_DIR)/nanofftf.o \
@@ -71,7 +73,9 @@ NATIVE_OBJS := \
 	$(NATIVE_DIR)/tlsf_chi2per.o \
 	$(NATIVE_DIR)/tls_chi2per.o \
 	$(NATIVE_DIR)/tlsdd_chi2per.o \
-	$(NATIVE_DIR)/utils.o
+	$(NATIVE_DIR)/tlsf_utils.o \
+	$(NATIVE_DIR)/tls_utils.o \
+	$(NATIVE_DIR)/tlsdd_utils.o
 
 .PHONY: all generic native clean
 .DELETE_ON_ERROR:
@@ -149,8 +153,14 @@ $(GENERIC_DIR)/tls_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 $(GENERIC_DIR)/tlsdd_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 	$(CC) $(GENERIC_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
-$(GENERIC_DIR)/utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
+$(GENERIC_DIR)/tlsf_utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
+
+$(GENERIC_DIR)/tls_utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -D DOUBLE -c $< -o $@
+
+$(GENERIC_DIR)/tlsdd_utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
 $(NATIVE_DIR)/nanofftf.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
@@ -188,8 +198,14 @@ $(NATIVE_DIR)/tls_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 $(NATIVE_DIR)/tlsdd_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 	$(CC) $(NATIVE_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
-$(NATIVE_DIR)/utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
+$(NATIVE_DIR)/tlsf_utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
+
+$(NATIVE_DIR)/tls_utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -D DOUBLE -c $< -o $@
+
+$(NATIVE_DIR)/tlsdd_utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
 $(LIB_DIR) $(PY_PACKAGE_DIR) $(GENERIC_DIR) $(NATIVE_DIR) $(NATIVE_SCALING_DIR):
 	mkdir -p $@
