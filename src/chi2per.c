@@ -243,7 +243,19 @@ static int execute_nufft_block(void *plan, int backend, const FLOAT *src_r, cons
     return CHI2PER_OK;
 }
 
-static void compute_twiddle_delta(int backend, FLOAT tm, double qdf, double advance, FLOAT *delta_r, FLOAT *delta_i) {
+static void compute_source_phase(NUFFT_INPUT_T tm, double qf0, FLOAT *phase_r, FLOAT *phase_i) {
+#if defined(DOUBLE_DOUBLE)
+    FLOAT phase = MUL(tm, FCAST(qf0));
+    *phase_r = M_COS2PI(phase);
+    *phase_i = M_SIN2PI(phase);
+#else
+    double phase = (double)tm * qf0;
+    *phase_r = FCAST(cos2pi(phase));
+    *phase_i = FCAST(sin2pi(phase));
+#endif
+}
+
+static void compute_twiddle_delta(int backend, NUFFT_INPUT_T tm, double qdf, double advance, FLOAT *delta_r, FLOAT *delta_i) {
     (void)backend;
 #if defined(DOUBLE_DOUBLE)
     if (backend == CHI2PER_BACKEND_PSWF43) {
@@ -263,9 +275,15 @@ static void compute_twiddle_delta(int backend, FLOAT tm, double qdf, double adva
     }
 #endif
 
-    FLOAT phase_delta = MUL(tm, FCAST(qdf * advance));
+#if defined(DOUBLE_DOUBLE)
+    FLOAT phase_delta = MUL(MUL(tm, FCAST(qdf)), FCAST(advance));
     *delta_r = M_COS2PI(phase_delta);
     *delta_i = M_SIN2PI(phase_delta);
+#else
+    double phase_delta = (double)tm * qdf * advance;
+    *delta_r = FCAST(cos2pi(phase_delta));
+    *delta_i = FCAST(sin2pi(phase_delta));
+#endif
 }
 
 static void rotate_source_level(FLOAT *src_r, FLOAT *src_i, const FLOAT *delta_r, const FLOAT *delta_i, int M) {
@@ -288,9 +306,9 @@ static void copy_twiddle_level_down(FLOAT *src_r_levels, FLOAT *src_i_levels, in
     }
 }
 
-static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, double df, int N, int max_factor, int block, int backend, void *plan, FLOAT *S,
-                             FLOAT *C, FLOAT *src_r_levels, FLOAT *src_i_levels, FLOAT *delta_r_levels, FLOAT *delta_i_levels, int ladder_levels, FLOAT *out_r,
-                             FLOAT *out_i) {
+static int compute_trig_sums(const NUFFT_INPUT_T *x, const FLOAT *h, int M, double f0, double df, int N, int max_factor, int block, int backend, void *plan,
+                             FLOAT *S, FLOAT *C, FLOAT *src_r_levels, FLOAT *src_i_levels, FLOAT *delta_r_levels, FLOAT *delta_i_levels, int ladder_levels,
+                             FLOAT *out_r, FLOAT *out_i) {
     size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
 
     for (int q = 1; q <= max_factor; ++q) {
@@ -298,10 +316,10 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
         double qdf = (double)q * df;
 
         for (int m = 0; m < M; ++m) {
-            FLOAT tm = tc[m];
-            FLOAT phase0 = MUL(qf0, tm);
-            FLOAT c0 = M_COS2PI(phase0);
-            FLOAT s0 = M_SIN2PI(phase0);
+            NUFFT_INPUT_T xm = x[m];
+            FLOAT c0;
+            FLOAT s0;
+            compute_source_phase(xm, TO_DOUBLE(qf0), &c0, &s0);
             FLOAT src_r0 = MUL(h[m], c0);
             FLOAT src_i0 = MUL(h[m], s0);
 
@@ -310,7 +328,7 @@ static int compute_trig_sums(const FLOAT *tc, const FLOAT *h, int M, double f0, 
                 src_r_levels[idx] = src_r0;
                 src_i_levels[idx] = src_i0;
                 double advance = tls_twiddle_ladder_advance(block, level);
-                compute_twiddle_delta(backend, tm, qdf, advance, &delta_r_levels[idx], &delta_i_levels[idx]);
+                compute_twiddle_delta(backend, xm, qdf, advance, &delta_r_levels[idx], &delta_i_levels[idx]);
             }
         }
 
@@ -1079,7 +1097,6 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
 
     FLOAT *w = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
     FLOAT *yw = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
-    FLOAT *tc = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
     NUFFT_INPUT_T *x = (NUFFT_INPUT_T *)checked_aligned_malloc((size_t)M, sizeof(NUFFT_INPUT_T));
     FLOAT *Sw = (FLOAT *)checked_malloc((size_t)(max_factor + 1) * N, sizeof(FLOAT));
     FLOAT *Cw = (FLOAT *)checked_malloc((size_t)(max_factor + 1) * N, sizeof(FLOAT));
@@ -1094,7 +1111,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     void *plan = NULL;
     int status = CHI2PER_OK;
 
-    if (!w || !yw || !tc || !x || !Sw || !Cw || !Syw || !Cyw || !src_r || !src_i || !delta_r || !delta_i || !out_r || !out_i) {
+    if (!w || !yw || !x || !Sw || !Cw || !Syw || !Cyw || !src_r || !src_i || !delta_r || !delta_i || !out_r || !out_i) {
         status = CHI2PER_ERR_ALLOC;
         goto cleanup;
     }
@@ -1112,7 +1129,6 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         w[m] = MUL(inv_dy, inv_dy);
         ws = ADD(ws, w[m]);
         wy = ADD(wy, MUL(w[m], y[m]));
-        tc[m] = time_to_float(centered_t);
         x[m] = time_to_nufft_input(centered_t);
     }
 
@@ -1166,9 +1182,9 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         NUFFT_LRA_PRE((LRA_PLAN_T *)plan, x, M, block, NUFFT_RANK);
     }
 
-    status = compute_trig_sums(tc, w, M, f0, df, N, max_factor, block, backend, plan, Sw, Cw, src_r, src_i, delta_r, delta_i, ladder_levels, out_r, out_i);
+    status = compute_trig_sums(x, w, M, f0, df, N, max_factor, block, backend, plan, Sw, Cw, src_r, src_i, delta_r, delta_i, ladder_levels, out_r, out_i);
     if (status == CHI2PER_OK)
-        status = compute_trig_sums(tc, yw, M, f0, df, N, degree, block, backend, plan, Syw, Cyw, src_r, src_i, delta_r, delta_i, ladder_levels, out_r, out_i);
+        status = compute_trig_sums(x, yw, M, f0, df, N, degree, block, backend, plan, Syw, Cyw, src_r, src_i, delta_r, delta_i, ladder_levels, out_r, out_i);
 
     if (status == CHI2PER_OK && degree == 1) {
         status = gls_impl(Sw, Cw, Syw, Cyw, N, ws, yws, chi2_ref, power, cond);
@@ -1188,7 +1204,6 @@ cleanup:
 
     free(w);
     free(yw);
-    free(tc);
     free(x);
     free(Sw);
     free(Cw);
