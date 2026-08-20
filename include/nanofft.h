@@ -231,6 +231,18 @@ static inline dd_t dd_exp(dd_t x) {
     return dd_exp2(dd_mul(x, inv_ln2));
 }
 
+static inline dd_t dd_log(dd_t x) {
+    if (x.hi <= 0.0) return dd_make(-INFINITY, 0.0);
+    double d = log(x.hi);
+    dd_t y = dd_make(d, 0.0);
+    dd_t ey = dd_exp(y);
+    dd_t dy = dd_div(dd_sub(x, ey), ey);
+    y = dd_add(y, dy);
+    ey = dd_exp(y);
+    dy = dd_div(dd_sub(x, ey), ey);
+    return dd_add(y, dy);
+}
+
 static inline dd_t cos2pidd(dd_t x) {
     // 1. Truncate argument modulo 1 using dd_t math
     double int_part = (double)((int64_t)x.hi);

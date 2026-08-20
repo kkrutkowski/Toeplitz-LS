@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tls.h>
 #include <utils.h>
 
 /* Return codes from the public fastchi2 entry points. */
@@ -195,6 +196,415 @@ static inline int condition_bound_is_invalid(FLOAT bound) {
 #endif
 }
 
+static inline int double_is_finite_bits(double value) {
+    union {
+        double f;
+        uint64_t u;
+    } bits = {value};
+    return (bits.u & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+
+static inline int float_is_finite_bits(float value) {
+    union {
+        float f;
+        uint32_t u;
+    } bits = {value};
+    return (bits.u & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+typedef struct {
+    double var_S;
+    double mean_S;
+    double k_eff;     /* shape parameter a */
+    double theta_eff; /* scale parameter theta */
+    double lgamma_k;  /* ln(Gamma(k_eff)) cached */
+    double sum_N_eff; /* sum_{j=1}^{2d} (M-j)^2 / M */
+    double inv_2d;    /* 1.0 / (2.0 * d) */
+} cybenko_model_t;
+
+static inline cybenko_model_t cybenko_model_init(int d, int M) {
+    cybenko_model_t m;
+    double d_dbl = (double)d;
+    double M_dbl = (double)M;
+    double inv_M = 1.0 / M_dbl;
+    double inv_M2 = inv_M * inv_M;
+
+    /* Exact 3rd-order Edgeworth expansion for Var(S) */
+    double term1 = 2.0 * d_dbl;
+    double term2 = (8.0 * d_dbl * d_dbl - 14.0 * d_dbl) * inv_M;
+    double term3 = ((184.0 / 3.0) * d_dbl * d_dbl * d_dbl - 98.0 * d_dbl * d_dbl + (158.0 / 3.0) * d_dbl) * inv_M2;
+    m.var_S = term1 + term2 + term3;
+
+    m.mean_S = 2.0 * d_dbl;
+    m.k_eff = (m.mean_S * m.mean_S) / m.var_S;
+    m.theta_eff = m.var_S / m.mean_S;
+    m.lgamma_k = lgamma(m.k_eff);
+    m.inv_2d = 1.0 / (2.0 * d_dbl);
+
+    double n = 2.0 * d_dbl;
+    m.sum_N_eff = n * M_dbl - n * (n + 1.0) + (n * (n + 1.0) * (2.0 * n + 1.0)) / (6.0 * M_dbl);
+
+    return m;
+}
+
+static inline double cybenko_kappa_to_S(double kappa, const cybenko_model_t *m) {
+    if (kappa <= 1.0 || !double_is_finite_bits(kappa)) return 0.0;
+    if (kappa > 5000.0) kappa = 5000.0;
+    double pow_k = pow(kappa, m->inv_2d);
+    double k_val = (pow_k - 1.0) / (pow_k + 1.0);
+    double k2 = k_val * k_val;
+    return m->sum_N_eff * k2;
+}
+
+#if defined(DOUBLE_DOUBLE)
+static inline dd_t cybenko_kappa_to_S_dd(dd_t kappa, const cybenko_model_t *m) {
+    double kh = kappa.hi;
+    if (kh <= 1.0 || !isfinite(kh)) return dd_make(0.0, 0.0);
+    if (kh > 5000.0) kh = 5000.0;
+    double pow_k = pow(kh, m->inv_2d);
+    double k_val = (pow_k - 1.0) / (pow_k + 1.0);
+    double k2 = k_val * k_val;
+    return dd_mul(dd_make(m->sum_N_eff, 0.0), dd_make(k2, 0.0));
+}
+
+static inline dd_t nll_exact_pochhammer_dd(int d, dd_t r2, dd_t b) {
+    if (r2.hi <= 0.0 || !isfinite(r2.hi)) return dd_make(0.0, 0.0);
+    if (r2.hi > 0.999999999999999) r2 = dd_make(0.999999999999999, 0.0);
+
+    dd_t one = dd_make(1.0, 0.0);
+    dd_t one_minus_r2 = dd_sub(one, r2);
+    dd_t ln_one_minus_r2 = dd_log(one_minus_r2);
+    dd_t term0 = dd_mul(dd_make(-b.hi, -b.lo), ln_one_minus_r2);
+    if (d <= 1) {
+        return (term0.hi > 0.0 && isfinite(term0.hi)) ? term0 : dd_make(0.0, 0.0);
+    }
+
+    dd_t c = one;
+    dd_t s_minus_1 = dd_make(0.0, 0.0);
+    for (int k = 1; k < d; ++k) {
+        dd_t num = dd_add(b, dd_make((double)(k - 1), 0.0));
+        dd_t factor = dd_div(num, dd_make((double)k, 0.0));
+        c = dd_mul(dd_mul(c, factor), r2);
+        s_minus_1 = dd_add(s_minus_1, c);
+    }
+
+    dd_t s = dd_add(one, s_minus_1);
+    dd_t ln_s = dd_log(s);
+    dd_t nll = dd_sub(term0, ln_s);
+    return (nll.hi > 0.0 && isfinite(nll.hi)) ? nll : dd_make(0.0, 0.0);
+}
+
+static inline dd_t nll_cybenko_dd(dd_t kappa, const cybenko_model_t *m, int d) {
+    dd_t s = cybenko_kappa_to_S_dd(kappa, m);
+    if (s.hi <= 0.0 || !isfinite(s.hi)) return dd_make(0.0, 0.0);
+
+    double k_eff = m->k_eff;
+    double th_eff = m->theta_eff;
+    double lg_k = m->lgamma_k;
+
+    if (d <= 2) {
+        dd_t z = dd_div(s, dd_make(th_eff, 0.0));
+        int order = 2 * d;
+        double delta_val = k_eff - (double)order;
+
+        dd_t c = dd_make(1.0, 0.0);
+        dd_t poly = dd_make(1.0, 0.0);
+        dd_t d_poly = dd_make(0.0, 0.0);
+
+        for (int k = 1; k < order; ++k) {
+            dd_t factor = dd_make(1.0 / (double)k, 0.0);
+            c = dd_mul(dd_mul(c, z), factor);
+            poly = dd_add(poly, c);
+            if (fabs(delta_val) > 1.0e-5) {
+                double H_k = 0.0;
+                for (int i = 1; i <= k; ++i) H_k += 1.0 / (double)i;
+                d_poly = dd_sub(d_poly, dd_mul(c, dd_make(H_k, 0.0)));
+            }
+        }
+
+        dd_t ln_poly = dd_log(poly);
+        dd_t nll = dd_sub(z, ln_poly);
+        if (fabs(delta_val) > 1.0e-5) {
+            dd_t ln_z = dd_log(z);
+            dd_t term = dd_add(ln_z, dd_div(d_poly, poly));
+            nll = dd_sub(nll, dd_mul(dd_make(delta_val, 0.0), term));
+        }
+        return (nll.hi > 0.0 && isfinite(nll.hi)) ? nll : dd_make(0.0, 0.0);
+    } else {
+        double s_d = s.hi;
+        double a = k_eff;
+        double z_d = s_d / th_eff;
+        if (z_d < a + 3.0) {
+            double c = 1.0;
+            double sum = 1.0;
+            for (int k = 1; k < 60; ++k) {
+                c *= z_d / (a + (double)(k - 1));
+                sum += c;
+                if (c < 1.0e-14 * sum) break;
+            }
+            double lg_inc = a * log(z_d) - z_d - log(a) + log(sum);
+            double nll = lg_k - lg_inc;
+            return dd_make((nll > 0.0 && isfinite(nll)) ? nll : 0.0, 0.0);
+        } else {
+            double inv_z = 1.0 / z_d;
+            double t1 = (a - 1.0) * inv_z;
+            double t2 = t1 * ((a - 2.0) * inv_z);
+            double t3 = t2 * ((a - 3.0) * inv_z);
+            double t4 = t3 * ((a - 4.0) * inv_z);
+            double poly_val = 1.0 + t1 + t2 + t3 + t4;
+            double nll = z_d - (a - 1.0) * log(z_d) + lg_k - log(poly_val);
+            return dd_make((nll > 0.0 && isfinite(nll)) ? nll : 0.0, 0.0);
+        }
+    }
+}
+
+static inline dd_t compute_bayes_laplace_dd(dd_t delta) {
+    static const dd_t ln2 = {0.693147180559945309417, 2.31904681384629955841e-17};
+    static const dd_t half = {0.5, 0.0};
+    static const dd_t one = {1.0, 0.0};
+
+    if (delta.hi >= 0.0) {
+        return dd_add(delta, ln2);
+    } else {
+        dd_t exp_delta = dd_exp(delta);
+        dd_t inner = dd_sub(one, dd_mul(half, exp_delta));
+        if (inner.hi <= 0.0) return dd_make(0.0, 0.0);
+        dd_t log_inner = dd_log(inner);
+        return dd_make(-log_inner.hi, -log_inner.lo);
+    }
+}
+
+static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb, FLOAT b) {
+    if (normalization == TLS_NORM_STANDARD) {
+        return DIV(dot, chi2_ref);
+    } else if (normalization == TLS_NORM_ASYMPTOTIC) {
+        double d1 = 2.0 * (double)degree + 1.0;
+        double d2 = (double)M - 1.0 - d1;
+        dd_t residual = dd_sub(chi2_ref, dot);
+        if (residual.hi <= 1e-32) residual = dd_make(1e-32, 0.0);
+        return dd_div(dd_mul(dd_make(d2, 0.0), dot), dd_mul(dd_make(d1, 0.0), residual));
+    } else if (normalization == TLS_NORM_NLL) {
+        dd_t r2 = DIV(dot, chi2_ref);
+        return nll_exact_pochhammer_dd(degree, r2, b);
+    } else { /* TLS_NORM_BAYES */
+        dd_t r2 = DIV(dot, chi2_ref);
+        dd_t nll_r2 = nll_exact_pochhammer_dd(degree, r2, b);
+        dd_t nll_cond = nll_cybenko_dd(condition_bound, cyb, degree);
+        dd_t delta = dd_sub(nll_r2, nll_cond);
+        return compute_bayes_laplace_dd(delta);
+    }
+}
+#elif defined(DOUBLE)
+static inline double nll_exact_pochhammer_scalar_d(int d, double r2, double b) {
+    if (!double_is_finite_bits(r2) || r2 <= 0.0) return 0.0;
+    if (r2 > 0.9999999999999) r2 = 0.9999999999999;
+    double term0 = -b * log1p(-r2);
+    if (d <= 1) return (term0 > 0.0 && double_is_finite_bits(term0)) ? term0 : 0.0;
+    double c = 1.0;
+    double s_minus_1 = 0.0;
+    for (int k = 1; k < d; ++k) {
+        c *= (b + (double)(k - 1)) / (double)k * r2;
+        s_minus_1 += c;
+    }
+    double ln_s = log1p(s_minus_1);
+    double nll = term0 - ln_s;
+    return (nll > 0.0 && double_is_finite_bits(nll)) ? nll : 0.0;
+}
+
+static inline double nll_cybenko_scalar_d(double kappa, const cybenko_model_t *m, int d) {
+    double s = cybenko_kappa_to_S(kappa, m);
+    if (s <= 0.0 || !double_is_finite_bits(s)) return 0.0;
+    double k_eff = m->k_eff;
+    double th_eff = m->theta_eff;
+    double lg_k = m->lgamma_k;
+
+    if (d <= 2) {
+        double z = s / th_eff;
+        int order = 2 * d;
+        double delta = k_eff - (double)order;
+        double c = 1.0;
+        double poly = 1.0;
+        double d_poly = 0.0;
+        for (int k = 1; k < order; ++k) {
+            c *= (z / (double)k);
+            poly += c;
+            if (fabs(delta) > 1.0e-5) {
+                double H_k = 0.0;
+                for (int i = 1; i <= k; ++i) H_k += 1.0 / (double)i;
+                d_poly += c * (-H_k);
+            }
+        }
+        double nll = z - log(poly);
+        if (fabs(delta) > 1.0e-5) {
+            nll -= delta * (log(z) + d_poly / poly);
+        }
+        return (nll > 0.0 && double_is_finite_bits(nll)) ? nll : 0.0;
+    } else {
+        double a = k_eff;
+        double z = s / th_eff;
+        if (z < a + 3.0) {
+            double c = 1.0;
+            double sum = 1.0;
+            for (int k = 1; k < 60; ++k) {
+                c *= z / (a + (double)(k - 1));
+                sum += c;
+                if (c < 1.0e-14 * sum) break;
+            }
+            double lg_inc = a * log(z) - z - log(a) + log(sum);
+            double nll = lg_k - lg_inc;
+            return (nll > 0.0 && double_is_finite_bits(nll)) ? nll : 0.0;
+        } else {
+            double inv_z = 1.0 / z;
+            double t1 = (a - 1.0) * inv_z;
+            double t2 = t1 * ((a - 2.0) * inv_z);
+            double t3 = t2 * ((a - 3.0) * inv_z);
+            double t4 = t3 * ((a - 4.0) * inv_z);
+            double poly = 1.0 + t1 + t2 + t3 + t4;
+            double nll = z - (a - 1.0) * log(z) + lg_k - log(poly);
+            return (nll > 0.0 && double_is_finite_bits(nll)) ? nll : 0.0;
+        }
+    }
+}
+
+static inline double compute_bayes_laplace_d(double delta) {
+    if (delta >= 0.0) {
+        return delta + 0.693147180559945309417; // ln(2)
+    } else {
+        double exp_delta = exp(delta);
+        double inner = 1.0 - 0.5 * exp_delta;
+        if (inner <= 0.0) return 0.0;
+        return -log(inner);
+    }
+}
+
+static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb, FLOAT b) {
+    if (normalization == TLS_NORM_STANDARD) {
+        return dot / chi2_ref;
+    } else if (normalization == TLS_NORM_ASYMPTOTIC) {
+        double d1 = 2.0 * (double)degree + 1.0;
+        double d2 = (double)M - 1.0 - d1;
+        double residual = chi2_ref - dot;
+        if (residual < 1e-32) residual = 1e-32;
+        return (d2 * dot) / (d1 * residual);
+    } else if (normalization == TLS_NORM_NLL) {
+        double r2 = dot / chi2_ref;
+        return nll_exact_pochhammer_scalar_d(degree, r2, b);
+    } else { /* TLS_NORM_BAYES */
+        double r2 = dot / chi2_ref;
+        double nll_r2 = nll_exact_pochhammer_scalar_d(degree, r2, b);
+        double nll_cond = nll_cybenko_scalar_d(condition_bound, cyb, degree);
+        double delta = nll_r2 - nll_cond;
+        return compute_bayes_laplace_d(delta);
+    }
+}
+#else
+static inline float nll_exact_pochhammer_scalar_f(int d, float r2, float b) {
+    if (!float_is_finite_bits(r2) || r2 <= 0.0f) return 0.0f;
+    if (r2 > 0.9999999f) r2 = 0.9999999f;
+    float term0 = -b * log1pf(-r2);
+    if (d <= 1) return (term0 > 0.0f && float_is_finite_bits(term0)) ? term0 : 0.0f;
+    double c = 1.0;
+    double s_minus_1 = 0.0;
+    double b_d = (double)b;
+    double r2_d = (double)r2;
+    for (int k = 1; k < d; ++k) {
+        c *= (b_d + (double)(k - 1)) / (double)k * r2_d;
+        s_minus_1 += c;
+    }
+    double ln_s = log1p(s_minus_1);
+    double nll = (double)term0 - ln_s;
+    return (nll > 0.0 && double_is_finite_bits(nll)) ? (float)nll : 0.0f;
+}
+
+static inline float nll_cybenko_scalar_f(float kappa, const cybenko_model_t *m, int d) {
+    double s = cybenko_kappa_to_S((double)kappa, m);
+    if (s <= 0.0 || !double_is_finite_bits(s)) return 0.0f;
+    float k_eff_f = (float)m->k_eff;
+    float th_eff_f = (float)m->theta_eff;
+    float lg_k_f = (float)m->lgamma_k;
+    float s_f = (float)s;
+
+    if (d <= 2) {
+        float z = s_f / th_eff_f;
+        int order = 2 * d;
+        float delta = k_eff_f - (float)order;
+        float c = 1.0f;
+        float poly = 1.0f;
+        float d_poly = 0.0f;
+        for (int k = 1; k < order; ++k) {
+            c *= (z / (float)k);
+            poly += c;
+            if (fabsf(delta) > 1.0e-5f) {
+                float H_k = 0.0f;
+                for (int i = 1; i <= k; ++i) H_k += 1.0f / (float)i;
+                d_poly += c * (-H_k);
+            }
+        }
+        float nll = z - logf(poly);
+        if (fabsf(delta) > 1.0e-5f) {
+            nll -= delta * (logf(z) + d_poly / poly);
+        }
+        return (nll > 0.0f && float_is_finite_bits(nll)) ? nll : 0.0f;
+    } else {
+        float a = k_eff_f;
+        float z = s_f / th_eff_f;
+        if (z < a + 3.0f) {
+            double c = 1.0;
+            double sum = 1.0;
+            for (int k = 1; k < 60; ++k) {
+                c *= (double)z / ((double)a + (double)(k - 1));
+                sum += c;
+                if (c < 1.0e-7 * sum) break;
+            }
+            double lg_inc = (double)a * log((double)z) - (double)z - log((double)a) + log(sum);
+            double nll = (double)lg_k_f - lg_inc;
+            return (nll > 0.0 && double_is_finite_bits(nll)) ? (float)nll : 0.0f;
+        } else {
+            float inv_z = 1.0f / z;
+            float t1 = (a - 1.0f) * inv_z;
+            float t2 = t1 * ((a - 2.0f) * inv_z);
+            float t3 = t2 * ((a - 3.0f) * inv_z);
+            float t4 = t3 * ((a - 4.0f) * inv_z);
+            float poly = 1.0f + t1 + t2 + t3 + t4;
+            float nll = z - (a - 1.0f) * logf(z) + lg_k_f - logf(poly);
+            return (nll > 0.0f && float_is_finite_bits(nll)) ? nll : 0.0f;
+        }
+    }
+}
+
+static inline float compute_bayes_laplace_f(float delta) {
+    if (delta >= 0.0f) {
+        return delta + 0.6931471805599453f; // ln(2)
+    } else {
+        float exp_delta = expf(delta);
+        float inner = 1.0f - 0.5f * exp_delta;
+        if (inner <= 0.0f) return 0.0f;
+        return -logf(inner);
+    }
+}
+
+static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb, FLOAT b) {
+    if (normalization == TLS_NORM_STANDARD) {
+        return dot / chi2_ref;
+    } else if (normalization == TLS_NORM_ASYMPTOTIC) {
+        float d1 = 2.0f * (float)degree + 1.0f;
+        float d2 = (float)M - 1.0f - d1;
+        float residual = chi2_ref - dot;
+        if (residual < 1e-32f) residual = 1e-32f;
+        return (d2 * dot) / (d1 * residual);
+    } else if (normalization == TLS_NORM_NLL) {
+        float r2 = dot / chi2_ref;
+        return nll_exact_pochhammer_scalar_f(degree, r2, b);
+    } else { /* TLS_NORM_BAYES */
+        float r2 = dot / chi2_ref;
+        float nll_r2 = nll_exact_pochhammer_scalar_f(degree, r2, b);
+        float nll_cond = nll_cybenko_scalar_f(condition_bound, cyb, degree);
+        float delta = nll_r2 - nll_cond;
+        return compute_bayes_laplace_f(delta);
+    }
+}
+#endif
+
 static inline int real_term_harmonic(int term) { return term == 0 ? 0 : (term + 1) / 2; }
 
 static inline int real_term_is_sin(int term) { return term > 0 && (term & 1); }
@@ -361,12 +771,11 @@ static int compute_trig_sums(const NUFFT_INPUT_T *x, const FLOAT *h, int M, doub
 // 4 used for generic AoV Solution by: Zechmeister and M. Kurster, A&A 496,
 // 577-584 (2009) Trig identity: Press W.H. and Rybicki, G.B, "Fast algorithm
 // for spectral analysis of unevenly sampled data". ApJ 1:338, p277, 1989
-static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, FLOAT ws, FLOAT yws, FLOAT chi2_ref, FLOAT *power,
-                    FLOAT *cond) {
+static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, FLOAT ws, FLOAT yws, FLOAT chi2_ref,
+                    int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
     FLOAT half = FCAST(0.5);
     FLOAT sqrt_half = M_SQRT(half);
     FLOAT inv_ws = DIV(FCAST(1.0), ws);
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
 
     for (int idx = 0; idx < N; ++idx) {
         FLOAT S = Sw[(size_t)N + idx];
@@ -418,16 +827,36 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
         YS = SUB(YS, MUL(MUL(yws, XS), inv_ws));
 
         FLOAT dot = ADD(DIV(MUL(YC, YC), CC), DIV(MUL(YS, YS), SS));
-        power[idx] = MUL(dot, inv_chi2_ref);
-        if (cond) cond[idx] = FCAST(1.0);
+        FLOAT abs2 = MUL(ADD(MUL(C, C), MUL(S, S)), MUL(inv_ws, inv_ws));
+        FLOAT condition_bound;
+#if defined(DOUBLE_DOUBLE)
+        double abs2_d = TO_DOUBLE(abs2);
+        if (abs2_d >= 1.0) abs2_d = 0.999999999999999;
+        double abs_refl = sqrt(abs2_d);
+        condition_bound = dd_div(dd_add(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)),
+                                 dd_sub(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)));
+#elif defined(DOUBLE)
+        double abs2_d = abs2;
+        if (abs2_d >= 1.0) abs2_d = 0.999999999999999;
+        double abs_refl = sqrt(abs2_d);
+        condition_bound = (1.0 + abs_refl) / (1.0 - abs_refl);
+#else
+        float abs2_f = abs2;
+        if (abs2_f >= 1.0f) abs2_f = 0.9999999f;
+        float abs_refl = sqrtf(abs2_f);
+        condition_bound = (1.0f + abs_refl) / (1.0f - abs_refl);
+#endif
+        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, 1, M, cyb, b);
+        if (cond) cond[idx] = condition_bound;
     }
 
     return CHI2PER_OK;
 }
 
 #if defined(DOUBLE_DOUBLE)
-static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power,
-                                     FLOAT *cond) {
+static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
+                                     int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -450,7 +879,6 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
         return CHI2PER_ERR_ALLOC;
     }
 
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
     int nan_count = 0;
 
     for (int idx = 0; idx < N; ++idx) {
@@ -471,7 +899,7 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
 
         FLOAT dot = FCAST(0.0);
         for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
-        power[idx] = MUL(dot, inv_chi2_ref);
+        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
     free(XTX);
@@ -484,8 +912,9 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
     return cond ? CHI2PER_OK : nan_count;
 }
 
-static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power,
-                                    FLOAT *cond) {
+static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
+                                    int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -508,7 +937,6 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
         return CHI2PER_ERR_ALLOC;
     }
 
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
     FLOAT max_cond = cond ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD);
     int nan_count = 0;
 
@@ -530,7 +958,7 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
 
         FLOAT dot = FCAST(0.0);
         for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
-        power[idx] = MUL(dot, inv_chi2_ref);
+        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
     free(XTX);
@@ -544,9 +972,9 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
 }
 
 static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
-                                FLOAT *power, FLOAT *cond) {
-    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power, cond);
-    if (solver == CHI2PER_SOLVER_SVD) return solve_periodogram_svd_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power, cond);
+                                int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, power, cond);
+    if (solver == CHI2PER_SOLVER_SVD) return solve_periodogram_svd_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, power, cond);
 
     const int norder = 2 * degree + 1;
 
@@ -620,7 +1048,6 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
         }
     }
 
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
     int nan_count = 0;
 
     for (int idx = 0; idx < N; ++idx) {
@@ -683,7 +1110,7 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
 
         FLOAT dot = FCAST(0.0);
         for (int k = 0; k < norder; ++k) dot = ADD(dot, ADD(MUL(Yr[k], Xr[k]), MUL(Yi[k], Xi[k])));
-        power[idx] = MUL(dot, inv_chi2_ref);
+        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
     free(Rr);
@@ -708,8 +1135,9 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
     return cond ? CHI2PER_OK : nan_count;
 }
 #else
-static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power,
-                                      FLOAT *cond) {
+static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
+                                      int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -732,7 +1160,6 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
         return CHI2PER_ERR_ALLOC;
     }
 
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
     int nan_count = 0;
 
     for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
@@ -768,7 +1195,7 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
             for (int k = 0; k < norder; ++k) {
                 dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
             }
-            power[idx] = MUL(dot, inv_chi2_ref);
+            power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
         }
     }
 
@@ -782,8 +1209,9 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
     return cond ? CHI2PER_OK : nan_count;
 }
 
-static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, FLOAT *power,
-                                     FLOAT *cond) {
+static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
+                                     int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -806,7 +1234,6 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
         return CHI2PER_ERR_ALLOC;
     }
 
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
     INTERNAL_VEC max_cond;
     for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) max_cond[lane] = cond ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD);
     int nan_count = 0;
@@ -844,7 +1271,7 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
             for (int k = 0; k < norder; ++k) {
                 dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
             }
-            power[idx] = MUL(dot, inv_chi2_ref);
+            power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
         }
     }
 
@@ -859,9 +1286,9 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
 }
 
 static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
-                                 FLOAT *power, FLOAT *cond) {
-    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power, cond);
-    if (solver == CHI2PER_SOLVER_SVD) return solve_periodogram_svd_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, power, cond);
+                                 int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, power, cond);
+    if (solver == CHI2PER_SOLVER_SVD) return solve_periodogram_svd_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, power, cond);
 
     const int norder = 2 * degree + 1;
 
@@ -935,7 +1362,6 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
         }
     }
 
-    FLOAT inv_chi2_ref = DIV(FCAST(1.0), chi2_ref);
     int nan_count = 0;
 
     for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
@@ -969,9 +1395,10 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
 
         int singular_lane[INTERNAL_VEC_LEN];
         for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) singular_lane[lane] = 0;
+        INTERNAL_VEC condition_bound;
 
         if (solver == CHI2PER_SOLVER_LEVINSON) {
-            INTERNAL_VEC condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
+            condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
                 if (idx >= N) continue;
@@ -983,7 +1410,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                 }
             }
         } else if (solver == CHI2PER_SOLVER_ZOHAR) {
-            INTERNAL_VEC condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
+            condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
                 if (idx >= N) continue;
@@ -995,7 +1422,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                 }
             }
         } else if (solver == CHI2PER_SOLVER_BAREISS) {
-            INTERNAL_VEC condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
+            condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
                 int idx = base + lane;
                 if (idx >= N) continue;
@@ -1042,7 +1469,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                 FLOAT xi = Xi[k][lane];
                 dot = ADD(dot, ADD(MUL(yr, xr), MUL(yi, xi)));
             }
-            power[idx] = MUL(dot, inv_chi2_ref);
+            power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
         }
     }
 
@@ -1070,11 +1497,14 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
 #endif
 
 int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
-                          FLOAT *power, FLOAT *cond) {
+                          int normalization, FLOAT *power, FLOAT *cond) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
+    if (normalization < TLS_NORM_STANDARD || normalization > TLS_NORM_BAYES) return CHI2PER_ERR_ARGUMENT;
     if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
     if (degree != 1 && solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS &&
         solver != CHI2PER_SOLVER_LDLT && solver != CHI2PER_SOLVER_SVD)
+        return CHI2PER_ERR_SOLVER;
+    if (normalization == TLS_NORM_BAYES && degree > 1 && (solver == CHI2PER_SOLVER_LDLT || solver == CHI2PER_SOLVER_SVD))
         return CHI2PER_ERR_SOLVER;
     if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
 
@@ -1186,13 +1616,22 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     if (status == CHI2PER_OK)
         status = compute_trig_sums(x, yw, M, f0, df, N, degree, block, backend, plan, Syw, Cyw, src_r, src_i, delta_r, delta_i, ladder_levels, out_r, out_i);
 
+    cybenko_model_t cyb = cybenko_model_init(degree, M);
+#if defined(DOUBLE_DOUBLE)
+    FLOAT b = dd_mul(dd_make(0.5, 0.0), dd_make((double)(M - 1 - 2 * degree), 0.0));
+#elif defined(DOUBLE)
+    FLOAT b = 0.5 * (double)(M - 1 - 2 * degree);
+#else
+    FLOAT b = 0.5f * (float)(M - 1 - 2 * degree);
+#endif
+
     if (status == CHI2PER_OK && degree == 1) {
-        status = gls_impl(Sw, Cw, Syw, Cyw, N, ws, yws, chi2_ref, power, cond);
+        status = gls_impl(Sw, Cw, Syw, Cyw, N, ws, yws, chi2_ref, normalization, M, &cyb, b, power, cond);
     } else if (status == CHI2PER_OK) {
 #if defined(DOUBLE_DOUBLE)
-        status = solve_periodogram_dd(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, power, cond);
+        status = solve_periodogram_dd(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, normalization, M, &cyb, b, power, cond);
 #else
-        status = solve_periodogram_vec(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, power, cond);
+        status = solve_periodogram_vec(Sw, Cw, Syw, Cyw, N, degree, solver, chi2_ref, normalization, M, &cyb, b, power, cond);
 #endif
     }
 
