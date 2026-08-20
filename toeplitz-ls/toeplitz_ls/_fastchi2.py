@@ -30,7 +30,7 @@ LIB_PATH = HERE / "tls.so"
 
 _BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4, "svd": 5}
-_NORMALIZATIONS = {"standard", "asymptotic"}
+_NORMALIZATIONS = {"standard": 0, "asymptotic": 1, "nll": 2, "bayes": 3}
 _STATUS_MESSAGES = {
     -1: "invalid argument",
     -2: "invalid backend",
@@ -79,6 +79,7 @@ def _load_library():
         ctypes.c_int,
         ctypes.c_int,
         ctypes.c_int,
+        ctypes.c_int,
         ctypes.POINTER(ctypes.c_float),
         ctypes.POINTER(ctypes.c_float),
     ]
@@ -95,6 +96,7 @@ def _load_library():
         ctypes.c_int,
         ctypes.c_int,
         ctypes.c_int,
+        ctypes.c_int,
         ctypes.POINTER(ctypes.c_double),
         ctypes.POINTER(ctypes.c_double),
     ]
@@ -107,6 +109,7 @@ def _load_library():
         ctypes.c_int,
         ctypes.c_double,
         ctypes.c_double,
+        ctypes.c_int,
         ctypes.c_int,
         ctypes.c_int,
         ctypes.c_int,
@@ -150,8 +153,10 @@ def _check_normalization(normalization):
     if isinstance(normalization, str):
         key = normalization.strip().lower()
         if key in _NORMALIZATIONS:
-            return key
-    raise ValueError("normalization must be 'standard' or 'asymptotic'")
+            return _NORMALIZATIONS[key]
+    if isinstance(normalization, int) and normalization in _NORMALIZATIONS.values():
+        return normalization
+    raise ValueError("normalization must be 'standard', 'asymptotic', 'nll', or 'bayes'")
 
 
 def _check_int(name, value, min_value, max_value=_C_INT_MAX):
@@ -393,16 +398,12 @@ class tlsf:
             nterms,
             backend,
             solver,
+            normalization,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             cond_ptr,
         )
         _raise_status("tlsf_fastchi2", status)
-        if normalization == "standard":
-            power = out
-        else:
-            power = _normalize_numpy_power(
-                out, normalization, t_arr.size, nterms, _numpy_chi2_ref(y_arr, dy_arr)
-            )
+        power = out
         if autonan:
             return power
         return power, cond
@@ -493,16 +494,12 @@ class tls:
             nterms,
             backend,
             solver,
+            normalization,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             cond_ptr,
         )
         _raise_status("tls_fastchi2", status)
-        if normalization == "standard":
-            power = out
-        else:
-            power = _normalize_numpy_power(
-                out, normalization, t_arr.size, nterms, _numpy_chi2_ref(y_arr, dy_arr)
-            )
+        power = out
         if autonan:
             return power
         return power, cond
@@ -616,16 +613,12 @@ class tlsdd:
             nterms,
             backend,
             solver,
+            normalization,
             out,
             cond_ptr,
         )
         _raise_status("tlsdd_fastchi2", status)
         power = [_dd_to_mpf(out[i]) for i in range(Nf)]
-        if normalization != "standard":
-            chi2_ref = _mp_chi2_ref(y_mpf, dy_mpf)
-            power = _normalize_mpf_power(
-                power, normalization, len(t_mpf), nterms, chi2_ref
-            )
         if autonan:
             return power
         condition = [_dd_to_mpf(cond[i]) for i in range(Nf)]
