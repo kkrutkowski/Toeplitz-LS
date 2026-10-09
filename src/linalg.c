@@ -374,8 +374,8 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
     INTERNAL_VEC E = R_r[0];
     INTERNAL_VEC cond_bound = VCONST(1.0);
 
-    x_r[0] = DIV(y_r[0], E);
-    x_i[0] = DIV(y_i[0], E);
+    INTERNAL_VEC inv_E = DIV(VCONST(1.0), E);
+    INTERNAL_VEC r2 = MUL(ADD(MUL(y_r[0], y_r[0]), MUL(y_i[0], y_i[0])), inv_E);
 
     /* a[0] is the leading (unit) coefficient, never modified. */
     a_r[0] = VCONST(1.0);
@@ -393,8 +393,8 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
             lambda_i = ADD(lambda_i, ADD(MUL(rr, ai), MUL(ri, ar)));
         }
 
-        INTERNAL_VEC gamma_r = NEG(DIV(lambda_r, E));
-        INTERNAL_VEC gamma_i = NEG(DIV(lambda_i, E));
+        INTERNAL_VEC gamma_r = NEG(MUL(lambda_r, inv_E));
+        INTERNAL_VEC gamma_i = NEG(MUL(lambda_i, inv_E));
 
         /* ----- snapshot current predictor before order-update */
         for (size_t i = 0; i < k; i++) {
@@ -422,38 +422,23 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
         INTERNAL_VEC abs2_gamma = ADD(MUL(gamma_r, gamma_r), MUL(gamma_i, gamma_i));
         cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_gamma));
         E = MUL(E, SUB(VCONST(1.0), abs2_gamma));
+        inv_E = DIV(VCONST(1.0), E);
 
-        /* ----- RHS residual: mu = y[k] - sum_{i=0}^{k-1} R[k-i] x[i] */
-        INTERNAL_VEC mu_r = y_r[k];
-        INTERNAL_VEC mu_i = y_i[k];
-
-        for (size_t i = 0; i < k; i++) {
-            INTERNAL_VEC rr = R_r[k - i], ri = R_i[k - i];
-            INTERNAL_VEC xr = x_r[i], xi = x_i[i];
-            mu_r = SUB(mu_r, SUB(MUL(rr, xr), MUL(ri, xi)));
-            mu_i = SUB(mu_i, ADD(MUL(rr, xi), MUL(ri, xr)));
+        /* ----- Forward R^2 inner product: xi_k = sum_{i=0}^k a[i] * y[k-i] */
+        INTERNAL_VEC xi_r = y_r[k];
+        INTERNAL_VEC xi_i = y_i[k];
+        for (size_t i = 1; i <= k; i++) {
+            INTERNAL_VEC ar = a_r[i], ai = a_i[i];
+            INTERNAL_VEC yr = y_r[k - i], yi = y_i[k - i];
+            xi_r = ADD(xi_r, SUB(MUL(ar, yr), MUL(ai, yi)));
+            xi_i = ADD(xi_i, ADD(MUL(ar, yi), MUL(ai, yr)));
         }
-
-        INTERNAL_VEC nu_r = DIV(mu_r, E);
-        INTERNAL_VEC nu_i = DIV(mu_i, E);
-
-        /* ----- solution update: x[i] += nu * conj(a[k-i]),  i = 0 … k */
-        /* i = k: a[k-k] = a[0] = 1+0j, so x[k] = nu * 1 */
-        INTERNAL_VEC a0_r = a_r[0];      /* always 1 */
-        INTERNAL_VEC a0_i = NEG(a_i[0]); /* always 0 */
-        x_r[k] = SUB(MUL(nu_r, a0_r), MUL(nu_i, a0_i));
-        x_i[k] = ADD(MUL(nu_r, a0_i), MUL(nu_i, a0_r));
-
-        for (size_t i = 0; i < k; i++) {
-            INTERNAL_VEC ak_r = a_r[k - i];
-            INTERNAL_VEC ak_i = NEG(a_i[k - i]);
-            INTERNAL_VEC tr = SUB(MUL(nu_r, ak_r), MUL(nu_i, ak_i));
-            INTERNAL_VEC ti = ADD(MUL(nu_r, ak_i), MUL(nu_i, ak_r));
-            x_r[i] = ADD(x_r[i], tr);
-            x_i[i] = ADD(x_i[i], ti);
-        }
+        INTERNAL_VEC abs2_xi = ADD(MUL(xi_r, xi_r), MUL(xi_i, xi_i));
+        r2 = ADD(r2, MUL(abs2_xi, inv_E));
     }
 
+    x_r[0] = r2;
+    x_i[0] = VCONST(0.0);
     return cond_bound;
 }
 
@@ -526,14 +511,18 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
         }
     }
 
+    for (size_t k = 0; k < n; k++) {
+        v_r[k] = DIV(VCONST(1.0), D[k]);
+    }
+
     for (size_t i = 0; i < n; i++) {
         w_r[i] = y_r[i];
         w_i[i] = y_i[i];
     }
 
     for (size_t j = 0; j < n; j++) {
-        w_r[j] = DIV(w_r[j], D[j]);
-        w_i[j] = DIV(w_i[j], D[j]);
+        w_r[j] = MUL(w_r[j], v_r[j]);
+        w_i[j] = MUL(w_i[j], v_r[j]);
 
         INTERNAL_VEC wj_r = w_r[j];
         INTERNAL_VEC wj_i = w_i[j];
@@ -548,24 +537,14 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
         }
     }
 
-    for (size_t r = n; r-- > 0;) {
-        INTERNAL_VEC sum_r = VCONST(0.0);
-        INTERNAL_VEC sum_i = VCONST(0.0);
-        size_t row_offset = r * n;
-
-        for (size_t j = r + 1; j < n; j++) {
-            INTERNAL_VEC Uij_r = U_r[row_offset + j];
-            INTERNAL_VEC Uij_i = U_i[row_offset + j];
-            INTERNAL_VEC xj_r = x_r[j];
-            INTERNAL_VEC xj_i = x_i[j];
-
-            sum_r = ADD(sum_r, ADD(MUL(Uij_r, xj_r), MUL(Uij_i, xj_i)));
-            sum_i = ADD(sum_i, SUB(MUL(Uij_r, xj_i), MUL(Uij_i, xj_r)));
-        }
-
-        x_r[r] = SUB(w_r[r], DIV(sum_r, D[r]));
-        x_i[r] = SUB(w_i[r], DIV(sum_i, D[r]));
+    /* Backwards substitution omitted: compute quadratic form R^2 forward-only */
+    INTERNAL_VEC r2 = VCONST(0.0);
+    for (size_t k = 0; k < n; k++) {
+        INTERNAL_VEC w2 = ADD(MUL(w_r[k], w_r[k]), MUL(w_i[k], w_i[k]));
+        r2 = ADD(r2, MUL(w2, D[k]));
     }
+    x_r[0] = r2;
+    x_i[0] = VCONST(0.0);
 
     return cond_bound;
 }
@@ -620,60 +599,82 @@ INTERNAL_VEC TLS(solve_zohar)(size_t n, const INTERNAL_VEC *restrict R_r, const 
         INTERNAL_VEC theta_r = MUL(y_r[i], inv_R0);
         INTERNAL_VEC theta_i = MUL(y_i[i], inv_R0);
 
-        /* ----- eta   = -conj(R[i+1]) / R[0]
-         *                - sum_{k<i} conj(rho_{k+1}) e_hat_prev[k]        */
-        INTERNAL_VEC eta_r = NEG(MUL(R_r[i + 1], inv_R0)); /* -Re(R[i+1])/R[0] */
-        INTERNAL_VEC eta_i = MUL(R_i[i + 1], inv_R0);      /* +Im(R[i+1])/R[0] → -conj */
+        /* ----- eta is only needed if i + 1 < n to prepare the next order */
+        INTERNAL_VEC eta_r = VCONST(0.0);
+        INTERNAL_VEC eta_i = VCONST(0.0);
 
-        for (size_t k = 0; k < i; k++) {
-            INTERNAL_VEC rho_ik_r = MUL(R_r[i - k], inv_R0);
-            INTERNAL_VEC rho_ik_i = MUL(R_i[i - k], inv_R0);
+        if (i + 1 < n) {
+            eta_r = NEG(MUL(R_r[i + 1], inv_R0)); /* -Re(R[i+1])/R[0] */
+            eta_i = MUL(R_i[i + 1], inv_R0);      /* +Im(R[i+1])/R[0] → -conj */
 
-            /* conj(rho_{k+1}) = (R_r[k+1] - j R_i[k+1]) / R[0] */
-            INTERNAL_VEC rho_mk1_r = MUL(R_r[k + 1], inv_R0);
-            INTERNAL_VEC rho_mk1_i = NEG(MUL(R_i[k + 1], inv_R0));
+            for (size_t k = 0; k < i; k++) {
+                INTERNAL_VEC rho_ik_r = MUL(R_r[i - k], inv_R0);
+                INTERNAL_VEC rho_ik_i = MUL(R_i[i - k], inv_R0);
 
-            theta_r = SUB(theta_r, SUB(MUL(s_r[k], rho_ik_r), MUL(s_i[k], rho_ik_i)));
-            theta_i = SUB(theta_i, ADD(MUL(s_r[k], rho_ik_i), MUL(s_i[k], rho_ik_r)));
+                /* conj(rho_{k+1}) = (R_r[k+1] - j R_i[k+1]) / R[0] */
+                INTERNAL_VEC rho_mk1_r = MUL(R_r[k + 1], inv_R0);
+                INTERNAL_VEC rho_mk1_i = NEG(MUL(R_i[k + 1], inv_R0));
 
-            eta_r = SUB(eta_r, SUB(MUL(rho_mk1_r, e_hat_prev_r[k]), MUL(rho_mk1_i, e_hat_prev_i[k])));
-            eta_i = SUB(eta_i, ADD(MUL(rho_mk1_r, e_hat_prev_i[k]), MUL(rho_mk1_i, e_hat_prev_r[k])));
+                theta_r = SUB(theta_r, SUB(MUL(s_r[k], rho_ik_r), MUL(s_i[k], rho_ik_i)));
+                theta_i = SUB(theta_i, ADD(MUL(s_r[k], rho_ik_i), MUL(s_i[k], rho_ik_r)));
+
+                eta_r = SUB(eta_r, SUB(MUL(rho_mk1_r, e_hat_prev_r[k]), MUL(rho_mk1_i, e_hat_prev_i[k])));
+                eta_i = SUB(eta_i, ADD(MUL(rho_mk1_r, e_hat_prev_i[k]), MUL(rho_mk1_i, e_hat_prev_r[k])));
+            }
+        } else {
+            for (size_t k = 0; k < i; k++) {
+                INTERNAL_VEC rho_ik_r = MUL(R_r[i - k], inv_R0);
+                INTERNAL_VEC rho_ik_i = MUL(R_i[i - k], inv_R0);
+
+                theta_r = SUB(theta_r, SUB(MUL(s_r[k], rho_ik_r), MUL(s_i[k], rho_ik_i)));
+                theta_i = SUB(theta_i, ADD(MUL(s_r[k], rho_ik_i), MUL(s_i[k], rho_ik_r)));
+            }
         }
 
-        INTERNAL_VEC t_lam_r = DIV(theta_r, lambda);
-        INTERNAL_VEC t_lam_i = DIV(theta_i, lambda);
-        INTERNAL_VEC e_lam_r = DIV(eta_r, lambda);
-        INTERNAL_VEC e_lam_i = DIV(eta_i, lambda);
+        INTERNAL_VEC inv_lambda = DIV(VCONST(1.0), lambda);
+        INTERNAL_VEC t_lam_r = MUL(theta_r, inv_lambda);
+        INTERNAL_VEC t_lam_i = MUL(theta_i, inv_lambda);
 
-        /* ----- simultaneous update of s and e_hat */
+        /* ----- simultaneous update of s */
         for (size_t k = 0; k < i; k++) {
-            /* s[k] += t_lam * e_hat_prev[k] */
             s_r[k] = ADD(s_r[k], SUB(MUL(t_lam_r, e_hat_prev_r[k]), MUL(t_lam_i, e_hat_prev_i[k])));
             s_i[k] = ADD(s_i[k], ADD(MUL(t_lam_r, e_hat_prev_i[k]), MUL(t_lam_i, e_hat_prev_r[k])));
-
-            /* e_hat[k+1] = e_hat_prev[k] + e_lam * conj(e_hat_prev[i-1-k]) */
-            size_t g_idx = i - 1 - k;
-            INTERNAL_VEC g_r = e_hat_prev_r[g_idx];
-            INTERNAL_VEC g_i = NEG(e_hat_prev_i[g_idx]);
-
-            e_hat_r[k + 1] = ADD(e_hat_prev_r[k], SUB(MUL(e_lam_r, g_r), MUL(e_lam_i, g_i)));
-            e_hat_i[k + 1] = ADD(e_hat_prev_i[k], ADD(MUL(e_lam_r, g_i), MUL(e_lam_i, g_r)));
         }
 
         s_r[i] = t_lam_r;
         s_i[i] = t_lam_i;
-        e_hat_r[0] = e_lam_r;
-        e_hat_i[0] = e_lam_i;
 
-        /* ----- lambda update */
-        INTERNAL_VEC eta_mag_sq = ADD(MUL(eta_r, eta_r), MUL(eta_i, eta_i));
-        /* The final update prepares the next order, so it is not part of this n-by-n solve. */
         if (i + 1 < n) {
+            INTERNAL_VEC e_lam_r = MUL(eta_r, inv_lambda);
+            INTERNAL_VEC e_lam_i = MUL(eta_i, inv_lambda);
+
+            for (size_t k = 0; k < i; k++) {
+                size_t g_idx = i - 1 - k;
+                INTERNAL_VEC g_r = e_hat_prev_r[g_idx];
+                INTERNAL_VEC g_i = NEG(e_hat_prev_i[g_idx]);
+
+                e_hat_r[k + 1] = ADD(e_hat_prev_r[k], SUB(MUL(e_lam_r, g_r), MUL(e_lam_i, g_i)));
+                e_hat_i[k + 1] = ADD(e_hat_prev_i[k], ADD(MUL(e_lam_r, g_i), MUL(e_lam_i, g_r)));
+            }
+
+            e_hat_r[0] = e_lam_r;
+            e_hat_i[0] = e_lam_i;
+
+            /* ----- lambda update */
             INTERNAL_VEC abs2_reflection = ADD(MUL(e_lam_r, e_lam_r), MUL(e_lam_i, e_lam_i));
             cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_reflection));
+
+            INTERNAL_VEC eta_mag_sq = ADD(MUL(eta_r, eta_r), MUL(eta_i, eta_i));
+            lambda = SUB(lambda, MUL(eta_mag_sq, inv_lambda));
         }
-        lambda = SUB(lambda, DIV(eta_mag_sq, lambda));
     }
+
+    INTERNAL_VEC r2 = VCONST(0.0);
+    for (size_t k = 0; k < n; k++) {
+        r2 = ADD(r2, ADD(MUL(y_r[k], s_r[k]), MUL(y_i[k], s_i[k])));
+    }
+    s_r[0] = r2;
+    s_i[0] = VCONST(0.0);
 
     return cond_bound;
 }

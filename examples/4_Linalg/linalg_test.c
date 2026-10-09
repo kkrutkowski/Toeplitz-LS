@@ -166,15 +166,11 @@ static benchmark_result benchmark_solvers(size_t d, size_t num_systems) {
     result.f_levinson_faster = t_lev < t_zoh;
 
     double num = 0.0, den = 0.0;
-    for (size_t i = 0; i < n; i++) {
-      for (int lane = 0; lane < VECF_LEN; lane++) {
-        double dr = (double)x_lev_r[i][lane] - (double)x_zoh_r[i][lane];
-        double di = (double)x_lev_i[i][lane] - (double)x_zoh_i[i][lane];
-        double lr = (double)x_lev_r[i][lane];
-        double li = (double)x_lev_i[i][lane];
-        num += dr * dr + di * di;
-        den += lr * lr + li * li;
-      }
+    for (int lane = 0; lane < VECF_LEN; lane++) {
+      double dr = (double)x_lev_r[0][lane] - (double)x_zoh_r[0][lane];
+      double lr = (double)x_lev_r[0][lane];
+      num += dr * dr;
+      den += lr * lr;
     }
     print_result("float", n, VECF_LEN, calls, t_lev, t_zoh,
                  sqrt(num / (den + 1e-300)));
@@ -287,15 +283,11 @@ static benchmark_result benchmark_solvers(size_t d, size_t num_systems) {
     result.d_levinson_faster = t_lev < t_zoh;
 
     double num = 0.0, den = 0.0;
-    for (size_t i = 0; i < n; i++) {
-      for (int lane = 0; lane < VEC_LEN; lane++) {
-        double dr = x_lev_r[i][lane] - x_zoh_r[i][lane];
-        double di = x_lev_i[i][lane] - x_zoh_i[i][lane];
-        double lr = x_lev_r[i][lane];
-        double li = x_lev_i[i][lane];
-        num += dr * dr + di * di;
-        den += lr * lr + li * li;
-      }
+    for (int lane = 0; lane < VEC_LEN; lane++) {
+      double dr = x_lev_r[0][lane] - x_zoh_r[0][lane];
+      double lr = x_lev_r[0][lane];
+      num += dr * dr;
+      den += lr * lr;
     }
     print_result("double", n, VEC_LEN, calls, t_lev, t_zoh,
                  sqrt(num / (den + 1e-300)));
@@ -400,14 +392,10 @@ static benchmark_result benchmark_solvers(size_t d, size_t num_systems) {
     result.dd_levinson_faster = t_lev < t_zoh;
 
     double num = 0.0, den = 0.0;
-    for (size_t i = 0; i < n; i++) {
-      double dr = dd_to_double(x_lev_r[i]) - dd_to_double(x_zoh_r[i]);
-      double di = dd_to_double(x_lev_i[i]) - dd_to_double(x_zoh_i[i]);
-      double lr = dd_to_double(x_lev_r[i]);
-      double li = dd_to_double(x_lev_i[i]);
-      num += dr * dr + di * di;
-      den += lr * lr + li * li;
-    }
+    double dr = dd_to_double(x_lev_r[0]) - dd_to_double(x_zoh_r[0]);
+    double lr = dd_to_double(x_lev_r[0]);
+    num += dr * dr;
+    den += lr * lr;
     print_result("double-double", n, 1, calls, t_lev, t_zoh,
                  sqrt(num / (den + 1e-300)));
 
