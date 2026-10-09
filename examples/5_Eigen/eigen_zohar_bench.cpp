@@ -37,6 +37,7 @@ struct ToeplitzSystem {
 struct QuadSolution {
   std::vector<mp_quad> xr;
   std::vector<mp_quad> xi;
+  mp_quad r2;
 };
 
 static double tls_clock(void) {
@@ -90,29 +91,28 @@ static QuadSolution solve_quad_reference(const ToeplitzSystem &sys) {
   QuadSolution ref;
   ref.xr.resize(n);
   ref.xi.resize(n);
+  mp_quad r2 = 0;
   for (int i = 0; i < n; i++) {
     ref.xr[i] = x(i);
     ref.xi[i] = x(n + i);
+    r2 += mp_quad(sys.Yr[i]) * x(i) + mp_quad(sys.Yi[i]) * x(n + i);
   }
+  ref.r2 = r2;
   return ref;
 }
 
 template <typename Scalar>
 static double
-rel_error_block_solution(const Eigen::Matrix<Scalar, Eigen::Dynamic, 1> &x,
-                         const QuadSolution &ref) {
+rel_error_block_r2(const ToeplitzSystem &sys,
+                   const Eigen::Matrix<Scalar, Eigen::Dynamic, 1> &x,
+                   const QuadSolution &ref) {
   const int n = (int)ref.xr.size();
-  mp_quad num = 0;
-  mp_quad den = 0;
+  mp_quad r2_val = 0;
   for (int i = 0; i < n; i++) {
-    const mp_quad xr = mp_quad(x(i));
-    const mp_quad xi = mp_quad(x(n + i));
-    const mp_quad dr = xr - ref.xr[i];
-    const mp_quad di = xi - ref.xi[i];
-    num += dr * dr + di * di;
-    den += ref.xr[i] * ref.xr[i] + ref.xi[i] * ref.xi[i];
+    r2_val += mp_quad(sys.Yr[i]) * mp_quad(x(i)) + mp_quad(sys.Yi[i]) * mp_quad(x(n + i));
   }
-  return std::sqrt((double)(num / (den + mp_quad("1e-300"))));
+  mp_quad dr = r2_val - ref.r2;
+  return std::sqrt((double)((dr * dr) / (ref.r2 * ref.r2 + mp_quad("1e-300"))));
 }
 
 static std::vector<ToeplitzSystem> make_fastchi2_systems(int nterms,
@@ -253,14 +253,10 @@ static void benchmark_float(int n, const std::vector<ToeplitzSystem> &systems,
   for (int s = 0; s < (int)systems.size(); s++) {
     const int call = s / lanes;
     const int lane = s % lanes;
-    for (int k = 0; k < n; k++) {
-      const mp_quad xr = (double)Xr[call * n + k][lane];
-      const mp_quad xi = (double)Xi[call * n + k][lane];
-      const mp_quad dr = xr - refs[s].xr[k];
-      const mp_quad di = xi - refs[s].xi[k];
-      z_num += dr * dr + di * di;
-      z_den += refs[s].xr[k] * refs[s].xr[k] + refs[s].xi[k] * refs[s].xi[k];
-    }
+    const mp_quad r2_z = (double)Xr[call * n + 0][lane];
+    const mp_quad dr = r2_z - refs[s].r2;
+    z_num += dr * dr;
+    z_den += refs[s].r2 * refs[s].r2;
 
     t0 = tls_clock();
     auto x_qr = solve_eigen_block<float>(systems[s], false);
@@ -269,8 +265,8 @@ static void benchmark_float(int n, const std::vector<ToeplitzSystem> &systems,
     auto x_ldlt = solve_eigen_block<float>(systems[s], true);
     t_ldlt += tls_clock() - t0;
 
-    const double e_qr = rel_error_block_solution(x_qr, refs[s]);
-    const double e_ldlt = rel_error_block_solution(x_ldlt, refs[s]);
+    const double e_qr = rel_error_block_r2(systems[s], x_qr, refs[s]);
+    const double e_ldlt = rel_error_block_r2(systems[s], x_ldlt, refs[s]);
     qr_num += mp_quad(e_qr) * mp_quad(e_qr);
     qr_den += 1;
     ldlt_num += mp_quad(e_ldlt) * mp_quad(e_ldlt);
@@ -325,14 +321,10 @@ static void benchmark_double(int n, const std::vector<ToeplitzSystem> &systems,
   for (int s = 0; s < (int)systems.size(); s++) {
     const int call = s / lanes;
     const int lane = s % lanes;
-    for (int k = 0; k < n; k++) {
-      const mp_quad xr = Xr[call * n + k][lane];
-      const mp_quad xi = Xi[call * n + k][lane];
-      const mp_quad dr = xr - refs[s].xr[k];
-      const mp_quad di = xi - refs[s].xi[k];
-      z_num += dr * dr + di * di;
-      z_den += refs[s].xr[k] * refs[s].xr[k] + refs[s].xi[k] * refs[s].xi[k];
-    }
+    const mp_quad r2_z = Xr[call * n + 0][lane];
+    const mp_quad dr = r2_z - refs[s].r2;
+    z_num += dr * dr;
+    z_den += refs[s].r2 * refs[s].r2;
 
     t0 = tls_clock();
     auto x_qr = solve_eigen_block<double>(systems[s], false);
@@ -341,8 +333,8 @@ static void benchmark_double(int n, const std::vector<ToeplitzSystem> &systems,
     auto x_ldlt = solve_eigen_block<double>(systems[s], true);
     t_ldlt += tls_clock() - t0;
 
-    const double e_qr = rel_error_block_solution(x_qr, refs[s]);
-    const double e_ldlt = rel_error_block_solution(x_ldlt, refs[s]);
+    const double e_qr = rel_error_block_r2(systems[s], x_qr, refs[s]);
+    const double e_ldlt = rel_error_block_r2(systems[s], x_ldlt, refs[s]);
     qr_num += mp_quad(e_qr) * mp_quad(e_qr);
     qr_den += 1;
     ldlt_num += mp_quad(e_ldlt) * mp_quad(e_ldlt);
@@ -391,14 +383,10 @@ static void benchmark_dd(int n, const std::vector<ToeplitzSystem> &systems,
   mp_quad z_num = 0, z_den = 0, ldlt_num = 0, ldlt_den = 0;
   double t_qr = 0.0, t_ldlt = 0.0;
   for (int s = 0; s < calls; s++) {
-    for (int k = 0; k < n; k++) {
-      const mp_quad xr = dd_to_mp_quad(Xr[s * n + k]);
-      const mp_quad xi = dd_to_mp_quad(Xi[s * n + k]);
-      const mp_quad dr = xr - refs[s].xr[k];
-      const mp_quad di = xi - refs[s].xi[k];
-      z_num += dr * dr + di * di;
-      z_den += refs[s].xr[k] * refs[s].xr[k] + refs[s].xi[k] * refs[s].xi[k];
-    }
+    const mp_quad r2_z = dd_to_mp_quad(Xr[s * n + 0]);
+    const mp_quad dr = r2_z - refs[s].r2;
+    z_num += dr * dr;
+    z_den += refs[s].r2 * refs[s].r2;
 
     t0 = tls_clock();
     (void)solve_eigen_block<mp_quad>(systems[s], false);
@@ -407,7 +395,7 @@ static void benchmark_dd(int n, const std::vector<ToeplitzSystem> &systems,
     auto x_ldlt = solve_eigen_block<mp_quad>(systems[s], true);
     t_ldlt += tls_clock() - t0;
 
-    const double e_ldlt = rel_error_block_solution(x_ldlt, refs[s]);
+    const double e_ldlt = rel_error_block_r2(systems[s], x_ldlt, refs[s]);
     ldlt_num += mp_quad(e_ldlt) * mp_quad(e_ldlt);
     ldlt_den += 1;
   }

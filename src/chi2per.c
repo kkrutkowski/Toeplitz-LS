@@ -1108,8 +1108,7 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
             continue;
         }
 
-        FLOAT dot = FCAST(0.0);
-        for (int k = 0; k < norder; ++k) dot = ADD(dot, ADD(MUL(Yr[k], Xr[k]), MUL(Yi[k], Xi[k])));
+        FLOAT dot = Xr[0];
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
@@ -1461,14 +1460,11 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             if (idx >= N) continue;
             if (singular_lane[lane]) continue;
 
-            FLOAT dot = FCAST(0.0);
-            for (int k = 0; k < norder; ++k) {
-                FLOAT yr = Yr[k][lane];
-                FLOAT yi = Yi[k][lane];
-                FLOAT xr = Xr[k][lane];
-                FLOAT xi = Xi[k][lane];
-                dot = ADD(dot, ADD(MUL(yr, xr), MUL(yi, xi)));
-            }
+#if defined(DOUBLE_DOUBLE)
+            FLOAT dot = Xr[0];
+#else
+            FLOAT dot = Xr[0][lane];
+#endif
             power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
         }
     }
