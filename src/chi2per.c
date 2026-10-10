@@ -64,9 +64,9 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define CHI2_PSWF21_GAMMA DD_PSWF21_GAMMA
 #    define CHI2_PSWF43_BETA DD_PSWF43_BETA
 #    define CHI2_PSWF43_GAMMA DD_PSWF43_GAMMA
-#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e22
-#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e22
-#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e22
+#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e26
+#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e26
+#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e26
 #    define COND_SINGULARITY_THRESHOLD_LDLT 1e10
 #    define COND_SINGULARITY_THRESHOLD_SVD 1e16
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
@@ -101,9 +101,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF21_GAMMA D_PSWF21_GAMMA
 #        define CHI2_PSWF43_BETA D_PSWF43_BETA
 #        define CHI2_PSWF43_GAMMA D_PSWF43_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e11
-#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e11
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e11
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e13
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e13
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e13
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e5
 #        define COND_SINGULARITY_THRESHOLD_SVD 1e8
 #    else
@@ -133,9 +133,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF21_GAMMA F_PSWF21_GAMMA
 #        define CHI2_PSWF43_BETA F_PSWF43_BETA
 #        define CHI2_PSWF43_GAMMA F_PSWF43_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e4
-#        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e4
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 5e4
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e5
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e5
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 5e5
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e2
 #        define COND_SINGULARITY_THRESHOLD_SVD 1e3
 #    endif
@@ -833,18 +833,19 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
         double abs2_d = TO_DOUBLE(abs2);
         if (abs2_d >= 1.0) abs2_d = 0.999999999999999;
         double abs_refl = sqrt(abs2_d);
-        condition_bound = dd_div(dd_add(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)),
-                                 dd_sub(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)));
+        condition_bound = dd_mul(dd_make(3.0, 0.0),
+                                 dd_div(dd_add(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)),
+                                        dd_sub(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0))));
 #elif defined(DOUBLE)
         double abs2_d = abs2;
         if (abs2_d >= 1.0) abs2_d = 0.999999999999999;
         double abs_refl = sqrt(abs2_d);
-        condition_bound = (1.0 + abs_refl) / (1.0 - abs_refl);
+        condition_bound = 3.0 * ((1.0 + abs_refl) / (1.0 - abs_refl));
 #else
         float abs2_f = abs2;
         if (abs2_f >= 1.0f) abs2_f = 0.9999999f;
         float abs_refl = sqrtf(abs2_f);
-        condition_bound = (1.0f + abs_refl) / (1.0f - abs_refl);
+        condition_bound = 3.0f * ((1.0f + abs_refl) / (1.0f - abs_refl));
 #endif
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, 1, M, cyb, b);
         if (cond) cond[idx] = condition_bound;
