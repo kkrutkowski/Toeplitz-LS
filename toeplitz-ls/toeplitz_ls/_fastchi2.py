@@ -1,8 +1,21 @@
 """ctypes wrappers for the FastChi2/AoVMH(W) least-squares periodogram.
 
-The bundled shared library returns the standard normalized power, i.e. the
-coefficient of determination R^2. This module can also transform that result
-to the asymptotic AOV-style normalization used by ``lcperiod.c``.
+The bundled shared library evaluates four periodogram normalizations:
+
+``standard`` (default)
+    Coefficient of determination :math:`R^2`.
+``anova``
+    ANOVA / F statistic, following Schwarzenberg-Czerny's convention.
+``nll``
+    Negative log false-alarm probability, natural logarithm:
+    :math:`-\\ln(\\mathrm{FAP})`.  This is the statistic used by
+    ``ihsnpeaks`` for IHS (its ``raw`` mode).
+``regularized``
+    Laplace-regularized Cybenko statistic, matching ``ihsnpeaks``'s
+    ``bayes`` / Relative Evidence Ratio.  For ``nterms > 1`` it requires a
+    Toeplitz solver.  The ``cond`` array returned by ``power()`` is the
+    condition upper bound ``(2 * nterms + 1) * P``; this normalization uses
+    the Cybenko product ``P``.
 
 The library is loaded with ``ctypes.CDLL``. On CPython, ctypes releases the GIL
 while calling functions from CDLL instances, so independent native
@@ -30,7 +43,15 @@ LIB_PATH = HERE / "tls.so"
 
 _BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4, "svd": 5}
-_NORMALIZATIONS = {"standard": 0, "asymptotic": 1, "nll": 2, "bayes": 3}
+_NORMALIZATIONS = {
+    "standard": 0,
+    "anova": 1,
+    "nll": 2,
+    "regularized": 3,
+    # Legacy aliases, intentionally undocumented:
+    "asymptotic": 1,
+    "bayes": 3,
+}
 _STATUS_MESSAGES = {
     -1: "invalid argument",
     -2: "invalid backend",
@@ -156,7 +177,7 @@ def _check_normalization(normalization):
             return _NORMALIZATIONS[key]
     if isinstance(normalization, int) and normalization in _NORMALIZATIONS.values():
         return normalization
-    raise ValueError("normalization must be 'standard', 'asymptotic', 'nll', or 'bayes'")
+    raise ValueError("normalization must be 'standard', 'anova', 'nll', or 'regularized'")
 
 
 def _check_int(name, value, min_value, max_value=_C_INT_MAX):
@@ -260,34 +281,6 @@ def _check_observation_count(num_observations, nterms):
         )
 
 
-def _asymptotic_dofs(num_observations, nterms):
-    d1 = 2 * nterms + 1
-    d2 = num_observations - 1 - d1
-    if d2 <= 0:
-        raise ValueError(
-            "asymptotic normalization requires more than 2 * nterms + 2 observations"
-        )
-    return d1, d2
-
-
-def _numpy_chi2_ref(y_arr, dy_arr):
-    w_arr = np.reciprocal(dy_arr * dy_arr)
-    ymean = np.sum(w_arr * y_arr) / np.sum(w_arr)
-    yc_arr = y_arr - ymean
-    return np.sum(yc_arr * yc_arr * w_arr)
-
-
-def _normalize_numpy_power(power, normalization, num_observations, nterms, chi2_ref):
-    if normalization == "standard":
-        return power
-
-    d1, d2 = _asymptotic_dofs(num_observations, nterms)
-    dot = power * chi2_ref
-    residual = np.maximum(chi2_ref - dot, 1e-32)
-    scaled = (d2 * dot) / (d1 * residual)
-    return scaled.astype(power.dtype, copy=False)
-
-
 def _raise_status(name, status):
     if status < 0:
         message = _STATUS_MESSAGES.get(status, f"status {status}")
@@ -330,29 +323,6 @@ def _dd_to_mpf(value):
     return mp.mpf(value.hi) + mp.mpf(value.lo)
 
 
-def _mp_chi2_ref(y_mpf, dy_mpf):
-    mp = _require_mpmath()
-    weights = [1 / (value * value) for value in dy_mpf]
-    weight_sum = mp.fsum(weights)
-    ymean = mp.fsum(w * y for w, y in zip(weights, y_mpf)) / weight_sum
-    return mp.fsum(w * (y - ymean) ** 2 for w, y in zip(weights, y_mpf))
-
-
-def _normalize_mpf_power(power, normalization, num_observations, nterms, chi2_ref):
-    if normalization == "standard":
-        return power
-
-    mp = _require_mpmath()
-    d1, d2 = _asymptotic_dofs(num_observations, nterms)
-    floor = mp.mpf("1e-32")
-    result = []
-    for value in power:
-        dot = value * chi2_ref
-        residual = max(chi2_ref - dot, floor)
-        result.append(d2 * dot / (d1 * residual))
-    return result
-
-
 class tlsf:
     """Single-precision FastChi2 periodogram wrapper."""
 
@@ -371,7 +341,11 @@ class tlsf:
         *,
         autonan=True,
     ):
-        """Return periodogram power on the grid ``f0 + df * arange(Nf)``."""
+        """Return periodogram power on the grid ``f0 + df * arange(Nf)``.
+
+        ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
+        ``'nll'``, or ``'regularized'``.
+        """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
         min_Nf = 32 if backend == _BACKENDS["lra"] else 16
@@ -423,7 +397,11 @@ class tlsf:
         *,
         autonan=True,
     ):
-        """Return automatic frequency and power arrays."""
+        """Return automatic frequency and power arrays.
+
+        ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
+        ``'nll'``, or ``'regularized'``.
+        """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
@@ -468,7 +446,11 @@ class tls:
         *,
         autonan=True,
     ):
-        """Return periodogram power on the grid ``f0 + df * arange(Nf)``."""
+        """Return periodogram power on the grid ``f0 + df * arange(Nf)``.
+
+        ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
+        ``'nll'``, or ``'regularized'``.
+        """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=8)
@@ -519,7 +501,11 @@ class tls:
         *,
         autonan=True,
     ):
-        """Return automatic double-precision frequency and power arrays."""
+        """Return automatic double-precision frequency and power arrays.
+
+        ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
+        ``'nll'``, or ``'regularized'``.
+        """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
@@ -564,7 +550,11 @@ class tlsdd:
         *,
         autonan=True,
     ):
-        """Return high-precision periodogram power."""
+        """Return high-precision periodogram power.
+
+        ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
+        ``'nll'``, or ``'regularized'``.
+        """
         mp = _require_mpmath()
         normalization = _check_normalization(normalization)
         Nf = _check_int("Nf", Nf, 1)
@@ -639,7 +629,11 @@ class tlsdd:
         *,
         autonan=True,
     ):
-        """Return automatic high-precision frequency and power lists."""
+        """Return automatic high-precision frequency and power lists.
+
+        ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
+        ``'nll'``, or ``'regularized'``.
+        """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)

@@ -29,6 +29,7 @@
 
 #if defined(DOUBLE_DOUBLE)
 #    define VCONST(x) FCONST(x)
+#    define VCAST(x)  FCAST(x)
 static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return FCAST(sqrt(TO_DOUBLE(abs2))); }
 #else
 static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
@@ -37,6 +38,7 @@ static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
     return v;
 }
 #    define VCONST(x) TLS(vec_splat)(FCONST(x))
+#    define VCAST(x)  TLS(vec_splat)(FCAST(x))
 static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return M_SQRT(abs2); }
 #endif
 
@@ -372,7 +374,7 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
                                  const INTERNAL_VEC *restrict y_i, INTERNAL_VEC *restrict x_r, INTERNAL_VEC *restrict x_i, INTERNAL_VEC *restrict a_r,
                                  INTERNAL_VEC *restrict a_i, INTERNAL_VEC *restrict a_prev_r, INTERNAL_VEC *restrict a_prev_i) {
     INTERNAL_VEC E = R_r[0];
-    INTERNAL_VEC cond_bound = VCONST(1.0);
+    INTERNAL_VEC cond_bound = VCAST((double)n);
 
     INTERNAL_VEC inv_E = DIV(VCONST(1.0), E);
     INTERNAL_VEC r2 = MUL(ADD(MUL(y_r[0], y_r[0]), MUL(y_i[0], y_i[0])), inv_E);
@@ -461,7 +463,7 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
                                 const INTERNAL_VEC *restrict y_i, INTERNAL_VEC *restrict x_r, INTERNAL_VEC *restrict x_i, INTERNAL_VEC *restrict U_r,
                                 INTERNAL_VEC *restrict U_i, INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict u_r, INTERNAL_VEC *restrict u_i,
                                 INTERNAL_VEC *restrict v_r, INTERNAL_VEC *restrict v_i, INTERNAL_VEC *restrict w_r, INTERNAL_VEC *restrict w_i) {
-    INTERNAL_VEC cond_bound = VCONST(1.0);
+    INTERNAL_VEC cond_bound = VCAST((double)n);
 
     for (size_t j = 0; j < n; j++) {
         u_r[j] = R_r[j];
@@ -584,8 +586,8 @@ INTERNAL_VEC TLS(solve_zohar)(size_t n, const INTERNAL_VEC *restrict R_r, const 
     /* lambda = 1 - |rho_{-1}|^2 */
     INTERNAL_VEC abs2_rho_m1 = ADD(MUL(rho_m1_r, rho_m1_r), MUL(rho_m1_i, rho_m1_i));
     INTERNAL_VEC lambda = SUB(VCONST(1.0), abs2_rho_m1);
-    INTERNAL_VEC cond_bound = VCONST(1.0);
-    if (n > 1) cond_bound = TLS(reflection_condition_step)(abs2_rho_m1);
+    INTERNAL_VEC cond_bound = VCAST((double)n);
+    if (n > 1) cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_rho_m1));
 
     for (size_t i = 1; i < n; i++) {
         /* ----- snapshot backwards predictor */
