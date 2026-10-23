@@ -17,6 +17,34 @@ pip3 install .
 
 The toeplitz-ls package exposes three submodules, each targeting a different precision level. The single-precision (tlsf) and double-precision (tls) submodules accept and return NumPy arrays. The double-double module (tlsdd) relies on compensated arithmetic and operates on a 106-bit mantissa; it uses Mpmath's mpf type to bridge the gap between the library's internal representation and Python's native numeric types. The get_peaks helper can turn a periodogram into a sorted, interpolated peak list for printing or saving.
 
+## Normalizations
+
+`power()` and `autopower()` accept `normalization=`:
+
+| value | output | notes |
+|---|---|---|
+| `"standard"` (default) | coefficient of determination `R^2` | |
+| `"anova"` | ANOVA / `F` statistic | Schwarzenberg-Czerny's ANOVA convention |
+| `"nll"` | natural negative log false-alarm probability | `-ln(FAP)`|
+| `"regularized"` | nll Laplace-regularized by Cybenko statistic |
+
+For `nterms = d` harmonics, with `b = (M - 1 - 2d) / 2`:
+
+- `anova`: `F = (d2 / d1) * R^2 / (1 - R^2)`, `d1 = 2d + 1`, `d2 = M - 1 - d1`.
+- `nll`: `NLL = -b*ln(1 - R^2) - ln(S_d(R^2, b))`, where
+  `S_d(R^2, b) = sum_{k=0}^{d-1} (b)_k / k! * (R^2)^k`. The logarithm is
+  natural, not base-10.
+- `regularized`: with `P` the Cybenko reflection-coefficient product and
+  `delta = NLL_data - NLL_cond(P)`, the output is `delta + ln(2)` when
+  `delta >= 0`, otherwise `-ln(1 - exp(delta) / 2)`.
+
+For `nterms > 1`, `regularized` requires one of the Toeplitz solvers
+(`levinson`, `zohar`, `bareiss`), because it needs the reflection-coefficient
+product. `ldlt` and `svd` raise `RuntimeError` for this combination.
+
+The `cond` array returned when `autonan=False` is the Toeplitz condition upper
+bound `(2*nterms + 1) * P`, not `P`; `regularized` internally uses `P`.
+
 ## [Free-threaded (GIL-free) Python](https://docs.python.org/3/howto/free-threading-python.html) support
 toeplitz-ls is compatible with free-threaded CPython (PEP 703, available as an optional build since Python 3.13). With the GIL disabled, ThreadPoolExecutor-based batch processing achieves true parallelism without the overhead of multiprocessing — no serialisation, no inter-process memory duplication. 
 
@@ -25,7 +53,7 @@ Note that Mpmath is not thread-safe by default; when using tlsdd in a multithrea
 ## NaN handling
 When the system matrix at a given frequency is numerically unstable, the solver returns NaN rather than raising an exception. Use np.nanargmax() and np.nanmax() in place of their standard counterparts to safely recover the peak frequency and power without short-circuiting on degenerate bins.
 
-For manual filtering, call power() or autopower() with autonan=False to receive rough conditionality estimates alongside the periodogram. These estimates are solver-specific: LDLT reports a diagonal-ratio estimate, while the three Toeplitz solvers (levinson, zohar, and bareiss) return a reflection-coefficient-based upper bound. The Toeplitz estimates are generally much higher (and more reliable) for the same frequencies, so threshold values should be chosen with the solver family in mind.
+For manual filtering, call power() or autopower() with autonan=False to receive rough conditionality estimates alongside the periodogram. These estimates are solver-specific: LDLT reports a diagonal-ratio estimate, while the three Toeplitz solvers (levinson, zohar, and bareiss) return a reflection-coefficient-based upper bound `(2*nterms + 1) * P`. The Toeplitz estimates are generally much higher (and more reliable) for the same frequencies, so threshold values should be chosen with the solver family in mind.
 
 ### Example usage of tls and tlsf modules
 ```python
@@ -45,7 +73,7 @@ freq, r2 = tls.autopower(
     nterms=1, # generalized Scargle periodogram
     oversampling=5, #frequency density, relative to a dense, uniform FFT
     backend="pswf43", # or "pswf21", "lra"
-    normalization="standard" # or "asymptotic"
+    normalization="standard" # or "anova", "nll", "regularized"
     )
 
 best_idx = np.nanargmax(r2)
@@ -92,7 +120,7 @@ freq, power, cond = tlsf.autopower(
     nterms=3,
     oversampling=5,
     solver="levinson", # or 'zohar', 'bareiss', 'ldlt', 'svd'
-    normalization="asymptotic",
+    normalization="anova",
     autonan=False,
 )
 

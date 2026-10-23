@@ -44,6 +44,21 @@ y = np.sin(2.0 * np.pi * 0.7 * t)
 frequency, power = tls.autopower(t, y)
 ```
 
+`power()` and `autopower()` accept `normalization=`:
+
+- `"standard"` (default) - coefficient of determination `R^2`.
+- `"anova"` - ANOVA / `F` statistic, following Schwarzenberg-Czerny's convention.
+- `"nll"` - natural-log negative log false-alarm probability, `-ln(FAP)`.
+  This is the statistic used by ihsnpeaks for IHS (`raw`).
+- `"regularized"` - Laplace-regularized Cybenko statistic, matching
+  ihsnpeaks' `bayes` (Relative Evidence Ratio). For `nterms > 1` it requires
+  a Toeplitz solver (`levinson`, `zohar`, or `bareiss`).
+
+The `cond` array returned with `autonan=False` is the condition upper bound
+`(2*nterms + 1) * P`, where `P` is Cybenko's reflection-coefficient product;
+`"regularized"` uses `P`, not the bound. See the parent README for the
+formulas.
+
 The shared library is loaded with `ctypes.CDLL`, so CPython releases the GIL
 during the C calls. Independent `power()` or `autopower()` calls can therefore
 run concurrently from a `concurrent.futures.ThreadPoolExecutor` while the

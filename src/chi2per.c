@@ -64,9 +64,9 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define CHI2_PSWF21_GAMMA DD_PSWF21_GAMMA
 #    define CHI2_PSWF43_BETA DD_PSWF43_BETA
 #    define CHI2_PSWF43_GAMMA DD_PSWF43_GAMMA
-#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e22
-#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e22
-#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e22
+#    define COND_SINGULARITY_THRESHOLD_LEVINSON 1e26
+#    define COND_SINGULARITY_THRESHOLD_ZOHAR 1e26
+#    define COND_SINGULARITY_THRESHOLD_BAREISS 1e26
 #    define COND_SINGULARITY_THRESHOLD_LDLT 1e10
 #    define COND_SINGULARITY_THRESHOLD_SVD 1e16
 static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
@@ -101,9 +101,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF21_GAMMA D_PSWF21_GAMMA
 #        define CHI2_PSWF43_BETA D_PSWF43_BETA
 #        define CHI2_PSWF43_GAMMA D_PSWF43_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e11
-#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e11
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e11
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e13
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e13
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 1e13
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e5
 #        define COND_SINGULARITY_THRESHOLD_SVD 1e8
 #    else
@@ -133,9 +133,9 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF21_GAMMA F_PSWF21_GAMMA
 #        define CHI2_PSWF43_BETA F_PSWF43_BETA
 #        define CHI2_PSWF43_GAMMA F_PSWF43_GAMMA
-#        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e4
-#        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e4
-#        define COND_SINGULARITY_THRESHOLD_BAREISS 5e4
+#        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e5
+#        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e5
+#        define COND_SINGULARITY_THRESHOLD_BAREISS 5e5
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e2
 #        define COND_SINGULARITY_THRESHOLD_SVD 1e3
 #    endif
@@ -374,10 +374,11 @@ static inline dd_t compute_bayes_laplace_dd(dd_t delta) {
     }
 }
 
-static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb, FLOAT b) {
+static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
+                                          FLOAT b) {
     if (normalization == TLS_NORM_STANDARD) {
         return DIV(dot, chi2_ref);
-    } else if (normalization == TLS_NORM_ASYMPTOTIC) {
+    } else if (normalization == TLS_NORM_ANOVA) {
         double d1 = 2.0 * (double)degree + 1.0;
         double d2 = (double)M - 1.0 - d1;
         dd_t residual = dd_sub(chi2_ref, dot);
@@ -386,10 +387,12 @@ static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condi
     } else if (normalization == TLS_NORM_NLL) {
         dd_t r2 = DIV(dot, chi2_ref);
         return nll_exact_pochhammer_dd(degree, r2, b);
-    } else { /* TLS_NORM_BAYES */
+    } else { /* TLS_NORM_REGULARIZED */
         dd_t r2 = DIV(dot, chi2_ref);
         dd_t nll_r2 = nll_exact_pochhammer_dd(degree, r2, b);
-        dd_t nll_cond = nll_cybenko_dd(condition_bound, cyb, degree);
+        /* condition_bound is (2 * degree + 1) * P; NLL uses the product P. */
+        dd_t kappa = dd_div(condition_bound, dd_make((double)(2 * degree + 1), 0.0));
+        dd_t nll_cond = nll_cybenko_dd(kappa, cyb, degree);
         dd_t delta = dd_sub(nll_r2, nll_cond);
         return compute_bayes_laplace_dd(delta);
     }
@@ -468,7 +471,7 @@ static inline double nll_cybenko_scalar_d(double kappa, const cybenko_model_t *m
 
 static inline double compute_bayes_laplace_d(double delta) {
     if (delta >= 0.0) {
-        return delta + 0.693147180559945309417; // ln(2)
+        return delta + 0.693147180559945309417;  // ln(2)
     } else {
         double exp_delta = exp(delta);
         double inner = 1.0 - 0.5 * exp_delta;
@@ -477,10 +480,11 @@ static inline double compute_bayes_laplace_d(double delta) {
     }
 }
 
-static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb, FLOAT b) {
+static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
+                                          FLOAT b) {
     if (normalization == TLS_NORM_STANDARD) {
         return dot / chi2_ref;
-    } else if (normalization == TLS_NORM_ASYMPTOTIC) {
+    } else if (normalization == TLS_NORM_ANOVA) {
         double d1 = 2.0 * (double)degree + 1.0;
         double d2 = (double)M - 1.0 - d1;
         double residual = chi2_ref - dot;
@@ -489,10 +493,12 @@ static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condi
     } else if (normalization == TLS_NORM_NLL) {
         double r2 = dot / chi2_ref;
         return nll_exact_pochhammer_scalar_d(degree, r2, b);
-    } else { /* TLS_NORM_BAYES */
+    } else { /* TLS_NORM_REGULARIZED */
         double r2 = dot / chi2_ref;
         double nll_r2 = nll_exact_pochhammer_scalar_d(degree, r2, b);
-        double nll_cond = nll_cybenko_scalar_d(condition_bound, cyb, degree);
+        /* condition_bound is (2 * degree + 1) * P; NLL uses the product P. */
+        double kappa = condition_bound / (double)(2 * degree + 1);
+        double nll_cond = nll_cybenko_scalar_d(kappa, cyb, degree);
         double delta = nll_r2 - nll_cond;
         return compute_bayes_laplace_d(delta);
     }
@@ -574,7 +580,7 @@ static inline float nll_cybenko_scalar_f(float kappa, const cybenko_model_t *m, 
 
 static inline float compute_bayes_laplace_f(float delta) {
     if (delta >= 0.0f) {
-        return delta + 0.6931471805599453f; // ln(2)
+        return delta + 0.6931471805599453f;  // ln(2)
     } else {
         float exp_delta = expf(delta);
         float inner = 1.0f - 0.5f * exp_delta;
@@ -583,10 +589,11 @@ static inline float compute_bayes_laplace_f(float delta) {
     }
 }
 
-static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb, FLOAT b) {
+static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
+                                          FLOAT b) {
     if (normalization == TLS_NORM_STANDARD) {
         return dot / chi2_ref;
-    } else if (normalization == TLS_NORM_ASYMPTOTIC) {
+    } else if (normalization == TLS_NORM_ANOVA) {
         float d1 = 2.0f * (float)degree + 1.0f;
         float d2 = (float)M - 1.0f - d1;
         float residual = chi2_ref - dot;
@@ -595,10 +602,12 @@ static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condi
     } else if (normalization == TLS_NORM_NLL) {
         float r2 = dot / chi2_ref;
         return nll_exact_pochhammer_scalar_f(degree, r2, b);
-    } else { /* TLS_NORM_BAYES */
+    } else { /* TLS_NORM_REGULARIZED */
         float r2 = dot / chi2_ref;
         float nll_r2 = nll_exact_pochhammer_scalar_f(degree, r2, b);
-        float nll_cond = nll_cybenko_scalar_f(condition_bound, cyb, degree);
+        /* condition_bound is (2 * degree + 1) * P; NLL uses the product P. */
+        float kappa = condition_bound / (float)(2 * degree + 1);
+        float nll_cond = nll_cybenko_scalar_f(kappa, cyb, degree);
         float delta = nll_r2 - nll_cond;
         return compute_bayes_laplace_f(delta);
     }
@@ -767,12 +776,30 @@ static int compute_trig_sums(const NUFFT_INPUT_T *x, const FLOAT *h, int M, doub
     return CHI2PER_OK;
 }
 
+/* One Cybenko reflection-coefficient factor (1 + |k|) / (1 - |k|). */
+static inline FLOAT reflection_condition_step(FLOAT abs2) {
+    FLOAT abs_refl = M_SQRT(abs2);
+    return DIV(ADD(FCAST(1.0), abs_refl), SUB(FCAST(1.0), abs_refl));
+}
+
+/* Keep |k|^2 strictly below one; NaN also maps to the finite maximum. */
+static inline FLOAT clamp_reflection_abs2(FLOAT abs2) {
+    double value = TO_DOUBLE(abs2);
+#if defined(DOUBLE_DOUBLE) || defined(DOUBLE)
+    const double limit = 0.999999999999999;
+#else
+    const double limit = 0.9999999;
+#endif
+    if (!(value >= 0.0) || value > limit) return FCAST(limit);
+    return abs2;
+}
+
 // Implementation of Generalized Scargle Periodogram using 3d NuFFTs instead of
 // 4 used for generic AoV Solution by: Zechmeister and M. Kurster, A&A 496,
 // 577-584 (2009) Trig identity: Press W.H. and Rybicki, G.B, "Fast algorithm
 // for spectral analysis of unevenly sampled data". ApJ 1:338, p277, 1989
-static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, FLOAT ws, FLOAT yws, FLOAT chi2_ref,
-                    int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, FLOAT ws, FLOAT yws, FLOAT chi2_ref, int normalization, int M,
+                    const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
     FLOAT half = FCAST(0.5);
     FLOAT sqrt_half = M_SQRT(half);
     FLOAT inv_ws = DIV(FCAST(1.0), ws);
@@ -827,25 +854,28 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
         YS = SUB(YS, MUL(MUL(yws, XS), inv_ws));
 
         FLOAT dot = ADD(DIV(MUL(YC, YC), CC), DIV(MUL(YS, YS), SS));
-        FLOAT abs2 = MUL(ADD(MUL(C, C), MUL(S, S)), MUL(inv_ws, inv_ws));
-        FLOAT condition_bound;
-#if defined(DOUBLE_DOUBLE)
-        double abs2_d = TO_DOUBLE(abs2);
-        if (abs2_d >= 1.0) abs2_d = 0.999999999999999;
-        double abs_refl = sqrt(abs2_d);
-        condition_bound = dd_div(dd_add(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)),
-                                 dd_sub(dd_make(1.0, 0.0), dd_make(abs_refl, 0.0)));
-#elif defined(DOUBLE)
-        double abs2_d = abs2;
-        if (abs2_d >= 1.0) abs2_d = 0.999999999999999;
-        double abs_refl = sqrt(abs2_d);
-        condition_bound = (1.0 + abs_refl) / (1.0 - abs_refl);
-#else
-        float abs2_f = abs2;
-        if (abs2_f >= 1.0f) abs2_f = 0.9999999f;
-        float abs_refl = sqrtf(abs2_f);
-        condition_bound = (1.0f + abs_refl) / (1.0f - abs_refl);
-#endif
+        /*
+         * Cybenko product P for the 3x3 Toeplitz matrix
+         * R0 = ws, R1 = C - iS, R2 = C2 - iS2:
+         *   |k1| = |R1| / R0
+         *   |k2| = |R0 R2 - R1^2| / (R0^2 - |R1|^2)
+         * The condition value is n * P with n = 3.
+         */
+        FLOAT c = MUL(C, inv_ws);
+        FLOAT s = MUL(S, inv_ws);
+        FLOAT c2 = MUL(C2, inv_ws);
+        FLOAT s2 = MUL(S2, inv_ws);
+        FLOAT c2_plus_s2 = ADD(MUL(c, c), MUL(s, s));
+        FLOAT k1_abs2 = clamp_reflection_abs2(c2_plus_s2);
+        FLOAT k2_num_r = SUB(ADD(c2, MUL(s, s)), MUL(c, c));
+        FLOAT k2_num_i = SUB(s2, MUL(FCAST(2.0), MUL(c, s)));
+        FLOAT k2_den = SUB(FCAST(1.0), c2_plus_s2);
+        FLOAT max_abs2 = clamp_reflection_abs2(FCAST(10.0));
+        FLOAT k2_abs2 = max_abs2;
+        if (TO_DOUBLE(k2_den) > 0.0) {
+            k2_abs2 = clamp_reflection_abs2(DIV(ADD(MUL(k2_num_r, k2_num_r), MUL(k2_num_i, k2_num_i)), MUL(k2_den, k2_den)));
+        }
+        FLOAT condition_bound = MUL(FCAST(3.0), MUL(reflection_condition_step(k1_abs2), reflection_condition_step(k2_abs2)));
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, 1, M, cyb, b);
         if (cond) cond[idx] = condition_bound;
     }
@@ -854,9 +884,9 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
 }
 
 #if defined(DOUBLE_DOUBLE)
-static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
-                                     int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
+static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, int normalization,
+                                     int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_REGULARIZED) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -912,9 +942,9 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
     return cond ? CHI2PER_OK : nan_count;
 }
 
-static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
-                                    int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
+static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, int normalization,
+                                    int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_REGULARIZED) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -1136,7 +1166,7 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
 #else
 static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
                                       int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
+    if (normalization == TLS_NORM_REGULARIZED) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -1208,9 +1238,9 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
     return cond ? CHI2PER_OK : nan_count;
 }
 
-static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref,
-                                     int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (normalization == TLS_NORM_BAYES) return CHI2PER_ERR_SOLVER;
+static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, int normalization,
+                                     int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
+    if (normalization == TLS_NORM_REGULARIZED) return CHI2PER_ERR_SOLVER;
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
@@ -1460,11 +1490,11 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             if (idx >= N) continue;
             if (singular_lane[lane]) continue;
 
-#if defined(DOUBLE_DOUBLE)
+#    if defined(DOUBLE_DOUBLE)
             FLOAT dot = Xr[0];
-#else
+#    else
             FLOAT dot = Xr[0][lane];
-#endif
+#    endif
             power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
         }
     }
@@ -1495,13 +1525,12 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
 int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
                           int normalization, FLOAT *power, FLOAT *cond) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
-    if (normalization < TLS_NORM_STANDARD || normalization > TLS_NORM_BAYES) return CHI2PER_ERR_ARGUMENT;
+    if (normalization < TLS_NORM_STANDARD || normalization > TLS_NORM_REGULARIZED) return CHI2PER_ERR_ARGUMENT;
     if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
     if (degree != 1 && solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS &&
         solver != CHI2PER_SOLVER_LDLT && solver != CHI2PER_SOLVER_SVD)
         return CHI2PER_ERR_SOLVER;
-    if (normalization == TLS_NORM_BAYES && degree > 1 && (solver == CHI2PER_SOLVER_LDLT || solver == CHI2PER_SOLVER_SVD))
-        return CHI2PER_ERR_SOLVER;
+    if (normalization == TLS_NORM_REGULARIZED && degree > 1 && (solver == CHI2PER_SOLVER_LDLT || solver == CHI2PER_SOLVER_SVD)) return CHI2PER_ERR_SOLVER;
     if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
 
     bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
