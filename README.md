@@ -26,14 +26,13 @@ For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and `autopower()` a
 | `"standard"` (default) | coefficient of determination `R^2` | |
 | `"anova"` | ANOVA / `F` statistic | Schwarzenberg-Czerny's ANOVA convention |
 | `"nll"` | natural negative log false-alarm probability | `-ln(FAP)`|
-| `"regularized"` | nll Laplace-regularized by Cybenko statistic |
+| `"regularized"` | nll Laplace-regularized by Cybenko statistic | Not equivalent to the other normalizations |
 
 For `nterms = d` harmonics, with `b = (M - 1 - 2d) / 2`:
 
 - `anova`: `F = (d2 / d1) * R^2 / (1 - R^2)`, `d1 = 2d + 1`, `d2 = M - 1 - d1`.
 - `nll`: `NLL = -b*ln(1 - R^2) - ln(S_d(R^2, b))`, where
-  `S_d(R^2, b) = sum_{k=0}^{d-1} (b)_k / k! * (R^2)^k`. The logarithm is
-  natural, not base-10.
+  `S_d(R^2, b) = sum_{k=0}^{d-1} (b)_k / k! * (R^2)^k`.
 - `regularized`: with `P` the Cybenko reflection-coefficient product and
   `delta = NLL_data - NLL_cond(P)`, the output is `delta + ln(2)` when
   `delta >= 0`, otherwise `-ln(1 - exp(delta) / 2)`.
@@ -65,7 +64,7 @@ statistics are:
   `R^2` estimates,
   `2 * sum_{k=1}^d |Z_k(f)|^2 / (sum_m w_m * chi2_ref)`.
 - `"nll"`: the IHS negative log false-alarm probability.  Each harmonic power
-  is normalized to the Rayleigh scale and passed through Wilkie's finite-sample
+  is normalized to the Rayleigh Z-test's result and passed through Wilkie's finite-sample
   correction before the harmonics are summed.  The sum is then passed through
   the Erlang correction `S - ln(sum_{k=0}^{d-1} S^k / k!)`.
 
@@ -73,7 +72,7 @@ The IHS path evaluates only `d` NuFFTs instead of the FastChi2 `3d` and
 replaces the `O(d^2)` normal-equation solve with an `O(d)` power
 accumulation. It is statistically weaker than the full multiharmonic
 least-squares periodogram; under uniformly sampled observation times its
-efficiency is approximately `2/pi` of the true chi-square periodogram.
+statistical significance is approximately `2/pi` of the true chi-square periodogram under assumption of the samples coming from an uniform probability distribution.
 
 ## [Free-threaded (GIL-free) Python](https://docs.python.org/3/howto/free-threading-python.html) support
 toeplitz-ls is compatible with free-threaded CPython (PEP 703, available as an optional build since Python 3.13). With the GIL disabled, ThreadPoolExecutor-based batch processing achieves true parallelism without the overhead of multiprocessing — no serialisation, no inter-process memory duplication. 
