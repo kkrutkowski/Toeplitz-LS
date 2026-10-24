@@ -44,6 +44,7 @@ class FileResult:
     filename: str
     source_id: str
     best_frequency: float
+    best_power: float
     failed_spectrum: bool
     user_cpu_seconds: float
 
@@ -108,6 +109,7 @@ def _compute_one(
         curve.t, fmax=fmax, oversampling=oversampling, nterms=nterms
     )
     dy = curve.dy if use_dy else None
+    normalization = getattr(method, "normalization", "standard")
     failed_spectrum = False
 
     started = _thread_user_time()
@@ -120,7 +122,7 @@ def _compute_one(
             curve.y,
             dy,
             nterms=nterms,
-            normalization="standard",
+            normalization=normalization,
             frequency=grid.frequency,
         )
     except np.linalg.LinAlgError:
@@ -131,6 +133,7 @@ def _compute_one(
     finally:
         user_cpu_seconds = _thread_user_time() - started
 
+    best_power = 0.0
     if failed_spectrum:
         best_frequency = 0.0
     else:
@@ -143,11 +146,13 @@ def _compute_one(
             indices = np.flatnonzero(finite)
             best_index = indices[np.argmax(power[finite])]
             best_frequency = float(grid.frequency[best_index])
+            best_power = float(power[best_index])
 
     return FileResult(
         filename=curve.filename,
         source_id=curve.source_id,
         best_frequency=best_frequency,
+        best_power=best_power,
         failed_spectrum=failed_spectrum,
         user_cpu_seconds=user_cpu_seconds,
     )
@@ -256,9 +261,12 @@ def write_output(
             "# cumulative_power_user_cpu_hours\t"
             f"{cumulative_user_cpu_seconds / 3600.0:.12g}\n"
         )
-        output.write("source_id\tbest_frequency\n")
+        output.write("source_id\tbest_frequency\tbest_power\n")
         for row in rows:
-            output.write(f"{row.source_id}\t{row.best_frequency:.12g}\n")
+            output.write(
+                f"{row.source_id}\t{row.best_frequency:.12g}\t"
+                f"{row.best_power:.12g}\n"
+            )
 
 
 def parse_methods(value: str, registry) -> list[str]:

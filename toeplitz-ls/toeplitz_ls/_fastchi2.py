@@ -8,8 +8,9 @@ The bundled shared library evaluates four periodogram normalizations:
     ANOVA / F statistic, following Schwarzenberg-Czerny's convention.
 ``nll``
     Negative log false-alarm probability, natural logarithm:
-    :math:`-\\ln(\\mathrm{FAP})`.  This is the statistic used by
-    ``ihsnpeaks`` for IHS (its ``raw`` mode).
+    :math:`-\\ln(\\mathrm{FAP})`.  This is the exact Pochhammer/incomplete-beta
+    statistic; the separate IHS modules use Wilkie finite-sample corrections
+    on the harmonics followed by an Erlang logarithmic correction.
 ``regularized``
     Laplace-regularized Cybenko statistic, matching ``ihsnpeaks``'s
     ``bayes`` / Relative Evidence Ratio.  For ``nterms > 1`` it requires a
@@ -139,6 +140,51 @@ def _load_library():
         ctypes.POINTER(DD),
     ]
     lib.tlsdd_fastchi2.restype = ctypes.c_int
+
+    lib.tlsf_ihs.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsf_ihs.restype = ctypes.c_int
+
+    lib.tls_ihs.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.tls_ihs.restype = ctypes.c_int
+
+    lib.tlsdd_ihs.argtypes = [
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(DD),
+    ]
+    lib.tlsdd_ihs.restype = ctypes.c_int
 
     _LIB = lib
     return lib

@@ -776,6 +776,157 @@ static int compute_trig_sums(const NUFFT_INPUT_T *x, const FLOAT *h, int M, doub
     return CHI2PER_OK;
 }
 
+/* Erlang logarithmic correction applied after the per-harmonic Wilkie terms. */
+static inline FLOAT ihs_correct_power(FLOAT sum, int degree) {
+#if defined(DOUBLE_DOUBLE)
+    if (TO_DOUBLE(sum) <= 0.0) return dd_make(0.0, 0.0);
+
+    dd_t log_sum = dd_make(1.0, 0.0);
+    dd_t term = dd_make(1.0, 0.0);
+    for (int i = 1; i < degree; ++i) {
+        term = dd_mul(term, dd_div(sum, dd_make((double)i, 0.0)));
+        log_sum = dd_add(log_sum, term);
+    }
+    if (!(log_sum.hi > 0.0) || !isfinite(log_sum.hi)) return dd_make(0.0, 0.0);
+
+    dd_t nll = dd_sub(sum, dd_log(log_sum));
+    return (nll.hi > 0.0 && isfinite(nll.hi)) ? nll : dd_make(0.0, 0.0);
+#else
+    double s = (double)sum;
+    if (!(s > 0.0) || !isfinite(s)) return FCAST(0.0);
+
+    double log_sum = 1.0;
+    double term = 1.0;
+    for (int i = 1; i < degree; ++i) {
+        term *= s / (double)i;
+        log_sum += term;
+    }
+    if (!(log_sum > 0.0) || !isfinite(log_sum)) return FCAST(0.0);
+
+    double nll = s - log(log_sum);
+    return (nll > 0.0 && isfinite(nll)) ? FCAST(nll) : FCAST(0.0);
+#endif
+}
+
+/*
+ * Wilkie's finite-sample Rayleigh correction, applied to one harmonic before
+ * the harmonic powers are summed:
+ *
+ *   P = exp(-Z) [1 + (2Z - Z^2)/(4 N_eff)
+ *                   - (24Z - 132Z^2 + 76Z^3 - 9Z^4)/(288 N_eff^2)]
+ *
+ * and the returned value is Z - ln(bracket).  The quartic expansion is only
+ * valid near the Rayleigh critical region; for large Z the bracket can become
+ * non-positive, in which case the uncorrected Z is used.
+ */
+static inline FLOAT ihs_wilkie_correct_power(FLOAT p, double n_eff) {
+#if defined(DOUBLE_DOUBLE)
+    if (!(TO_DOUBLE(p) > 0.0) || !(n_eff > 0.0) || !isfinite(n_eff)) return p;
+
+    dd_t z = p;
+    dd_t n = dd_make(n_eff, 0.0);
+    dd_t inv_n = dd_div(dd_make(1.0, 0.0), n);
+    dd_t z2 = dd_mul(z, z);
+    dd_t z3 = dd_mul(z2, z);
+    dd_t z4 = dd_mul(z3, z);
+    dd_t term1 = dd_mul(dd_sub(dd_mul(dd_make(2.0, 0.0), z), z2), dd_mul(dd_make(0.25, 0.0), inv_n));
+    dd_t numerator =
+        dd_add(dd_sub(dd_mul(dd_make(24.0, 0.0), z), dd_mul(dd_make(132.0, 0.0), z2)), dd_sub(dd_mul(dd_make(76.0, 0.0), z3), dd_mul(dd_make(9.0, 0.0), z4)));
+    dd_t denominator = dd_mul(dd_make(288.0, 0.0), dd_mul(n, n));
+    dd_t delta = dd_sub(term1, dd_div(numerator, denominator));
+    dd_t one_plus = dd_add(dd_make(1.0, 0.0), delta);
+    if (!(one_plus.hi > 0.0) || !isfinite(one_plus.hi)) return p;
+
+    dd_t corrected = dd_sub(z, dd_log(one_plus));
+    return (corrected.hi > 0.0 && isfinite(corrected.hi)) ? corrected : p;
+#else
+    if (!(n_eff > 0.0) || !isfinite(n_eff)) return p;
+    double z = (double)p;
+    if (!(z > 0.0) || !isfinite(z)) return FCAST(0.0);
+
+    double inv_n = 1.0 / n_eff;
+    double inv_n2 = inv_n * inv_n;
+    double z2 = z * z;
+    double z3 = z2 * z;
+    double z4 = z3 * z;
+    double delta = (2.0 * z - z2) * 0.25 * inv_n;
+    delta -= (24.0 * z - 132.0 * z2 + 76.0 * z3 - 9.0 * z4) * inv_n2 / 288.0;
+    if (!(delta > -1.0) || !isfinite(delta)) return p;
+
+    double corrected = z - log1p(delta);
+    return (corrected > 0.0 && isfinite(corrected)) ? FCAST(corrected) : p;
+#endif
+}
+
+/*
+ * IHS forward sweep.  Unlike compute_trig_sums(), this evaluates only the
+ * weighted signal transform and accumulates either |Z_k(f)|^2 or the
+ * per-harmonic Wilkie-corrected NLL in place.  One NuFFT is executed per
+ * harmonic.
+ */
+static int ihs_power_sweep(const NUFFT_INPUT_T *x, const FLOAT *wy, int M, double f0, double df, int N, int degree, int block, int backend, void *plan,
+                           FLOAT *power, FLOAT *src_r_levels, FLOAT *src_i_levels, FLOAT *delta_r_levels, FLOAT *delta_i_levels, int ladder_levels,
+                           FLOAT *out_r, FLOAT *out_i, int normalization, FLOAT nll_scale, double n_eff) {
+    size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
+
+    for (int idx = 0; idx < N; ++idx) power[idx] = FCAST(0.0);
+
+    for (int q = 1; q <= degree; ++q) {
+        FLOAT qf0 = FCAST((double)q * f0);
+        double qdf = (double)q * df;
+
+        for (int m = 0; m < M; ++m) {
+            NUFFT_INPUT_T xm = x[m];
+            FLOAT c0;
+            FLOAT s0;
+            compute_source_phase(xm, TO_DOUBLE(qf0), &c0, &s0);
+            FLOAT src_r0 = MUL(wy[m], c0);
+            FLOAT src_i0 = MUL(wy[m], s0);
+
+            for (int level = 0; level < ladder_levels; ++level) {
+                size_t idx = (size_t)level * (size_t)M + (size_t)m;
+                src_r_levels[idx] = src_r0;
+                src_i_levels[idx] = src_i0;
+                double advance = tls_twiddle_ladder_advance(block, level);
+                compute_twiddle_delta(backend, xm, qdf, advance, &delta_r_levels[idx], &delta_i_levels[idx]);
+            }
+        }
+
+        for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+            size_t base = block_idx * (size_t)block;
+            int status = execute_nufft_block(plan, backend, src_r_levels, src_i_levels, out_r, out_i, q);
+            if (status != CHI2PER_OK) return status;
+
+            int count = (base + (size_t)block <= (size_t)N) ? block : (int)((size_t)N - base);
+            if (normalization == TLS_NORM_NLL) {
+                for (int k = 0; k < count; ++k) {
+                    FLOAT re = out_r[k];
+                    FLOAT im = out_i[k];
+                    size_t idx = base + (size_t)k;
+                    FLOAT q = MUL(ADD(MUL(re, re), MUL(im, im)), nll_scale);
+                    power[idx] = ADD(power[idx], ihs_wilkie_correct_power(q, n_eff));
+                }
+            } else {
+                for (int k = 0; k < count; ++k) {
+                    FLOAT re = out_r[k];
+                    FLOAT im = out_i[k];
+                    size_t idx = base + (size_t)k;
+                    power[idx] = ADD(power[idx], ADD(MUL(re, re), MUL(im, im)));
+                }
+            }
+
+            if (block_idx + 1 < num_blocks) {
+                int level = tls_twiddle_ladder_carry_level(block_idx + 1, ladder_levels);
+                size_t offset = (size_t)level * (size_t)M;
+                rotate_source_level(src_r_levels + offset, src_i_levels + offset, delta_r_levels + offset, delta_i_levels + offset, M);
+                copy_twiddle_level_down(src_r_levels, src_i_levels, M, level);
+            }
+        }
+    }
+
+    return CHI2PER_OK;
+}
+
 /* One Cybenko reflection-coefficient factor (1 + |k|) / (1 - |k|). */
 static inline FLOAT reflection_condition_step(FLOAT abs2) {
     FLOAT abs_refl = M_SQRT(abs2);
@@ -1673,6 +1824,155 @@ cleanup:
     free(Cw);
     free(Syw);
     free(Cyw);
+    free(src_r);
+    free(src_i);
+    free(delta_r);
+    free(delta_i);
+    free(out_r);
+    free(out_i);
+    return status;
+}
+
+int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                     FLOAT *power) {
+    if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
+    if (normalization != TLS_NORM_STANDARD && normalization != TLS_NORM_NLL) return CHI2PER_ERR_ARGUMENT;
+    if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
+    if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
+
+    bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
+    bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
+    double beta = CHI2_LRA_BETA;
+    double gamma = CHI2_LRA_GAMMA;
+    if (use_pswf43) {
+        beta = CHI2_PSWF43_BETA;
+        gamma = CHI2_PSWF43_GAMMA;
+    } else if (use_pswf) {
+        beta = CHI2_PSWF21_BETA;
+        gamma = CHI2_PSWF21_GAMMA;
+    }
+    int plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
+    if (use_pswf43) plan_block = tls_pswf43_plan_len_from_base(plan_block);
+    int block = use_pswf43 ? tls_pswf43_output_len_for_plan(plan_block) : plan_block;
+    int ladder_levels = tls_twiddle_ladder_levels(N, block);
+
+    FLOAT *w = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
+    FLOAT *wy = (FLOAT *)checked_aligned_malloc((size_t)M, sizeof(FLOAT));
+    NUFFT_INPUT_T *x = (NUFFT_INPUT_T *)checked_aligned_malloc((size_t)M, sizeof(NUFFT_INPUT_T));
+    FLOAT *src_r = (FLOAT *)checked_aligned_malloc((size_t)ladder_levels * (size_t)M, sizeof(FLOAT));
+    FLOAT *src_i = (FLOAT *)checked_aligned_malloc((size_t)ladder_levels * (size_t)M, sizeof(FLOAT));
+    FLOAT *delta_r = (FLOAT *)checked_aligned_malloc((size_t)ladder_levels * (size_t)M, sizeof(FLOAT));
+    FLOAT *delta_i = (FLOAT *)checked_aligned_malloc((size_t)ladder_levels * (size_t)M, sizeof(FLOAT));
+    FLOAT *out_r = (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
+    FLOAT *out_i = (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
+    void *plan = NULL;
+    int status = CHI2PER_OK;
+
+    if (!w || !wy || !x || !src_r || !src_i || !delta_r || !delta_i || !out_r || !out_i) {
+        status = CHI2PER_ERR_ALLOC;
+        goto cleanup;
+    }
+
+    FLOAT ws = FCAST(0.0);
+    FLOAT wy_sum_abs = FCAST(0.0);
+    FLOAT wy_sq_sum = FCAST(0.0);
+    FLOAT sum_w2 = FCAST(0.0);
+    FLOAT wy_mean = FCAST(0.0);
+    TIME_INPUT_T t_mid = MUL(FCONST(0.5), ADD(t[0], t[M - 1]));
+    for (int m = 0; m < M; ++m) {
+        if (TO_DOUBLE(dy[m]) <= 0.0) {
+            status = CHI2PER_ERR_ARGUMENT;
+            goto cleanup;
+        }
+        TIME_INPUT_T centered_t = SUB(t[m], t_mid);
+        FLOAT inv_dy = DIV(FCAST(1.0), dy[m]);
+        w[m] = MUL(inv_dy, inv_dy);
+        ws = ADD(ws, w[m]);
+        sum_w2 = ADD(sum_w2, MUL(w[m], w[m]));
+        wy_mean = ADD(wy_mean, MUL(w[m], y[m]));
+        x[m] = time_to_nufft_input(centered_t);
+    }
+
+    if (TO_DOUBLE(ws) == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT ymean = DIV(wy_mean, ws);
+    FLOAT chi2_ref = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        FLOAT yc = SUB(y[m], ymean);
+        wy[m] = MUL(w[m], yc);
+        wy_sum_abs = ADD(wy_sum_abs, FCAST(M_FABS(wy[m])));
+        wy_sq_sum = ADD(wy_sq_sum, MUL(wy[m], wy[m]));
+        chi2_ref = ADD(chi2_ref, MUL(wy[m], yc));
+    }
+
+    if (TO_DOUBLE(chi2_ref) == 0.0 || TO_DOUBLE(wy_sq_sum) == 0.0 || TO_DOUBLE(wy_sum_abs) == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    /*
+     * standard: 2 * sum_k |Z_k|^2 / (ws * chi2_ref), the sum of the
+     * per-harmonic R^2 contributions under the uncorrelated-term assumption.
+     *
+     * NLL: normalize each harmonic power with
+     * amp_neff / (sum_m |w_m y_m|)^2, apply Wilkie's finite-sample
+     * correction to every harmonic, sum the corrected terms, and finish with
+     * the Erlang correction.
+     */
+    FLOAT standard_scale = DIV(FCAST(2.0), MUL(ws, chi2_ref));
+    FLOAT amp_neff = SUB(DIV(MUL(wy_sum_abs, wy_sum_abs), wy_sq_sum), FCAST(2.0));
+    FLOAT neff = SUB(DIV(MUL(ws, ws), sum_w2), FCAST(2.0));
+    FLOAT norm_neff = (TO_DOUBLE(amp_neff) > 0.0) ? amp_neff : neff;
+    FLOAT nll_scale = FCAST(0.0);
+    if (TO_DOUBLE(norm_neff) > 0.0) nll_scale = DIV(norm_neff, MUL(wy_sum_abs, wy_sum_abs));
+    if (!double_is_finite_bits(TO_DOUBLE(nll_scale)) || TO_DOUBLE(nll_scale) < 0.0) nll_scale = FCAST(0.0);
+
+    if (backend == CHI2PER_BACKEND_PSWF43) {
+        plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W43, df, degree, "43");
+        if (!plan) {
+            status = CHI2PER_ERR_ALLOC;
+            goto cleanup;
+        }
+        NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
+    } else if (backend == CHI2PER_BACKEND_PSWF21) {
+        plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W21, df, degree, "21");
+        if (!plan) {
+            status = CHI2PER_ERR_ALLOC;
+            goto cleanup;
+        }
+        NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
+    } else {
+        plan = NUFFT_LRA_INIT(M, block, NUFFT_RANK, df, degree);
+        if (!plan) {
+            status = CHI2PER_ERR_ALLOC;
+            goto cleanup;
+        }
+        NUFFT_LRA_PRE((LRA_PLAN_T *)plan, x, M, block, NUFFT_RANK);
+    }
+
+    status = ihs_power_sweep(x, wy, M, f0, df, N, degree, block, backend, plan, power, src_r, src_i, delta_r, delta_i, ladder_levels, out_r, out_i,
+                             normalization, nll_scale, TO_DOUBLE(norm_neff));
+
+    if (status == CHI2PER_OK) {
+        if (normalization == TLS_NORM_STANDARD) {
+            for (int idx = 0; idx < N; ++idx) power[idx] = MUL(power[idx], standard_scale);
+        } else {
+            for (int idx = 0; idx < N; ++idx) power[idx] = ihs_correct_power(power[idx], degree);
+        }
+    }
+
+cleanup:
+    if (plan && use_pswf)
+        NUFFT_PSWF_FREE((PSWF_PLAN_T *)plan);
+    else if (plan)
+        NUFFT_LRA_FREE((LRA_PLAN_T *)plan);
+
+    free(w);
+    free(wy);
+    free(x);
     free(src_r);
     free(src_i);
     free(delta_r);

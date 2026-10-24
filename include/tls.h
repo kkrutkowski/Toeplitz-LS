@@ -46,6 +46,31 @@ int tls_fastchi2(const double *t, const double *y, const double *dy, int M, doub
 int tlsdd_fastchi2(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int solver, int normalization,
                    dd_t *power, dd_t *cond);
 
+/*
+ * Incoherent harmonic sum (IHS) periodogram.
+ *
+ * The IHS path uses one NuFFT per harmonic (degree NuFFTs total) and
+ * accumulates |sum_m w_m y_m exp(-2 pi i k f t_m)|^2 directly.  It does not
+ * build or solve the Toeplitz normal equations.  Only two normalizations are
+ * supported:
+ *
+ * TLS_NORM_STANDARD  sum of the uncorrelated per-harmonic R^2 estimates:
+ *                    2 * sum_k |Z_k(f)|^2 / (sum_m w_m * chi2_ref).
+ * TLS_NORM_NLL       IHS NLL: each harmonic power is normalized to the
+ *                    Rayleigh scale and passed through Wilkie's finite-sample
+ *                    correction before the harmonics are summed.  The sum is
+ *                    then passed through the Erlang logarithmic correction
+ *                    sum - ln(sum_{k=0}^{degree-1} sum^k / k!).
+ *
+ * Both entry points return only the power array; IHS has no Toeplitz
+ * condition bound.
+ */
+int tlsf_ihs(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization, float *power);
+
+int tls_ihs(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int normalization, double *power);
+
+int tlsdd_ihs(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int normalization, dd_t *power);
+
 #ifdef __cplusplus
 }
 #endif

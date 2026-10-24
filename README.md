@@ -15,11 +15,11 @@ pip3 install .
 
 ## Usage
 
-The toeplitz-ls package exposes three submodules, each targeting a different precision level. The single-precision (tlsf) and double-precision (tls) submodules accept and return NumPy arrays. The double-double module (tlsdd) relies on compensated arithmetic and operates on a 106-bit mantissa; it uses Mpmath's mpf type to bridge the gap between the library's internal representation and Python's native numeric types. The get_peaks helper can turn a periodogram into a sorted, interpolated peak list for printing or saving.
+The package exposes two periodogram families. The FastChi2/AoVMH modules (`tlsf`, `tls`, `tlsdd`) use the Toeplitz least-squares solve. The IHS modules (`ihsf`, `ihs`, `ihsdd`) use the incoherent harmonic sum: one NuFFT per harmonic, no linear solve, and only the `standard` or `nll` statistic. Each family has single-, double-, and double-double-precision variants. The single- and double-precision variants accept and return NumPy arrays. The double-double variants rely on compensated arithmetic and operate on a 106-bit mantissa; they use Mpmath's mpf type to bridge the gap between the library's internal representation and Python's native numeric types. The `get_peaks` helper can turn a periodogram into a sorted, interpolated peak list for printing or saving.
 
 ## Normalizations
 
-`power()` and `autopower()` accept `normalization=`:
+For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and `autopower()` accept `normalization=`:
 
 | value | output | notes |
 |---|---|---|
@@ -44,6 +44,36 @@ product. `ldlt` and `svd` raise `RuntimeError` for this combination.
 
 The `cond` array returned when `autonan=False` is the Toeplitz condition upper
 bound `(2*nterms + 1) * P`, not `P`; `regularized` internally uses `P`.
+
+## IHS periodogram
+
+The `ihsf`, `ihs`, and `ihsdd` modules expose the same `power()` and
+`autopower()` call shape, but no `solver`, no `autonan`, and no condition
+array:
+
+```python
+from toeplitz_ls import ihs
+
+frequency, power = ihs.autopower(t, y, dy=None, nterms=3, normalization="nll")
+```
+
+With `w_m = 1 / dy_m^2`, `chi2_ref = sum_m w_m (y_m - ymean)^2`, and
+`Z_k(f) = sum_m w_m (y_m - ymean) exp(-2*pi*i*k*f*t_m)`, the supported
+statistics are:
+
+- `"standard"` (default): the sum of the uncorrelated per-harmonic
+  `R^2` estimates,
+  `2 * sum_{k=1}^d |Z_k(f)|^2 / (sum_m w_m * chi2_ref)`.
+- `"nll"`: the IHS negative log false-alarm probability.  Each harmonic power
+  is normalized to the Rayleigh scale and passed through Wilkie's finite-sample
+  correction before the harmonics are summed.  The sum is then passed through
+  the Erlang correction `S - ln(sum_{k=0}^{d-1} S^k / k!)`.
+
+The IHS path evaluates only `d` NuFFTs instead of the FastChi2 `3d` and
+replaces the `O(d^2)` normal-equation solve with an `O(d)` power
+accumulation. It is statistically weaker than the full multiharmonic
+least-squares periodogram; under uniformly sampled observation times its
+efficiency is approximately `2/pi` of the true chi-square periodogram.
 
 ## [Free-threaded (GIL-free) Python](https://docs.python.org/3/howto/free-threading-python.html) support
 toeplitz-ls is compatible with free-threaded CPython (PEP 703, available as an optional build since Python 3.13). With the GIL disabled, ThreadPoolExecutor-based batch processing achieves true parallelism without the overhead of multiprocessing — no serialisation, no inter-process memory duplication. 

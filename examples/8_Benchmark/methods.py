@@ -16,6 +16,7 @@ TOEPLITZ_PYTHON = ROOT / "toeplitz-ls"
 if str(TOEPLITZ_PYTHON) not in sys.path:
     sys.path.insert(0, str(TOEPLITZ_PYTHON))
 
+from toeplitz_ls import ihsf as _ihsf  # noqa: E402
 from toeplitz_ls import tls as _tls  # noqa: E402
 from toeplitz_ls import tlsf as _tlsf  # noqa: E402
 
@@ -119,7 +120,7 @@ def make_frequency_grid(
     return FrequencyGrid(frequency=frequency, Nf=Nf, df=df, f0=f0)
 
 
-def _check_power_request(Nf, df, f0, nterms, normalization):
+def _check_power_request(Nf, df, f0, nterms, normalization, allowed_normalizations=("standard",)):
     Nf = _positive_int("Nf", Nf)
     nterms = _positive_int("nterms", nterms)
     df = _finite_float("df", df)
@@ -128,8 +129,9 @@ def _check_power_request(Nf, df, f0, nterms, normalization):
         raise ValueError("df must be positive")
     if f0 < 0.0:
         raise ValueError("f0 must be non-negative")
-    if normalization != "standard":
-        raise ValueError("comparison adapters support normalization='standard' only")
+    if normalization not in allowed_normalizations:
+        choices = " or ".join(repr(value) for value in allowed_normalizations)
+        raise ValueError(f"comparison adapter supports normalization={choices} only")
     return Nf, df, f0, nterms
 
 
@@ -172,6 +174,7 @@ class Method:
     """Base adapter implementing automatic-grid delegation to ``power``."""
 
     name = ""
+    normalization = "standard"
     max_nterms: int | None = None
 
     def supports(self, nterms: int) -> bool:
@@ -186,8 +189,10 @@ class Method:
         fmax=4,
         oversampling=5,
         nterms=1,
-        normalization="standard",
+        normalization=None,
     ):
+        if normalization is None:
+            normalization = self.normalization
         grid = make_frequency_grid(
             t, fmin=fmin, fmax=fmax, oversampling=oversampling, nterms=nterms
         )
@@ -221,14 +226,60 @@ class TLSMethod(Method):
 class TLSFMethod(Method):
     name = "tlsf"
 
+    def __init__(self, name="tlsf", normalization="standard"):
+        self.name = name
+        self.normalization = normalization
+
     def power(
-        self, Nf, df, f0, t, y, dy=None, nterms=1, normalization="standard", *, frequency=None
+        self, Nf, df, f0, t, y, dy=None, nterms=1, normalization=None, *, frequency=None
     ):
-        Nf, df, f0, nterms = _check_power_request(Nf, df, f0, nterms, normalization)
+        if normalization is None:
+            normalization = self.normalization
+        Nf, df, f0, nterms = _check_power_request(
+            Nf,
+            df,
+            f0,
+            nterms,
+            normalization,
+            allowed_normalizations=("standard", "regularized"),
+        )
         kwargs = {"backend": "pswf43", "nterms": nterms, "normalization": normalization}
         if nterms > 1:
             kwargs["solver"] = "levinson"
         return _tlsf.power(Nf, df, f0, t, y, dy, **kwargs)
+
+
+class IHSFMethod(Method):
+    name = "ihsf"
+
+    def __init__(self, name="ihsf", normalization="standard"):
+        self.name = name
+        self.normalization = normalization
+
+    def power(
+        self, Nf, df, f0, t, y, dy=None, nterms=1, normalization=None, *, frequency=None
+    ):
+        if normalization is None:
+            normalization = self.normalization
+        Nf, df, f0, nterms = _check_power_request(
+            Nf,
+            df,
+            f0,
+            nterms,
+            normalization,
+            allowed_normalizations=("standard", "nll"),
+        )
+        return _ihsf.power(
+            Nf,
+            df,
+            f0,
+            t,
+            y,
+            dy,
+            backend="pswf43",
+            nterms=nterms,
+            normalization=normalization,
+        )
 
 
 class AstropySlowMethod(Method):
@@ -521,6 +572,10 @@ METHODS = {
     for method in (
         TLSMethod(),
         TLSFMethod(),
+        TLSFMethod("tlsf_standard", "standard"),
+        TLSFMethod("tlsf_regularized", "regularized"),
+        IHSFMethod("ihsf_standard", "standard"),
+        IHSFMethod("ihsf_nll", "nll"),
         FastChi2103Method(),
         AoVDISTMethod(),
         AstropySlowMethod(),

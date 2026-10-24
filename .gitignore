@@ -17,7 +17,8 @@ REASONIX.md
 /examples/8_Benchmark/aovdist/
 /examples/8_Benchmark/.unpacked-*
 /examples/8_Benchmark/build/
-/examples/8_Benchmark/out/
+/examples/8_Benchmark/out*/
 /examples/8_Benchmark/phot/
 /examples/8_Benchmark/index.tsv
+/examples/8_Benchmark/index_rrlyr.tsv
 /examples/8_Benchmark/*.tar.xz
