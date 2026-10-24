@@ -52,6 +52,23 @@ class ComparisonMethodTests(unittest.TestCase):
                 _grid, candidate = self.power(name, 3)
                 self.assertEqual(int(np.nanargmax(candidate)), expected_bin)
 
+    def test_ihsf_and_tlsf_benchmark_normalizations(self):
+        grid = make_frequency_grid(self.t, fmax=0.65, oversampling=5, nterms=3)
+        for name in ("tlsf_standard", "tlsf_regularized", "ihsf_standard", "ihsf_nll"):
+            with self.subTest(method=name):
+                power = METHODS[name].power(
+                    grid.Nf,
+                    grid.df,
+                    grid.f0,
+                    self.t,
+                    self.y,
+                    self.dy,
+                    nterms=3,
+                    frequency=grid.frequency,
+                )
+                self.assertTrue(np.all(np.isfinite(power)))
+                self.assertTrue(np.all(np.asarray(power) >= 0.0))
+
     def test_fastchi2_rejects_non_fft_grid_and_documented_high_order(self):
         grid = make_frequency_grid(self.t, fmax=0.65, oversampling=5, nterms=1)
         with self.assertRaises(ValueError):
