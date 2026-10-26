@@ -143,6 +143,38 @@ class TestNormalizations(unittest.TestCase):
                 if norm == "standard":
                     self.assertTrue(np.all((power >= 0.0) & (power < 1.0)))
 
+    def test_d1_fast_path_matches_condition_path(self):
+        """The fast path must not change power when cond is not requested."""
+        # -ffast-math may reassociate the simpler fast loop, so allow a few ULP;
+        # the analytic reference tests below are the hard correctness gate.
+        for mod, rtol, atol in ((tlsf, 1e-6, 1e-9), (tls, 1e-12, 1e-15)):
+            for norm in PRIMARY_NORMALIZATIONS:
+                p_fast = mod.power(
+                    self.nf,
+                    self.df,
+                    self.f0,
+                    self.t,
+                    self.y,
+                    self.dy,
+                    nterms=1,
+                    normalization=norm,
+                    autonan=True,
+                )
+                p_full, cond = mod.power(
+                    self.nf,
+                    self.df,
+                    self.f0,
+                    self.t,
+                    self.y,
+                    self.dy,
+                    nterms=1,
+                    normalization=norm,
+                    autonan=False,
+                )
+                np.testing.assert_allclose(p_fast, p_full, rtol=rtol, atol=atol)
+                self.assertTrue(np.all(np.isfinite(cond)))
+                self.assertTrue(np.all(cond >= 3.0 - 1e-6))
+
     def test_anova_matches_formula(self):
         """Verify ANOVA normalization matches F = (d2 * R2) / (d1 * (1 - R2))."""
         m = self.t.size
