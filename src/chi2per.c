@@ -954,6 +954,12 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
     FLOAT half = FCAST(0.5);
     FLOAT sqrt_half = M_SQRT(half);
     FLOAT inv_ws = DIV(FCAST(1.0), ws);
+    /*
+     * The Cybenko product is consumed only by the regularized normalization
+     * and by callers that explicitly ask for the condition array.  Skip it
+     * for standard/anova/nll on the common autonan=True path.
+     */
+    const bool need_cond = (normalization == TLS_NORM_REGULARIZED) || (cond != NULL);
 
     for (int idx = 0; idx < N; ++idx) {
         FLOAT S = Sw[(size_t)N + idx];
@@ -1005,30 +1011,33 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
         YS = SUB(YS, MUL(MUL(yws, XS), inv_ws));
 
         FLOAT dot = ADD(DIV(MUL(YC, YC), CC), DIV(MUL(YS, YS), SS));
-        /*
-         * Cybenko product P for the 3x3 Toeplitz matrix
-         * R0 = ws, R1 = C - iS, R2 = C2 - iS2:
-         *   |k1| = |R1| / R0
-         *   |k2| = |R0 R2 - R1^2| / (R0^2 - |R1|^2)
-         * The condition value is n * P with n = 3.
-         */
-        FLOAT c = MUL(C, inv_ws);
-        FLOAT s = MUL(S, inv_ws);
-        FLOAT c2 = MUL(C2, inv_ws);
-        FLOAT s2 = MUL(S2, inv_ws);
-        FLOAT c2_plus_s2 = ADD(MUL(c, c), MUL(s, s));
-        FLOAT k1_abs2 = clamp_reflection_abs2(c2_plus_s2);
-        FLOAT k2_num_r = SUB(ADD(c2, MUL(s, s)), MUL(c, c));
-        FLOAT k2_num_i = SUB(s2, MUL(FCAST(2.0), MUL(c, s)));
-        FLOAT k2_den = SUB(FCAST(1.0), c2_plus_s2);
-        FLOAT max_abs2 = clamp_reflection_abs2(FCAST(10.0));
-        FLOAT k2_abs2 = max_abs2;
-        if (TO_DOUBLE(k2_den) > 0.0) {
-            k2_abs2 = clamp_reflection_abs2(DIV(ADD(MUL(k2_num_r, k2_num_r), MUL(k2_num_i, k2_num_i)), MUL(k2_den, k2_den)));
+        FLOAT condition_bound = FCAST(0.0);
+        if (need_cond) {
+            /*
+             * Cybenko product P for the 3x3 Toeplitz matrix
+             * R0 = ws, R1 = C - iS, R2 = C2 - iS2:
+             *   |k1| = |R1| / R0
+             *   |k2| = |R0 R2 - R1^2| / (R0^2 - |R1|^2)
+             * The condition value is n * P with n = 3.
+             */
+            FLOAT c = MUL(C, inv_ws);
+            FLOAT s = MUL(S, inv_ws);
+            FLOAT c2 = MUL(C2, inv_ws);
+            FLOAT s2 = MUL(S2, inv_ws);
+            FLOAT c2_plus_s2 = ADD(MUL(c, c), MUL(s, s));
+            FLOAT k1_abs2 = clamp_reflection_abs2(c2_plus_s2);
+            FLOAT k2_num_r = SUB(ADD(c2, MUL(s, s)), MUL(c, c));
+            FLOAT k2_num_i = SUB(s2, MUL(FCAST(2.0), MUL(c, s)));
+            FLOAT k2_den = SUB(FCAST(1.0), c2_plus_s2);
+            FLOAT max_abs2 = clamp_reflection_abs2(FCAST(10.0));
+            FLOAT k2_abs2 = max_abs2;
+            if (TO_DOUBLE(k2_den) > 0.0) {
+                k2_abs2 = clamp_reflection_abs2(DIV(ADD(MUL(k2_num_r, k2_num_r), MUL(k2_num_i, k2_num_i)), MUL(k2_den, k2_den)));
+            }
+            condition_bound = MUL(FCAST(3.0), MUL(reflection_condition_step(k1_abs2), reflection_condition_step(k2_abs2)));
+            if (cond) cond[idx] = condition_bound;
         }
-        FLOAT condition_bound = MUL(FCAST(3.0), MUL(reflection_condition_step(k1_abs2), reflection_condition_step(k2_abs2)));
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, 1, M, cyb, b);
-        if (cond) cond[idx] = condition_bound;
     }
 
     return CHI2PER_OK;
