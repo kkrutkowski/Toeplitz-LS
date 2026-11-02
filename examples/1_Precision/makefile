@@ -9,7 +9,7 @@ COMMON_CFLAGS := $(CFLAGS) $(INCLUDES)
 
 NANOFFT_OBJS := nanofftf.o nanofft.o nanofftdd.o
 NUFFT_OBJS := tlsf_nufft1.o tls_nufft1.o tlsdd_nufft1.o
-OBJS := $(NANOFFT_OBJS) $(NUFFT_OBJS)
+OBJS := $(NANOFFT_OBJS) $(NUFFT_OBJS) tuning.o
 TARGET := nufft_bench
 
 .PHONY: all bench clean
@@ -37,6 +37,9 @@ tls_nufft1.o: $(ROOT)/src/nufft1.c
 
 tlsdd_nufft1.o: $(ROOT)/src/nufft1.c
 	$(CC) $(COMMON_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+tuning.o: $(ROOT)/src/tuning.c
+	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
 bench: all
 	timeout 90s ./$(TARGET)

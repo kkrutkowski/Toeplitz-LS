@@ -18,7 +18,7 @@ NUFFT_OBJS := tlsf_nufft1.o tls_nufft1.o tlsdd_nufft1.o
 LINALG_OBJS := tlsf_linalg.o tls_linalg.o tlsdd_linalg.o
 CHI2_OBJS := tlsf_chi2per.o tls_chi2per.o tlsdd_chi2per.o
 UTIL_OBJS := utils.o
-OBJS := $(NANOFFT_OBJS) $(NUFFT_OBJS) $(LINALG_OBJS) $(CHI2_OBJS) $(UTIL_OBJS)
+OBJS := $(NANOFFT_OBJS) $(NUFFT_OBJS) $(LINALG_OBJS) $(CHI2_OBJS) $(UTIL_OBJS) tuning.o
 
 .PHONY: all static shared clean
 
@@ -58,6 +58,9 @@ tls_nufft1.o: $(ROOT)/src/nufft1.c
 
 tlsdd_nufft1.o: $(ROOT)/src/nufft1.c
 	$(CC) $(COMMON_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+tuning.o: $(ROOT)/src/tuning.c
+	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
 tlsf_linalg.o: $(ROOT)/src/linalg.c
 	$(CC) $(COMMON_CFLAGS) -c $< -o $@

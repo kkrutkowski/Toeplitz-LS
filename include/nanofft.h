@@ -7,6 +7,46 @@
 /* -------------------------------------------------------------------------
  * SIMD vector width selection
  * ------------------------------------------------------------------------- */
+/*
+ * Fused-twiddle FFT depth, chosen at build time and configurable separately
+ * for each precision:
+ *
+ *   NANOFFT_FFT_FUSE_FLOAT   float pass      (default 3)
+ *   NANOFFT_FFT_FUSE_DOUBLE  double pass     (default 3)
+ *   NANOFFT_FFT_FUSE_DD      double-double   (default 3)
+ *
+ * Each value is the number of radix-2 DIF stages one pass fuses (1 = plain
+ * stage-at-a-time transform, 4 = radix-16 pass).  It is also the maximum the
+ * runtime switch (tls_tuning_set_fft_fuse) can select for that precision, and
+ * only kernels up to that depth are compiled.
+ *
+ *   make FFT_FUSE_FLOAT=2 FFT_FUSE_DOUBLE=4
+ */
+#ifndef NANOFFT_FFT_FUSE_FLOAT
+#    define NANOFFT_FFT_FUSE_FLOAT 3
+#endif
+#ifndef NANOFFT_FFT_FUSE_DOUBLE
+#    define NANOFFT_FFT_FUSE_DOUBLE 3
+#endif
+#ifndef NANOFFT_FFT_FUSE_DD
+#    define NANOFFT_FFT_FUSE_DD 3
+#endif
+
+/* Largest depth any precision may be built with. */
+#ifndef NANOFFT_FFT_FUSE_MAX
+#    define NANOFFT_FFT_FUSE_MAX 4
+#endif
+
+#if NANOFFT_FFT_FUSE_FLOAT < 1 || NANOFFT_FFT_FUSE_FLOAT > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_FUSE_FLOAT must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_FUSE_DOUBLE < 1 || NANOFFT_FFT_FUSE_DOUBLE > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_FUSE_DOUBLE must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_FUSE_DD < 1 || NANOFFT_FFT_FUSE_DD > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_FUSE_DD must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+
 #ifndef VEC_BYTES
 #    ifdef __AVX512F__
 #        define VEC_BYTES 64
@@ -20,6 +60,14 @@
 /* -------------------------------------------------------------------------
  * Fast 2π-periodic trig approximations (Single & Double)
  * ------------------------------------------------------------------------- */
+
+/* Reverse the low `bits` bits of `value`: the FFT's slot -> bin map.  Only
+ * used while plans are built, never in a transform loop. */
+static inline uint32_t nanofft_reverse_bits(uint32_t value, uint32_t bits) {
+    uint32_t out = 0;
+    for (uint32_t b = 0; b < bits; ++b) out = (out << 1) | ((value >> b) & 1u);
+    return out;
+}
 
 static inline float sin2pif(float x) {
     float f = x - (float)((int)x);
@@ -331,7 +379,14 @@ typedef uint32_t VECF_INT __attribute__((vector_size(VEC_BYTES)));
 typedef struct nanofftf_plan nanofftf_plan;
 nanofftf_plan *nanofftf_make_plan(uint32_t N);
 void nanofftf_destroy_plan(nanofftf_plan *plan);
+/* Full transform: Sande-Tukey passes plus bit reversal (frequency order). */
 void nanofftf_execute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
+/* Sande-Tukey passes only: the spectrum stays in the FFT's bit-reversed slot
+ * order, so one permutation can be deferred to a single scalar result array. */
+void nanofftf_execute_raw(nanofftf_plan *plan, float *real_signal, float *imag_signal);
+/* In-place bit reversal of a slot-ordered pair / single array. */
+void nanofftf_permute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
+void nanofftf_permute_1d(nanofftf_plan *plan, float *values);
 
 /* -------------------------------------------------------------------------
  * Double Precision API (nanofft)
@@ -381,6 +436,9 @@ typedef struct nanofft_plan nanofft_plan;
 nanofft_plan *nanofft_make_plan(uint32_t N);
 void nanofft_destroy_plan(nanofft_plan *plan);
 void nanofft_execute(nanofft_plan *plan, double *real_signal, double *imag_signal);
+void nanofft_execute_raw(nanofft_plan *plan, double *real_signal, double *imag_signal);
+void nanofft_permute(nanofft_plan *plan, double *real_signal, double *imag_signal);
+void nanofft_permute_1d(nanofft_plan *plan, double *values);
 
 /* -------------------------------------------------------------------------
  * Double-Double Precision API (nanofftdd)
@@ -389,5 +447,8 @@ typedef struct nanofftdd_plan nanofftdd_plan;
 nanofftdd_plan *nanofftdd_make_plan(uint32_t N);
 void nanofftdd_destroy_plan(nanofftdd_plan *plan);
 void nanofftdd_execute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
+void nanofftdd_execute_raw(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
+void nanofftdd_permute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
+void nanofftdd_permute_1d(nanofftdd_plan *plan, dd_t *values);
 
 #endif /* NANOFFT_H */

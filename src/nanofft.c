@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tls_tuning.h>
 
 /* =========================================================================
  * Triple-Precision Macro Engine
@@ -15,11 +16,25 @@
 #define PLAN_T PREFIX(plan)
 #define FALLBACK_PLAN_T FALLBACK_PREFIX(plan)
 
+/* Build-time depth of this precision pass: the runtime switch can only pick
+ * up to it, and only those fused kernels are compiled. */
+#if defined(DOUBLE_DOUBLE)
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_DD
+#elif defined(DOUBLE)
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_DOUBLE
+#else
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_FLOAT
+#endif
+
+#define NANOFFT_EFFECTIVE_FUSE(fuse)                                                                                                                 ((fuse) < 1 ? 1 : ((fuse) > NANOFFT_FFT_FUSE_BUILD ? NANOFFT_FFT_FUSE_BUILD : (fuse)))
+
 struct PLAN_T {
     uint32_t N;
+    int fuse;     /* radix-2 DIF stages fused per pass (1 = classically staged) */
+    int cobravo;  /* 1 = vectorized tile bit reversal, 0 = scalar in-tile swap */
     FLOAT *twiddle_real;
     FLOAT *twiddle_imag;
-    FLOAT *cobra_buffer_real;
+    FLOAT *cobra_buffer_real; /* two tiles: A at offset 0, B at BLOCK_ELEMS */
     FLOAT *cobra_buffer_imag;
 };
 
@@ -32,7 +47,26 @@ static inline uint32_t intmin(uint32_t a, uint32_t b) { return (a < b) ? a : b; 
 static inline uint32_t intmax(int32_t a, int32_t b) { return (a > b) ? a : b; }
 
 #define LOG_BLOCK_WIDTH 6
-#define BLOCK_WIDTH (1 << LOG_BLOCK_WIDTH)
+#define BLOCK_WIDTH (1u << LOG_BLOCK_WIDTH)
+#define BLOCK_ELEMS (BLOCK_WIDTH * BLOCK_WIDTH)
+
+/* The classic COBRA 64x64 tiling needs log2(N) >= 12.  A tile width of
+ * min(log2(N)/2, 6) runs the same algorithm down to log2(N) = 8, where the
+ * scalar in-place permutation stops paying off. */
+#define COBRAVO_MIN_LOG 8
+#define COBRAVO_W4_LEN (1u << 8)  /* in-tile indices of a 16x16 tile */
+#define COBRAVO_W5_LEN (1u << 10) /* 32x32 */
+#define COBRAVO_W6_LEN (1u << 12) /* 64x64 */
+#define COBRAVO_IDX_LEN (COBRAVO_W4_LEN + COBRAVO_W5_LEN + COBRAVO_W6_LEN)
+
+/* Gather-emitted tiles for the real types; double-double keeps the scalar
+ * in-tile swap (its 16-byte elements have no gather). */
+#if !defined(DOUBLE_DOUBLE) && (defined(__AVX512F__) || defined(__AVX2__))
+#    define COBRAVO_GATHER 1
+#    include <immintrin.h>
+#else
+#    define COBRAVO_GATHER 0
+#endif
 
 static inline uint32_t intlog2(uint32_t input) {
     uint32_t output;
@@ -86,92 +120,203 @@ static inline void table_shuffle(FLOAT *real, FLOAT *imag, uint32_t log_n) {
     }
 }
 
-static inline void cobra_shuffle(FLOAT *real, FLOAT *imag, uint32_t log_n, FLOAT *buffer_real, FLOAT *buffer_imag) {
-    uint32_t num_b_bits = log_n - 2 * LOG_BLOCK_WIDTH;
-    uint32_t b_size = 1 << num_b_bits;
-    uint32_t shift_top = num_b_bits + LOG_BLOCK_WIDTH;
-
-    uint32_t rev6[BLOCK_WIDTH];
-    for (uint32_t i = 0; i < BLOCK_WIDTH; ++i) {
-        rev6[i] = bit_reverse_table[i] >> 2;
-    }
-
-    for (uint32_t b = 0; b < b_size; ++b) {
-        uint32_t b_rev = reverse_bits(b, num_b_bits);
-        uint32_t b_shifted = b << LOG_BLOCK_WIDTH;
-        uint32_t b_rev_shifted = b_rev << LOG_BLOCK_WIDTH;
-
-        for (uint32_t a = 0; a < BLOCK_WIDTH; ++a) {
-            uint32_t a_rev = rev6[a];
-            uint32_t a_shifted = a << shift_top;
-            uint32_t a_rev_shifted = a_rev << LOG_BLOCK_WIDTH;
-
-            for (uint32_t c = 0; c < BLOCK_WIDTH; ++c) {
-                uint32_t idx = a_shifted | b_shifted | c;
-                uint32_t buffer_idx = a_rev_shifted | c;
-
-                buffer_real[buffer_idx] = real[idx];
-                buffer_imag[buffer_idx] = imag[idx];
-            }
-        }
-
-        for (uint32_t c = 0; c < BLOCK_WIDTH; ++c) {
-            uint32_t c_rev = rev6[c];
-            uint32_t c_rev_shifted = c_rev << shift_top;
-
-            for (uint32_t a_rev = 0; a_rev < BLOCK_WIDTH; ++a_rev) {
-                uint32_t a = rev6[a_rev];
-                bool index_less_than_reverse = (a < c_rev) || (a == c_rev && b < b_rev) || (a == c_rev && b == b_rev && a_rev < c);
-
-                if (index_less_than_reverse) {
-                    uint32_t v_idx = c_rev_shifted | b_rev_shifted | a_rev;
-                    uint32_t b_idx = (a_rev << LOG_BLOCK_WIDTH) | c;
-
-                    FLOAT temp_real = real[v_idx];
-                    FLOAT temp_imag = imag[v_idx];
-
-                    real[v_idx] = buffer_real[b_idx];
-                    imag[v_idx] = buffer_imag[b_idx];
-
-                    buffer_real[b_idx] = temp_real;
-                    buffer_imag[b_idx] = temp_imag;
-                }
-            }
-        }
-
-        for (uint32_t a = 0; a < BLOCK_WIDTH; ++a) {
-            uint32_t a_rev = rev6[a];
-            uint32_t a_shifted = a << shift_top;
-
-            for (uint32_t c = 0; c < BLOCK_WIDTH; ++c) {
-                uint32_t c_rev = rev6[c];
-                bool index_less_than_reverse = (a < c_rev) || (a == c_rev && b < b_rev) || (a == c_rev && b == b_rev && a_rev < c);
-
-                if (index_less_than_reverse) {
-                    uint32_t v_idx = a_shifted | b_shifted | c;
-                    uint32_t b_idx = (a_rev << LOG_BLOCK_WIDTH) | c;
-
-                    FLOAT temp_real = real[v_idx];
-                    FLOAT temp_imag = imag[v_idx];
-
-                    real[v_idx] = buffer_real[b_idx];
-                    imag[v_idx] = buffer_imag[b_idx];
-
-                    buffer_real[b_idx] = temp_real;
-                    buffer_imag[b_idx] = temp_imag;
-                }
-            }
+static inline void table_shuffle_1d(FLOAT *values, uint32_t log_n) {
+    for (uint32_t i = 0; i < (1u << log_n); ++i) {
+        uint32_t j = reverse_bits(i, log_n);
+        if (j > i) {
+            FLOAT temp = values[i];
+            values[i] = values[j];
+            values[j] = temp;
         }
     }
 }
 
-inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N, FLOAT *buffer_real, FLOAT *buffer_imag) {
-    uint32_t order = intlog2(N);
-    if (order <= 2 * LOG_BLOCK_WIDTH) {
-        table_shuffle(real, imag, order);
-    } else {
-        cobra_shuffle(real, imag, order, buffer_real, buffer_imag);
+/* -------------------------------------------------------------------------
+ * COBRAVO tile bit reversal
+ *
+ * The index is split as (a | b | c), where a and c are the top and bottom w
+ * bits.  A 2w-bit reversal maps a <-> c, so every 2^w x 2^w tile is reversed
+ * inside a contiguous staging buffer and written to the mirrored b offset.
+ * Each row of a tile is at least one SIMD vector wide, so the staging buffer
+ * is loaded and stored with row-sized memcpy / vector moves.
+ * ------------------------------------------------------------------------- */
+
+#if COBRAVO_GATHER
+/* In-tile reversal indices of every supported tile width, packed back to back.
+ * Pure data derived from the fixed bit reversal, built by a constructor so no
+ * transform can observe a half-initialised table. */
+static int cobravo_gather_idx[COBRAVO_IDX_LEN] __attribute__((aligned(64)));
+
+static inline int *cobravo_idx_table(uint32_t w) {
+    if (w > 5u) return cobravo_gather_idx + COBRAVO_W4_LEN + COBRAVO_W5_LEN;
+    if (w == 5u) return cobravo_gather_idx + COBRAVO_W4_LEN;
+    return cobravo_gather_idx;
+}
+
+__attribute__((constructor)) static void cobravo_build_idx_table(void) {
+    for (uint32_t w = 4u; w <= (uint32_t)LOG_BLOCK_WIDTH; ++w) {
+        int *tab = cobravo_idx_table(w);
+        const uint32_t tile = 1u << (2u * w);
+        for (uint32_t i = 0; i < tile; ++i) tab[i] = (int)reverse_bits(i, 2u * w);
     }
+}
+#else
+static inline int *cobravo_idx_table(uint32_t w) {
+    (void)w;
+    return NULL;
+}
+#endif
+
+static inline void cobravo_load_tile(const FLOAT *src, uint32_t b_shifted, uint32_t shift_top, uint32_t w, FLOAT *dst) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + (size_t)a * width, src + ((size_t)a << shift_top) + b_shifted, (size_t)width * sizeof(FLOAT));
+}
+
+static inline void cobravo_store_tile(const FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + ((size_t)a << shift_top) + b_shifted, src + (size_t)a * width, (size_t)width * sizeof(FLOAT));
+}
+
+#if COBRAVO_GATHER
+/* Destination positions are enumerated in order; the source index is the
+ * in-tile reversal, so one gather plus one contiguous store per vector. */
+static inline void cobravo_emit_tile_gather(const FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    const uint32_t row_mask = (1u << w) - 1u;
+    const int *idx = cobravo_idx_table(w);
+#    if defined(DOUBLE)
+#        if defined(__AVX512F__)
+    for (uint32_t v = 0; v < tile; v += 8u) {
+        const __m256i ix = _mm256_load_si256((const __m256i *)(const void *)(idx + v));
+        const __m512d x = _mm512_i32gather_pd(ix, src, 8);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm512_storeu_pd(dst + off, x);
+    }
+#        else
+    for (uint32_t v = 0; v < tile; v += 4u) {
+        const __m128i ix = _mm_load_si128((const __m128i *)(const void *)(idx + v));
+        const __m256d x = _mm256_i32gather_pd(src, ix, 8);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm256_storeu_pd(dst + off, x);
+    }
+#        endif
+#    else
+#        if defined(__AVX512F__)
+    for (uint32_t v = 0; v < tile; v += 16u) {
+        const __m512i ix = _mm512_load_si512((const void *)(idx + v));
+        const __m512 x = _mm512_i32gather_ps(ix, src, 4);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm512_storeu_ps(dst + off, x);
+    }
+#        else
+    for (uint32_t v = 0; v < tile; v += 8u) {
+        const __m256i ix = _mm256_load_si256((const __m256i *)(const void *)(idx + v));
+        const __m256 x = _mm256_i32gather_ps(src, ix, 4);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm256_storeu_ps(dst + off, x);
+    }
+#        endif
+#    endif
+}
+#endif /* COBRAVO_GATHER */
+
+static inline void cobravo_reverse_tile(FLOAT *tile_values, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    for (uint32_t i = 0; i < tile; ++i) {
+        const uint32_t j = reverse_bits(i, 2u * w);
+        if (j > i) {
+            const FLOAT temp = tile_values[i];
+            tile_values[i] = tile_values[j];
+            tile_values[j] = temp;
+        }
+    }
+}
+
+static inline void cobravo_emit_tile(FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w, int vectorized) {
+#if COBRAVO_GATHER
+    if (vectorized) {
+        cobravo_emit_tile_gather(src, dst, b_shifted, shift_top, w);
+        return;
+    }
+#else
+    (void)vectorized;
+#endif
+    cobravo_reverse_tile(src, w);
+    cobravo_store_tile(src, dst, b_shifted, shift_top, w);
+}
+
+static inline void cobravo_shuffle(FLOAT *real, FLOAT *imag, uint32_t log_n, FLOAT *bufA_real, FLOAT *bufA_imag, FLOAT *bufB_real, FLOAT *bufB_imag,
+                                   int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > (uint32_t)LOG_BLOCK_WIDTH) w = (uint32_t)LOG_BLOCK_WIDTH;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile(real, b_shifted, shift_top, w, bufA_real);
+        cobravo_load_tile(imag, b_shifted, shift_top, w, bufA_imag);
+        if (b != b_rev) {
+            cobravo_load_tile(real, b_rev_shifted, shift_top, w, bufB_real);
+            cobravo_load_tile(imag, b_rev_shifted, shift_top, w, bufB_imag);
+        }
+
+        cobravo_emit_tile(bufA_real, real, b_rev_shifted, shift_top, w, vectorized);
+        cobravo_emit_tile(bufA_imag, imag, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) {
+            cobravo_emit_tile(bufB_real, real, b_shifted, shift_top, w, vectorized);
+            cobravo_emit_tile(bufB_imag, imag, b_shifted, shift_top, w, vectorized);
+        }
+    }
+}
+
+static inline void cobravo_shuffle_1d(FLOAT *values, uint32_t log_n, FLOAT *bufA, FLOAT *bufB, int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > (uint32_t)LOG_BLOCK_WIDTH) w = (uint32_t)LOG_BLOCK_WIDTH;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile(values, b_shifted, shift_top, w, bufA);
+        if (b != b_rev) cobravo_load_tile(values, b_rev_shifted, shift_top, w, bufB);
+
+        cobravo_emit_tile(bufA, values, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) cobravo_emit_tile(bufB, values, b_shifted, shift_top, w, vectorized);
+    }
+}
+
+inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N, const PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (order < COBRAVO_MIN_LOG) {
+        table_shuffle(real, imag, order);
+        return;
+    }
+    cobravo_shuffle(real, imag, order, plan->cobra_buffer_real, plan->cobra_buffer_imag, plan->cobra_buffer_real + BLOCK_ELEMS,
+                    plan->cobra_buffer_imag + BLOCK_ELEMS, plan->cobravo);
+}
+
+inline static void bit_reverse_permutation_1d(FLOAT *values, uint32_t N, const PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (order < COBRAVO_MIN_LOG) {
+        table_shuffle_1d(values, order);
+        return;
+    }
+    cobravo_shuffle_1d(values, order, plan->cobra_buffer_real, plan->cobra_buffer_real + BLOCK_ELEMS, plan->cobravo);
 }
 
 /* =========================================================================
@@ -284,9 +429,90 @@ static inline void nanofft_vec_inv_perm(INTERNAL_VEC *a, INTERNAL_VEC *b, uint32
  * Core FFT kernels
  * ========================================================================= */
 
-static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N) {
-    uint32_t shift = 0;
+/*
+ * Radix-2^L DIF pass.
+ *
+ * A pass fusing L Sande-Tukey DIF stages with initial step `step` acts on the
+ * 2^L points at i + j + m*q (q = step >> L).  Stage t (0-based) pairs m with
+ * m + 2^(L-1-t) and applies the twiddle exp(-2 pi i * 2^t * (j + m*q) / step),
+ * which is exactly what the plain stage-at-a-time loop applies.  The plan's
+ * twiddle table stores, per pass and per stage, those factors with m as the
+ * outer and j the inner index, so a fused pass streams (2^L - 1) vectors per
+ * j-block instead of reloading the buffer once per stage.
+ */
+#define NANOFFT_FUSED_PASS_BODY(L)                                                                                    \
+    {                                                                                                                 \
+        const uint32_t q = step >> (L);                                                                                \
+        uint32_t base[1 << (L)];                                                                                      \
+        {                                                                                                             \
+            uint32_t acc = shift;                                                                                     \
+            for (uint32_t t = 0; t < (L); ++t) {                                                                      \
+                base[t] = acc;                                                                                        \
+                acc += step >> (t + 1);                                                                               \
+            }                                                                                                         \
+        }                                                                                                             \
+        for (uint32_t i = 0; i < n; i += step) {                                                                      \
+            for (uint32_t j = 0; j < q; j += INTERNAL_VEC_LEN) {                                                      \
+                INTERNAL_VEC vr[1 << (L)], vi[1 << (L)];                                                              \
+                _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                                 \
+                    vr[m] = LOAD_VEC(&real[i + j + m * q]);                                                           \
+                    vi[m] = LOAD_VEC(&imag[i + j + m * q]);                                                           \
+                }                                                                                                     \
+                _Pragma("GCC unroll 4") for (uint32_t t = 0; t < (L); ++t) {                                          \
+                    const uint32_t h = 1u << ((L) - 1u - t);                                                          \
+                    _Pragma("GCC unroll 16") for (uint32_t lo = 0; lo < (1u << (L)); lo += 2u * h) {                  \
+                        _Pragma("GCC unroll 8") for (uint32_t m = 0; m < h; ++m) {                                    \
+                            const uint32_t a = lo + m, b = a + h;                                                     \
+                            const INTERNAL_VEC wr = LOAD_VEC(&tw_r[base[t] + m * q + j]);                             \
+                            const INTERNAL_VEC wi = LOAD_VEC(&tw_i[base[t] + m * q + j]);                             \
+                            const INTERNAL_VEC sr = ADD(vr[a], vr[b]);                                                \
+                            const INTERNAL_VEC si = ADD(vi[a], vi[b]);                                                \
+                            const INTERNAL_VEC dr = SUB(vr[a], vr[b]);                                                \
+                            const INTERNAL_VEC di = SUB(vi[a], vi[b]);                                                \
+                            vr[a] = sr;                                                                               \
+                            vi[a] = si;                                                                               \
+                            vr[b] = SUB(MUL(dr, wr), MUL(di, wi));                                                    \
+                            vi[b] = ADD(MUL(dr, wi), MUL(di, wr));                                                    \
+                        }                                                                                             \
+                    }                                                                                                 \
+                }                                                                                                     \
+                _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                                 \
+                    STORE_VEC(&real[i + j + m * q], vr[m]);                                                           \
+                    STORE_VEC(&imag[i + j + m * q], vi[m]);                                                           \
+                }                                                                                                     \
+            }                                                                                                         \
+        }                                                                                                             \
+    }
 
+static inline void sande_tukey_fused_pass(FLOAT *real, FLOAT *imag, const FLOAT *tw_r, const FLOAT *tw_i, uint32_t n, uint32_t step, uint32_t shift,
+                                         int layers) {
+    switch (layers) {
+        case 1:
+            NANOFFT_FUSED_PASS_BODY(1)
+            break;
+#if NANOFFT_FFT_FUSE_BUILD >= 2
+        case 2:
+            NANOFFT_FUSED_PASS_BODY(2)
+            break;
+#endif
+#if NANOFFT_FFT_FUSE_BUILD >= 3
+        case 3:
+            NANOFFT_FUSED_PASS_BODY(3)
+            break;
+#endif
+#if NANOFFT_FFT_FUSE_BUILD >= 4
+        case 4:
+            NANOFFT_FUSED_PASS_BODY(4)
+            break;
+#endif
+        default:
+            break;
+    }
+}
+
+/* Plain stage-at-a-time DIF (fuse == 1).  Kept separate from the fused kernel
+ * so the un-fused build behaves exactly like it always did. */
+static void sande_tukey_stages(FLOAT *real_signal, FLOAT *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N, uint32_t shift) {
     for (uint32_t step = N; step > INTERNAL_VEC_LEN; step >>= 1) {
         uint32_t half_step = step >> 1;
         for (uint32_t i = 0; i < N; i += step) {
@@ -310,9 +536,39 @@ static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const F
         }
         shift += half_step;
     }
+}
 
+static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N, int fuse) {
+    const uint32_t log_n = intlog2(N);
+    const uint32_t log_v = (INTERNAL_VEC_LEN > 1) ? intlog2((uint32_t)INTERNAL_VEC_LEN) : 0;
+    const uint32_t stages = (log_n > log_v) ? log_n - log_v : 0;
+    const uint32_t layers = (uint32_t)fuse;
+    uint32_t shift = 0;
+    uint32_t step = N;
+
+    if (layers == 1) {
+        /* The plain transform leaves the same state the intra-vector pass
+         * expects; the scalar tail below is only reachable with one lane. */
+        sande_tukey_stages(real_signal, imag_signal, real_buffer, imag_buffer, N, 0);
+        goto intra_vector;
+    }
+
+    for (uint32_t pass = 0; pass < stages / layers; ++pass) {
+        sande_tukey_fused_pass(real_signal, imag_signal, real_buffer, imag_buffer, N, step, shift, (int)layers);
+        shift += step - (step >> layers);
+        step >>= layers;
+    }
+
+    const uint32_t remainder = stages % layers;
+    if (remainder) {
+        sande_tukey_fused_pass(real_signal, imag_signal, real_buffer, imag_buffer, N, step, shift, (int)remainder);
+        shift += step - (step >> remainder);
+        step >>= remainder;
+    }
+
+intra_vector:
 #ifdef HAS_INTRA_VEC_PASS
-    for (uint32_t i = intmax(0, (int32_t)intlog2(INTERNAL_VEC_LEN) - (int32_t)intlog2(N)); i < (uint32_t)intlog2(INTERNAL_VEC_LEN); i++) {
+    for (uint32_t i = intmax(0, (int32_t)intlog2(INTERNAL_VEC_LEN) - (int32_t)log_n); i < (uint32_t)intlog2(INTERNAL_VEC_LEN); i++) {
         for (uint32_t j = 0; j < N; j += INTERNAL_VEC_LEN * 2) {
             INTERNAL_VEC r_even = LOAD_VEC(&real_signal[j]);
             INTERNAL_VEC r_odd = LOAD_VEC(&real_signal[j + INTERNAL_VEC_LEN]);
@@ -345,9 +601,9 @@ static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const F
         }
     }
 #else
-    for (uint32_t step = intmin(INTERNAL_VEC_LEN, N); step > 1; step >>= 1) {
-        uint32_t half_step = step >> 1;
-        for (uint32_t i = 0; i < N; i += step) {
+    for (uint32_t tail = intmin(INTERNAL_VEC_LEN, N); tail > 1; tail >>= 1) {
+        uint32_t half_step = tail >> 1;
+        for (uint32_t i = 0; i < N; i += tail) {
             for (uint32_t j = 0; j < half_step; j++) {
                 FLOAT re = real_signal[i + j], ie = imag_signal[i + j];
                 FLOAT ro = real_signal[i + j + half_step], io = imag_signal[i + j + half_step];
@@ -365,21 +621,48 @@ static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const F
 #endif
 }
 
-static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer) {
-    uint32_t shift = 0;
-    for (uint32_t step = N; step > 1; step >>= 1) {
-        uint32_t half_step = step >> 1;
-        for (uint32_t j = 0; j < half_step; j++) {
+/* Twiddles of one fused pass: per stage t the (m, j) grid described above. */
+static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, FLOAT *real_buffer, FLOAT *imag_buffer) {
+    const uint32_t q = step >> layers;
+    uint32_t base = shift;
+    for (uint32_t t = 0; t < layers; ++t) {
+        const uint32_t half = step >> (t + 1);
+        const uint32_t groups = half / q; /* 2^(layers-1-t) */
+        const uint32_t mult = 1u << t;
+        for (uint32_t m = 0; m < groups; ++m) {
+            for (uint32_t j = 0; j < q; ++j) {
 #if defined(DOUBLE_DOUBLE)
-            dd_t angle = dd_div(dd_make(-(double)j, 0.0), dd_make((double)step, 0.0));
+                dd_t angle = dd_div(dd_make(-(double)(mult * (j + m * q)), 0.0), dd_make((double)step, 0.0));
 #else
-            double angle = -1.0 * j / step;
+                double angle = -1.0 * (double)(mult * (j + m * q)) / (double)step;
 #endif
-            real_buffer[shift + j] = M_COS2PI(angle);
-            imag_buffer[shift + j] = NEG(M_SIN2PI(angle));
+                real_buffer[base + m * q + j] = M_COS2PI(angle);
+                imag_buffer[base + m * q + j] = NEG(M_SIN2PI(angle));
+            }
         }
-        shift += half_step;
+        base += half;
     }
+}
+
+static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, int fuse) {
+    const uint32_t log_n = intlog2(N);
+    const uint32_t log_v = (INTERNAL_VEC_LEN > 1) ? intlog2((uint32_t)INTERNAL_VEC_LEN) : 0;
+    const uint32_t stages = (log_n > log_v) ? log_n - log_v : 0;
+    const uint32_t layers = (uint32_t)fuse;
+    uint32_t shift = 0;
+    uint32_t step = N;
+
+    for (uint32_t pass = 0; pass < stages / layers; ++pass) {
+        generate_fused_pass(step, shift, layers, real_buffer, imag_buffer);
+        shift += step - (step >> layers);
+        step >>= layers;
+    }
+
+    const uint32_t remainder = stages % layers;
+    if (remainder) generate_fused_pass(step, shift, remainder, real_buffer, imag_buffer);
+
+    /* The remaining stages live inside one vector and use compile-time
+     * twiddles; nothing else is read from the table. */
 }
 
 /* =========================================================================
@@ -394,12 +677,14 @@ PLAN_T *PREFIX(make_plan)(uint32_t N) {
 
     PLAN_T *plan = (PLAN_T *)malloc(sizeof(PLAN_T));
     plan->N = N;
+    plan->fuse = NANOFFT_EFFECTIVE_FUSE(tls_tuning_fft_fuse());
+    plan->cobravo = tls_tuning_cobravo();
 
     plan->twiddle_real = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
     plan->twiddle_imag = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
-    generate_buffer(N, plan->twiddle_real, plan->twiddle_imag);
+    generate_buffer(N, plan->twiddle_real, plan->twiddle_imag, plan->fuse);
 
-    size_t cobra_size = BLOCK_WIDTH * BLOCK_WIDTH * sizeof(FLOAT);
+    size_t cobra_size = 2u * BLOCK_ELEMS * sizeof(FLOAT);
     plan->cobra_buffer_real = (FLOAT *)aligned_alloc(64, cobra_size);
     plan->cobra_buffer_imag = (FLOAT *)aligned_alloc(64, cobra_size);
 
@@ -416,9 +701,17 @@ void PREFIX(destroy_plan)(PLAN_T *plan) {
     }
 }
 
+void PREFIX(execute_raw)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
+    sande_tukey_in_place(real_signal, imag_signal, plan->twiddle_real, plan->twiddle_imag, plan->N, plan->fuse);
+}
+
+void PREFIX(permute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) { bit_reverse_permutation(real_signal, imag_signal, plan->N, plan); }
+
+void PREFIX(permute_1d)(PLAN_T *plan, FLOAT *values) { bit_reverse_permutation_1d(values, plan->N, plan); }
+
 void PREFIX(execute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
-    sande_tukey_in_place(real_signal, imag_signal, plan->twiddle_real, plan->twiddle_imag, plan->N);
-    bit_reverse_permutation(real_signal, imag_signal, plan->N, plan->cobra_buffer_real, plan->cobra_buffer_imag);
+    PREFIX(execute_raw)(plan, real_signal, imag_signal);
+    PREFIX(permute)(plan, real_signal, imag_signal);
 }
 
 /* =========================================================================
@@ -440,13 +733,13 @@ __attribute__((weak)) FALLBACK_PLAN_T *FALLBACK_PREFIX(make_plan)(uint32_t N) {
 
 __attribute__((weak)) void FALLBACK_PREFIX(destroy_plan)(FALLBACK_PLAN_T *plan) { PREFIX(destroy_plan)((PLAN_T *)plan); }
 
-__attribute__((weak)) void FALLBACK_PREFIX(execute)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
+__attribute__((weak)) void FALLBACK_PREFIX(execute_raw)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
     static bool warned = false;
     if (!warned) {
         fprintf(stderr,
                 "[nanofft warning] %s is missing. Falling back to %s. "
                 "Expect severe performance degradation due to array casting!\n",
-                STR(FALLBACK_PREFIX(execute)), STR(PREFIX(execute)));
+                STR(FALLBACK_PREFIX(execute_raw)), STR(PREFIX(execute_raw)));
         warned = true;
     }
 
@@ -460,7 +753,7 @@ __attribute__((weak)) void FALLBACK_PREFIX(execute)(FALLBACK_PLAN_T *plan, FALLB
         temp_i[i] = FROM_FALLBACK(imag[i]);
     }
 
-    PREFIX(execute)((PLAN_T *)plan, temp_r, temp_i);
+    PREFIX(execute_raw)((PLAN_T *)plan, temp_r, temp_i);
 
     for (uint32_t i = 0; i < N; ++i) {
         real[i] = TO_FALLBACK(temp_r[i]);
@@ -469,4 +762,41 @@ __attribute__((weak)) void FALLBACK_PREFIX(execute)(FALLBACK_PLAN_T *plan, FALLB
 
     free(temp_r);
     free(temp_i);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(execute)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
+    FALLBACK_PREFIX(execute_raw)(plan, real, imag);
+    FALLBACK_PREFIX(permute)(plan, real, imag);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(permute)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
+    uint32_t N = ((PLAN_T *)plan)->N;
+    FLOAT *temp_r = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
+    FLOAT *temp_i = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
+
+    for (uint32_t i = 0; i < N; ++i) {
+        temp_r[i] = FROM_FALLBACK(real[i]);
+        temp_i[i] = FROM_FALLBACK(imag[i]);
+    }
+
+    PREFIX(permute)((PLAN_T *)plan, temp_r, temp_i);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        real[i] = TO_FALLBACK(temp_r[i]);
+        imag[i] = TO_FALLBACK(temp_i[i]);
+    }
+
+    free(temp_r);
+    free(temp_i);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(permute_1d)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *values) {
+    uint32_t N = ((PLAN_T *)plan)->N;
+    FLOAT *temp = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
+
+    for (uint32_t i = 0; i < N; ++i) temp[i] = FROM_FALLBACK(values[i]);
+    PREFIX(permute_1d)((PLAN_T *)plan, temp);
+    for (uint32_t i = 0; i < N; ++i) values[i] = TO_FALLBACK(temp[i]);
+
+    free(temp);
 }

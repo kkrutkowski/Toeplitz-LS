@@ -21,8 +21,14 @@ LDLIBS := -lm
 MAX_TWIDDLE_REUSE ?= 16
 TWIDDLE_CFLAGS := -DMAX_TWIDDLE_REUSE=$(MAX_TWIDDLE_REUSE)
 
+# Fused-twiddle FFT depth per precision (1 = no fusion .. 4 = radix-16 pass).
+FFT_FUSE_FLOAT ?= 3
+FFT_FUSE_DOUBLE ?= 3
+FFT_FUSE_DD ?= 3
+FUSE_CFLAGS := -DNANOFFT_FFT_FUSE_FLOAT=$(FFT_FUSE_FLOAT) -DNANOFFT_FFT_FUSE_DOUBLE=$(FFT_FUSE_DOUBLE) -DNANOFFT_FFT_FUSE_DD=$(FFT_FUSE_DD)
+
 SCALING_GENERIC := $(INC_DIR)/scaling_generic.h
-LIB_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/linalg.c $(SRC_DIR)/chi2per.c $(SRC_DIR)/utils.c
+LIB_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/linalg.c $(SRC_DIR)/chi2per.c $(SRC_DIR)/utils.c $(SRC_DIR)/tuning.c
 SCALING_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/scaling.c
 PUBLIC_HEADERS := \
 	$(INC_DIR)/nanofft.h \
@@ -30,6 +36,8 @@ PUBLIC_HEADERS := \
 	$(INC_DIR)/nufft1.h \
 	$(INC_DIR)/linalg.h \
 	$(INC_DIR)/tls.h \
+	$(INC_DIR)/tls_internal.h \
+	$(INC_DIR)/tls_tuning.h \
 	$(INC_DIR)/utils.h \
 	$(SCALING_GENERIC)
 
@@ -40,8 +48,8 @@ NATIVE_SCALING_DIR := $(TMP_DIR)/native-scaling
 GENERIC_SCALING_HEADER := $(GENERIC_DIR)/scaling.h
 NATIVE_SCALING_HEADER := $(NATIVE_DIR)/scaling.h
 
-GENERIC_CFLAGS := $(GENERIC_FLAGS) $(PICFLAGS) $(TWIDDLE_CFLAGS) -I$(INC_DIR) -I$(GENERIC_DIR)
-NATIVE_CFLAGS := $(NATIVE_FLAGS) $(PICFLAGS) $(TWIDDLE_CFLAGS) -I$(INC_DIR) -I$(NATIVE_DIR)
+GENERIC_CFLAGS := $(GENERIC_FLAGS) $(PICFLAGS) $(TWIDDLE_CFLAGS) $(FUSE_CFLAGS) -I$(INC_DIR) -I$(GENERIC_DIR)
+NATIVE_CFLAGS := $(NATIVE_FLAGS) $(PICFLAGS) $(TWIDDLE_CFLAGS) $(FUSE_CFLAGS) -I$(INC_DIR) -I$(NATIVE_DIR)
 
 GENERIC_OBJS := \
 	$(GENERIC_DIR)/nanofftf.o \
@@ -58,7 +66,8 @@ GENERIC_OBJS := \
 	$(GENERIC_DIR)/tlsdd_chi2per.o \
 	$(GENERIC_DIR)/tlsf_utils.o \
 	$(GENERIC_DIR)/tls_utils.o \
-	$(GENERIC_DIR)/tlsdd_utils.o
+	$(GENERIC_DIR)/tlsdd_utils.o \
+	$(GENERIC_DIR)/tuning.o
 
 NATIVE_OBJS := \
 	$(NATIVE_DIR)/nanofftf.o \
@@ -75,7 +84,8 @@ NATIVE_OBJS := \
 	$(NATIVE_DIR)/tlsdd_chi2per.o \
 	$(NATIVE_DIR)/tlsf_utils.o \
 	$(NATIVE_DIR)/tls_utils.o \
-	$(NATIVE_DIR)/tlsdd_utils.o
+	$(NATIVE_DIR)/tlsdd_utils.o \
+	$(NATIVE_DIR)/tuning.o
 
 .PHONY: all generic native clean
 .DELETE_ON_ERROR:
@@ -109,9 +119,10 @@ $(NATIVE_SCALING_HEADER): | $(NATIVE_DIR) $(NATIVE_SCALING_DIR)
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tls_nufft1.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o
-	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftf.o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o -o $(NATIVE_SCALING_DIR)/tlsf_nufft_scaling $(LDLIBS)
-	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofft.o $(NATIVE_SCALING_DIR)/tls_nufft1.o -o $(NATIVE_SCALING_DIR)/tls_nufft_scaling $(LDLIBS)
-	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftdd.o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o -o $(NATIVE_SCALING_DIR)/tlsdd_nufft_scaling $(LDLIBS)
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/tuning.c -o $(NATIVE_SCALING_DIR)/tuning.o
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftf.o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsf_nufft_scaling $(LDLIBS)
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofft.o $(NATIVE_SCALING_DIR)/tls_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tls_nufft_scaling $(LDLIBS)
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftdd.o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsdd_nufft_scaling $(LDLIBS)
 	cd $(NATIVE_DIR) && ../native-scaling/tlsf_nufft_scaling
 	cd $(NATIVE_DIR) && ../native-scaling/tls_nufft_scaling
 	cd $(NATIVE_DIR) && ../native-scaling/tlsdd_nufft_scaling
@@ -162,6 +173,9 @@ $(GENERIC_DIR)/tls_utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
 $(GENERIC_DIR)/tlsdd_utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
+$(GENERIC_DIR)/tuning.o: $(SRC_DIR)/tuning.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
+
 $(NATIVE_DIR)/nanofftf.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
 
@@ -206,6 +220,9 @@ $(NATIVE_DIR)/tls_utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
 
 $(NATIVE_DIR)/tlsdd_utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+$(NATIVE_DIR)/tuning.o: $(SRC_DIR)/tuning.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
 
 $(LIB_DIR) $(PY_PACKAGE_DIR) $(GENERIC_DIR) $(NATIVE_DIR) $(NATIVE_SCALING_DIR):
 	mkdir -p $@

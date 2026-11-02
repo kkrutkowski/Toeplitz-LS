@@ -22,3 +22,6 @@ REASONIX.md
 /examples/8_Benchmark/index.tsv
 /examples/8_Benchmark/index_rrlyr.tsv
 /examples/8_Benchmark/*.tar.xz
+/tests/build/
+/lib/
+/tmp/

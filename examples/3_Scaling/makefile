@@ -18,13 +18,13 @@ TARGETS := tlsf_nufft_scaling tls_nufft_scaling tlsdd_nufft_scaling
 all: $(TARGETS)
 	rm -f $(OBJS)
 
-tlsf_nufft_scaling: $(ROOT)/src/scaling.c nanofftf.o tlsf_nufft1.o
+tlsf_nufft_scaling: $(ROOT)/src/scaling.c nanofftf.o tlsf_nufft1.o tuning.o
 	$(CC) $(COMMON_CFLAGS) $(SAVE_FLAGS) $^ -o $@ $(LDLIBS)
 
-tls_nufft_scaling: $(ROOT)/src/scaling.c nanofft.o tls_nufft1.o
+tls_nufft_scaling: $(ROOT)/src/scaling.c nanofft.o tls_nufft1.o tuning.o
 	$(CC) $(COMMON_CFLAGS) -D DOUBLE $(SAVE_FLAGS) $^ -o $@ $(LDLIBS)
 
-tlsdd_nufft_scaling: $(ROOT)/src/scaling.c nanofftdd.o tlsdd_nufft1.o
+tlsdd_nufft_scaling: $(ROOT)/src/scaling.c nanofftdd.o tlsdd_nufft1.o tuning.o
 	$(CC) $(COMMON_CFLAGS) -D DOUBLE_DOUBLE $(SAVE_FLAGS) $^ -o $@ $(LDLIBS)
 
 nanofftf.o: $(ROOT)/src/nanofft.c
@@ -44,6 +44,9 @@ tls_nufft1.o: $(ROOT)/src/nufft1.c
 
 tlsdd_nufft1.o: $(ROOT)/src/nufft1.c
 	$(CC) $(COMMON_CFLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+tuning.o: $(ROOT)/src/tuning.c
+	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
 bench: all
 	./tlsf_nufft_scaling
