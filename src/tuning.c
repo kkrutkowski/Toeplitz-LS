@@ -16,6 +16,7 @@
 static int tuning_fft_fuse = TLS_TUNING_FFT_FUSE_DEFAULT;
 static int tuning_cobravo = TLS_TUNING_COBRAVO_DEFAULT;
 static int tuning_defer = TLS_TUNING_DEFER_DEFAULT;
+static int tuning_permute = TLS_PERMUTE_AUTO;
 static unsigned long long tuning_work_bytes = 0;
 
 int tls_tuning_fft_fuse(void) { return tuning_fft_fuse; }
@@ -33,6 +34,14 @@ void tls_tuning_set_cobravo(int on) { tuning_cobravo = on ? 1 : 0; }
 int tls_tuning_defer(void) { return tuning_defer; }
 
 void tls_tuning_set_defer(int on) { tuning_defer = on ? 1 : 0; }
+
+int tls_tuning_permute(void) { return tuning_permute; }
+
+void tls_tuning_set_permute(int mode) {
+    if (mode < TLS_PERMUTE_AUTO) mode = TLS_PERMUTE_AUTO;
+    if (mode > TLS_PERMUTE_COBRAVO) mode = TLS_PERMUTE_COBRAVO;
+    tuning_permute = mode;
+}
 
 unsigned long long tls_tuning_work_bytes(void) { return tuning_work_bytes; }
 

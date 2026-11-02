@@ -29,9 +29,9 @@ OBJS := \
 	$(BUILD)/tlsdd_utils.o \
 	$(BUILD)/tuning.o
 
-TARGETS := $(BUILD)/check_nanofft $(BUILD)/check_periodogram $(BUILD)/dump_periodogram $(BUILD)/bench_fft $(BUILD)/bench_periodogram $(BUILD)/bench_public
+TARGETS := $(BUILD)/check_nanofft $(BUILD)/check_periodogram $(BUILD)/dump_periodogram $(BUILD)/bench_fft $(BUILD)/bench_permute $(BUILD)/bench_periodogram $(BUILD)/bench_public
 
-.PHONY: all check bench clean
+.PHONY: all check bench bench_permute permute clean
 .DELETE_ON_ERROR:
 
 all: $(TARGETS)
@@ -95,11 +95,19 @@ $(BUILD)/dump_periodogram: dump_periodogram.c $(OBJS)
 $(BUILD)/bench_fft: bench_fft.c $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
 
+$(BUILD)/bench_permute: bench_permute.c $(OBJS)
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
+
 $(BUILD)/bench_periodogram: bench_periodogram.c $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
 
 $(BUILD)/bench_public: bench_public.c $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
+
+bench_permute: $(BUILD)/bench_permute
+
+permute: $(BUILD)/bench_permute
+	./$(BUILD)/bench_permute
 
 check: $(BUILD)/check_nanofft $(BUILD)/check_periodogram
 	./$(BUILD)/check_nanofft
@@ -107,6 +115,7 @@ check: $(BUILD)/check_nanofft $(BUILD)/check_periodogram
 
 bench: all
 	./$(BUILD)/bench_fft
+	./$(BUILD)/bench_permute
 	./$(BUILD)/bench_periodogram
 
 clean:

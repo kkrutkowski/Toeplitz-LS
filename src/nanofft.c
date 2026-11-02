@@ -28,6 +28,11 @@
 
 #define NANOFFT_EFFECTIVE_FUSE(fuse)                                                                                                                 ((fuse) < 1 ? 1 : ((fuse) > NANOFFT_FFT_FUSE_BUILD ? NANOFFT_FFT_FUSE_BUILD : (fuse)))
 
+typedef struct {
+    uint32_t i;
+    uint32_t j;
+} rev_pair;
+
 struct PLAN_T {
     uint32_t N;
     int fuse;     /* radix-2 DIF stages fused per pass (1 = classically staged) */
@@ -36,6 +41,9 @@ struct PLAN_T {
     FLOAT *twiddle_imag;
     FLOAT *cobra_buffer_real; /* two tiles: A at offset 0, B at BLOCK_ELEMS */
     FLOAT *cobra_buffer_imag;
+    int permute;        /* effective bit-reversal strategy for this plan */
+    rev_pair *pairs;    /* lazily built swap-pair list, NULL until first use */
+    uint32_t npairs;
 };
 
 /* =========================================================================
@@ -54,6 +62,19 @@ static inline uint32_t intmax(int32_t a, int32_t b) { return (a > b) ? a : b; }
  * min(log2(N)/2, 6) runs the same algorithm down to log2(N) = 8, where the
  * scalar in-place permutation stops paying off. */
 #define COBRAVO_MIN_LOG 8
+/* Measured crossover of the precomputed swap-pair walk (tests/bench_permute.c):
+ * below PAIRS_MIN_LOG the plain table shuffle wins, from PAIRS_MIN_LOG to
+ * PAIRS_MAX_LOG the pair list does, and above it the 4N-byte pair table leaves
+ * L1 and the tiled reversal takes over again. */
+#define PAIRS_MIN_LOG 6
+/* The pair table is 4N bytes whatever the element size, so the crossover only
+ * depends on where it leaves L1: 2^13 entries for 4-byte floats, 2^12 once the
+ * elements are 8 bytes wide (measured; see tests/bench_permute.c). */
+#if defined(DOUBLE) || defined(DOUBLE_DOUBLE)
+#    define PAIRS_MAX_LOG 12
+#else
+#    define PAIRS_MAX_LOG 13
+#endif
 #define COBRAVO_W4_LEN (1u << 8)  /* in-tile indices of a 16x16 tile */
 #define COBRAVO_W5_LEN (1u << 10) /* 32x32 */
 #define COBRAVO_W6_LEN (1u << 12) /* 64x64 */
@@ -128,6 +149,35 @@ static inline void table_shuffle_1d(FLOAT *values, uint32_t log_n) {
             values[i] = values[j];
             values[j] = temp;
         }
+    }
+}
+
+/* Swap pairs of the bit reversal, precomputed once per plan: unlike
+ * table_shuffle this walks only the N/2 - 1 pairs that actually exchange two
+ * elements, needs no bit arithmetic per element and has no per-element branch.
+ * The table is 8 bytes per pair (4N bytes total), so it is only built for the
+ * grid sizes where the microbenchmark shows it winning. */
+
+static inline void pair_shuffle(FLOAT *real, FLOAT *imag, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const FLOAT tr = real[i];
+        const FLOAT ti = imag[i];
+        real[i] = real[j];
+        imag[i] = imag[j];
+        real[j] = tr;
+        imag[j] = ti;
+    }
+}
+
+static inline void pair_shuffle_1d(FLOAT *values, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const FLOAT t = values[i];
+        values[i] = values[j];
+        values[j] = t;
     }
 }
 
@@ -234,7 +284,10 @@ static inline void cobravo_reverse_tile(FLOAT *tile_values, uint32_t w) {
 
 static inline void cobravo_emit_tile(FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w, int vectorized) {
 #if COBRAVO_GATHER
-    if (vectorized) {
+    /* The gather writes one contiguous vector per step and derives its offset
+     * from the first element, so it is only valid when a tile row holds a whole
+     * vector; narrower tiles must use the scalar swap below. */
+    if (vectorized && w >= 4u) {
         cobravo_emit_tile_gather(src, dst, b_shifted, shift_top, w);
         return;
     }
@@ -300,9 +353,35 @@ static inline void cobravo_shuffle_1d(FLOAT *values, uint32_t log_n, FLOAT *bufA
     }
 }
 
-inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N, const PLAN_T *plan) {
+/* Build the swap-pair list on first use: one reverse_bits() sweep, then every
+ * later permutation of this plan is a branch-free walk over the pairs. */
+static void ensure_pairs(PLAN_T *plan) {
+    if (plan->pairs != NULL) return;
+    const uint32_t order = intlog2(plan->N);
+    const uint32_t capacity = plan->N / 2u;
+    rev_pair *pairs = (rev_pair *)malloc((size_t)capacity * sizeof(rev_pair));
+    if (pairs == NULL) return;
+    uint32_t count = 0;
+    for (uint32_t i = 1; i < plan->N; ++i) {
+        const uint32_t j = reverse_bits(i, order);
+        if (j > i) {
+            pairs[count].i = i;
+            pairs[count].j = j;
+            ++count;
+        }
+    }
+    plan->pairs = pairs;
+    plan->npairs = count;
+}
+
+inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N, PLAN_T *plan) {
     const uint32_t order = intlog2(N);
-    if (order < COBRAVO_MIN_LOG) {
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle(real, imag, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute != TLS_PERMUTE_COBRAVO) {
         table_shuffle(real, imag, order);
         return;
     }
@@ -310,9 +389,14 @@ inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N,
                     plan->cobra_buffer_imag + BLOCK_ELEMS, plan->cobravo);
 }
 
-inline static void bit_reverse_permutation_1d(FLOAT *values, uint32_t N, const PLAN_T *plan) {
+inline static void bit_reverse_permutation_1d(FLOAT *values, uint32_t N, PLAN_T *plan) {
     const uint32_t order = intlog2(N);
-    if (order < COBRAVO_MIN_LOG) {
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle_1d(values, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute != TLS_PERMUTE_COBRAVO) {
         table_shuffle_1d(values, order);
         return;
     }
@@ -679,6 +763,22 @@ PLAN_T *PREFIX(make_plan)(uint32_t N) {
     plan->N = N;
     plan->fuse = NANOFFT_EFFECTIVE_FUSE(tls_tuning_fft_fuse());
     plan->cobravo = tls_tuning_cobravo();
+    plan->pairs = NULL;
+    plan->npairs = 0;
+    {
+        const uint32_t order = intlog2(N);
+        int mode = tls_tuning_permute();
+        if (mode == TLS_PERMUTE_AUTO) {
+            mode = (order < PAIRS_MIN_LOG) ? TLS_PERMUTE_TABLE
+                                           : ((order <= PAIRS_MAX_LOG) ? TLS_PERMUTE_PAIRS : TLS_PERMUTE_COBRAVO);
+        }
+        /* The pair table costs 4N bytes: keep a forced request from allocating
+         * it for a whole monolithic grid, and keep a forced tiled reversal away
+         * from tile widths the vectorized emitter cannot address. */
+        if (mode == TLS_PERMUTE_PAIRS && order > PAIRS_MAX_LOG + 3u) mode = TLS_PERMUTE_COBRAVO;
+        if (mode == TLS_PERMUTE_COBRAVO && order < COBRAVO_MIN_LOG) mode = TLS_PERMUTE_TABLE;
+        plan->permute = mode;
+    }
 
     plan->twiddle_real = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
     plan->twiddle_imag = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
@@ -697,6 +797,7 @@ void PREFIX(destroy_plan)(PLAN_T *plan) {
         free(plan->twiddle_imag);
         free(plan->cobra_buffer_real);
         free(plan->cobra_buffer_imag);
+        free(plan->pairs);
         free(plan);
     }
 }

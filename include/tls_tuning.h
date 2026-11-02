@@ -36,6 +36,19 @@ void tls_tuning_set_cobravo(int on);
 int tls_tuning_defer(void);
 void tls_tuning_set_defer(int on);
 
+/* Bit-reversal strategy: 0 = automatic (the measured crossover), 1 = scalar
+ * table shuffle, 2 = precomputed swap pairs, 3 = Cobravo tiled reversal.
+ * Exposed so the benchmark harness can interleave strategies in one process. */
+int tls_tuning_permute(void);
+void tls_tuning_set_permute(int mode);
+
+enum {
+    TLS_PERMUTE_AUTO = 0,
+    TLS_PERMUTE_TABLE = 1,
+    TLS_PERMUTE_PAIRS = 2,
+    TLS_PERMUTE_COBRAVO = 3,
+};
+
 /* Bytes of periodogram work arrays allocated by the most recent fastchi2 call. */
 unsigned long long tls_tuning_work_bytes(void);
 
