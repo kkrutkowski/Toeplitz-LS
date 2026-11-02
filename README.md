@@ -74,6 +74,73 @@ accumulation. It is statistically weaker than the full multiharmonic
 least-squares periodogram; under uniformly sampled observation times its
 statistical significance is approximately `2/pi` of the true chi-square periodogram under assumption of the samples coming from an uniform probability distribution.
 
+## Performance
+
+The hot path is a blocked NuFFT sweep: the frequency grid is cut into blocks,
+each block is one transform of `2 x block` points, and the Toeplitz system of
+every frequency in the block is solved immediately. Four things are tuned for
+it (all measured with the interleaved harness in [`tests/`](tests/README.md)):
+
+- **Fused-twiddle FFT.** A pass fuses `L` radix-2 DIF stages (a radix-`2^L`
+  pass) so the buffer is traversed once per `L` stages instead of once per
+  stage. `L` is a build-time constant, set separately per precision:
+
+  | variable | precision | default |
+  |---|---|---|
+  | `NANOFFT_FFT_FUSE_FLOAT` | `tlsf` (float) | 3 |
+  | `NANOFFT_FFT_FUSE_DOUBLE` | `tls` (double) | 3 |
+  | `NANOFFT_FFT_FUSE_DD` | `tlsdd` (double-double) | 3 |
+
+  The range is 1 (the classic stage-at-a-time transform) to 4 (radix-16). It
+  is also a cap: the runtime switch `tls_tuning_set_fft_fuse()` (see
+  `include/tls_tuning.h`, intended for benchmarking) can only select a depth
+  the precision was built for. Build with e.g.
+
+  ```console
+  make native FFT_FUSE_FLOAT=4 FFT_FUSE_DOUBLE=2
+  ```
+
+- **Vectorized COBRAVO bit reversal.** The COBRA tile reversal is emitted with
+  AVX-512/AVX2 gathers from a contiguous staging buffer instead of the scalar
+  in-tile swap, and the tile width shrinks with `log2(N)` so transforms below
+  `2^13` use it too.
+
+- **Deferred bit reversal.** The NuFFT can hand its block back in the FFT's
+  bit-reversed *slot* order; the per-frequency sums, the Toeplitz solve and the
+  normalization are all per-bin, so the results are permuted once per block
+  instead of once per transform. This applies to every FastChi2 path (including
+  the `nterms=1` GLS closed form) and to IHS with `nterms >= 2`. IHS at
+  `nterms = 1` keeps the frequency-ordered path: it runs a single transform per
+  block, so deferring the permutation cannot save anything.
+
+- **Block-sized work arrays.** The trig-sum rows and the twiddle-ladder state
+  are sized by the NuFFT block and the model order, not by the whole frequency
+  grid, and the solver scratch is allocated once per periodogram instead of
+  once per block.
+
+Two knobs exist for benchmarking only: `tls_tuning_set_defer()` (0 restores
+frequency-ordered output) and `tls_tuning_set_cobravo()` (0 restores the scalar
+in-tile permutation). They are process-global and read when a plan is created;
+the defaults above are what a plain build ships with.
+
+Representative single-core numbers (AMD Ryzen 9 7945HX, gcc 14, `-O3
+-ffast-math -march=native`), branch / unmodified `main`, best of 5 interleaved
+rounds (`M` observations, `N` frequencies):
+
+| workload | main | branch | ratio |
+|---|---|---|---|
+| `N=4096, nterms=3` | 524 us | 477 us | 0.91 |
+| `N=8192, nterms=3` | 978 | 684 | 0.70 |
+| `N=12288, nterms=3` | 1249 | 783 | 0.63 |
+| `N=8192, nterms=1` | 258 | 237 | 0.92 |
+| `N=8192, nterms=8` | 3005 | 1997 | 0.67 |
+| `N=8192, nterms=3`, `nll` | 914 | 839 | 0.92 |
+| `N=8192, nterms=3`, `pswf21` | 800 | 675 | 0.84 |
+| `N=65536, nterms=3` | 5844 | 3161 | 0.54 |
+| `N=131072, nterms=3` | 9200 | 5638 | 0.61 |
+| IHS, `nterms=3` | 268 | 255 | 0.95 |
+| IHS, `nterms=1` (unchanged path) | 125 | 125 | 1.00 |
+
 ## [Free-threaded (GIL-free) Python](https://docs.python.org/3/howto/free-threading-python.html) support
 toeplitz-ls is compatible with free-threaded CPython (PEP 703, available as an optional build since Python 3.13). With the GIL disabled, ThreadPoolExecutor-based batch processing achieves true parallelism without the overhead of multiprocessing — no serialisation, no inter-process memory duplication. 
 
