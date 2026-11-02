@@ -3,6 +3,7 @@
 #include <float.h>
 #include <math.h>
 #include <nufft1.h>
+#include <tls_internal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -64,6 +65,8 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define NANOFFT_PLAN nanofftdd_plan
 #    define NANOFFT_MAKE_PLAN nanofftdd_make_plan
 #    define NANOFFT_EXECUTE nanofftdd_execute
+#    define NANOFFT_EXECUTE_RAW nanofftdd_execute_raw
+#    define NANOFFT_PERMUTE_1D nanofftdd_permute_1d
 #    define NANOFFT_DESTROY_PLAN nanofftdd_destroy_plan
 #    define LRA_BESSEL_TERMS 14
 #    define GL_NEWTON_TOL FCONST(5e-32, 0)
@@ -72,6 +75,8 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define NANOFFT_PLAN nanofft_plan
 #    define NANOFFT_MAKE_PLAN nanofft_make_plan
 #    define NANOFFT_EXECUTE nanofft_execute
+#    define NANOFFT_EXECUTE_RAW nanofft_execute_raw
+#    define NANOFFT_PERMUTE_1D nanofft_permute_1d
 #    define NANOFFT_DESTROY_PLAN nanofft_destroy_plan
 #    define LRA_BESSEL_TERMS 8
 #    define GL_NEWTON_TOL FCONST(2.0e-16)
@@ -80,6 +85,8 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define NANOFFT_PLAN nanofftf_plan
 #    define NANOFFT_MAKE_PLAN nanofftf_make_plan
 #    define NANOFFT_EXECUTE nanofftf_execute
+#    define NANOFFT_EXECUTE_RAW nanofftf_execute_raw
+#    define NANOFFT_PERMUTE_1D nanofftf_permute_1d
 #    define NANOFFT_DESTROY_PLAN nanofftf_destroy_plan
 #    define LRA_BESSEL_TERMS 6
 #    define GL_NEWTON_TOL FCONST(1.0e-7)
@@ -738,6 +745,15 @@ struct PFX(pswf_plan) {
     FLOAT *deconv, *shift_r, *shift_i;
     NANOFFT_PLAN *nanofft_p;
     FLOAT *fft_real, *fft_imag;
+    /* Slot-order (deferred bit reversal) support.  `slot_deconv` is the
+     * deconvolution table indexed by FFT position, with the NuFFT oversampling
+     * padding zeroed; `period`/`nvalid`/`slot_offsets` describe the periodic
+     * pattern of kept positions so only those are ever written out. */
+    int slots, valid_slots, period, nvalid;
+    int slot_tables_built;
+    unsigned char slot_offsets[64];
+    FLOAT *slot_deconv;
+    FLOAT *perm_scratch;
 };
 
 static inline int PFX(positive_mod_int)(int value, int modulus) {
@@ -878,7 +894,79 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     plan->fft_real = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
     plan->fft_imag = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
     plan->nanofft_p = NANOFFT_MAKE_PLAN(plan->Nfft);
+
+    plan->slots = plan->Nfft;
+    plan->valid_slots = plan->Nout;
+    plan->period = 0;
+    plan->nvalid = 0;
+    plan->slot_deconv = PFX(allocate_aligned)((size_t)plan->slots);
+    plan->perm_scratch = PFX(allocate_aligned)((size_t)plan->slots);
     return plan;
+}
+
+/* =========================================================================
+ * Slot-order (deferred bit reversal) support
+ * ========================================================================= */
+
+static inline uint32_t PFX(nfft_log2)(uint32_t n) {
+    uint32_t bits = 0;
+    while ((1u << bits) < n) ++bits;
+    return bits;
+}
+
+/*
+ * Slot p holds FFT bin reverse_bits(p).  The kept bins are the two contiguous
+ * runs at the ends of the spectrum, so their bit-reversed image repeats with a
+ * small power-of-two period; only the kept offsets inside one period are ever
+ * written out.  Bins the output window never maps (the oversampling padding)
+ * get a zero deconvolution factor.
+ */
+static void PFX(pswf_build_slot_tables)(struct PFX(pswf_plan) * plan) {
+    const int nfft = plan->Nfft;
+    const uint32_t log_nfft = PFX(nfft_log2)((uint32_t)nfft);
+    const int first_bin = nfft - plan->output_shift;
+    const int tail = plan->Nout - plan->output_shift;
+    FLOAT *slot_deconv = plan->slot_deconv;
+
+    plan->period = 0;
+    plan->nvalid = 0;
+    plan->slot_tables_built = 1;
+    if (!slot_deconv || !plan->deconv) return;
+
+    for (int p = 0; p < nfft; ++p) {
+        const int bin = (int)nanofft_reverse_bits((uint32_t)p, log_nfft);
+        if (bin >= first_bin) {
+            slot_deconv[p] = plan->deconv[bin - first_bin];
+        } else if (bin < tail) {
+            slot_deconv[p] = plan->deconv[bin + plan->output_shift];
+        } else {
+            slot_deconv[p] = FCAST(0.0); /* NuFFT padding: never mapped */
+        }
+    }
+
+    int period = 0;
+    for (int candidate = 1; candidate <= (int)sizeof(plan->slot_offsets) && candidate <= nfft; candidate <<= 1) {
+        bool uniform = true;
+        for (int p = candidate; p < nfft && uniform; ++p) {
+            const bool here = TO_DOUBLE(slot_deconv[p]) != 0.0;
+            const bool folded = TO_DOUBLE(slot_deconv[p % candidate]) != 0.0;
+            uniform = (here == folded);
+        }
+        if (uniform) {
+            period = candidate;
+            break;
+        }
+    }
+    if (period == 0) return; /* no small period: stay in frequency order */
+
+    int nvalid = 0;
+    for (int r = 0; r < period; ++r) {
+        if (TO_DOUBLE(slot_deconv[r]) != 0.0) plan->slot_offsets[nvalid++] = (unsigned char)r;
+    }
+    if ((long long)nvalid * (long long)(nfft / period) != (long long)plan->Nout) return; /* defensive */
+
+    plan->period = period;
+    plan->nvalid = nvalid;
 }
 
 void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) {
@@ -1016,7 +1104,62 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     }
 }
 
-void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const FLOAT *y_imag, FLOAT *out_real, FLOAT *out_imag, int freq_factor) {
+/* Compact slot output: only the kept FFT positions, in slot order. */
+static void PFX(pswf_emit_slots)(const struct PFX(pswf_plan) * plan, const FLOAT *fr, const FLOAT *fi, FLOAT *out_r, FLOAT *out_i) {
+    const int period = plan->period;
+    const int nvalid = plan->nvalid;
+    FLOAT *dst_r = out_r, *dst_i = out_i;
+    for (int base = 0; base < plan->slots; base += period) {
+        const FLOAT *sd = plan->slot_deconv + base;
+        const FLOAT *sr = fr + base, *si = fi + base;
+        for (int k = 0; k < nvalid; ++k) {
+            const int src = (int)plan->slot_offsets[k];
+            *dst_r++ = MUL(sr[src], sd[src]);
+            *dst_i++ = MUL(si[src], sd[src]);
+        }
+    }
+}
+
+/*
+ * Turn one compact slot block (as written by TLS_NUFFT_OUT_SLOTS) back into
+ * frequency order: pad the dropped positions with zeros so the permutation
+ * stays a plain power-of-two bit reversal, reverse once, then rotate the two
+ * contiguous bin runs into grid order.
+ */
+void PFX(pswf_finish_slots)(struct PFX(pswf_plan) * plan, const FLOAT *compact, FLOAT *out, int count) {
+    if (!plan || !compact || !out || count <= 0 || plan->period <= 0 || !plan->perm_scratch) return;
+
+    FLOAT *padded = plan->perm_scratch;
+    memset(padded, 0, (size_t)plan->slots * sizeof(FLOAT));
+    int s = 0;
+    for (int base = 0; base < plan->slots; base += plan->period) {
+        for (int k = 0; k < plan->nvalid; ++k) padded[base + (int)plan->slot_offsets[k]] = compact[s++];
+    }
+
+    NANOFFT_PERMUTE_1D(plan->nanofft_p, padded);
+
+    const int split = plan->output_shift;
+    const int first_bin = plan->Nfft - split;
+    const int first = (split < count) ? split : count;
+    for (int k = 0; k < first; ++k) out[k] = padded[first_bin + k];
+    for (int k = first; k < count; ++k) out[k] = padded[k - split];
+}
+
+/* Slot support is built on demand: a plan that only ever produces frequency
+ * order (the IHS d = 1 path, every natural-order call) never pays for it.
+ * Callers must have run pswf_precompute() first, as chi2per always does. */
+static void PFX(pswf_ensure_slot_tables)(struct PFX(pswf_plan) * plan) {
+    if (!plan || plan->slot_tables_built) return;
+    PFX(pswf_build_slot_tables)(plan);
+}
+
+int PFX(pswf_slots_available)(struct PFX(pswf_plan) * plan) {
+    PFX(pswf_ensure_slot_tables)(plan);
+    return (plan && plan->period > 0 && plan->nvalid > 0) ? 1 : 0;
+}
+
+void PFX(pswf_execute_mode)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const FLOAT *y_imag, FLOAT *out_real, FLOAT *out_imag, int freq_factor,
+                            int mode) {
     int f_idx = freq_factor - 1;
     if (f_idx < 0 || f_idx >= plan->num_factors) return;
 
@@ -1069,6 +1212,13 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
         plan->fft_imag[dst] = ADD(plan->fft_imag[dst], plan->fft_imag[src]);
     }
 
+    if (mode == TLS_NUFFT_OUT_SLOTS) PFX(pswf_ensure_slot_tables)(plan);
+    if (mode == TLS_NUFFT_OUT_SLOTS && plan->period > 0) {
+        NANOFFT_EXECUTE_RAW(plan->nanofft_p, plan->fft_real, plan->fft_imag);
+        PFX(pswf_emit_slots)(plan, plan->fft_real, plan->fft_imag, out_real, out_imag);
+        return;
+    }
+
     NANOFFT_EXECUTE(plan->nanofft_p, plan->fft_real, plan->fft_imag);
 
     for (int k = 0; k < plan->Nout; ++k) {
@@ -1077,6 +1227,10 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
         out_real[k] = MUL(plan->fft_real[fft_idx], plan->deconv[k]);
         out_imag[k] = MUL(plan->fft_imag[fft_idx], plan->deconv[k]);
     }
+}
+
+void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const FLOAT *y_imag, FLOAT *out_real, FLOAT *out_imag, int freq_factor) {
+    PFX(pswf_execute_mode)(plan, y_real, y_imag, out_real, out_imag, freq_factor, TLS_NUFFT_OUT_NATURAL);
 }
 
 void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
@@ -1088,6 +1242,8 @@ void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     free(plan->shift_i);
     free(plan->fft_real);
     free(plan->fft_imag);
+    free(plan->slot_deconv);
+    free(plan->perm_scratch);
     if (plan->nanofft_p) NANOFFT_DESTROY_PLAN(plan->nanofft_p);
     free(plan);
 }
