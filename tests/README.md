@@ -78,6 +78,34 @@ front over the range the periodogram actually uses (`2 x plan_block`, i.e.
 there for other grids. Depth 4 needs 32 vector registers and starts to spill.
 The vectorized COBRAVO permutation is 1.4-1.6x the scalar one everywhere.
 
+## bench_permute
+
+Bit-reversal strategies only (no butterflies), one process, both precisions,
+order rotated every round. `./build/bench_permute 6 8 4 16` on a Ryzen 9
+7945HX, ns per element, best of 8 inside 6 rotations:
+
+| n | table | pairs | cobravo (vec) | cobravo (scalar) | auto |
+|---|---|---|---|---|---|
+| 2^6 | 0.94 | **0.47** | 0.94 | 0.94 | 0.47 |
+| 2^8 | 0.86 | **0.39** | 0.82 | 1.68 | 0.39 |
+| 2^10 | 1.03 | **0.39** | 0.69 | 1.45 | 0.40 |
+| 2^11 | 1.03 | **0.40** | 0.68 | 1.49 | 0.40 |
+| 2^12 | 1.05 | **0.47** | 0.69 | 1.54 | 0.56 |
+| 2^13 | 1.21 | 0.64 | **0.68** | 1.51 | 0.68 |
+| 2^14 | 1.62 | 1.03 | **0.68** | 1.49 | 0.67 |
+| 2^16 | 5.16 | 8.02 | **0.66** | 1.41 | 0.66 |
+
+Double precision shifts the upper crossover down by one power of two (the pair
+table is 4N bytes whatever the element size, so it leaves L1 earlier):
+`pairs` wins up to 2^12 and `cobravo` from 2^13.
+
+The dispatch therefore uses `table` below 2^6 (differences there are inside the
+timer resolution), `pairs` up to 2^13 (float) / 2^12 (double), and `cobravo`
+above. `tls_tuning_set_permute(0..3)` forces one strategy for A/B runs. The pair
+list is built lazily on first use and freed with the plan; the blocked solver
+creates one plan per call and permutes it once per block, so the build cost is
+amortised.
+
 ## bench_periodogram
 
 The same interleaving inside one process over the algorithm variants, per
