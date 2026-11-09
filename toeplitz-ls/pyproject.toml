@@ -1,10 +1,10 @@
 [build-system]
 # Only used when installing straight from a clone; the release wheels and the
 # sdist are assembled by `dispatch.wheel` / `dispatch.sdist` (see dispatch/).
-# 61 is the first setuptools with PEP 621 metadata.  The license is a table
-# rather than an SPDX string because the string form needs setuptools >= 77
-# (and therefore Python >= 3.9).
-requires = ["setuptools>=61"]
+# 61.1 is the first setuptools with PEP 621 metadata and the package-data fix.
+# The license is a table rather than an SPDX string because the string form
+# needs setuptools >= 77 (and therefore Python >= 3.9).
+requires = ["setuptools>=61.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
