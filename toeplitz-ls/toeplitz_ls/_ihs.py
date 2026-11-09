@@ -1,29 +1,33 @@
 """ctypes wrappers for the incoherent harmonic sum (IHS) periodogram.
 
-The IHS path is a deliberately simpler alternative to the FastChi2/AoVMH
-periodogram in :mod:`toeplitz_ls._fastchi2`.  It evaluates one NuFFT per
+The IHS path is a simplified formulation of a similar periodogram.  It assumes
+the harmonic frequencies are independent (a regression from the standard
+least-squares periodogram) but not orthogonal.  It evaluates one NuFFT per
 harmonic and accumulates the squared magnitudes directly, so it never builds
-or solves the Toeplitz normal equations.
+or solves the Toeplitz normal equations.  In practice it is usually slightly
+less accurate than FastChi2, but at least 3x less computationally expensive.
 
 Two statistics are available through ``normalization=``:
 
 ``standard`` (default)
-    Sum of the uncorrelated per-harmonic coefficient-of-determination
-    estimates, ``2 * sum_k |Z_k(f)|^2 / (sum_m w_m * chi2_ref)``.
+    Direct sum of the per-harmonic coefficient-of-determination estimates.
+    For ``nterms > 1`` this is a sum, not a bounded R^2, and may exceed 1.
 ``nll``
-    The IHS negative log false-alarm probability.  Each harmonic power is
-    normalized to the Rayleigh scale and passed through Wilkie's finite-sample
-    correction before the harmonics are summed.  The sum is then passed
-    through the Erlang correction ``sum - ln(sum_{k=0}^{d-1} sum^k / k!)``.
+    Negative log false-alarm probability with Wilkie's (1983) finite-sample
+    correction for the Rayleigh Z test applied to each harmonic.
 
 Unlike the FastChi2 wrappers these modules do not accept ``solver`` or
 ``autonan`` and do not return a condition array: IHS has no linear solve and
 no Toeplitz condition bound.
+
+The approximation is not suitable when ``nterms**4 > num_observations``; the
+Python wrappers emit a :class:`RuntimeWarning` in that case.
 """
 
 from __future__ import annotations
 
 import ctypes
+import warnings
 
 import numpy as np
 
@@ -58,6 +62,18 @@ def _check_ihs_normalization(normalization):
     raise ValueError("normalization must be 'standard' or 'nll'")
 
 
+def _warn_if_ihs_undersampled(num_observations, nterms):
+    """Warn when the IHS approximation is outside its intended regime."""
+    if nterms**4 > num_observations:
+        warnings.warn(
+            "IHS is not suitable when nterms**4 > num_observations "
+            f"(nterms={nterms}, observations={num_observations}); use the "
+            "Toeplitz FastChi2 modules (tls/tlsf/tlsdd) or reduce nterms.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 class ihsf:
     """Single-precision IHS periodogram wrapper."""
 
@@ -73,6 +89,7 @@ class ihsf:
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
+        _warn_if_ihs_undersampled(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float32)
 
         status = _load_library().tlsf_ihs(
@@ -132,6 +149,7 @@ class ihs:
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
+        _warn_if_ihs_undersampled(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float64)
 
         status = _load_library().tls_ihs(
@@ -213,6 +231,7 @@ class ihsdd:
         if any(value <= 0 for value in dy_mpf):
             raise ValueError("dy entries must be positive")
         _check_observation_count(len(t_mpf), nterms)
+        _warn_if_ihs_undersampled(len(t_mpf), nterms)
 
         t_dd = _as_dd_array(t_mpf)
         y_dd = _as_dd_array(y_mpf)

@@ -1,17 +1,100 @@
-# [WIP] Toeplitz-LS
+# Toeplitz-LS
 Reference implementation of multiharmonic least-squares periodogram (AoVMH(W) / FastChi²) using blocked NuFFT and a fast Toeplitz solver for complex coefficients.
 
 ## Installation
-The codebase is currently in a pre-release state (versioned as 0.0.0), so breaking changes may occur and no release builds are available yet. As such compilation from source is recommended.
 
-To install the Python wrapper:
+Prebuilt wheels are the recommended installation path:
+
 ```console
-git clone https://github.com/kkrutkowski/Toeplitz-ls.git --depth=1
-cd ./Toeplitz_ls
-make native  # use 'make generic' if build time is a priority — this may take a few minutes
+pip install toeplitz-ls
+```
+
+The wheels are tagged `py3-none-<platform>`: the package is a ctypes binding, so
+one wheel serves every Python version on that platform. Each wheel contains
+several microarchitecture builds of the native library and loads the widest one
+the CPU can execute, once, at import — see [Runtime dispatch](#runtime-dispatch).
+
+Supported platforms: Linux on glibc and musl (`x86-64`, `aarch64`), Windows
+(`x86-64`, `arm64`) and macOS (`x86-64`, `arm64`). The package requires
+Python >= 3.8 and NumPy >= 1.17.3; the optional `tlsdd` extra requires
+mpmath >= 1.0.
+
+Building from source instead:
+
+```console
+git clone https://github.com/kkrutkowski/Toeplitz-LS.git --depth=1
+cd ./Toeplitz-LS
+make native        # also tunes the FFT fusion depth on this machine (about a minute)
+                   # 'make TUNE=0 native' skips the tuning, 'make generic' is the
+                   # portable baseline and skips it too
 cd ./toeplitz-ls
 pip3 install .
 ```
+
+## Runtime dispatch
+
+A wheel ships one shared object per microarchitecture level, plus a manifest
+describing them:
+
+| platform | variants |
+|---|---|
+| Linux x86-64 | `x86-64`, `x86-64-v2`, `x86-64-v2+avx`, `x86-64-v3`, `x86-64-v4` |
+| Linux aarch64 | `armv8-a`, `armv8.2-a+sve-256`, `armv8.2-a+sve-512` |
+| Windows x86-64 | same five x86 levels as Linux |
+| Windows arm64 | same three ARM levels as Linux |
+| macOS x86-64 | same five x86 levels as Linux |
+| macOS arm64 | `armv8-a` (Apple silicon has no SVE, so there is nothing wider) |
+
+`toeplitz_ls._dispatch` probes the CPU at import and loads the first variant
+whose requirements are met, falling back to the baseline library. The features
+come from the library itself (`tls_cpu_features()`, a CPUID/HWCAP probe in the
+baseline `.so` that also checks the OS enabled the AVX state), not from an OS
+summary such as `IsProcessorFeaturePresent` — so a variant is only ever chosen
+when it can really execute. The choice is made once, so a periodogram call pays
+nothing for it:
+
+```python
+import toeplitz_ls
+toeplitz_ls.__dispatch__   # {'name': 'x86-64-v3', 'file': 'libtls-x86-64-v3.so', ...}
+```
+
+`TOEPLITZ_LS_DISPATCH` overrides the choice (`=list` prints what the wheel
+contains and what this CPU supports; naming a variant this CPU cannot run is an
+error rather than a crash). SVE libraries are only selected when the hardware
+vector length matches the length they were compiled for; Linux reports it
+through `prctl`, Windows through a `cntb` probe in the baseline library.
+
+## FFT fusion depth
+
+The FFT fuses several radix-2 stages into one pass, and the best depth depends
+on the grid: short transforms like deeper passes (fewer twiddle loads), long
+ones prefer shallower passes (less register pressure and a smaller working
+set). `make native` and every release build therefore measure the depth per
+power-of-two grid with `tests/bench_fuse --tune` and bake the result in as
+`nanofft_depth_table.h`, which the library consults when the caller asks for
+the automatic choice. This is a build artifact like the scaling calibration: it
+is measured once per vector width on the build machine, and variants that cannot
+run there borrow the measurement of the same vector width (the generated file
+records which variant it came from).
+
+`make TUNE=0 native` keeps the per-precision defaults instead, and
+`toeplitz_ls` callers can still override the depth explicitly through
+`tls_tuning_set_fft_fuse()`.
+
+## Numerical accuracy of the built-in vector exponential
+
+The library carries its own Remez implementation of `exp` for the SIMD paths
+(`include/nanofft_vecmath.h`, coefficients from
+`src/miscellaneous/remez_exp_lut.cpp`) instead of calling the platform's
+vectorised exponential, because libmvec exists only in glibc and the same
+sources would otherwise link differently on musl, macOS and Windows. It is
+compiled with the caller's fast-math settings on purpose (the Horner chain
+reassociation is a win), which costs a few ulp: `tests/check_vecmath` bounds it
+relative to libm over the whole finite range, saturates to 0/inf where `exp`
+does, and the double-double code is built without fast-math entirely. What
+matters for the statistics — R² and NLL — is covered by
+`tests/check_periodogram` and the Python test suite, whose tolerances are far
+above these differences.
 
 ## Usage
 
@@ -26,23 +109,20 @@ For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and `autopower()` a
 | `"standard"` (default) | coefficient of determination `R^2` | |
 | `"anova"` | ANOVA / `F` statistic | Schwarzenberg-Czerny's ANOVA convention |
 | `"nll"` | natural negative log false-alarm probability | `-ln(FAP)`|
-| `"regularized"` | nll Laplace-regularized by Cybenko statistic | Not equivalent to the other normalizations |
 
-For `nterms = d` harmonics, with `b = (M - 1 - 2d) / 2`:
+For `nterms = d` harmonics:
 
-- `anova`: `F = (d2 / d1) * R^2 / (1 - R^2)`, `d1 = 2d + 1`, `d2 = M - 1 - d1`.
-- `nll`: `NLL = -b*ln(1 - R^2) - ln(S_d(R^2, b))`, where
-  `S_d(R^2, b) = sum_{k=0}^{d-1} (b)_k / k! * (R^2)^k`.
-- `regularized`: with `P` the Cybenko reflection-coefficient product and
-  `delta = NLL_data - NLL_cond(P)`, the output is `delta + ln(2)` when
-  `delta >= 0`, otherwise `-ln(1 - exp(delta) / 2)`.
-
-For `nterms > 1`, `regularized` requires one of the Toeplitz solvers
-(`levinson`, `zohar`, `bareiss`), because it needs the reflection-coefficient
-product. `ldlt` and `svd` raise `RuntimeError` for this combination.
+- `"standard"` is the coefficient of determination `R^2` of the full model.
+  Values at or above 1 are numerical artefacts of an ill-conditioned solve and
+  are reported as 0.
+- `"anova"` is the ANOVA `F` statistic in Schwarzenberg-Czerny's convention.
+- `"nll"` is the natural-log negative false-alarm probability, `-ln(FAP)`,
+  computed from the direct Pochhammer/incomplete-beta statistic with its
+  finite-sample correction.
 
 The `cond` array returned when `autonan=False` is the Toeplitz condition upper
-bound `(2*nterms + 1) * P`, not `P`; `regularized` internally uses `P`.
+bound `(2*nterms + 1) * P`, where `P` is the Cybenko reflection-coefficient
+product.
 
 ## IHS periodogram
 
@@ -56,23 +136,22 @@ from toeplitz_ls import ihs
 frequency, power = ihs.autopower(t, y, dy=None, nterms=3, normalization="nll")
 ```
 
-With `w_m = 1 / dy_m^2`, `chi2_ref = sum_m w_m (y_m - ymean)^2`, and
-`Z_k(f) = sum_m w_m (y_m - ymean) exp(-2*pi*i*k*f*t_m)`, the supported
-statistics are:
+IHS is a simplified formulation of a similar periodogram. It assumes that the
+harmonic frequencies are independent (a regression from the standard
+least-squares periodogram) but not orthogonal. In practice it is usually
+slightly less accurate than FastChi2, but at least 3x less computationally
+expensive: it evaluates `d` NuFFTs instead of `3d` and replaces the `O(d^2)`
+normal-equation solve with an `O(d)` power accumulation.
 
-- `"standard"` (default): the sum of the uncorrelated per-harmonic
-  `R^2` estimates,
-  `2 * sum_{k=1}^d |Z_k(f)|^2 / (sum_m w_m * chi2_ref)`.
-- `"nll"`: the IHS negative log false-alarm probability.  Each harmonic power
-  is normalized to the Rayleigh Z-test's result and passed through Wilkie's finite-sample
-  correction before the harmonics are summed.  The sum is then passed through
-  the Erlang correction `S - ln(sum_{k=0}^{d-1} S^k / k!)`.
+The supported statistics are:
 
-The IHS path evaluates only `d` NuFFTs instead of the FastChi2 `3d` and
-replaces the `O(d^2)` normal-equation solve with an `O(d)` power
-accumulation. It is statistically weaker than the full multiharmonic
-least-squares periodogram; under uniformly sampled observation times its
-statistical significance is approximately `2/pi` of the true chi-square periodogram under assumption of the samples coming from an uniform probability distribution.
+- `"standard"` (default): a direct estimate from the per-harmonic powers. For
+  `nterms > 1` this is a sum, not a bounded `R^2`, and may exceed 1.
+- `"nll"`: the IHS negative log false-alarm probability, using Wilkie's (1983)
+  finite-sample correction for the Rayleigh Z test on each harmonic.
+
+IHS is not suitable when `nterms^4 > M`; the Python wrappers emit a
+`RuntimeWarning` in that case. Use the FastChi2 modules or reduce `nterms`.
 
 ## Performance
 
@@ -87,18 +166,28 @@ it (all measured with the interleaved harness in [`tests/`](tests/README.md)):
 
   | variable | precision | default |
   |---|---|---|
-  | `NANOFFT_FFT_FUSE_FLOAT` | `tlsf` (float) | 3 |
-  | `NANOFFT_FFT_FUSE_DOUBLE` | `tls` (double) | 3 |
-  | `NANOFFT_FFT_FUSE_DD` | `tlsdd` (double-double) | 3 |
+  | `NANOFFT_FFT_FUSE_FLOAT` | `tlsf` (float) | `floor(log2(VECF_LEN)) - 1` |
+  | `NANOFFT_FFT_FUSE_DOUBLE` | `tls` (double) | `floor(log2(VEC_LEN))` |
+  | `NANOFFT_FFT_FUSE_DD` | `tlsdd` (double-double) | 2 |
 
-  The range is 1 (the classic stage-at-a-time transform) to 4 (radix-16). It
-  is also a cap: the runtime switch `tls_tuning_set_fft_fuse()` (see
-  `include/tls_tuning.h`, intended for benchmarking) can only select a depth
-  the precision was built for. Build with e.g.
+  i.e. 3 / 3 / 2 with 512-bit vectors, 2 / 2 / 2 with 256-bit, 1 / 1 / 2 with
+  128-bit. The float pass takes the depth a double-precision vector of the same
+  width would use: a fused pass keeps `2^(L+1)` data vectors plus ~6 twiddle
+  and temporary registers live, so the full-lane depth fills the whole register
+  file and measured never faster than one step shallower. The range is 1 (the
+  classic stage-at-a-time transform) to 4 (radix-16). It is also a cap: the
+  runtime switch `tls_tuning_set_fft_fuse()` (see `include/tls_tuning.h`,
+  intended for benchmarking) can only select a depth the precision was built
+  for. Build with e.g.
 
   ```console
   make native FFT_FUSE_FLOAT=4 FFT_FUSE_DOUBLE=2
   ```
+
+  The leftover stages of an odd stage count go first (`TLS_FFT_ORDER_END`, the
+  default: the first DIF pass streams the whole array and is bandwidth bound,
+  the deepest fusion lands on the cache-resident tail), or last
+  (`TLS_FFT_ORDER_FRONT`) via `tls_tuning_set_fft_order()`.
 
 - **Vectorized COBRAVO bit reversal.** The COBRA tile reversal is emitted with
   AVX-512/AVX2 gathers from a contiguous staging buffer instead of the scalar
@@ -169,7 +258,7 @@ freq, r2 = tls.autopower(
     nterms=1, # generalized Scargle periodogram
     oversampling=5, #frequency density, relative to a dense, uniform FFT
     backend="pswf43", # or "pswf21", "lra"
-    normalization="standard" # or "anova", "nll", "regularized"
+    normalization="standard" # or "anova", "nll"
     )
 
 best_idx = np.nanargmax(r2)
@@ -223,3 +312,21 @@ freq, power, cond = tlsf.autopower(
 peaks = get_peaks(freq, power, cond, threshold=10)
 peaks.print(10)
 ```
+
+## Development
+
+The C and Python halves share one style: `.clang-format` and `ruff.toml` use the
+same 160-column budget and 4-space indentation, so `make format` leaves both in
+a state `make format-check` accepts.
+
+```console
+make format        # clang-format (src, include, tests) + ruff format/check (package, dispatch)
+make format-check  # the same, without writing
+make native        # build for this machine, tuning the FFT fusion depth
+make -C tests check
+make wheels        # every release wheel, each ABI-checked against its tag
+make sdist         # source distribution; compiles on install for platforms without a wheel
+```
+
+Build artifacts (objects, staged wheel payloads, `.toolchains/`) live under
+`.build/`.  Nothing is committed to it.

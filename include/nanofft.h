@@ -3,34 +3,97 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <tls_export.h>
 
 /* -------------------------------------------------------------------------
  * SIMD vector width selection
+ * ------------------------------------------------------------------------- */
+#ifndef VEC_BYTES
+#    ifdef __AVX512F__
+#        define VEC_BYTES 64
+#    elif defined(__AVX__)
+#        define VEC_BYTES 32
+#    elif defined(__ARM_FEATURE_SVE_BITS) && __ARM_FEATURE_SVE_BITS > 0
+/* SVE: the vector length has to be a compile-time constant for the GNU vector
+ * extensions below, which is what -msve-vector-bits=N fixes (128/256/512).
+ * Without that flag __ARM_FEATURE_SVE_BITS is 0 and the NEON width is used. */
+#        define VEC_BYTES (__ARM_FEATURE_SVE_BITS / 8)
+#    elif defined(__ARM_NEON) || defined(__aarch64__)
+#        define VEC_BYTES 16
+#    else
+#        define VEC_BYTES 16
+#    endif
+#endif
+
+/* Alignment the plan and the transform buffers ask the allocator for: exactly
+ * one vector, which is all an aligned vector load needs. */
+#define NANOFFT_ALIGN VEC_BYTES
+
+/* Portable allocation helpers, the shuffle macros and the math constants. */
+#include <tls_platform.h>
+
+/* -------------------------------------------------------------------------
+ * Fused-twiddle FFT depth
  * ------------------------------------------------------------------------- */
 /*
  * Fused-twiddle FFT depth, chosen at build time and configurable separately
  * for each precision:
  *
- *   NANOFFT_FFT_FUSE_FLOAT   float pass      (default 3)
- *   NANOFFT_FFT_FUSE_DOUBLE  double pass     (default 3)
- *   NANOFFT_FFT_FUSE_DD      double-double   (default 3)
+ *   NANOFFT_FFT_FUSE_FLOAT   float pass      (default floor(log2(VECF_LEN)) - 1)
+ *   NANOFFT_FFT_FUSE_DOUBLE  double pass     (default floor(log2(VEC_LEN)))
+ *   NANOFFT_FFT_FUSE_DD      double-double   (default 2, not vectorized)
  *
  * Each value is the number of radix-2 DIF stages one pass fuses (1 = plain
  * stage-at-a-time transform, 4 = radix-16 pass).  It is also the maximum the
  * runtime switch (tls_tuning_set_fft_fuse) can select for that precision, and
  * only kernels up to that depth are compiled.
  *
+ * Single precision is deliberately one step shallower than its own lane count
+ * suggests: it takes the fusion depth that a double-precision vector of the
+ * same width would use.  One fused pass keeps 2^(L+1) data vectors plus ~6
+ * twiddle/temporary registers live, so the full log2(VECF_LEN) depth fills the
+ * whole register file, while the double-equivalent depth needs half of it.
+ * The preliminary benchmarks (tests/bench_fuse.c, both -march=native and
+ * -march=x86-64-v3, median over 64 relative cache-line offsets) show the
+ * full-depth pass ending up slightly slower or at best equal to its shallower
+ * neighbour, never faster, so there is no reason to pay for the extra pressure.
+ * Depth 4 stays compiled and selectable at runtime; it is just not the default.
+ *
  *   make FFT_FUSE_FLOAT=2 FFT_FUSE_DOUBLE=4
  */
+#if VEC_BYTES >= 64
+#    define NANOFFT_FFT_FUSE_FLOAT_DEFAULT 3  /* max(log2(VECF_LEN) - 1, 1), VECF_LEN = 16 */
+#    define NANOFFT_FFT_FUSE_DOUBLE_DEFAULT 3 /* log2(VEC_LEN),  VEC_LEN  =  8 */
+#elif VEC_BYTES >= 32
+#    define NANOFFT_FFT_FUSE_FLOAT_DEFAULT 2  /* VECF_LEN = 8 */
+#    define NANOFFT_FFT_FUSE_DOUBLE_DEFAULT 2 /* VEC_LEN  = 4 */
+#else
+#    define NANOFFT_FFT_FUSE_FLOAT_DEFAULT 1  /* VECF_LEN = 4 */
+#    define NANOFFT_FFT_FUSE_DOUBLE_DEFAULT 1 /* VEC_LEN  = 2 */
+#endif
+#define NANOFFT_FFT_FUSE_DD_DEFAULT 2
+
 #ifndef NANOFFT_FFT_FUSE_FLOAT
-#    define NANOFFT_FFT_FUSE_FLOAT 3
+#    define NANOFFT_FFT_FUSE_FLOAT NANOFFT_FFT_FUSE_FLOAT_DEFAULT
 #endif
 #ifndef NANOFFT_FFT_FUSE_DOUBLE
-#    define NANOFFT_FFT_FUSE_DOUBLE 3
+#    define NANOFFT_FFT_FUSE_DOUBLE NANOFFT_FFT_FUSE_DOUBLE_DEFAULT
 #endif
 #ifndef NANOFFT_FFT_FUSE_DD
-#    define NANOFFT_FFT_FUSE_DD 3
+#    define NANOFFT_FFT_FUSE_DD NANOFFT_FFT_FUSE_DD_DEFAULT
 #endif
+
+/*
+ * Fusion depth a plan would use for a grid of `N` points when the caller asks
+ * for the automatic choice (TLS_TUNING_FFT_FUSE_AUTO): the per-grid value from
+ * the tuned table when the library was built with one (-DNANOFFT_DEPTH_TABLE,
+ * produced by `make tune` and by the release build), otherwise the
+ * per-precision default above.  An explicit tls_tuning_set_fft_fuse() value
+ * always wins over both.
+ */
+TLS_API int nanofftf_depth_for(uint32_t N);
+TLS_API int nanofft_depth_for(uint32_t N);
+TLS_API int nanofftdd_depth_for(uint32_t N);
 
 /* Largest depth any precision may be built with. */
 #ifndef NANOFFT_FFT_FUSE_MAX
@@ -45,16 +108,6 @@
 #endif
 #if NANOFFT_FFT_FUSE_DD < 1 || NANOFFT_FFT_FUSE_DD > NANOFFT_FFT_FUSE_MAX
 #    error "NANOFFT_FFT_FUSE_DD must be between 1 and NANOFFT_FFT_FUSE_MAX"
-#endif
-
-#ifndef VEC_BYTES
-#    ifdef __AVX512F__
-#        define VEC_BYTES 64
-#    elif defined(__AVX__)
-#        define VEC_BYTES 32
-#    else
-#        define VEC_BYTES 16
-#    endif
 #endif
 
 /* -------------------------------------------------------------------------
@@ -154,40 +207,35 @@ typedef struct {
     double lo;
 } dd_t;
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_make(double hi,
-                                                                                                                                                  double lo) {
+NANOFFT_DIAG_PUSH_NAN
+static inline dd_t dd_make(double hi, double lo) {
     dd_t res = {hi, lo};
     return res;
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void dd_two_sum(
-    double a, double b, double *r, double *e) {
+static inline void dd_two_sum(double a, double b, double *r, double *e) {
     *r = a + b;
     double v = *r - a;
     *e = (a - (*r - v)) + (b - v);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void dd_two_sum_quick(
-    double x, double y, double *r, double *e) {
+static inline void dd_two_sum_quick(double x, double y, double *r, double *e) {
     *r = x + y;
     *e = y - (*r - x);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void dd_two_difference(
-    double x, double y, double *r, double *e) {
+static inline void dd_two_difference(double x, double y, double *r, double *e) {
     *r = x - y;
     double t = *r - x;
     *e = (x - (*r - t)) - (y + t);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void dd_two_product(
-    double x, double y, double *r, double *e) {
+static inline void dd_two_product(double x, double y, double *r, double *e) {
     *r = x * y;
     *e = fma(x, y, -*r);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_add(dd_t a,
-                                                                                                                                                 dd_t b) {
+static inline dd_t dd_add(dd_t a, dd_t b) {
     double r, e, r_f, e_f;
     dd_two_sum(a.hi, b.hi, &r, &e);
     e = e + a.lo + b.lo;
@@ -195,8 +243,7 @@ __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-ma
     return dd_make(r_f, e_f);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_sub(dd_t a,
-                                                                                                                                                 dd_t b) {
+static inline dd_t dd_sub(dd_t a, dd_t b) {
     double r, e, r_f, e_f;
     dd_two_difference(a.hi, b.hi, &r, &e);
     e = e + a.lo - b.lo;
@@ -204,8 +251,7 @@ __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-ma
     return dd_make(r_f, e_f);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_mul(dd_t a,
-                                                                                                                                                 dd_t b) {
+static inline dd_t dd_mul(dd_t a, dd_t b) {
     double r, e, r_f, e_f;
     dd_two_product(a.hi, b.hi, &r, &e);
     e = e + a.hi * b.lo + a.lo * b.hi;
@@ -215,8 +261,7 @@ __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-ma
 
 static inline double dd_to_double(dd_t a) { return a.hi + a.lo; }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_div(dd_t a,
-                                                                                                                                                 dd_t b) {
+static inline dd_t dd_div(dd_t a, dd_t b) {
     double q1 = a.hi / b.hi;
     dd_t q1_dd = dd_make(q1, 0.0);
     dd_t r = dd_sub(a, dd_mul(b, q1_dd));
@@ -224,7 +269,7 @@ __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-ma
     return dd_add(q1_dd, dd_make(q2, 0.0));
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline dd_t dd_sqrt(dd_t a) {
+static inline dd_t dd_sqrt(dd_t a) {
     if (a.hi > 0.0) {
         double c = sqrt(a.hi);
         double u, uu;
@@ -368,25 +413,34 @@ static inline dd_t sin2pidd(dd_t x) {
     p = dd_mul(p, f);
     return dd_make(p.hi * sign, p.lo * sign);
 }
+NANOFFT_DIAG_POP
 
 /* -------------------------------------------------------------------------
  * Single Precision API (nanofftf)
+ *
+ * Plans accept any power of two from 2 * INTERNAL_VEC_LEN upwards (32 for
+ * float on AVX-512, 16 for float on AVX2 or double on AVX-512, 8 for double on
+ * AVX2).  The intra-vector tail loads two vectors per step, so shorter grids
+ * would read past the signal; make_plan() rejects them instead.  Every fusion
+ * depth and both fusion orders are valid on every accepted grid.
+ *
+ * Signals handed to execute/permute must be aligned to NANOFFT_ALIGN bytes.
  * ------------------------------------------------------------------------- */
 #define VECF_LEN (VEC_BYTES / 4)
 typedef float VECF __attribute__((vector_size(VEC_BYTES)));
 typedef uint32_t VECF_INT __attribute__((vector_size(VEC_BYTES)));
 
 typedef struct nanofftf_plan nanofftf_plan;
-nanofftf_plan *nanofftf_make_plan(uint32_t N);
-void nanofftf_destroy_plan(nanofftf_plan *plan);
+TLS_API nanofftf_plan *nanofftf_make_plan(uint32_t N);
+TLS_API void nanofftf_destroy_plan(nanofftf_plan *plan);
 /* Full transform: Sande-Tukey passes plus bit reversal (frequency order). */
-void nanofftf_execute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
+TLS_API void nanofftf_execute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
 /* Sande-Tukey passes only: the spectrum stays in the FFT's bit-reversed slot
  * order, so one permutation can be deferred to a single scalar result array. */
-void nanofftf_execute_raw(nanofftf_plan *plan, float *real_signal, float *imag_signal);
+TLS_API void nanofftf_execute_raw(nanofftf_plan *plan, float *real_signal, float *imag_signal);
 /* In-place bit reversal of a slot-ordered pair / single array. */
-void nanofftf_permute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
-void nanofftf_permute_1d(nanofftf_plan *plan, float *values);
+TLS_API void nanofftf_permute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
+TLS_API void nanofftf_permute_1d(nanofftf_plan *plan, float *values);
 
 /* -------------------------------------------------------------------------
  * Double Precision API (nanofft)
@@ -396,59 +450,34 @@ typedef double VEC __attribute__((vector_size(VEC_BYTES)));
 typedef uint64_t VEC_INT __attribute__((vector_size(VEC_BYTES)));
 
 /* -------------------------------------------------------------------------
- * Vectorized exp / sqrt helpers  (float and double only, not dd_t)
+ * Vectorized sqrt / exp helpers  (float and double only, not dd_t)
  *
- * Each function loops over a compile-time-constant lane count so the
- * auto-vectorizer can lower the loop to:
- *   sqrt  -> vsqrtps / vsqrtpd  (IEEE-exact; always vectorized at -O2)
- *   exp   -> _ZGVdN*v_exp / _ZGVsN*v_expf  (libmvec, glibc >= 2.22)
- *            or SVML equivalents when using icc/icx.
- *
- * GCC vector-extension types support subscript access v[i] directly, so
- * no union tricks or pointer casts are needed.
+ * sqrt lowers to a single vsqrtps / vsqrtpd.  exp is the library's own Remez
+ * polynomial instead of the platform's vector exponential: glibc would provide
+ * libmvec, which musl, macOS and the MSVC CRT do not, and without it the same
+ * lane loop silently degrades to scalar calls.  See nanofft_vecmath.h and
+ * nanofft_exp_coeffs.h; both precisions are accurate to 1 ulp over the whole
+ * finite range, denormals and saturation included.
  * ------------------------------------------------------------------------- */
-
-static inline VECF vecf_sqrt(VECF v) {
-    VECF r;
-    for (int i = 0; i < VECF_LEN; i++) r[i] = sqrtf(v[i]);
-    return r;
-}
-
-static inline VECF vecf_exp(VECF v) {
-    VECF r;
-    for (int i = 0; i < VECF_LEN; i++) r[i] = expf(v[i]);
-    return r;
-}
-
-static inline VEC vec_sqrt(VEC v) {
-    VEC r;
-    for (int i = 0; i < VEC_LEN; i++) r[i] = sqrt(v[i]);
-    return r;
-}
-
-static inline VEC vec_exp(VEC v) {
-    VEC r;
-    for (int i = 0; i < VEC_LEN; i++) r[i] = exp(v[i]);
-    return r;
-}
+#include <nanofft_vecmath.h>
 
 typedef struct nanofft_plan nanofft_plan;
-nanofft_plan *nanofft_make_plan(uint32_t N);
-void nanofft_destroy_plan(nanofft_plan *plan);
-void nanofft_execute(nanofft_plan *plan, double *real_signal, double *imag_signal);
-void nanofft_execute_raw(nanofft_plan *plan, double *real_signal, double *imag_signal);
-void nanofft_permute(nanofft_plan *plan, double *real_signal, double *imag_signal);
-void nanofft_permute_1d(nanofft_plan *plan, double *values);
+TLS_API nanofft_plan *nanofft_make_plan(uint32_t N);
+TLS_API void nanofft_destroy_plan(nanofft_plan *plan);
+TLS_API void nanofft_execute(nanofft_plan *plan, double *real_signal, double *imag_signal);
+TLS_API void nanofft_execute_raw(nanofft_plan *plan, double *real_signal, double *imag_signal);
+TLS_API void nanofft_permute(nanofft_plan *plan, double *real_signal, double *imag_signal);
+TLS_API void nanofft_permute_1d(nanofft_plan *plan, double *values);
 
 /* -------------------------------------------------------------------------
  * Double-Double Precision API (nanofftdd)
  * ------------------------------------------------------------------------- */
 typedef struct nanofftdd_plan nanofftdd_plan;
-nanofftdd_plan *nanofftdd_make_plan(uint32_t N);
-void nanofftdd_destroy_plan(nanofftdd_plan *plan);
-void nanofftdd_execute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
-void nanofftdd_execute_raw(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
-void nanofftdd_permute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
-void nanofftdd_permute_1d(nanofftdd_plan *plan, dd_t *values);
+TLS_API nanofftdd_plan *nanofftdd_make_plan(uint32_t N);
+TLS_API void nanofftdd_destroy_plan(nanofftdd_plan *plan);
+TLS_API void nanofftdd_execute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
+TLS_API void nanofftdd_execute_raw(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
+TLS_API void nanofftdd_permute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
+TLS_API void nanofftdd_permute_1d(nanofftdd_plan *plan, dd_t *values);
 
 #endif /* NANOFFT_H */

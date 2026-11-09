@@ -3,12 +3,12 @@
 #include <float.h>
 #include <math.h>
 #include <nufft1.h>
-#include <tls_internal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tls_internal.h>
 
 /* =========================================================================
  * Common Helpers
@@ -340,7 +340,7 @@ static const FLOAT PFX(pswf43_coeffs)[19][24] = {
 
 static FLOAT *PFX(allocate_aligned)(size_t N) {
     size_t alloc_size = (sz_max(N * sizeof(FLOAT), 64) + 63) & ~63;
-    FLOAT *ptr = (FLOAT *)aligned_alloc(64, alloc_size);
+    FLOAT *ptr = (FLOAT *)nanofft_aligned_alloc(64, alloc_size);
     if (!ptr) exit(EXIT_FAILURE);
     memset(ptr, 0, alloc_size);
     return ptr;
@@ -350,8 +350,9 @@ static FLOAT *PFX(allocate_aligned)(size_t N) {
  * Kahan Summation (SOA layout)
  * ========================================================================= */
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) __attribute__((noinline)) static void
-PFX(kahan_add_soa)(FLOAT *sum_r, FLOAT *sum_i, FLOAT *comp_r, FLOAT *comp_i, FLOAT input_r, FLOAT input_i) {
+NANOFFT_EXACT_FP __attribute__((noinline)) static void PFX(kahan_add_soa)(FLOAT *sum_r, FLOAT *sum_i, FLOAT *comp_r, FLOAT *comp_i, FLOAT input_r,
+                                                                          FLOAT input_i) {
+    NANOFFT_EXACT_FP_PRAGMA
     FLOAT yr = SUB(input_r, *comp_r);
     FLOAT yi = SUB(input_i, *comp_i);
     FLOAT tr = ADD(*sum_r, yr);
@@ -371,33 +372,33 @@ typedef struct {
     FLOAT lo;
 } PFX(ff_t);
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline PFX(ff_t)
-    PFX(ff_make)(FLOAT hi, FLOAT lo) {
+NANOFFT_EXACT_FP static inline PFX(ff_t) PFX(ff_make)(FLOAT hi, FLOAT lo) {
+    NANOFFT_EXACT_FP_PRAGMA
     PFX(ff_t) res = {hi, lo};
     return res;
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void PFX(ff_two_sum_quick)(
-    FLOAT x, FLOAT y, FLOAT *r, FLOAT *e) {
+NANOFFT_EXACT_FP static inline void PFX(ff_two_sum_quick)(FLOAT x, FLOAT y, FLOAT *r, FLOAT *e) {
+    NANOFFT_EXACT_FP_PRAGMA
     *r = ADD(x, y);
     *e = SUB(y, SUB(*r, x));
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void PFX(
-    ff_two_difference)(FLOAT x, FLOAT y, FLOAT *r, FLOAT *e) {
+NANOFFT_EXACT_FP static inline void PFX(ff_two_difference)(FLOAT x, FLOAT y, FLOAT *r, FLOAT *e) {
+    NANOFFT_EXACT_FP_PRAGMA
     *r = SUB(x, y);
     FLOAT t = SUB(*r, x);
     *e = SUB(SUB(x, SUB(*r, t)), ADD(y, t));
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline void PFX(ff_two_product)(
-    FLOAT x, FLOAT y, FLOAT *r, FLOAT *e) {
+NANOFFT_EXACT_FP static inline void PFX(ff_two_product)(FLOAT x, FLOAT y, FLOAT *r, FLOAT *e) {
+    NANOFFT_EXACT_FP_PRAGMA
     *r = MUL(x, y);
     *e = M_FMA(x, y, NEG(*r));
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline PFX(ff_t)
-    PFX(ff_sub)(PFX(ff_t) a, PFX(ff_t) b) {
+NANOFFT_EXACT_FP NANOFFT_UNUSED static inline PFX(ff_t) PFX(ff_sub)(PFX(ff_t) a, PFX(ff_t) b) {
+    NANOFFT_EXACT_FP_PRAGMA
     FLOAT r, e, r_f, e_f;
     PFX(ff_two_difference)(a.hi, b.hi, &r, &e);
     e = SUB(ADD(e, a.lo), b.lo);
@@ -405,8 +406,8 @@ __attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-ma
     return PFX(ff_make)(r_f, e_f);
 }
 
-__attribute__((optimize("no-fast-math", "no-associative-math", "no-reciprocal-math", "no-unsafe-math-optimizations"))) static inline PFX(ff_t)
-    PFX(ff_mul)(PFX(ff_t) a, PFX(ff_t) b) {
+NANOFFT_EXACT_FP NANOFFT_UNUSED static inline PFX(ff_t) PFX(ff_mul)(PFX(ff_t) a, PFX(ff_t) b) {
+    NANOFFT_EXACT_FP_PRAGMA
     FLOAT r, e, r_f, e_f;
     PFX(ff_two_product)(a.hi, b.hi, &r, &e);
     e = ADD(ADD(e, MUL(a.hi, b.lo)), MUL(a.lo, b.hi));
@@ -430,31 +431,31 @@ typedef struct {
 } PFX(MatrixC);
 
 static PFX(MatrixF) * PFX(mat_alloc)(int r, int c) {
-    PFX(MatrixF) *M = (PFX(MatrixF) *)malloc(sizeof(PFX(MatrixF)));
+    PFX(MatrixF) *M = (PFX(MatrixF) *)nanofft_malloc(sizeof(PFX(MatrixF)));
     M->rows = r;
     M->cols = c;
-    M->d = (FLOAT *)calloc((size_t)r * c, sizeof(FLOAT));
+    M->d = (FLOAT *)nanofft_calloc((size_t)r * c, sizeof(FLOAT));
     return M;
 }
 
 static PFX(MatrixC) * PFX(matc_alloc)(int r, int c) {
-    PFX(MatrixC) *M = (PFX(MatrixC) *)malloc(sizeof(PFX(MatrixC)));
+    PFX(MatrixC) *M = (PFX(MatrixC) *)nanofft_malloc(sizeof(PFX(MatrixC)));
     M->rows = r;
     M->cols = c;
-    M->r = (FLOAT *)calloc((size_t)r * c, sizeof(FLOAT));
-    M->i = (FLOAT *)calloc((size_t)r * c, sizeof(FLOAT));
+    M->r = (FLOAT *)nanofft_calloc((size_t)r * c, sizeof(FLOAT));
+    M->i = (FLOAT *)nanofft_calloc((size_t)r * c, sizeof(FLOAT));
     return M;
 }
 
 static void PFX(mat_free)(PFX(MatrixF) * M) {
-    free(M->d);
-    free(M);
+    nanofft_aligned_free(M->d);
+    nanofft_aligned_free(M);
 }
 
 static void PFX(matc_free)(PFX(MatrixC) * M) {
-    free(M->r);
-    free(M->i);
-    free(M);
+    nanofft_aligned_free(M->r);
+    nanofft_aligned_free(M->i);
+    nanofft_aligned_free(M);
 }
 
 static inline FLOAT PFX(mat_get)(const PFX(MatrixF) * M, int i, int j) { return M->d[i * M->cols + j]; }
@@ -553,7 +554,7 @@ static PFX(MatrixC) * PFX(bessel_mat)(int K) {
 }
 
 struct PFX(lra_plan) * PFX(lra_initialize)(int max_Mpoints, int max_N, int max_rank, double df, int freq_factor) {
-    struct PFX(lra_plan) *plan = (struct PFX(lra_plan) *)calloc(1, sizeof(struct PFX(lra_plan)));
+    struct PFX(lra_plan) *plan = (struct PFX(lra_plan) *)nanofft_calloc(1, sizeof(struct PFX(lra_plan)));
     plan->max_Mpoints = max_Mpoints;
     plan->max_N = max_N;
     plan->max_K = max_rank;
@@ -562,20 +563,20 @@ struct PFX(lra_plan) * PFX(lra_initialize)(int max_Mpoints, int max_N, int max_r
     plan->Nfft_allocated = next_fast_len(max_N);
     plan->Nfft = plan->Nfft_allocated;
 
-    plan->Tidx = (int *)malloc((size_t)max_Mpoints * freq_factor * sizeof(int));
-    plan->conjU_r = (FLOAT *)calloc((size_t)max_Mpoints * max_rank * freq_factor, sizeof(FLOAT));
-    plan->conjU_i = (FLOAT *)calloc((size_t)max_Mpoints * max_rank * freq_factor, sizeof(FLOAT));
-    plan->conjV = (FLOAT *)calloc((size_t)plan->Nfft_allocated * max_rank, sizeof(FLOAT));
+    plan->Tidx = (int *)nanofft_malloc((size_t)max_Mpoints * freq_factor * sizeof(int));
+    plan->conjU_r = (FLOAT *)nanofft_calloc((size_t)max_Mpoints * max_rank * freq_factor, sizeof(FLOAT));
+    plan->conjU_i = (FLOAT *)nanofft_calloc((size_t)max_Mpoints * max_rank * freq_factor, sizeof(FLOAT));
+    plan->conjV = (FLOAT *)nanofft_calloc((size_t)plan->Nfft_allocated * max_rank, sizeof(FLOAT));
 
     plan->fft_real = PFX(allocate_aligned)(plan->Nfft_allocated);
     plan->fft_imag = PFX(allocate_aligned)(plan->Nfft_allocated);
     plan->nanofft_p = NANOFFT_MAKE_PLAN(plan->Nfft_allocated);
 
     size_t V_size = (size_t)plan->Nfft_allocated * max_rank;
-    plan->temp_r = (FLOAT *)calloc(V_size, sizeof(FLOAT));
-    plan->temp_i = (FLOAT *)calloc(V_size, sizeof(FLOAT));
-    plan->temp_comp_r = (FLOAT *)calloc(V_size, sizeof(FLOAT));
-    plan->temp_comp_i = (FLOAT *)calloc(V_size, sizeof(FLOAT));
+    plan->temp_r = (FLOAT *)nanofft_calloc(V_size, sizeof(FLOAT));
+    plan->temp_i = (FLOAT *)nanofft_calloc(V_size, sizeof(FLOAT));
+    plan->temp_comp_r = (FLOAT *)nanofft_calloc(V_size, sizeof(FLOAT));
+    plan->temp_comp_i = (FLOAT *)nanofft_calloc(V_size, sizeof(FLOAT));
     return plan;
 }
 
@@ -589,7 +590,7 @@ void PFX(lra_precompute)(struct PFX(lra_plan) * plan, const nufft_input_t *x, in
     for (int f_idx = 0; f_idx < plan->num_factors; ++f_idx) {
         int k_factor = f_idx + 1;
 
-        nufft_input_t *x_scaled = (nufft_input_t *)malloc(Mpoints * sizeof(nufft_input_t));
+        nufft_input_t *x_scaled = (nufft_input_t *)nanofft_malloc(Mpoints * sizeof(nufft_input_t));
         for (int i = 0; i < Mpoints; ++i) {
 #ifdef DOUBLE_DOUBLE
             x_scaled[i] = dd_mul(x[i], dd_make(plan->df * k_factor, 0.0));
@@ -602,8 +603,8 @@ void PFX(lra_precompute)(struct PFX(lra_plan) * plan, const nufft_input_t *x, in
         int *current_Tidx = plan->Tidx + offset_T;
         get_lra_params(x_scaled, Mpoints, Nfft, current_Tidx);
 
-        FLOAT *er = (FLOAT *)malloc(Mpoints * sizeof(FLOAT));
-        FLOAT *scaled = (FLOAT *)malloc(Mpoints * sizeof(FLOAT));
+        FLOAT *er = (FLOAT *)nanofft_malloc(Mpoints * sizeof(FLOAT));
+        FLOAT *scaled = (FLOAT *)nanofft_malloc(Mpoints * sizeof(FLOAT));
         for (int i = 0; i < Mpoints; ++i) {
 #ifdef DOUBLE_DOUBLE
             dd_t z = dd_mul(x_scaled[i], dd_make((double)Nfft, 0.0));
@@ -617,7 +618,7 @@ void PFX(lra_precompute)(struct PFX(lra_plan) * plan, const nufft_input_t *x, in
         }
 
         PFX(MatrixF) *Tcheb_U = PFX(chebyshev_mat)(rank - 1, scaled, Mpoints);
-        free(scaled);
+        nanofft_aligned_free(scaled);
         PFX(MatrixC) *B = PFX(bessel_mat)(rank);
 
         size_t offset_U = (size_t)f_idx * plan->max_Mpoints * plan->max_K;
@@ -641,16 +642,16 @@ void PFX(lra_precompute)(struct PFX(lra_plan) * plan, const nufft_input_t *x, in
 
         PFX(mat_free)(Tcheb_U);
         PFX(matc_free)(B);
-        free(er);
-        free(x_scaled);
+        nanofft_aligned_free(er);
+        nanofft_aligned_free(x_scaled);
     }
 
-    FLOAT *X = (FLOAT *)malloc((size_t)Nfft * sizeof(FLOAT));
+    FLOAT *X = (FLOAT *)nanofft_malloc((size_t)Nfft * sizeof(FLOAT));
     for (int w = 0; w < Nfft; ++w) {
         X[w] = SUB(DIV(FCAST(2.0 * w), FCAST(Nfft)), FCAST(1.0));
     }
     PFX(MatrixF) *Tcheb_V = PFX(chebyshev_mat)(rank - 1, X, Nfft);
-    free(X);
+    nanofft_aligned_free(X);
     for (int w = 0; w < Nfft; ++w) {
         for (int k = 0; k < rank; ++k) plan->conjV[(size_t)w * rank + k] = PFX(mat_get)(Tcheb_V, w, k);
     }
@@ -715,17 +716,17 @@ void PFX(lra_execute)(const struct PFX(lra_plan) * plan, const FLOAT *y_real, co
 void PFX(free_lra_plan)(struct PFX(lra_plan) * plan) {
     if (!plan) return;
     if (plan->nanofft_p) NANOFFT_DESTROY_PLAN(plan->nanofft_p);
-    free(plan->fft_real);
-    free(plan->fft_imag);
-    free(plan->conjU_r);
-    free(plan->conjU_i);
-    free(plan->conjV);
-    free(plan->temp_r);
-    free(plan->temp_i);
-    free(plan->temp_comp_r);
-    free(plan->temp_comp_i);
-    free(plan->Tidx);
-    free(plan);
+    nanofft_aligned_free(plan->fft_real);
+    nanofft_aligned_free(plan->fft_imag);
+    nanofft_aligned_free(plan->conjU_r);
+    nanofft_aligned_free(plan->conjU_i);
+    nanofft_aligned_free(plan->conjV);
+    nanofft_aligned_free(plan->temp_r);
+    nanofft_aligned_free(plan->temp_i);
+    nanofft_aligned_free(plan->temp_comp_r);
+    nanofft_aligned_free(plan->temp_comp_i);
+    nanofft_aligned_free(plan->Tidx);
+    nanofft_aligned_free(plan);
 }
 
 /* =========================================================================
@@ -776,7 +777,7 @@ static inline bool PFX(pswf_lut_lookup)(int w, bool mode43, const FLOAT **coeffs
     if (!mode43 && w < 19) {
         *coeffs = PFX(pswf_coeffs)[w];
         *deg = pswf_degrees[w];
-        *c = FCAST(M_PI * w * 0.75 - 0.05);
+        *c = FCAST(NANOFFT_PI * w * 0.75 - 0.05);
         return true;
     }
 
@@ -867,7 +868,7 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     if (mode43 && (N % 4) != 0) return NULL;
     if (w < 1 || w > PSWF_MAX_W) return NULL;
 
-    struct PFX(pswf_plan) *plan = (struct PFX(pswf_plan) *)calloc(1, sizeof(struct PFX(pswf_plan)));
+    struct PFX(pswf_plan) *plan = (struct PFX(pswf_plan) *)nanofft_calloc(1, sizeof(struct PFX(pswf_plan)));
     if (!plan) return NULL;
     plan->Mpoints = Mpoints;
     plan->N = N;
@@ -884,12 +885,12 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     plan->fft_alloc_len = plan->Nfft + plan->spread_pad;
     plan->alpha = DIV(MUL(FCAST(plan->w), FCONST(0.5)), FCAST(plan->Nfft));
 
-    plan->spread_base_idx = (int *)malloc((size_t)Mpoints * freq_factor * sizeof(int));
+    plan->spread_base_idx = (int *)nanofft_malloc((size_t)Mpoints * freq_factor * sizeof(int));
     plan->spread_weight = PFX(allocate_aligned)((size_t)Mpoints * plan->spread_stride * freq_factor);
-    plan->deconv = (FLOAT *)malloc((size_t)plan->Nout * sizeof(FLOAT));
+    plan->deconv = (FLOAT *)nanofft_malloc((size_t)plan->Nout * sizeof(FLOAT));
 
-    plan->shift_r = (FLOAT *)malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
-    plan->shift_i = (FLOAT *)malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
+    plan->shift_r = (FLOAT *)nanofft_malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
+    plan->shift_i = (FLOAT *)nanofft_malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
 
     plan->fft_real = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
     plan->fft_imag = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
@@ -992,9 +993,9 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         plan->deconv[k] = DIV(FCAST(1.0), MUL(FCAST(plan->w), phi_hat_half));
     }
 
-    free(precomp_vals);
-    free(gl_nodes);
-    free(gl_weights);
+    nanofft_aligned_free(precomp_vals);
+    nanofft_aligned_free(gl_nodes);
+    nanofft_aligned_free(gl_weights);
 
     FLOAT z_buf[64] __attribute__((aligned(64)));
     FLOAT kval_buf[64] __attribute__((aligned(64)));
@@ -1235,15 +1236,15 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
 
 void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     if (!plan) return;
-    free(plan->spread_base_idx);
-    free(plan->spread_weight);
-    free(plan->deconv);
-    free(plan->shift_r);
-    free(plan->shift_i);
-    free(plan->fft_real);
-    free(plan->fft_imag);
-    free(plan->slot_deconv);
-    free(plan->perm_scratch);
+    nanofft_aligned_free(plan->spread_base_idx);
+    nanofft_aligned_free(plan->spread_weight);
+    nanofft_aligned_free(plan->deconv);
+    nanofft_aligned_free(plan->shift_r);
+    nanofft_aligned_free(plan->shift_i);
+    nanofft_aligned_free(plan->fft_real);
+    nanofft_aligned_free(plan->fft_imag);
+    nanofft_aligned_free(plan->slot_deconv);
+    nanofft_aligned_free(plan->perm_scratch);
     if (plan->nanofft_p) NANOFFT_DESTROY_PLAN(plan->nanofft_p);
-    free(plan);
+    nanofft_aligned_free(plan);
 }

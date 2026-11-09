@@ -25,13 +25,18 @@ ROOT=$(cd .. && pwd)
 BUILD=$(pwd)/build
 BASE=${BASE:-$(cd .. && pwd)/../baseline}
 CFLAGS=${CFLAGS:--std=gnu11 -O3 -ffast-math -march=native -mtune=native -Wall -Wextra}
-FUSE=${FUSE:--DNANOFFT_FFT_FUSE_FLOAT=3 -DNANOFFT_FFT_FUSE_DOUBLE=3 -DNANOFFT_FFT_FUSE_DD=3}
+# Empty by default: the branch is built with its shipped per-precision depths.
+FUSE=${FUSE:-}
 
 mkdir -p "$BUILD" || exit 1
 run() { taskset -c "$CPU" "$@"; }
 
 echo "== build branch =="
-make -s all CFLAGS="$CFLAGS" FFT_FUSE_FLOAT=3 FFT_FUSE_DOUBLE=3 FFT_FUSE_DD=3 || exit 1
+if [ -n "$FUSE" ]; then
+    make -s all CFLAGS="$CFLAGS" FUSE_CFLAGS="$FUSE" || exit 1
+else
+    make -s all CFLAGS="$CFLAGS" || exit 1
+fi
 
 echo "== build baseline ($BASE) =="
 if [ ! -d "$BASE/src" ]; then

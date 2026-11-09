@@ -7,6 +7,7 @@
  */
 
 #include <nanofft.h>
+#include <tls_internal.h>
 #include <tls_tuning.h>
 
 #ifndef NANOFFT_FFT_FUSE_MAX
@@ -14,6 +15,7 @@
 #endif
 
 static int tuning_fft_fuse = TLS_TUNING_FFT_FUSE_DEFAULT;
+static int tuning_fft_order = TLS_FFT_ORDER_END;
 static int tuning_cobravo = TLS_TUNING_COBRAVO_DEFAULT;
 static int tuning_defer = TLS_TUNING_DEFER_DEFAULT;
 static int tuning_permute = TLS_PERMUTE_AUTO;
@@ -22,10 +24,14 @@ static unsigned long long tuning_work_bytes = 0;
 int tls_tuning_fft_fuse(void) { return tuning_fft_fuse; }
 
 void tls_tuning_set_fft_fuse(int fuse) {
-    if (fuse < 1) fuse = 1;
+    if (fuse < 0) fuse = TLS_TUNING_FFT_FUSE_AUTO;
     if (fuse > NANOFFT_FFT_FUSE_MAX) fuse = NANOFFT_FFT_FUSE_MAX;
     tuning_fft_fuse = fuse;
 }
+
+int tls_tuning_fft_order(void) { return tuning_fft_order; }
+
+void tls_tuning_set_fft_order(int order) { tuning_fft_order = (order == TLS_FFT_ORDER_FRONT) ? TLS_FFT_ORDER_FRONT : TLS_FFT_ORDER_END; }
 
 int tls_tuning_cobravo(void) { return tuning_cobravo; }
 

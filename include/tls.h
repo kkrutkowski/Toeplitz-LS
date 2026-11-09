@@ -19,12 +19,11 @@ enum { TLS_SOLVER_LEVINSON = 1, TLS_SOLVER_ZOHAR = 2, TLS_SOLVER_BAREISS = 3, TL
  * TLS_NORM_STANDARD     coefficient of determination R^2.
  * TLS_NORM_ANOVA        ANOVA / F statistic, after Schwarzenberg-Czerny.
  * TLS_NORM_NLL          negative log false-alarm probability, natural log.
- * TLS_NORM_REGULARIZED  Laplace-regularized Cybenko statistic.
+ * TLS_NORM_REGULARIZED  internal/reserved in 1.0; not part of the documented
+ *                       public normalization set.
  *
  * The Toeplitz solvers report the condition upper bound n * P, with
  * n = 2 * degree + 1 and P the Cybenko reflection-coefficient product.
- * TLS_NORM_REGULARIZED uses P, not n * P.  For degree > 1 it requires one of
- * the Toeplitz solvers, since it needs the reflection-coefficient product.
  *
  * TLS_NORM_ASYMPTOTIC and TLS_NORM_BAYES are legacy aliases.
  */
@@ -37,14 +36,14 @@ enum {
     TLS_NORM_BAYES = TLS_NORM_REGULARIZED
 };
 
-int tlsf_fastchi2(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver, int normalization,
-                  float *power, float *cond);
+TLS_API int tlsf_fastchi2(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                          int normalization, float *power, float *cond);
 
-int tls_fastchi2(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int solver, int normalization,
-                 double *power, double *cond);
+TLS_API int tls_fastchi2(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                         int normalization, double *power, double *cond);
 
-int tlsdd_fastchi2(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int solver, int normalization,
-                   dd_t *power, dd_t *cond);
+TLS_API int tlsdd_fastchi2(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                           int normalization, dd_t *power, dd_t *cond);
 
 /*
  * Incoherent harmonic sum (IHS) periodogram.
@@ -65,11 +64,14 @@ int tlsdd_fastchi2(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f
  * Both entry points return only the power array; IHS has no Toeplitz
  * condition bound.
  */
-int tlsf_ihs(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization, float *power);
+TLS_API int tlsf_ihs(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                     float *power);
 
-int tls_ihs(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int normalization, double *power);
+TLS_API int tls_ihs(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                    double *power);
 
-int tlsdd_ihs(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int normalization, dd_t *power);
+TLS_API int tlsdd_ihs(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                      dd_t *power);
 
 #ifdef __cplusplus
 }

@@ -82,7 +82,7 @@ int main(int argc, char **argv) {
     uint32_t sizes[MAX_SIZES];
     int nsizes = 0;
     for (int s = 0; s < MAX_SIZES; ++s) {
-        const int log2_n = (int)log2((double)bench_sizes[s]) ;
+        const int log2_n = (int)log2((double)bench_sizes[s]);
         if (log2_n < min_log || log2_n > max_log) continue;
         sizes[nsizes++] = bench_sizes[s];
     }
@@ -167,10 +167,11 @@ int main(int argc, char **argv) {
         }
         for (int v = 0; v < nvariants; ++v) {
             char name[32];
-            if (variants[v].cobravo)
-                snprintf(name, sizeof(name), "fuse=%d cobravo=vec", variants[v].fuse);
+            const char *fuse_name = variants[v].fuse == TLS_TUNING_FFT_FUSE_AUTO ? "auto" : "";
+            if (variants[v].fuse == TLS_TUNING_FFT_FUSE_AUTO)
+                snprintf(name, sizeof(name), "fuse=%s cobravo=%s", fuse_name, variants[v].cobravo ? "vec" : "scalar");
             else
-                snprintf(name, sizeof(name), "fuse=%d cobravo=scalar", variants[v].fuse);
+                snprintf(name, sizeof(name), "fuse=%d cobravo=%s", variants[v].fuse, variants[v].cobravo ? "vec" : "scalar");
             const double full_ns = (best_raw[v] + best_full[v]) * 1e9;
             printf("  %-22s %10.1f %10.1f %10.1f %10.3f %8.3f\n", name, best_raw[v] * 1e9, best_full[v] * 1e9, full_ns, full_ns / (double)n,
                    full_ns / best_full_ns);

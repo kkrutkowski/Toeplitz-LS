@@ -3,6 +3,7 @@
 /* nanofft.h provides: dd_t and its arithmetic (dd_add/dd_sub/dd_mul/dd_div …),
  * VEC / VECF GCC vector types, VEC_LEN / VECF_LEN, and all the fast-trig
  * helpers that nanofft_precision.h macros reference internally.            */
+#include <linalg.h>
 #include <nanofft.h>
 #include <stddef.h>
 
@@ -29,7 +30,7 @@
 
 #if defined(DOUBLE_DOUBLE)
 #    define VCONST(x) FCONST(x)
-#    define VCAST(x)  FCAST(x)
+#    define VCAST(x) FCAST(x)
 static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return FCAST(sqrt(TO_DOUBLE(abs2))); }
 #else
 static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
@@ -38,7 +39,7 @@ static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
     return v;
 }
 #    define VCONST(x) TLS(vec_splat)(FCONST(x))
-#    define VCAST(x)  TLS(vec_splat)(FCAST(x))
+#    define VCAST(x) TLS(vec_splat)(FCAST(x))
 static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return M_SQRT(abs2); }
 #endif
 
@@ -315,7 +316,9 @@ INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTE
             TLS(lane_set)(&D[i], lane, lambda);
         }
 
+        NANOFFT_DIAG_PUSH_NAN
         FLOAT lane_condition = have_nonzero ? DIV(max_abs, min_abs) : FCAST(INFINITY);
+        NANOFFT_DIAG_POP
         if (!lane_converged[lane]) lane_condition = NEG(lane_condition);
         TLS(lane_set)(&condition, lane, lane_condition);
 

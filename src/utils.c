@@ -254,7 +254,9 @@ int TLS(get_peaks)(const FLOAT *freq, const FLOAT *power, const FLOAT *cond, int
         TLS(peak) peak;
         peak.freq = vertex_freq;
         peak.power = vertex_power;
+        NANOFFT_DIAG_PUSH_NAN
         peak.cond = FLOAT_NAN;
+        NANOFFT_DIAG_POP
         if (cond) {
             FLOAT c0 = cond[idx - 1];
             FLOAT c1 = cond[idx];

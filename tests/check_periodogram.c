@@ -24,14 +24,14 @@
 static int failures = 0;
 static int dump_mode = 0;
 
-#define CHECK(cond, ...)                                                                                                                            \
-    do {                                                                                                                                            \
-        if (!(cond)) {                                                                                                                              \
-            printf("FAIL %s:%d: ", __FILE__, __LINE__);                                                                                             \
-            printf(__VA_ARGS__);                                                                                                                    \
-            printf("\n");                                                                                                                           \
-            ++failures;                                                                                                                             \
-        }                                                                                                                                           \
+#define CHECK(cond, ...)                                \
+    do {                                                \
+        if (!(cond)) {                                  \
+            printf("FAIL %s:%d: ", __FILE__, __LINE__); \
+            printf(__VA_ARGS__);                        \
+            printf("\n");                               \
+            ++failures;                                 \
+        }                                               \
     } while (0)
 
 static uint64_t rng_state = 88172645463325252ull;
@@ -113,8 +113,8 @@ static void dump_line(const char *tag, const char *name, int N, int degree, int 
         checksum2 += (double)v * (double)(i % 97);
         if ((double)v > peak) peak = (double)v;
     }
-    printf("DUMP %-6s %s N=%d d=%d be=%d so=%d nm=%d sum=%.9g chk=%.9g peak=%.9g nan=%d work=%llu\n", tag, name, N, degree, backend, solver, norm,
-           checksum, checksum2, peak, nan_count, bytes);
+    printf("DUMP %-6s %s N=%d d=%d be=%d so=%d nm=%d sum=%.9g chk=%.9g peak=%.9g nan=%d work=%llu\n", tag, name, N, degree, backend, solver, norm, checksum,
+           checksum2, peak, nan_count, bytes);
 }
 
 /* ------------------------------------------------------------------ */
@@ -153,6 +153,13 @@ static void run_fastchi2_case(const char *name, int M, int N, int degree, int ba
         /* deferred is a pure permutation: allow only ULP-level drift */
         CHECK(same_values(p0, p1, N, 1e-6, 1e-9), "%s: power changed when deferring the bit reversal", name);
         CHECK(same_values(c0, c1, N, 1e-6, 1e-9), "%s: condition bound changed when deferring", name);
+        if (norm == TLS_NORM_STANDARD) {
+            for (int i = 0; i < N; ++i) {
+                const float v = p1[i];
+                if (isnan(v)) continue; /* singular solves report NaN */
+                CHECK(v >= 0.0f && v < 1.0f, "%s: standard power[%d]=%.9g outside [0,1)", name, i, (double)v);
+            }
+        }
     }
 
     /* fused depths must agree with the plain transform */
@@ -197,7 +204,16 @@ static void run_double_case(const char *name, int M, int N, int degree, int back
     int s1 = tls_fastchi2(t, y, dy, M, 0.001, 0.0005, N, degree, backend, solver, norm, p1, NULL);
 
     CHECK(s0 == s1, "%s: status %d vs %d (double, defer off/on)", name, s0, s1);
-    if (s0 >= 0) CHECK(same_values_d(p0, p1, N, 1e-12, 1e-15), "%s: double power changed when deferring", name);
+    if (s0 >= 0) {
+        CHECK(same_values_d(p0, p1, N, 1e-12, 1e-15), "%s: double power changed when deferring", name);
+        if (norm == TLS_NORM_STANDARD) {
+            for (int i = 0; i < N; ++i) {
+                const double v = p1[i];
+                if (isnan(v)) continue;
+                CHECK(v >= 0.0 && v < 1.0, "%s: double standard power[%d]=%.15g outside [0,1)", name, i, v);
+            }
+        }
+    }
     if (dump_mode) {
         double sum = 0.0;
         for (int i = 0; i < N; ++i)
@@ -232,7 +248,14 @@ static void run_ihs_case(const char *name, int M, int N, int degree, int backend
     int s1 = tlsf_ihs(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, norm, p1);
 
     CHECK(s0 == s1, "%s: IHS status %d vs %d", name, s0, s1);
-    if (s0 >= 0) CHECK(same_values(p0, p1, N, 1e-6, 1e-9), "%s: IHS power changed when deferring", name);
+    if (s0 >= 0) {
+        CHECK(same_values(p0, p1, N, 1e-6, 1e-9), "%s: IHS power changed when deferring", name);
+        for (int i = 0; i < N; ++i) {
+            const float v = p1[i];
+            CHECK(isfinite(v) && v >= 0.0f, "%s: IHS power[%d]=%.9g is not finite/non-negative", name, i, (double)v);
+            if (norm == TLS_NORM_STANDARD && degree == 1) CHECK(v < 1.0f, "%s: IHS d=1 standard power[%d]=%.9g is not below 1", name, i, (double)v);
+        }
+    }
     if (dump_mode) dump_line("ihs", name, N, degree, backend, 0, norm, p1, N, s0 < 0 ? s0 : 0, 0);
 
     free(t);
@@ -277,6 +300,13 @@ static void run_dd_case(const char *name, int M, int N, int degree, int backend,
             if (fabs(a - b) > err) err = fabs(a - b);
         }
         CHECK(err <= 1e-18 + 1e-12 * scale, "%s: double-double power changed when deferring (%.3g)", name, err);
+        if (norm == TLS_NORM_STANDARD) {
+            for (int i = 0; i < N; ++i) {
+                const double v = dd_to_double(p1[i]);
+                if (isnan(v)) continue;
+                CHECK(v >= 0.0 && v < 1.0, "%s: double-double standard power[%d]=%.15g outside [0,1)", name, i, v);
+            }
+        }
     }
 
     free(t);

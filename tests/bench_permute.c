@@ -46,11 +46,8 @@ typedef struct {
 } precision;
 
 static const strategy STRATEGIES[MAX_STRATEGIES] = {
-    {"auto", TLS_PERMUTE_AUTO, 1},
-    {"table", TLS_PERMUTE_TABLE, 1},
-    {"pairs", TLS_PERMUTE_PAIRS, 1},
-    {"cobravo", TLS_PERMUTE_COBRAVO, 1},
-    {"cobravo-s", TLS_PERMUTE_COBRAVO, 0},
+    {"auto", TLS_PERMUTE_AUTO, 1},       {"table", TLS_PERMUTE_TABLE, 1},       {"pairs", TLS_PERMUTE_PAIRS, 1},
+    {"cobravo", TLS_PERMUTE_COBRAVO, 1}, {"cobravo-s", TLS_PERMUTE_COBRAVO, 0},
 };
 
 static double now_seconds(void) {

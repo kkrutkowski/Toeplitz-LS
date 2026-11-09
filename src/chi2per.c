@@ -24,8 +24,14 @@ enum { CHI2PER_SOLVER_LEVINSON = 1, CHI2PER_SOLVER_ZOHAR = 2, CHI2PER_SOLVER_BAR
 __attribute__((unused)) static void *checked_malloc(size_t count, size_t size) {
     if (count == 0 || size == 0) return NULL;
     if (count > SIZE_MAX / size) return NULL;
-    return malloc(count * size);
+    return nanofft_malloc(count * size);
 }
+
+/* NaN sentinel for degenerate input; kept in one place so the fast-math
+ * warning about the NAN macro is silenced once instead of at every use. */
+NANOFFT_DIAG_PUSH_NAN
+static inline FLOAT chi2_nan(void) { return FCAST(NAN); }
+NANOFFT_DIAG_POP
 
 static void *checked_aligned_malloc(size_t count, size_t size) {
     if (count == 0 || size == 0) return NULL;
@@ -34,7 +40,7 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
     size_t bytes = count * size;
     size_t align = 64;
     size_t padded = (bytes + align - 1) & ~(align - 1);
-    return aligned_alloc(align, padded);
+    return nanofft_aligned_alloc(align, padded);
 }
 
 #if defined(DOUBLE_DOUBLE)
@@ -71,7 +77,7 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
 #    define COND_SINGULARITY_THRESHOLD_BAREISS 1e26
 #    define COND_SINGULARITY_THRESHOLD_LDLT 1e10
 #    define COND_SINGULARITY_THRESHOLD_SVD 1e16
-static inline FLOAT time_to_float(TIME_INPUT_T x) { return x; }
+static inline NANOFFT_UNUSED FLOAT time_to_float(TIME_INPUT_T x) { return x; }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #else
 #    define TIME_INPUT_T double
@@ -141,7 +147,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define COND_SINGULARITY_THRESHOLD_LDLT 1e2
 #        define COND_SINGULARITY_THRESHOLD_SVD 1e3
 #    endif
-static inline FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
+static inline NANOFFT_UNUSED FLOAT time_to_float(TIME_INPUT_T x) { return FCAST(x); }
 static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #endif
 
@@ -151,7 +157,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #define NUFFT_PSWF_FINISH_SLOTS CHI2_PREFIX(nufft_pswf_finish_slots)
 #define NUFFT_PSWF_SLOTS_AVAILABLE CHI2_PREFIX(nufft_pswf_slots_available)
 
-static inline int double_is_nan_bits(double value) {
+static inline NANOFFT_UNUSED int double_is_nan_bits(double value) {
     union {
         double f;
         uint64_t u;
@@ -159,7 +165,7 @@ static inline int double_is_nan_bits(double value) {
     return (bits.u & UINT64_C(0x7fffffffffffffff)) > UINT64_C(0x7ff0000000000000);
 }
 
-static inline int float_is_nan_bits(float value) {
+static inline NANOFFT_UNUSED int float_is_nan_bits(float value) {
     union {
         float f;
         uint32_t u;
@@ -212,7 +218,7 @@ static inline int double_is_finite_bits(double value) {
     return (bits.u & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
 }
 
-static inline int float_is_finite_bits(float value) {
+static inline NANOFFT_UNUSED int float_is_finite_bits(float value) {
     union {
         float f;
         uint32_t u;
@@ -255,7 +261,7 @@ static inline cybenko_model_t cybenko_model_init(int d, int M) {
     return m;
 }
 
-static inline double cybenko_kappa_to_S(double kappa, const cybenko_model_t *m) {
+static inline NANOFFT_UNUSED double cybenko_kappa_to_S(double kappa, const cybenko_model_t *m) {
     if (kappa <= 1.0 || !double_is_finite_bits(kappa)) return 0.0;
     if (kappa > 5000.0) kappa = 5000.0;
     double pow_k = pow(kappa, m->inv_2d);
@@ -384,6 +390,11 @@ static inline dd_t compute_bayes_laplace_dd(dd_t delta) {
 
 static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
                                           FLOAT b) {
+    /* Invalid explained chi^2: non-positive, NaN/Inf, or at/above the total.
+     * Report exactly zero so that such a bin cannot win the peak search. */
+    const double dot_d = TO_DOUBLE(dot);
+    const double ref_d = TO_DOUBLE(chi2_ref);
+    if (!(dot_d > 0.0) || !(dot_d < ref_d)) return FCAST(0.0);
     if (normalization == TLS_NORM_STANDARD) {
         return DIV(dot, chi2_ref);
     } else if (normalization == TLS_NORM_ANOVA) {
@@ -490,6 +501,11 @@ static inline double compute_bayes_laplace_d(double delta) {
 
 static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
                                           FLOAT b) {
+    /* Invalid explained chi^2: non-positive, NaN/Inf, or at/above the total.
+     * Report exactly zero so that such a bin cannot win the peak search. */
+    const double dot_d = TO_DOUBLE(dot);
+    const double ref_d = TO_DOUBLE(chi2_ref);
+    if (!(dot_d > 0.0) || !(dot_d < ref_d)) return FCAST(0.0);
     if (normalization == TLS_NORM_STANDARD) {
         return dot / chi2_ref;
     } else if (normalization == TLS_NORM_ANOVA) {
@@ -599,6 +615,11 @@ static inline float compute_bayes_laplace_f(float delta) {
 
 static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
                                           FLOAT b) {
+    /* Invalid explained chi^2: non-positive, NaN/Inf, or at/above the total.
+     * Report exactly zero so that such a bin cannot win the peak search. */
+    const double dot_d = TO_DOUBLE(dot);
+    const double ref_d = TO_DOUBLE(chi2_ref);
+    if (!(dot_d > 0.0) || !(dot_d < ref_d)) return FCAST(0.0);
     if (normalization == TLS_NORM_STANDARD) {
         return dot / chi2_ref;
     } else if (normalization == TLS_NORM_ANOVA) {
@@ -760,18 +781,16 @@ typedef struct {
     int prepared; /* block index the state currently describes */
 } block_ladder;
 
-static size_t ladder_offset(const block_ladder *lad, int q, int level) {
-    return (((size_t)(q - 1) * (size_t)lad->levels) + (size_t)level) * (size_t)lad->M;
-}
+static size_t ladder_offset(const block_ladder *lad, int q, int level) { return (((size_t)(q - 1) * (size_t)lad->levels) + (size_t)level) * (size_t)lad->M; }
 
 static void block_ladder_free(block_ladder *lad) {
     if (!lad) return;
-    free(lad->srcw_r);
-    free(lad->srcw_i);
-    free(lad->srcy_r);
-    free(lad->srcy_i);
-    free(lad->delta_r);
-    free(lad->delta_i);
+    nanofft_aligned_free(lad->srcw_r);
+    nanofft_aligned_free(lad->srcw_i);
+    nanofft_aligned_free(lad->srcy_r);
+    nanofft_aligned_free(lad->srcy_i);
+    nanofft_aligned_free(lad->delta_r);
+    nanofft_aligned_free(lad->delta_i);
     memset(lad, 0, sizeof(*lad));
 }
 
@@ -854,10 +873,10 @@ typedef struct {
 
 static void trig_rows_free(trig_rows *rows) {
     if (!rows) return;
-    free(rows->Sw);
-    free(rows->Cw);
-    free(rows->Syw);
-    free(rows->Cyw);
+    nanofft_aligned_free(rows->Sw);
+    nanofft_aligned_free(rows->Cw);
+    nanofft_aligned_free(rows->Syw);
+    nanofft_aligned_free(rows->Cyw);
     memset(rows, 0, sizeof(*rows));
 }
 
@@ -1043,7 +1062,7 @@ static int ihs_power_sweep_deferred(block_ladder *ladder, int N, int block, int 
             const size_t src_off = (size_t)(q - 1) * (size_t)ladder->levels * (size_t)ladder->M;
             const int status = execute_nufft_block(plan, backend, ladder->srcw_r + src_off, ladder->srcw_i + src_off, out_r, out_i, q, mode);
             if (status != CHI2PER_OK) {
-                free(acc_block);
+                nanofft_aligned_free(acc_block);
                 return status;
             }
             FLOAT *acc = slot_block ? acc_block : power + base;
@@ -1066,7 +1085,7 @@ static int ihs_power_sweep_deferred(block_ladder *ladder, int N, int block, int 
         if (slot_block) NUFFT_PSWF_FINISH_SLOTS((PSWF_PLAN_T *)plan, acc_block, power + base, count);
     }
 
-    free(acc_block);
+    nanofft_aligned_free(acc_block);
     return CHI2PER_OK;
 }
 
@@ -1202,13 +1221,13 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
     FLOAT *Z = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
 
     if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
-        free(XTX);
-        free(XTy);
-        free(X);
-        free(L);
-        free(D);
-        free(Y);
-        free(Z);
+        nanofft_aligned_free(XTX);
+        nanofft_aligned_free(XTy);
+        nanofft_aligned_free(X);
+        nanofft_aligned_free(L);
+        nanofft_aligned_free(D);
+        nanofft_aligned_free(Y);
+        nanofft_aligned_free(Z);
         return CHI2PER_ERR_ALLOC;
     }
 
@@ -1225,7 +1244,7 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
         FLOAT condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
         if (cond) cond[idx] = condition_bound;
         if (!cond && condition_bound_is_singular(condition_bound, CHI2PER_SOLVER_LDLT)) {
-            power[idx] = FCAST(NAN);
+            power[idx] = chi2_nan();
             ++nan_count;
             continue;
         }
@@ -1235,13 +1254,13 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
-    free(XTX);
-    free(XTy);
-    free(X);
-    free(L);
-    free(D);
-    free(Y);
-    free(Z);
+    nanofft_aligned_free(XTX);
+    nanofft_aligned_free(XTy);
+    nanofft_aligned_free(X);
+    nanofft_aligned_free(L);
+    nanofft_aligned_free(D);
+    nanofft_aligned_free(Y);
+    nanofft_aligned_free(Z);
     return cond ? CHI2PER_OK : nan_count;
 }
 
@@ -1260,13 +1279,13 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
     FLOAT *Y = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
 
     if (!XTX || !XTy || !X || !Q || !S || !D || !Y) {
-        free(XTX);
-        free(XTy);
-        free(X);
-        free(Q);
-        free(S);
-        free(D);
-        free(Y);
+        nanofft_aligned_free(XTX);
+        nanofft_aligned_free(XTy);
+        nanofft_aligned_free(X);
+        nanofft_aligned_free(Q);
+        nanofft_aligned_free(S);
+        nanofft_aligned_free(D);
+        nanofft_aligned_free(Y);
         return CHI2PER_ERR_ALLOC;
     }
 
@@ -1284,7 +1303,7 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
         FLOAT condition_bound = SOLVE_SVD((size_t)norder, XTX, XTy, X, Q, S, D, Y, max_cond);
         if (cond) cond[idx] = condition_bound;
         if (!cond && condition_bound_is_invalid(condition_bound)) {
-            power[idx] = FCAST(NAN);
+            power[idx] = chi2_nan();
             ++nan_count;
             continue;
         }
@@ -1294,13 +1313,13 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
-    free(XTX);
-    free(XTy);
-    free(X);
-    free(Q);
-    free(S);
-    free(D);
-    free(Y);
+    nanofft_aligned_free(XTX);
+    nanofft_aligned_free(XTy);
+    nanofft_aligned_free(X);
+    nanofft_aligned_free(Q);
+    nanofft_aligned_free(S);
+    nanofft_aligned_free(D);
+    nanofft_aligned_free(Y);
     return cond ? CHI2PER_OK : nan_count;
 }
 
@@ -1332,16 +1351,16 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
     FLOAT *Bwi = NULL;
 
     if (!Rr || !Ri || !Yr || !Yi || !Xr || !Xi || !Ar || !Ai || !Apr || !Api) {
-        free(Rr);
-        free(Ri);
-        free(Yr);
-        free(Yi);
-        free(Xr);
-        free(Xi);
-        free(Ar);
-        free(Ai);
-        free(Apr);
-        free(Api);
+        nanofft_aligned_free(Rr);
+        nanofft_aligned_free(Ri);
+        nanofft_aligned_free(Yr);
+        nanofft_aligned_free(Yi);
+        nanofft_aligned_free(Xr);
+        nanofft_aligned_free(Xi);
+        nanofft_aligned_free(Ar);
+        nanofft_aligned_free(Ai);
+        nanofft_aligned_free(Apr);
+        nanofft_aligned_free(Api);
         return CHI2PER_ERR_ALLOC;
     }
 
@@ -1358,25 +1377,25 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
         Bwi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
 
         if (!BUr || !BUi || !BD || !Bur || !Bui || !Bvr || !Bvi || !Bwr || !Bwi) {
-            free(Rr);
-            free(Ri);
-            free(Yr);
-            free(Yi);
-            free(Xr);
-            free(Xi);
-            free(Ar);
-            free(Ai);
-            free(Apr);
-            free(Api);
-            free(BUr);
-            free(BUi);
-            free(BD);
-            free(Bur);
-            free(Bui);
-            free(Bvr);
-            free(Bvi);
-            free(Bwr);
-            free(Bwi);
+            nanofft_aligned_free(Rr);
+            nanofft_aligned_free(Ri);
+            nanofft_aligned_free(Yr);
+            nanofft_aligned_free(Yi);
+            nanofft_aligned_free(Xr);
+            nanofft_aligned_free(Xi);
+            nanofft_aligned_free(Ar);
+            nanofft_aligned_free(Ai);
+            nanofft_aligned_free(Apr);
+            nanofft_aligned_free(Api);
+            nanofft_aligned_free(BUr);
+            nanofft_aligned_free(BUi);
+            nanofft_aligned_free(BD);
+            nanofft_aligned_free(Bur);
+            nanofft_aligned_free(Bui);
+            nanofft_aligned_free(Bvr);
+            nanofft_aligned_free(Bvi);
+            nanofft_aligned_free(Bwr);
+            nanofft_aligned_free(Bwi);
             return CHI2PER_ERR_ALLOC;
         }
     }
@@ -1412,31 +1431,31 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
         } else if (solver == CHI2PER_SOLVER_BAREISS) {
             condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
         } else {
-            free(Rr);
-            free(Ri);
-            free(Yr);
-            free(Yi);
-            free(Xr);
-            free(Xi);
-            free(Ar);
-            free(Ai);
-            free(Apr);
-            free(Api);
-            free(BUr);
-            free(BUi);
-            free(BD);
-            free(Bur);
-            free(Bui);
-            free(Bvr);
-            free(Bvi);
-            free(Bwr);
-            free(Bwi);
+            nanofft_aligned_free(Rr);
+            nanofft_aligned_free(Ri);
+            nanofft_aligned_free(Yr);
+            nanofft_aligned_free(Yi);
+            nanofft_aligned_free(Xr);
+            nanofft_aligned_free(Xi);
+            nanofft_aligned_free(Ar);
+            nanofft_aligned_free(Ai);
+            nanofft_aligned_free(Apr);
+            nanofft_aligned_free(Api);
+            nanofft_aligned_free(BUr);
+            nanofft_aligned_free(BUi);
+            nanofft_aligned_free(BD);
+            nanofft_aligned_free(Bur);
+            nanofft_aligned_free(Bui);
+            nanofft_aligned_free(Bvr);
+            nanofft_aligned_free(Bvi);
+            nanofft_aligned_free(Bwr);
+            nanofft_aligned_free(Bwi);
             return CHI2PER_ERR_SOLVER;
         }
 
         if (cond) cond[idx] = condition_bound;
         if (!cond && condition_bound_is_singular(condition_bound, solver)) {
-            power[idx] = FCAST(NAN);
+            power[idx] = chi2_nan();
             ++nan_count;
             continue;
         }
@@ -1445,25 +1464,25 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
     }
 
-    free(Rr);
-    free(Ri);
-    free(Yr);
-    free(Yi);
-    free(Xr);
-    free(Xi);
-    free(Ar);
-    free(Ai);
-    free(Apr);
-    free(Api);
-    free(BUr);
-    free(BUi);
-    free(BD);
-    free(Bur);
-    free(Bui);
-    free(Bvr);
-    free(Bvi);
-    free(Bwr);
-    free(Bwi);
+    nanofft_aligned_free(Rr);
+    nanofft_aligned_free(Ri);
+    nanofft_aligned_free(Yr);
+    nanofft_aligned_free(Yi);
+    nanofft_aligned_free(Xr);
+    nanofft_aligned_free(Xi);
+    nanofft_aligned_free(Ar);
+    nanofft_aligned_free(Ai);
+    nanofft_aligned_free(Apr);
+    nanofft_aligned_free(Api);
+    nanofft_aligned_free(BUr);
+    nanofft_aligned_free(BUi);
+    nanofft_aligned_free(BD);
+    nanofft_aligned_free(Bur);
+    nanofft_aligned_free(Bui);
+    nanofft_aligned_free(Bvr);
+    nanofft_aligned_free(Bvi);
+    nanofft_aligned_free(Bwr);
+    nanofft_aligned_free(Bwi);
     return cond ? CHI2PER_OK : nan_count;
 }
 #else
@@ -1478,25 +1497,25 @@ typedef struct {
 
 static void toep_workspace_free(toep_workspace *ws) {
     if (!ws) return;
-    free(ws->Rr);
-    free(ws->Ri);
-    free(ws->Yr);
-    free(ws->Yi);
-    free(ws->Xr);
-    free(ws->Xi);
-    free(ws->Ehr);
-    free(ws->Ehi);
-    free(ws->Ehpr);
-    free(ws->Ehpi);
-    free(ws->BUr);
-    free(ws->BUi);
-    free(ws->BD);
-    free(ws->Bur);
-    free(ws->Bui);
-    free(ws->Bvr);
-    free(ws->Bvi);
-    free(ws->Bwr);
-    free(ws->Bwi);
+    nanofft_aligned_free(ws->Rr);
+    nanofft_aligned_free(ws->Ri);
+    nanofft_aligned_free(ws->Yr);
+    nanofft_aligned_free(ws->Yi);
+    nanofft_aligned_free(ws->Xr);
+    nanofft_aligned_free(ws->Xi);
+    nanofft_aligned_free(ws->Ehr);
+    nanofft_aligned_free(ws->Ehi);
+    nanofft_aligned_free(ws->Ehpr);
+    nanofft_aligned_free(ws->Ehpi);
+    nanofft_aligned_free(ws->BUr);
+    nanofft_aligned_free(ws->BUi);
+    nanofft_aligned_free(ws->BD);
+    nanofft_aligned_free(ws->Bur);
+    nanofft_aligned_free(ws->Bui);
+    nanofft_aligned_free(ws->Bvr);
+    nanofft_aligned_free(ws->Bvi);
+    nanofft_aligned_free(ws->Bwr);
+    nanofft_aligned_free(ws->Bwi);
     memset(ws, 0, sizeof(*ws));
 }
 
@@ -1551,13 +1570,13 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
     INTERNAL_VEC *Z = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
 
     if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
-        free(XTX);
-        free(XTy);
-        free(X);
-        free(L);
-        free(D);
-        free(Y);
-        free(Z);
+        nanofft_aligned_free(XTX);
+        nanofft_aligned_free(XTy);
+        nanofft_aligned_free(X);
+        nanofft_aligned_free(L);
+        nanofft_aligned_free(D);
+        nanofft_aligned_free(Y);
+        nanofft_aligned_free(Z);
         return CHI2PER_ERR_ALLOC;
     }
 
@@ -1587,7 +1606,7 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
             if (idx >= N) continue;
             if (cond) cond[idx] = condition_bound[lane];
             if (!cond && condition_bound_is_singular(condition_bound[lane], CHI2PER_SOLVER_LDLT)) {
-                power[idx] = FCAST(NAN);
+                power[idx] = chi2_nan();
                 ++nan_count;
                 continue;
             }
@@ -1600,13 +1619,13 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
         }
     }
 
-    free(XTX);
-    free(XTy);
-    free(X);
-    free(L);
-    free(D);
-    free(Y);
-    free(Z);
+    nanofft_aligned_free(XTX);
+    nanofft_aligned_free(XTy);
+    nanofft_aligned_free(X);
+    nanofft_aligned_free(L);
+    nanofft_aligned_free(D);
+    nanofft_aligned_free(Y);
+    nanofft_aligned_free(Z);
     return cond ? CHI2PER_OK : nan_count;
 }
 
@@ -1625,13 +1644,13 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
     INTERNAL_VEC *Y = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
 
     if (!XTX || !XTy || !X || !Q || !S || !D || !Y) {
-        free(XTX);
-        free(XTy);
-        free(X);
-        free(Q);
-        free(S);
-        free(D);
-        free(Y);
+        nanofft_aligned_free(XTX);
+        nanofft_aligned_free(XTy);
+        nanofft_aligned_free(X);
+        nanofft_aligned_free(Q);
+        nanofft_aligned_free(S);
+        nanofft_aligned_free(D);
+        nanofft_aligned_free(Y);
         return CHI2PER_ERR_ALLOC;
     }
 
@@ -1663,7 +1682,7 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
             if (idx >= N) continue;
             if (cond) cond[idx] = condition_bound[lane];
             if (!cond && condition_bound_is_invalid(condition_bound[lane])) {
-                power[idx] = FCAST(NAN);
+                power[idx] = chi2_nan();
                 ++nan_count;
                 continue;
             }
@@ -1676,13 +1695,13 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
         }
     }
 
-    free(XTX);
-    free(XTy);
-    free(X);
-    free(Q);
-    free(S);
-    free(D);
-    free(Y);
+    nanofft_aligned_free(XTX);
+    nanofft_aligned_free(XTy);
+    nanofft_aligned_free(X);
+    nanofft_aligned_free(Q);
+    nanofft_aligned_free(S);
+    nanofft_aligned_free(D);
+    nanofft_aligned_free(Y);
     return cond ? CHI2PER_OK : nan_count;
 }
 
@@ -1758,7 +1777,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                 if (cond) cond[idx] = condition_bound[lane];
                 if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
-                    power[idx] = FCAST(NAN);
+                    power[idx] = chi2_nan();
                     ++nan_count;
                 }
             }
@@ -1770,7 +1789,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                 if (cond) cond[idx] = condition_bound[lane];
                 if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
-                    power[idx] = FCAST(NAN);
+                    power[idx] = chi2_nan();
                     ++nan_count;
                 }
             }
@@ -1782,7 +1801,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
                 if (cond) cond[idx] = condition_bound[lane];
                 if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
                     singular_lane[lane] = 1;
-                    power[idx] = FCAST(NAN);
+                    power[idx] = chi2_nan();
                     ++nan_count;
                 }
             }
@@ -1980,11 +1999,11 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
             block_status = gls_impl(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, ws, yws, chi2_ref, normalization, M, &cyb, b, power_block, cond_block);
         } else {
 #if defined(DOUBLE_DOUBLE)
-            block_status = solve_periodogram_dd(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, power_block,
-                                                cond_block);
+            block_status =
+                solve_periodogram_dd(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, power_block, cond_block);
 #else
-            block_status = solve_periodogram_vec(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b,
-                                                 power_block, cond_block, &workspace);
+            block_status = solve_periodogram_vec(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, power_block,
+                                                 cond_block, &workspace);
 #endif
         }
         if (block_status < 0) {
@@ -2013,13 +2032,13 @@ cleanup:
     else if (plan)
         NUFFT_LRA_FREE((LRA_PLAN_T *)plan);
 
-    free(w);
-    free(yw);
-    free(x);
-    free(out_r);
-    free(out_i);
-    free(power_block);
-    free(cond_block);
+    nanofft_aligned_free(w);
+    nanofft_aligned_free(yw);
+    nanofft_aligned_free(x);
+    nanofft_aligned_free(out_r);
+    nanofft_aligned_free(out_i);
+    nanofft_aligned_free(power_block);
+    nanofft_aligned_free(cond_block);
     block_ladder_free(&ladder);
     trig_rows_free(&rows);
 #if !defined(DOUBLE_DOUBLE)
@@ -2152,18 +2171,26 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
             status = ihs_power_sweep_d1(&ladder, N, block, plan, backend, power, out_r, out_i, normalization, nll_scale, TO_DOUBLE(norm_neff));
         } else {
             const int defer = (tls_tuning_defer() != 0 && use_pswf && NUFFT_PSWF_SLOTS_AVAILABLE((PSWF_PLAN_T *)plan)) ? 1 : 0;
-            status = ihs_power_sweep_deferred(&ladder, N, block, degree, plan, backend, power, out_r, out_i, defer, normalization, nll_scale,
-                                              TO_DOUBLE(norm_neff));
+            status =
+                ihs_power_sweep_deferred(&ladder, N, block, degree, plan, backend, power, out_r, out_i, defer, normalization, nll_scale, TO_DOUBLE(norm_neff));
         }
     }
 
     if (status == CHI2PER_OK) {
-        tls_tuning_report_work_bytes((unsigned long long)((size_t)degree * (size_t)ladder_levels * (size_t)M * 4u * sizeof(FLOAT) +
-                                                          (size_t)2 * (size_t)block * sizeof(FLOAT)));
+        tls_tuning_report_work_bytes(
+            (unsigned long long)((size_t)degree * (size_t)ladder_levels * (size_t)M * 4u * sizeof(FLOAT) + (size_t)2 * (size_t)block * sizeof(FLOAT)));
         if (normalization == TLS_NORM_STANDARD) {
-            for (int idx = 0; idx < N; ++idx) power[idx] = MUL(power[idx], standard_scale);
+            for (int idx = 0; idx < N; ++idx) {
+                power[idx] = MUL(power[idx], standard_scale);
+                /* nterms == 1 is a true R^2.  nterms > 1 is a sum of
+                 * per-harmonic contributions and may legitimately exceed 1. */
+                if (degree == 1 && !(TO_DOUBLE(power[idx]) < 1.0)) power[idx] = FCAST(0.0);
+            }
         } else {
-            for (int idx = 0; idx < N; ++idx) power[idx] = ihs_correct_power(power[idx], degree);
+            for (int idx = 0; idx < N; ++idx) {
+                power[idx] = ihs_correct_power(power[idx], degree);
+                if (!(TO_DOUBLE(power[idx]) >= 0.0)) power[idx] = FCAST(0.0);
+            }
         }
     }
 
@@ -2173,11 +2200,11 @@ cleanup:
     else if (plan)
         NUFFT_LRA_FREE((LRA_PLAN_T *)plan);
 
-    free(w);
-    free(wy);
-    free(x);
-    free(out_r);
-    free(out_i);
+    nanofft_aligned_free(w);
+    nanofft_aligned_free(wy);
+    nanofft_aligned_free(x);
+    nanofft_aligned_free(out_r);
+    nanofft_aligned_free(out_i);
     block_ladder_free(&ladder);
     return status;
 }

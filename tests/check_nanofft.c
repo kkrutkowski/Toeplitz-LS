@@ -6,7 +6,11 @@
  *     the real half of the 2-D one,
  *   - the vectorized (COBRAVO) and scalar tile paths agree bit for bit,
  *   - every fused pass depth (1..4) reproduces a double-precision naive DFT,
- *   - the fused depths agree with each other to float roundoff.
+ *   - the fused depths agree with each other to float roundoff,
+ *   - both fusion orders reproduce the un-fused transform on every supported
+ *     grid, and are bit-identical when the stage count divides by the depth,
+ *   - make_plan() rejects grids below 2 * VEC_LEN instead of reading past the
+ *     signal, and the smallest accepted grid still matches the naive DFT.
  */
 
 #include <math.h>
@@ -14,7 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <tls_tuning.h>
+#include <unistd.h>
 
 #ifndef NANOFFT_FFT_FUSE_MAX
 #    define NANOFFT_FFT_FUSE_MAX 4
@@ -22,14 +28,14 @@
 
 static int failures = 0;
 
-#define CHECK(cond, ...)                                                                                                                            \
-    do {                                                                                                                                            \
-        if (!(cond)) {                                                                                                                              \
-            printf("FAIL %s:%d: ", __FILE__, __LINE__);                                                                                             \
-            printf(__VA_ARGS__);                                                                                                                    \
-            printf("\n");                                                                                                                           \
-            ++failures;                                                                                                                             \
-        }                                                                                                                                           \
+#define CHECK(cond, ...)                                \
+    do {                                                \
+        if (!(cond)) {                                  \
+            printf("FAIL %s:%d: ", __FILE__, __LINE__); \
+            printf(__VA_ARGS__);                        \
+            printf("\n");                               \
+            ++failures;                                 \
+        }                                               \
     } while (0)
 
 /* nanofft expects 64-byte aligned signals (the vector loads are aligned). */
@@ -193,7 +199,7 @@ static void check_fft_float(void) {
             for (uint32_t k = 0; k < n; ++k) {
                 const double mag = sqrt(dr[k] * dr[k] + di[k] * di[k]);
                 if (mag > scale) scale = mag;
-                const double er = (double)or[k] - dr[k], ei = (double)oi[k] - di[k];
+                const double er = (double) or [k] - dr[k], ei = (double)oi[k] - di[k];
                 const double e = sqrt(er * er + ei * ei);
                 if (e > err) err = e;
             }
@@ -278,23 +284,27 @@ static void check_fft_double(void) {
     naive_dft(fr, fi, dr, di, (int)n);
 
     for (int fuse = 1; fuse <= NANOFFT_FFT_FUSE_MAX; ++fuse) {
-        tls_tuning_set_fft_fuse(fuse);
-        nanofft_plan *plan = nanofft_make_plan(n);
-        memcpy(or, r, n * sizeof(double));
-        memcpy(oi, i, n * sizeof(double));
-        nanofft_execute(plan, or, oi);
-        double err = 0.0, scale = 0.0;
-        for (uint32_t k = 0; k < n; ++k) {
-            const double mag = sqrt(dr[k] * dr[k] + di[k] * di[k]);
-            if (mag > scale) scale = mag;
-            const double er = or[k] - dr[k], ei = oi[k] - di[k];
-            const double e = sqrt(er * er + ei * ei);
-            if (e > err) err = e;
+        for (int ord = 0; ord < 2; ++ord) {
+            tls_tuning_set_fft_fuse(fuse);
+            tls_tuning_set_fft_order(ord ? TLS_FFT_ORDER_FRONT : TLS_FFT_ORDER_END);
+            nanofft_plan *plan = nanofft_make_plan(n);
+            memcpy(or, r, n * sizeof(double));
+            memcpy(oi, i, n * sizeof(double));
+            nanofft_execute(plan, or, oi);
+            double err = 0.0, scale = 0.0;
+            for (uint32_t k = 0; k < n; ++k) {
+                const double mag = sqrt(dr[k] * dr[k] + di[k] * di[k]);
+                if (mag > scale) scale = mag;
+                const double er = or [k] - dr[k], ei = oi[k] - di[k];
+                const double e = sqrt(er * er + ei * ei);
+                if (e > err) err = e;
+            }
+            const double rel = scale > 0.0 ? err / scale : err;
+            CHECK(rel < 1e-4, "double FFT fuse=%d order=%d relative error %.3g", fuse, ord, rel);
+            nanofft_destroy_plan(plan);
         }
-        const double rel = scale > 0.0 ? err / scale : err;
-        CHECK(rel < 1e-4, "double FFT fuse=%d relative error %.3g", fuse, rel);
-        nanofft_destroy_plan(plan);
     }
+    tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
     tls_tuning_set_fft_fuse(TLS_TUNING_FFT_FUSE_DEFAULT);
 
     free(r);
@@ -354,23 +364,27 @@ static void check_fft_dd(void) {
     naive_dft(fr, fi, dr, di, (int)n);
 
     for (int fuse = 1; fuse <= NANOFFT_FFT_FUSE_DD; ++fuse) {
-        tls_tuning_set_fft_fuse(fuse);
-        nanofftdd_plan *plan = nanofftdd_make_plan(n);
-        memcpy(or_, r, n * sizeof(dd_t));
-        memcpy(oi, i, n * sizeof(dd_t));
-        nanofftdd_execute(plan, or_, oi);
-        double err = 0.0, scale = 0.0;
-        for (uint32_t k = 0; k < n; ++k) {
-            const double mag = sqrt(dr[k] * dr[k] + di[k] * di[k]);
-            if (mag > scale) scale = mag;
-            const double er = dd_to_double(or_[k]) - dr[k], ei = dd_to_double(oi[k]) - di[k];
-            const double e = sqrt(er * er + ei * ei);
-            if (e > err) err = e;
+        for (int ord = 0; ord < 2; ++ord) {
+            tls_tuning_set_fft_fuse(fuse);
+            tls_tuning_set_fft_order(ord ? TLS_FFT_ORDER_FRONT : TLS_FFT_ORDER_END);
+            nanofftdd_plan *plan = nanofftdd_make_plan(n);
+            memcpy(or_, r, n * sizeof(dd_t));
+            memcpy(oi, i, n * sizeof(dd_t));
+            nanofftdd_execute(plan, or_, oi);
+            double err = 0.0, scale = 0.0;
+            for (uint32_t k = 0; k < n; ++k) {
+                const double mag = sqrt(dr[k] * dr[k] + di[k] * di[k]);
+                if (mag > scale) scale = mag;
+                const double er = dd_to_double(or_[k]) - dr[k], ei = dd_to_double(oi[k]) - di[k];
+                const double e = sqrt(er * er + ei * ei);
+                if (e > err) err = e;
+            }
+            const double rel = scale > 0.0 ? err / scale : err;
+            CHECK(rel < 1e-12, "double-double FFT fuse=%d order=%d relative error %.3g", fuse, ord, rel);
+            nanofftdd_destroy_plan(plan);
         }
-        const double rel = scale > 0.0 ? err / scale : err;
-        CHECK(rel < 1e-12, "double-double FFT fuse=%d relative error %.3g", fuse, rel);
-        nanofftdd_destroy_plan(plan);
     }
+    tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
     tls_tuning_set_fft_fuse(TLS_TUNING_FFT_FUSE_DEFAULT);
 
     free(r);
@@ -383,6 +397,140 @@ static void check_fft_dd(void) {
     free(di);
 }
 
+/* ------------------------------------------------------------------ */
+
+/* Both fusion orders must reproduce the un-fused transform for every depth on
+ * every supported grid.  Where the stage count is a multiple of the depth the
+ * two orders describe the same schedule, so they must agree bit for bit. */
+static void check_fft_order(void) {
+    const uint32_t min_n = 2u * (uint32_t)VECF_LEN;
+    const uint32_t log_v = (uint32_t)(log2((double)VECF_LEN) + 0.5);
+    const uint32_t cap = 1u << 16;
+    float *r = (float *)test_alloc(cap * sizeof(float));
+    float *i = (float *)test_alloc(cap * sizeof(float));
+    float *ref_r = (float *)test_alloc(cap * sizeof(float));
+    float *ref_i = (float *)test_alloc(cap * sizeof(float));
+    float *a_r = (float *)test_alloc(cap * sizeof(float));
+    float *a_i = (float *)test_alloc(cap * sizeof(float));
+    float *b_r = (float *)test_alloc(cap * sizeof(float));
+    float *b_i = (float *)test_alloc(cap * sizeof(float));
+
+    for (uint32_t n = min_n; n <= cap; n <<= 1) {
+        const uint32_t log_n = (uint32_t)(log2((double)n) + 0.5);
+        const uint32_t stages = (log_n > log_v) ? log_n - log_v : 0;
+        for (uint32_t k = 0; k < n; ++k) {
+            r[k] = frand();
+            i[k] = frand();
+            ref_r[k] = r[k];
+            ref_i[k] = i[k];
+        }
+
+        tls_tuning_set_fft_fuse(1);
+        nanofftf_plan *ref = nanofftf_make_plan(n);
+        nanofftf_execute(ref, ref_r, ref_i);
+        nanofftf_destroy_plan(ref);
+
+        for (int fuse = 1; fuse <= NANOFFT_FFT_FUSE_MAX; ++fuse) {
+            for (int ord = 0; ord < 2; ++ord) {
+                const int order = ord ? TLS_FFT_ORDER_FRONT : TLS_FFT_ORDER_END;
+                tls_tuning_set_fft_fuse(fuse);
+                tls_tuning_set_fft_order(order);
+                nanofftf_plan *plan = nanofftf_make_plan(n);
+                memcpy(a_r, r, n * sizeof(float));
+                memcpy(a_i, i, n * sizeof(float));
+                nanofftf_execute(plan, a_r, a_i);
+                nanofftf_destroy_plan(plan);
+                const double rel = max_rel_error(ref_r, ref_i, a_r, a_i, (int)n);
+                CHECK(rel < 2e-5, "order=%d fuse=%d disagrees with fuse=1 at n=%u (%.3g)", order, fuse, n, rel);
+                if (ord == 0) {
+                    memcpy(b_r, a_r, n * sizeof(float));
+                    memcpy(b_i, a_i, n * sizeof(float));
+                }
+            }
+            /* the plan clamps the request to the depth this build compiled */
+            const uint32_t eff = (fuse > NANOFFT_FFT_FUSE_FLOAT) ? (uint32_t)NANOFFT_FFT_FUSE_FLOAT : (uint32_t)fuse;
+            if (eff > 1 && (stages % eff) == 0)
+                CHECK(memcmp(b_r, a_r, n * sizeof(float)) == 0 && memcmp(b_i, a_i, n * sizeof(float)) == 0,
+                      "fuse=%d n=%u: the two orders should describe the same schedule", fuse, n);
+        }
+    }
+
+    tls_tuning_set_fft_fuse(TLS_TUNING_FFT_FUSE_DEFAULT);
+    tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
+    free(r);
+    free(i);
+    free(ref_r);
+    free(ref_i);
+    free(a_r);
+    free(a_i);
+    free(b_r);
+    free(b_i);
+}
+
+/* make_plan() must reject a grid shorter than two vectors (the intra-vector
+ * tail loads two per step) instead of reading past the signal.  The expected
+ * exit() runs in a child so the checks survive it. */
+static int child_rejects(uint32_t n) {
+    fflush(stdout);
+    const pid_t pid = fork();
+    CHECK(pid >= 0, "fork failed");
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(2);
+        (void)nanofftf_make_plan(n);
+        _exit(0); /* only reached if the unsupported grid was accepted */
+    }
+    int status = 0;
+    if (pid > 0) waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == EXIT_FAILURE;
+}
+
+static void check_min_grid(void) {
+    const uint32_t min_f = 2u * (uint32_t)VECF_LEN;
+    const uint32_t min_d = 2u * (uint32_t)VEC_LEN;
+    CHECK(child_rejects(min_f / 2), "float make_plan accepted n=%u (< %u)", min_f / 2, min_f);
+    CHECK(child_rejects(min_d / 2), "double make_plan accepted n=%u (< %u)", min_d / 2, min_d);
+
+    /* the smallest accepted float grid must still match the naive DFT */
+    const uint32_t n = min_f;
+    float *r = (float *)test_alloc(n * sizeof(float));
+    float *i = (float *)test_alloc(n * sizeof(float));
+    float *ref_r = (float *)test_alloc(n * sizeof(float));
+    float *ref_i = (float *)test_alloc(n * sizeof(float));
+    double *dr = (double *)test_alloc(n * sizeof(double));
+    double *di = (double *)test_alloc(n * sizeof(double));
+    for (uint32_t k = 0; k < n; ++k) {
+        r[k] = frand();
+        i[k] = frand();
+    }
+    naive_dft(r, i, dr, di, (int)n);
+    for (int ord = 0; ord < 2; ++ord) {
+        tls_tuning_set_fft_order(ord ? TLS_FFT_ORDER_FRONT : TLS_FFT_ORDER_END);
+        nanofftf_plan *plan = nanofftf_make_plan(n);
+        memcpy(ref_r, r, n * sizeof(float));
+        memcpy(ref_i, i, n * sizeof(float));
+        nanofftf_execute(plan, ref_r, ref_i);
+        double err = 0.0, scale = 0.0;
+        for (uint32_t k = 0; k < n; ++k) {
+            const double mag = sqrt(dr[k] * dr[k] + di[k] * di[k]);
+            if (mag > scale) scale = mag;
+            const double er = (double)ref_r[k] - dr[k], ei = (double)ref_i[k] - di[k];
+            const double e = sqrt(er * er + ei * ei);
+            if (e > err) err = e;
+        }
+        const double rel = scale > 0.0 ? err / scale : err;
+        CHECK(rel < 5e-5, "smallest grid n=%u order=%d relative error %.3g", n, ord, rel);
+        nanofftf_destroy_plan(plan);
+    }
+    tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
+    free(r);
+    free(i);
+    free(ref_r);
+    free(ref_i);
+    free(dr);
+    free(di);
+    printf("  smallest grid n=%u accepted, rejected below\n", n);
+}
+
 int main(void) {
     printf("check_nanofft: permutation\n");
     check_permutation();
@@ -390,6 +538,9 @@ int main(void) {
     check_fft_float();
     printf("check_nanofft: fused depth agreement\n");
     check_fft_fuse_agreement();
+    printf("check_nanofft: fused order and grid range\n");
+    check_fft_order();
+    check_min_grid();
     printf("check_nanofft: double FFT\n");
     check_fft_double();
     printf("check_nanofft: double-double permutation\n");

@@ -1,22 +1,18 @@
 """ctypes wrappers for the FastChi2/AoVMH(W) least-squares periodogram.
 
-The bundled shared library evaluates four periodogram normalizations:
+The bundled shared library evaluates three documented periodogram
+normalizations:
 
 ``standard`` (default)
-    Coefficient of determination :math:`R^2`.
+    Coefficient of determination :math:`R^2`.  Values at or above 1 are
+    numerical artefacts of an ill-conditioned solve and are reported as 0.
 ``anova``
     ANOVA / F statistic, following Schwarzenberg-Czerny's convention.
 ``nll``
     Negative log false-alarm probability, natural logarithm:
     :math:`-\\ln(\\mathrm{FAP})`.  This is the exact Pochhammer/incomplete-beta
-    statistic; the separate IHS modules use Wilkie finite-sample corrections
-    on the harmonics followed by an Erlang logarithmic correction.
-``regularized``
-    Laplace-regularized Cybenko statistic, matching ``ihsnpeaks``'s
-    ``bayes`` / Relative Evidence Ratio.  For ``nterms > 1`` it requires a
-    Toeplitz solver.  The ``cond`` array returned by ``power()`` is the
-    condition upper bound ``(2 * nterms + 1) * P``; this normalization uses
-    the Cybenko product ``P``.
+    statistic for FastChi2; the separate IHS modules use Wilkie (1983)
+    finite-sample corrections on the harmonics.
 
 The library is loaded with ``ctypes.CDLL``. On CPython, ctypes releases the GIL
 while calling functions from CDLL instances, so independent native
@@ -38,9 +34,9 @@ try:
 except ImportError:  # pragma: no cover - exercised only without mpmath
     _mp = None
 
+from ._dispatch import load as _load_native
 
 HERE = Path(__file__).resolve().parent
-LIB_PATH = HERE / "tls.so"
 
 _BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4, "svd": 5}
@@ -48,7 +44,7 @@ _NORMALIZATIONS = {
     "standard": 0,
     "anova": 1,
     "nll": 2,
-    "regularized": 3,
+    "regularized": 3,  # implemented, intentionally undocumented in 1.0
     # Legacy aliases, intentionally undocumented:
     "asymptotic": 1,
     "bayes": 3,
@@ -78,17 +74,17 @@ class DD(ctypes.Structure):
 
 
 def _load_library():
+    """Bind the ctypes signatures of the selected native library, once.
+
+    The library itself is chosen at import time by :mod:`toeplitz_ls._dispatch`
+    (one shared object per microarchitecture variant, widest usable one wins),
+    so this function never makes a decision, it only declares the ABI.
+    """
     global _LIB
     if _LIB is not None:
         return _LIB
 
-    if not LIB_PATH.exists():
-        raise FileNotFoundError(
-            f"{LIB_PATH} does not exist. Build from the repository root with "
-            "'make generic' or 'make native' before installing."
-        )
-
-    lib = ctypes.CDLL(str(LIB_PATH))
+    lib = _load_native()
 
     lib.tlsf_fastchi2.argtypes = [
         ctypes.POINTER(ctypes.c_double),
@@ -223,7 +219,7 @@ def _check_normalization(normalization):
             return _NORMALIZATIONS[key]
     if isinstance(normalization, int) and normalization in _NORMALIZATIONS.values():
         return normalization
-    raise ValueError("normalization must be 'standard', 'anova', 'nll', or 'regularized'")
+    raise ValueError("normalization must be 'standard', 'anova', or 'nll'")
 
 
 def _check_int(name, value, min_value, max_value=_C_INT_MAX):
@@ -305,11 +301,7 @@ def _prepare_numpy_inputs(t, y, dy, y_dtype):
         raise ValueError("t, y, and dy must have the same length")
     if t_arr.size <= 0:
         raise ValueError("t, y, and dy must not be empty")
-    if not (
-        np.all(np.isfinite(t_arr))
-        and np.all(np.isfinite(y_arr))
-        and np.all(np.isfinite(dy_arr))
-    ):
+    if not (np.all(np.isfinite(t_arr)) and np.all(np.isfinite(y_arr)) and np.all(np.isfinite(dy_arr))):
         raise ValueError("t, y, and dy entries must be finite")
     if np.any(dy_arr <= 0):
         raise ValueError("dy entries must be positive")
@@ -322,9 +314,7 @@ def _check_observation_count(num_observations, nterms):
         raise ValueError(f"number of observations must be at most {_C_INT_MAX}")
     min_observations = 2 * nterms + 2
     if num_observations < min_observations:
-        raise ValueError(
-            f"at least {min_observations} observations are required for nterms={nterms}"
-        )
+        raise ValueError(f"at least {min_observations} observations are required for nterms={nterms}")
 
 
 def _raise_status(name, status):
@@ -390,7 +380,7 @@ class tlsf:
         """Return periodogram power on the grid ``f0 + df * arange(Nf)``.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``, or ``'regularized'``.
+        ``'nll'``.
         """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
@@ -401,11 +391,7 @@ class tlsf:
         _check_observation_count(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float32)
         cond = None if autonan else np.empty(Nf, dtype=np.float32)
-        cond_ptr = (
-            ctypes.POINTER(ctypes.c_float)()
-            if cond is None
-            else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        )
+        cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
         status = _load_library().tlsf_fastchi2(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -446,7 +432,7 @@ class tlsf:
         """Return automatic frequency and power arrays.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``, or ``'regularized'``.
+        ``'nll'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
@@ -495,7 +481,7 @@ class tls:
         """Return periodogram power on the grid ``f0 + df * arange(Nf)``.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``, or ``'regularized'``.
+        ``'nll'``.
         """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
@@ -505,11 +491,7 @@ class tls:
         _check_observation_count(t_arr.size, nterms)
         out = np.empty(Nf, dtype=np.float64)
         cond = None if autonan else np.empty(Nf, dtype=np.float64)
-        cond_ptr = (
-            ctypes.POINTER(ctypes.c_double)()
-            if cond is None
-            else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-        )
+        cond_ptr = ctypes.POINTER(ctypes.c_double)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
 
         status = _load_library().tls_fastchi2(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -550,7 +532,7 @@ class tls:
         """Return automatic double-precision frequency and power arrays.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``, or ``'regularized'``.
+        ``'nll'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
@@ -599,7 +581,7 @@ class tlsdd:
         """Return high-precision periodogram power.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``, or ``'regularized'``.
+        ``'nll'``.
         """
         mp = _require_mpmath()
         normalization = _check_normalization(normalization)
@@ -678,7 +660,7 @@ class tlsdd:
         """Return automatic high-precision frequency and power lists.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``, or ``'regularized'``.
+        ``'nll'``.
         """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)

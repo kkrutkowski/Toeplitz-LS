@@ -38,14 +38,7 @@ def old_numpy_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
     p0 = power_arr[:-2]
     p1 = power_arr[1:-1]
     p2 = power_arr[2:]
-    mask = (
-        np.isfinite(p0)
-        & np.isfinite(p1)
-        & np.isfinite(p2)
-        & (p1 > p0)
-        & (p1 > p2)
-        & (p1 > threshold)
-    )
+    mask = np.isfinite(p0) & np.isfinite(p1) & np.isfinite(p2) & (p1 > p0) & (p1 > p2) & (p1 > threshold)
     idx = np.nonzero(mask)[0] + 1
     if idx.size == 0:
         return []
@@ -68,11 +61,7 @@ def old_numpy_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
         return peaks if num_peaks is None else peaks[:num_peaks]
 
     vertex_cond = np.full(vertex_power.shape, np.nan, dtype=np.float64)
-    cond_finite = (
-        np.isfinite(cond_arr[idx - 1])
-        & np.isfinite(cond_arr[idx])
-        & np.isfinite(cond_arr[idx + 1])
-    )
+    cond_finite = np.isfinite(cond_arr[idx - 1]) & np.isfinite(cond_arr[idx]) & np.isfinite(cond_arr[idx + 1])
     if np.any(cond_finite):
         c0 = cond_arr[idx[cond_finite] - 1]
         c1 = cond_arr[idx[cond_finite]]
@@ -81,9 +70,7 @@ def old_numpy_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
         cx1 = x1[cond_finite]
         cx2 = x2[cond_finite]
         cslope01, ccurvature = _quadratic_terms(cx0, c0, cx1, c1, cx2, c2)
-        vertex_cond[cond_finite] = _evaluate_quadratic(
-            vertex_freq[cond_finite], cx0, c0, cx1, cslope01, ccurvature
-        )
+        vertex_cond[cond_finite] = _evaluate_quadratic(vertex_freq[cond_finite], cx0, c0, cx1, cslope01, ccurvature)
     peaks = [Peak(vertex_freq[i], vertex_power[i], vertex_cond[i]) for i in order]
     return peaks if num_peaks is None else peaks[:num_peaks]
 
@@ -93,11 +80,7 @@ def old_mpmath_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
     for idx in range(1, len(power) - 1):
         if not all(mp.isfinite(value) for value in power[idx - 1 : idx + 2]):
             continue
-        if not (
-            power[idx] > power[idx - 1]
-            and power[idx] > power[idx + 1]
-            and power[idx] > threshold
-        ):
+        if not (power[idx] > power[idx - 1] and power[idx] > power[idx + 1] and power[idx] > threshold):
             continue
 
         x0, x1, x2 = freq[idx - 1], freq[idx], freq[idx + 1]
@@ -109,9 +92,7 @@ def old_mpmath_get_peaks(freq, power, cond=None, threshold=0, num_peaks=25):
         else:
             linear = slope01 - curvature * (x0 + x1)
             vertex_freq = -linear / (2 * curvature)
-            vertex_power = _evaluate_quadratic(
-                vertex_freq, x0, y0, x1, slope01, curvature
-            )
+            vertex_power = _evaluate_quadratic(vertex_freq, x0, y0, x1, slope01, curvature)
         if cond is None:
             peaks.append(Peak(vertex_freq, vertex_power))
         elif all(mp.isfinite(value) for value in cond[idx - 1 : idx + 2]):
@@ -156,21 +137,13 @@ def bench_numpy():
     rng = np.random.default_rng(12345)
     n = 1_000_000
     freq = np.linspace(0.0, 2000.0, n, dtype=np.float64)
-    power = (
-        np.sin(freq * 0.91)
-        + 0.3 * np.sin(freq * 7.3)
-        + 0.03 * rng.standard_normal(n)
-    )
+    power = np.sin(freq * 0.91) + 0.3 * np.sin(freq * 7.3) + 0.03 * rng.standard_normal(n)
     cond = 1.0 + 0.001 * freq + 0.000001 * freq * freq
     power[12345] = np.nan
     cond[54321] = np.nan
 
-    old_time, old_result = median_seconds(
-        lambda: old_numpy_get_peaks(freq, power, cond=cond, threshold=0.8), repeat=5
-    )
-    new_time, new_result = median_seconds(
-        lambda: get_peaks(freq, power, cond=cond, threshold=0.8), repeat=5
-    )
+    old_time, old_result = median_seconds(lambda: old_numpy_get_peaks(freq, power, cond=cond, threshold=0.8), repeat=5)
+    new_time, new_result = median_seconds(lambda: get_peaks(freq, power, cond=cond, threshold=0.8), repeat=5)
     print(
         "numpy/float64 "
         f"old={old_time:.6f}s new={new_time:.6f}s "
@@ -197,9 +170,7 @@ def bench_mpmath():
             lambda: old_mpmath_get_peaks(freq, power, cond=cond, threshold=threshold),
             repeat=5,
         )
-        new_time, new_result = median_seconds(
-            lambda: get_peaks(freq, power, cond=cond, threshold=threshold), repeat=5
-        )
+        new_time, new_result = median_seconds(lambda: get_peaks(freq, power, cond=cond, threshold=threshold), repeat=5)
         print(
             "mpmath/tlsdd "
             f"old={old_time:.6f}s new={new_time:.6f}s "

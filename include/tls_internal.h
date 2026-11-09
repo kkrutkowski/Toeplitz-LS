@@ -29,11 +29,11 @@ enum {
  * the plan found the periodic kept-bin pattern, which
  * TLS_*_nufft_pswf_slots_available() reports.
  */
-#define TLS_INTERNAL_PSWF_DECL(prefix, type, plan_type)                                                                               \
-    void prefix##_nufft_pswf_execute_mode(plan_type *plan, const type *y_real, const type *y_imag, type *out_real, type *out_imag,      \
-                                          int freq_factor, int mode);                                                                  \
-    int prefix##_nufft_pswf_slots_available(plan_type *plan);                                                                    \
-    void prefix##_nufft_pswf_finish_slots(plan_type *plan, const type *compact, type *out, int count);
+#define TLS_INTERNAL_PSWF_DECL(prefix, type, plan_type)                                                                                                     \
+    TLS_API void prefix##_nufft_pswf_execute_mode(plan_type *plan, const type *y_real, const type *y_imag, type *out_real, type *out_imag, int freq_factor, \
+                                                  int mode);                                                                                                \
+    TLS_API int prefix##_nufft_pswf_slots_available(plan_type *plan);                                                                                       \
+    TLS_API void prefix##_nufft_pswf_finish_slots(plan_type *plan, const type *compact, type *out, int count);
 
 TLS_INTERNAL_PSWF_DECL(tlsf, float, tlsf_nufft_pswf_plan)
 TLS_INTERNAL_PSWF_DECL(tls, double, tls_nufft_pswf_plan)
@@ -42,7 +42,7 @@ TLS_INTERNAL_PSWF_DECL(tlsdd, dd_t, tlsdd_nufft_pswf_plan)
 #undef TLS_INTERNAL_PSWF_DECL
 
 /* chi2per reports the size of the work arrays it allocated (benchmark stats). */
-void tls_tuning_report_work_bytes(unsigned long long bytes);
+TLS_API void tls_tuning_report_work_bytes(unsigned long long bytes);
 
 #ifdef __cplusplus
 }

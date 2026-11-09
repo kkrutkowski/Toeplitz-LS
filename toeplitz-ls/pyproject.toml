@@ -1,20 +1,45 @@
 [build-system]
+# Only used when installing straight from a clone; the release wheels and the
+# sdist are assembled by `dispatch.wheel` / `dispatch.sdist` (see dispatch/).
+# 61 is the first setuptools with PEP 621 metadata.  The license is a table
+# rather than an SPDX string because the string form needs setuptools >= 77
+# (and therefore Python >= 3.9).
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "toeplitz-ls"
-version = "0.0.0"
-description = "Python ctypes interface for the Toeplitz least-squares FastChi2 library."
+version = "1.0.0"
+description = "Fast Toeplitz least-squares periodogram (AoVMH / FastChi2 / IHS) with runtime microarchitecture dispatch."
 readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Kacper Rutkowski" }]
+keywords = ["astronomy", "periodogram", "least squares", "Toeplitz", "FFT", "time series"]
 requires-python = ">=3.8"
 dependencies = [
-    "numpy",
+    "numpy>=1.17.3",
 ]
+
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+[project.urls]
+Homepage = "https://github.com/kkrutkowski/Toeplitz-LS"
+Source = "https://github.com/kkrutkowski/Toeplitz-LS"
+Issues = "https://github.com/kkrutkowski/Toeplitz-LS/issues"
 
 [project.optional-dependencies]
 tlsdd = [
-    "mpmath",
+    "mpmath>=1.0",
 ]
 
 [tool.setuptools]
@@ -25,4 +50,6 @@ where = ["."]
 include = ["toeplitz_ls*"]
 
 [tool.setuptools.package-data]
-toeplitz_ls = ["*.so"]
+# The release wheels carry one shared object per microarchitecture variant plus
+# the manifest the dispatcher reads; source builds keep the single tls.so.
+toeplitz_ls = ["*.so", "_lib/*.so", "_lib/*.dll", "_lib/manifest.json"]

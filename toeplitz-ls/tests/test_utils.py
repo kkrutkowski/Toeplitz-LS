@@ -22,11 +22,7 @@ def _reference_get_peaks(freq, power, cond=None, threshold=0):
         power_window = power[idx - 1 : idx + 2]
         if not all(_reference_is_finite(value) for value in power_window):
             continue
-        if not (
-            power[idx] > power[idx - 1]
-            and power[idx] > power[idx + 1]
-            and power[idx] > threshold
-        ):
+        if not (power[idx] > power[idx - 1] and power[idx] > power[idx + 1] and power[idx] > threshold):
             continue
 
         vertex_freq, vertex_power = _reference_quadratic_vertex(
@@ -71,9 +67,7 @@ def _reference_quadratic_vertex(x0, y0, x1, y1, x2, y2):
         return x1, y1
     linear = slope01 - curvature * (x0 + x1)
     vertex_x = -linear / (2 * curvature)
-    vertex_y = _reference_evaluate_quadratic(
-        vertex_x, x0, y0, x1, slope01, curvature
-    )
+    vertex_y = _reference_evaluate_quadratic(vertex_x, x0, y0, x1, slope01, curvature)
     return vertex_x, vertex_y
 
 
@@ -136,9 +130,7 @@ class PeakUtilityTests(unittest.TestCase):
 
     def test_endpoints_and_plateaus_are_ignored(self):
         self.assertEqual(len(get_peaks([0.0, 1.0, 2.0], [2.0, 1.0, 3.0])), 0)
-        self.assertEqual(
-            len(get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 1.0, 0.0])), 0
-        )
+        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 1.0, 0.0])), 0)
 
     def test_nan_power_samples_are_accepted_and_skip_windows(self):
         freq = list(range(9))
@@ -181,19 +173,13 @@ class PeakUtilityTests(unittest.TestCase):
         for dtype in (np.float32, np.float64):
             with self.subTest(dtype=dtype):
                 freq = np.linspace(0.0, 25.0, 4097, dtype=dtype)
-                power = (
-                    np.sin(freq * dtype(1.7))
-                    + dtype(0.15) * np.sin(freq * dtype(11.0))
-                    + dtype(2.0)
-                ).astype(dtype)
+                power = (np.sin(freq * dtype(1.7)) + dtype(0.15) * np.sin(freq * dtype(11.0)) + dtype(2.0)).astype(dtype)
                 power[111] = np.nan
                 cond = (dtype(1.0) + freq * dtype(0.25) + freq * freq * dtype(0.01)).astype(dtype)
                 cond[1000] = np.nan
 
                 native = get_peaks(freq, power, cond=cond, threshold=1.9, num_peaks=None)
-                reference = _reference_get_peaks(
-                    list(freq), list(power), cond=list(cond), threshold=dtype(1.9)
-                )
+                reference = _reference_get_peaks(list(freq), list(power), cond=list(cond), threshold=dtype(1.9))
 
                 self.assertEqual(len(native), len(reference))
                 for native_peak, ref_peak in zip(native, reference):
@@ -257,9 +243,7 @@ class PeakUtilityTests(unittest.TestCase):
 
     def test_print_omits_or_includes_condition_column(self):
         no_cond = get_peaks([0.0, 1.0, 2.0], [0.0, 1.0, 0.0])
-        with_cond = get_peaks(
-            [0.0, 1.0, 2.0], [0.0, 1.0, 0.0], cond=[2.0, 3.0, 4.0]
-        )
+        with_cond = get_peaks([0.0, 1.0, 2.0], [0.0, 1.0, 0.0], cond=[2.0, 3.0, 4.0])
 
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
@@ -313,9 +297,7 @@ class PeakUtilityTests(unittest.TestCase):
         self.assertEqual(peaks.freq_decimals, 6)
 
     def test_save_writes_tsv(self):
-        peaks = get_peaks(
-            [0.0, 1.0, 2.0], [0.0, 1.0, 0.0], cond=[2.0, 3.0, 4.0]
-        )
+        peaks = get_peaks([0.0, 1.0, 2.0], [0.0, 1.0, 0.0], cond=[2.0, 3.0, 4.0])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "peaks.tsv"
@@ -369,21 +351,13 @@ class MpmathPeakUtilityTests(unittest.TestCase):
     def test_mpmath_native_path_matches_reference(self):
         with mp.workprec(106):
             freq = [mp.mpf(i) / 16 for i in range(256)]
-            power = [
-                mp.sin(mp.mpf("2.7") * x)
-                + mp.mpf("0.25") * mp.cos(mp.mpf("13.0") * x)
-                for x in freq
-            ]
+            power = [mp.sin(mp.mpf("2.7") * x) + mp.mpf("0.25") * mp.cos(mp.mpf("13.0") * x) for x in freq]
             power[77] = mp.nan
             cond = [mp.mpf(2) + x + x * x for x in freq]
             cond[120] = mp.nan
 
-            native = get_peaks(
-                freq, power, cond=cond, threshold=mp.mpf("0.8"), num_peaks=None
-            )
-            reference = _reference_get_peaks(
-                freq, power, cond=cond, threshold=mp.mpf("0.8")
-            )
+            native = get_peaks(freq, power, cond=cond, threshold=mp.mpf("0.8"), num_peaks=None)
+            reference = _reference_get_peaks(freq, power, cond=cond, threshold=mp.mpf("0.8"))
 
             self.assertEqual(len(native), len(reference))
             for native_peak, ref_peak in zip(native, reference):

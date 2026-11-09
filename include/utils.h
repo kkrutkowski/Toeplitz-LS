@@ -10,20 +10,20 @@ extern "C" {
 
 enum { TLS_UTIL_OK = 0, TLS_UTIL_ERR_ARGUMENT = -1, TLS_UTIL_ERR_ALLOC = -3 };
 
-double tls_approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma, int backend);
-int tls_optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma, int backend);
-int tls_pswf43_plan_len_from_base(int base_len);
-int tls_pswf43_output_len_for_plan(int plan_len);
-int tls_twiddle_ladder_levels(int N, int block);
-int tls_twiddle_ladder_carry_level(size_t next_block, int levels);
-double tls_twiddle_ladder_advance(int block, int level);
+TLS_API double tls_approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma, int backend);
+TLS_API int tls_optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma, int backend);
+TLS_API int tls_pswf43_plan_len_from_base(int base_len);
+TLS_API int tls_pswf43_output_len_for_plan(int plan_len);
+TLS_API int tls_twiddle_ladder_levels(int N, int block);
+TLS_API int tls_twiddle_ladder_carry_level(size_t next_block, int levels);
+TLS_API double tls_twiddle_ladder_advance(int block, int level);
 
-int tlsf_get_peaks(const float *freq, const float *power, const float *cond, int n, int max_peaks, float threshold, float *out_freq, float *out_power,
-                   float *out_cond, int *out_count);
-int tls_get_peaks(const double *freq, const double *power, const double *cond, int n, int max_peaks, double threshold, double *out_freq, double *out_power,
-                  double *out_cond, int *out_count);
-int tlsdd_get_peaks(const dd_t *freq, const dd_t *power, const dd_t *cond, int n, int max_peaks, dd_t threshold, dd_t *out_freq, dd_t *out_power,
-                    dd_t *out_cond, int *out_count);
+TLS_API int tlsf_get_peaks(const float *freq, const float *power, const float *cond, int n, int max_peaks, float threshold, float *out_freq, float *out_power,
+                           float *out_cond, int *out_count);
+TLS_API int tls_get_peaks(const double *freq, const double *power, const double *cond, int n, int max_peaks, double threshold, double *out_freq,
+                          double *out_power, double *out_cond, int *out_count);
+TLS_API int tlsdd_get_peaks(const dd_t *freq, const dd_t *power, const dd_t *cond, int n, int max_peaks, dd_t threshold, dd_t *out_freq, dd_t *out_power,
+                            dd_t *out_cond, int *out_count);
 
 #ifdef __cplusplus
 }

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import math
 import operator
-import ctypes
 from collections.abc import MutableSequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,11 +39,7 @@ class Peak:
     def __eq__(self, other) -> bool:
         if not isinstance(other, Peak):
             return NotImplemented
-        return (
-            _values_equal(self.freq, other.freq)
-            and _values_equal(self.power, other.power)
-            and _values_equal(self.cond, other.cond)
-        )
+        return _values_equal(self.freq, other.freq) and _values_equal(self.power, other.power) and _values_equal(self.cond, other.cond)
 
 
 class Peaks(MutableSequence):
@@ -79,10 +75,7 @@ class Peaks(MutableSequence):
         self._peaks.insert(index, value)
 
     def __repr__(self) -> str:
-        return (
-            f"{type(self).__name__}({self._peaks!r}, "
-            f"has_cond={self.has_cond!r}, freq_decimals={self.freq_decimals!r})"
-        )
+        return f"{type(self).__name__}({self._peaks!r}, has_cond={self.has_cond!r}, freq_decimals={self.freq_decimals!r})"
 
     def sort(self, *, key=None, reverse: bool = False) -> None:
         self._peaks.sort(key=key, reverse=reverse)
@@ -119,12 +112,7 @@ class Peaks(MutableSequence):
                 row.append(_format_fixed(peak.cond, precision))
             rows.append(row)
 
-        widths = [
-            max(len(headers[col]), *(len(row[col]) for row in rows))
-            if rows
-            else len(headers[col])
-            for col in range(len(headers))
-        ]
+        widths = [max(len(headers[col]), *(len(row[col]) for row in rows)) if rows else len(headers[col]) for col in range(len(headers))]
         print(_format_table_row(headers, widths))
         print(_format_table_row(["-" * width for width in widths], widths))
         for row in rows:
@@ -239,9 +227,7 @@ def _peak_capacity(num_samples: int, num_peaks) -> int:
     return min(requested, max_possible)
 
 
-def get_peaks(
-    freq, power, cond=None, threshold=0, num_peaks=25, *, x=None, nterms=None
-) -> Peaks:
+def get_peaks(freq, power, cond=None, threshold=0, num_peaks=25, *, x=None, nterms=None) -> Peaks:
     """Return strict local maxima refined by quadratic interpolation.
 
     A sample at index ``i`` is considered a peak when all three neighboring
@@ -295,9 +281,7 @@ def get_peaks(
     )
 
 
-def _get_peaks_numpy_native(
-    freq, power, cond, *, threshold, num_peaks, freq_decimals: int
-) -> Peaks:
+def _get_peaks_numpy_native(freq, power, cond, *, threshold, num_peaks, freq_decimals: int) -> Peaks:
     freq_arr = np.asarray(freq)
     power_arr = np.asarray(power)
     cond_arr = None if cond is None else np.asarray(cond)
@@ -351,16 +335,10 @@ def _get_peaks_numpy_native(
     )
 
 
-def _get_peaks_double_native(
-    freq_values, power_values, cond_values, *, threshold, num_peaks, freq_decimals: int
-) -> Peaks:
+def _get_peaks_double_native(freq_values, power_values, cond_values, *, threshold, num_peaks, freq_decimals: int) -> Peaks:
     freq_arr = np.ascontiguousarray(freq_values, dtype=np.float64)
     power_arr = np.ascontiguousarray(power_values, dtype=np.float64)
-    cond_arr = (
-        None
-        if cond_values is None
-        else np.ascontiguousarray(cond_values, dtype=np.float64)
-    )
+    cond_arr = None if cond_values is None else np.ascontiguousarray(cond_values, dtype=np.float64)
     return _call_tls_get_peaks(
         freq_arr,
         power_arr,
@@ -371,24 +349,14 @@ def _get_peaks_double_native(
     )
 
 
-def _call_tlsf_get_peaks(
-    freq_arr, power_arr, cond_arr, *, max_peaks: int, threshold, freq_decimals: int
-) -> Peaks:
+def _call_tlsf_get_peaks(freq_arr, power_arr, cond_arr, *, max_peaks: int, threshold, freq_decimals: int) -> Peaks:
     n_input = _check_c_length("freq", freq_arr.size)
     out_freq = np.empty(max_peaks, dtype=np.float32)
     out_power = np.empty(max_peaks, dtype=np.float32)
     out_cond = None if cond_arr is None else np.empty(max_peaks, dtype=np.float32)
     count = ctypes.c_int()
-    cond_ptr = (
-        ctypes.POINTER(ctypes.c_float)()
-        if cond_arr is None
-        else cond_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-    )
-    out_cond_ptr = (
-        ctypes.POINTER(ctypes.c_float)()
-        if out_cond is None
-        else out_cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-    )
+    cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond_arr is None else cond_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    out_cond_ptr = ctypes.POINTER(ctypes.c_float)() if out_cond is None else out_cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
     status = _load_utils_library().tlsf_get_peaks(
         freq_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         power_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -411,24 +379,14 @@ def _call_tlsf_get_peaks(
     return Peaks(peaks, has_cond=out_cond is not None, freq_decimals=freq_decimals)
 
 
-def _call_tls_get_peaks(
-    freq_arr, power_arr, cond_arr, *, max_peaks: int, threshold, freq_decimals: int
-) -> Peaks:
+def _call_tls_get_peaks(freq_arr, power_arr, cond_arr, *, max_peaks: int, threshold, freq_decimals: int) -> Peaks:
     n_input = _check_c_length("freq", freq_arr.size)
     out_freq = np.empty(max_peaks, dtype=np.float64)
     out_power = np.empty(max_peaks, dtype=np.float64)
     out_cond = None if cond_arr is None else np.empty(max_peaks, dtype=np.float64)
     count = ctypes.c_int()
-    cond_ptr = (
-        ctypes.POINTER(ctypes.c_double)()
-        if cond_arr is None
-        else cond_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-    )
-    out_cond_ptr = (
-        ctypes.POINTER(ctypes.c_double)()
-        if out_cond is None
-        else out_cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-    )
+    cond_ptr = ctypes.POINTER(ctypes.c_double)() if cond_arr is None else cond_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    out_cond_ptr = ctypes.POINTER(ctypes.c_double)() if out_cond is None else out_cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
     status = _load_utils_library().tls_get_peaks(
         freq_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         power_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -463,9 +421,7 @@ def _should_use_mpmath_peak_path(freq_values, power_values, cond_values, thresho
     return cond_values is not None and any(isinstance(value, _mp.mpf) for value in cond_values)
 
 
-def _get_peaks_mpmath_native(
-    freq_values, power_values, cond_values, *, threshold, num_peaks, freq_decimals: int
-) -> Peaks:
+def _get_peaks_mpmath_native(freq_values, power_values, cond_values, *, threshold, num_peaks, freq_decimals: int) -> Peaks:
     mp = _mp
     freq_mpf = _mpf_values(freq_values)
     power_mpf = _mpf_values(power_values)
@@ -502,10 +458,7 @@ def _get_peaks_mpmath_native(
     if out_cond is None:
         peaks = [Peak(_dd_to_mpf(out_freq[i]), _dd_to_mpf(out_power[i])) for i in range(n_peaks)]
     else:
-        peaks = [
-            Peak(_dd_to_mpf(out_freq[i]), _dd_to_mpf(out_power[i]), _dd_to_mpf(out_cond[i]))
-            for i in range(n_peaks)
-        ]
+        peaks = [Peak(_dd_to_mpf(out_freq[i]), _dd_to_mpf(out_power[i]), _dd_to_mpf(out_cond[i])) for i in range(n_peaks)]
     return Peaks(peaks, has_cond=out_cond is not None, freq_decimals=freq_decimals)
 
 
@@ -529,9 +482,7 @@ def _can_use_numpy_fast_path(freq, power, cond) -> bool:
         return False
     if not (_is_fast_float_dtype(freq.dtype) and _is_fast_float_dtype(power.dtype)):
         return False
-    return cond is None or (
-        isinstance(cond, np.ndarray) and _is_fast_float_dtype(cond.dtype)
-    )
+    return cond is None or (isinstance(cond, np.ndarray) and _is_fast_float_dtype(cond.dtype))
 
 
 def _is_fast_float_dtype(dtype) -> bool:
@@ -552,9 +503,7 @@ def _as_sequence(values, name: str) -> List[object]:
     return result
 
 
-def _check_lengths(
-    freq: Sequence[object], power: Sequence[object], cond: Optional[Sequence[object]]
-) -> None:
+def _check_lengths(freq: Sequence[object], power: Sequence[object], cond: Optional[Sequence[object]]) -> None:
     if len(freq) != len(power):
         raise ValueError("freq and power must have the same length")
     if cond is not None and len(freq) != len(cond):

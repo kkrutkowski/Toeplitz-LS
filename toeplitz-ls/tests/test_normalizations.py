@@ -143,6 +143,23 @@ class TestNormalizations(unittest.TestCase):
                 if norm == "standard":
                     self.assertTrue(np.all((power >= 0.0) & (power < 1.0)))
 
+    def test_standard_stays_below_one_for_multiharmonic_models(self):
+        """FastChi2 standard R^2 must stay in [0, 1) for d > 1 too."""
+        for _precision, mod in [("tlsf", tlsf), ("tls", tls)]:
+            for degree in [2, 3]:
+                power = mod.power(
+                    self.nf,
+                    self.df,
+                    self.f0,
+                    self.t,
+                    self.y,
+                    self.dy,
+                    nterms=degree,
+                    solver="levinson",
+                    normalization="standard",
+                )
+                self.assertTrue(np.all(np.isnan(power) | ((power >= 0.0) & (power < 1.0))))
+
     def test_d1_fast_path_matches_condition_path(self):
         """The fast path must not change power when cond is not requested."""
         # -ffast-math may reassociate the simpler fast loop, so allow a few ULP;
@@ -579,8 +596,9 @@ class TestNormalizations(unittest.TestCase):
                 solver="levinson",
             )
         message = str(ctx.exception)
-        self.assertIn("regularized", message)
+        self.assertIn("nll", message)
         self.assertIn("anova", message)
+        self.assertNotIn("regularized", message)
         self.assertNotIn("bayes", message)
         self.assertNotIn("asymptotic", message)
 

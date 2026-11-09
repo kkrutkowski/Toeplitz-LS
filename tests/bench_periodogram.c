@@ -31,6 +31,7 @@ typedef struct {
     int fuse;
     int cobravo;
     int defer;
+    int order;
     const char *name;
 } variant;
 
@@ -114,31 +115,39 @@ int main(int argc, char **argv) {
     variant variants[MAX_VARIANTS];
     int nvariants = 0;
     char names[MAX_VARIANTS][48];
+    /* default order first, then the same depth in the other order, so the
+     * fusion-order effect is visible end to end, not just in the FFT bench */
     for (int fuse = 1; fuse <= fuse_build; ++fuse) {
         const int vi = nvariants;
-        snprintf(names[vi], sizeof(names[vi]), "fuse=%d vec defer", fuse);
-        variants[vi] = (variant){fuse, 1, 1, names[vi]};
+        snprintf(names[vi], sizeof(names[vi]), "fuse=%d vec end", fuse);
+        variants[vi] = (variant){fuse, 1, 1, TLS_FFT_ORDER_END, names[vi]};
         ++nvariants;
+        if (fuse == 3) {
+            const int vf = nvariants;
+            snprintf(names[vf], sizeof(names[vf]), "fuse=%d vec front", fuse);
+            variants[vf] = (variant){fuse, 1, 1, TLS_FFT_ORDER_FRONT, names[vf]};
+            ++nvariants;
+        }
     }
     int vi;
     vi = nvariants;
     snprintf(names[vi], sizeof(names[vi]), "fuse=1 vec natural");
-    variants[vi] = (variant){1, 1, 0, names[vi]};
+    variants[vi] = (variant){1, 1, 0, TLS_FFT_ORDER_FRONT, names[vi]};
     ++nvariants;
 
     vi = nvariants;
-    snprintf(names[vi], sizeof(names[vi]), "fuse=%d vec natural", TLS_TUNING_FFT_FUSE_DEFAULT);
-    variants[vi] = (variant){TLS_TUNING_FFT_FUSE_DEFAULT, 1, 0, names[vi]};
+    snprintf(names[vi], sizeof(names[vi]), "fuse=auto vec natural");
+    variants[vi] = (variant){TLS_TUNING_FFT_FUSE_AUTO, 1, 0, TLS_FFT_ORDER_END, names[vi]};
     ++nvariants;
 
     vi = nvariants;
-    snprintf(names[vi], sizeof(names[vi]), "fuse=%d scal defer", TLS_TUNING_FFT_FUSE_DEFAULT);
-    variants[vi] = (variant){TLS_TUNING_FFT_FUSE_DEFAULT, 0, 1, names[vi]};
+    snprintf(names[vi], sizeof(names[vi]), "fuse=auto scal defer");
+    variants[vi] = (variant){TLS_TUNING_FFT_FUSE_AUTO, 0, 1, TLS_FFT_ORDER_END, names[vi]};
     ++nvariants;
 
     vi = nvariants;
     snprintf(names[vi], sizeof(names[vi]), "fuse=1 scal natural");
-    variants[vi] = (variant){1, 0, 0, names[vi]};
+    variants[vi] = (variant){1, 0, 0, TLS_FFT_ORDER_FRONT, names[vi]};
     ++nvariants;
 
     printf("bench_periodogram: %d rounds, %d reps, build fuse depth %d\n", rounds, reps, fuse_build);
@@ -175,6 +184,7 @@ int main(int argc, char **argv) {
                 tls_tuning_set_fft_fuse(variants[v].fuse);
                 tls_tuning_set_cobravo(variants[v].cobravo);
                 tls_tuning_set_defer(variants[v].defer);
+                tls_tuning_set_fft_order(variants[v].order);
                 for (int rep = 0; rep < reps; ++rep) {
                     const double t0 = now_seconds();
                     int st;
@@ -198,6 +208,7 @@ int main(int argc, char **argv) {
             tls_tuning_set_fft_fuse(variants[v].fuse);
             tls_tuning_set_cobravo(variants[v].cobravo);
             tls_tuning_set_defer(variants[v].defer);
+            tls_tuning_set_fft_order(variants[v].order);
             if (is_ihs) {
                 status[v] = tlsf_ihs(t, fy, fdy, wl->M, f0, df, wl->N, wl->degree, wl->backend, wl->norm, power);
             } else {

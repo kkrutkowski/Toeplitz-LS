@@ -138,9 +138,7 @@ class TestIHS(unittest.TestCase):
             + 1.5 * np.sin(2.0 * np.pi * 2.4 * t + 2.0)
             + rng.normal(0.0, 0.2, t.size)
         )
-        standard = ihs.power(
-            500, 0.002, 0.1, t, y, dy, nterms=3, normalization="standard"
-        )
+        standard = ihs.power(500, 0.002, 0.1, t, y, dy, nterms=3, normalization="standard")
         nll = ihs.power(500, 0.002, 0.1, t, y, dy, nterms=3, normalization="nll")
         self.assertNotEqual(int(np.argmax(standard)), int(np.argmax(nll)))
         self.assertAlmostEqual(0.1 + 0.002 * int(np.argmax(nll)), 0.8, places=12)
@@ -238,6 +236,10 @@ class TestIHS(unittest.TestCase):
                     normalization=normalization,
                 )
                 expected = _ihs_reference(self.t, self.y, dy, freqs, 2, normalization)
+                if normalization == "standard":
+                    # nterms > 1 is a sum of per-harmonic contributions, not a
+                    # bounded R^2; at least one bin here is legitimately > 1.
+                    self.assertGreater(float(np.max(expected)), 1.0)
                 np.testing.assert_allclose(
                     power,
                     expected,
@@ -245,6 +247,20 @@ class TestIHS(unittest.TestCase):
                     atol=1e-7,
                     err_msg=f"{precision} {normalization} multiblock mismatch",
                 )
+
+    def test_warns_when_nterms4_exceeds_observations(self):
+        """IHS is not suitable when d^4 > M; the wrapper must warn."""
+        with self.assertWarns(RuntimeWarning):
+            ihs.power(
+                16,
+                self.df,
+                self.f0,
+                self.t[:48],
+                self.y[:48],
+                self.dy[:48],
+                nterms=3,
+                normalization="standard",
+            )
 
     def test_backends_agree(self):
         for normalization in ["standard", "nll"]:
