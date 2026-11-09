@@ -125,6 +125,9 @@ def link_command(tc, *, objs, out, variant, musl_tmp=None):
         cmd.append("--sysroot=" + tc.sysroot)
     cmd += ["-L" + d for d in tc.lib_dirs]
     cmd += ["-shared", "-o", str(out), *[str(o) for o in objs]]
+    if "macos" in tc.name:
+        # Do not bake the build machine's absolute path into LC_ID_DYLIB.
+        cmd += ["-Wl,-install_name,@loader_path/" + out.name]
     if tc.musl_soname:
         # musl's own shared object has no usable SONAME on every distro, and
         # musllinux wheels must record the canonical one.  Linking against a

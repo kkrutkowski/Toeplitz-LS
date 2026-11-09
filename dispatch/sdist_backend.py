@@ -101,7 +101,10 @@ def compile_library(build_dir: Path) -> Path:
         objects.append(obj)
 
     library = build_dir / (PACKAGE + ".so")
-    _run([_cc(), *flags, "-shared", "-o", str(library), *objects, "-lm"])
+    link = [_cc(), *flags, "-shared", "-o", str(library), *objects, "-lm"]
+    if platform.system() == "Darwin":
+        link += ["-Wl,-install_name,@loader_path/" + library.name]
+    _run(link)
     return library
 
 
