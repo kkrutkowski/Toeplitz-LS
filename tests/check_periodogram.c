@@ -342,8 +342,9 @@ int main(int argc, char **argv) {
 
     printf("check_periodogram: IHS (d = 1 stays natural, d >= 2 defers)\n");
     run_ihs_case("ihs_d1", 400, 512, 1, 1, TLS_NORM_STANDARD);
-    run_ihs_case("ihs_d3", 400, 512, 3, 1, TLS_NORM_STANDARD);
-    run_ihs_case("ihs_d3_nll", 400, 512, 3, 1, TLS_NORM_NLL);
+    run_ihs_case("ihs_d3_raw", 400, 512, 3, 1, TLS_NORM_IHS_RAW);
+    run_ihs_case("ihs_d3_default", 400, 512, 3, 1, TLS_NORM_IHS_DEFAULT);
+    run_ihs_case("ihs_d3_corrected", 400, 512, 3, 1, TLS_NORM_IHS_CORRECTED);
     run_ihs_case("ihs_d3_odd", 400, 777, 3, 1, TLS_NORM_NLL);
 
     printf("check_periodogram: double-double\n");

@@ -236,10 +236,10 @@ typedef struct {
     double inv_2d;    /* 1.0 / (2.0 * d) */
 } cybenko_model_t;
 
-static inline cybenko_model_t cybenko_model_init(int d, int M) {
+static inline cybenko_model_t cybenko_model_init(int d, double M) {
     cybenko_model_t m;
     double d_dbl = (double)d;
-    double M_dbl = (double)M;
+    double M_dbl = M;
     double inv_M = 1.0 / M_dbl;
     double inv_M2 = inv_M * inv_M;
 
@@ -1019,12 +1019,13 @@ static int ihs_power_sweep_d1(block_ladder *ladder, int N, int block, void *plan
         const int status = execute_nufft_block(plan, backend, ladder->srcw_r, ladder->srcw_i, out_r, out_i, 1, TLS_NUFFT_OUT_NATURAL);
         if (status != CHI2PER_OK) return status;
 
-        if (normalization == TLS_NORM_NLL) {
+        if (normalization == TLS_NORM_NLL || normalization == TLS_NORM_IHS_DEFAULT) {
             for (int k = 0; k < count; ++k) {
                 FLOAT re = out_r[k];
                 FLOAT im = out_i[k];
                 FLOAT z = MUL(ADD(MUL(re, re), MUL(im, im)), nll_scale);
-                power[base + (size_t)k] = ADD(power[base + (size_t)k], ihs_wilkie_correct_power(z, n_eff));
+                if (normalization == TLS_NORM_NLL) z = ihs_wilkie_correct_power(z, n_eff);
+                power[base + (size_t)k] = ADD(power[base + (size_t)k], z);
             }
         } else {
             for (int k = 0; k < count; ++k) {
@@ -1066,12 +1067,13 @@ static int ihs_power_sweep_deferred(block_ladder *ladder, int N, int block, int 
                 return status;
             }
             FLOAT *acc = slot_block ? acc_block : power + base;
-            if (normalization == TLS_NORM_NLL) {
+            if (normalization == TLS_NORM_NLL || normalization == TLS_NORM_IHS_DEFAULT) {
                 for (int k = 0; k < count; ++k) {
                     FLOAT re = out_r[k];
                     FLOAT im = out_i[k];
                     FLOAT z = MUL(ADD(MUL(re, re), MUL(im, im)), nll_scale);
-                    acc[k] = ADD(acc[k], ihs_wilkie_correct_power(z, n_eff));
+                    if (normalization == TLS_NORM_NLL) z = ihs_wilkie_correct_power(z, n_eff);
+                    acc[k] = ADD(acc[k], z);
                 }
             } else {
                 for (int k = 0; k < count; ++k) {
@@ -1879,6 +1881,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     }
 
     FLOAT ws = FCAST(0.0);
+    FLOAT sum_w2 = FCAST(0.0);
     FLOAT wy = FCAST(0.0);
     TIME_INPUT_T t_mid = MUL(FCONST(0.5), ADD(t[0], t[M - 1]));
     for (int m = 0; m < M; ++m) {
@@ -1890,6 +1893,7 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         FLOAT inv_dy = DIV(FCAST(1.0), dy[m]);
         w[m] = MUL(inv_dy, inv_dy);
         ws = ADD(ws, w[m]);
+        sum_w2 = ADD(sum_w2, MUL(w[m], w[m]));
         wy = ADD(wy, MUL(w[m], y[m]));
         x[m] = time_to_nufft_input(centered_t);
     }
@@ -1937,13 +1941,14 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         NUFFT_LRA_PRE((LRA_PLAN_T *)plan, x, M, block, NUFFT_RANK);
     }
 
-    cybenko_model_t cyb = cybenko_model_init(degree, M);
+    const double neff_w = TO_DOUBLE(DIV(MUL(ws, ws), sum_w2));
+    cybenko_model_t cyb = cybenko_model_init(degree, neff_w);
 #if defined(DOUBLE_DOUBLE)
-    FLOAT b = dd_mul(dd_make(0.5, 0.0), dd_make((double)(M - 1 - 2 * degree), 0.0));
+    FLOAT b = dd_mul(dd_make(0.5, 0.0), dd_make(neff_w - 1.0 - 2.0 * (double)degree, 0.0));
 #elif defined(DOUBLE)
-    FLOAT b = 0.5 * (double)(M - 1 - 2 * degree);
+    FLOAT b = 0.5 * (neff_w - 1.0 - 2.0 * (double)degree);
 #else
-    FLOAT b = 0.5f * (float)(M - 1 - 2 * degree);
+    FLOAT b = (float)(0.5 * (neff_w - 1.0 - 2.0 * (double)degree));
 #endif
 
     status = trig_rows_init(&rows, block, max_factor, degree, INTERNAL_VEC_LEN);
@@ -2050,7 +2055,7 @@ cleanup:
 int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
                      FLOAT *power) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
-    if (normalization != TLS_NORM_STANDARD && normalization != TLS_NORM_NLL) return CHI2PER_ERR_ARGUMENT;
+    if (normalization != TLS_NORM_STANDARD && normalization != TLS_NORM_NLL && normalization != TLS_NORM_IHS_DEFAULT) return CHI2PER_ERR_ARGUMENT;
     if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
     if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
 
@@ -2088,7 +2093,6 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
     FLOAT ws = FCAST(0.0);
     FLOAT wy_sum_abs = FCAST(0.0);
     FLOAT wy_sq_sum = FCAST(0.0);
-    FLOAT sum_w2 = FCAST(0.0);
     FLOAT wy_mean = FCAST(0.0);
     TIME_INPUT_T t_mid = MUL(FCONST(0.5), ADD(t[0], t[M - 1]));
     for (int m = 0; m < M; ++m) {
@@ -2100,7 +2104,6 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
         FLOAT inv_dy = DIV(FCAST(1.0), dy[m]);
         w[m] = MUL(inv_dy, inv_dy);
         ws = ADD(ws, w[m]);
-        sum_w2 = ADD(sum_w2, MUL(w[m], w[m]));
         wy_mean = ADD(wy_mean, MUL(w[m], y[m]));
         x[m] = time_to_nufft_input(centered_t);
     }
@@ -2126,18 +2129,19 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
     }
 
     /*
-     * standard: 2 * sum_k |Z_k|^2 / (ws * chi2_ref), the sum of the
-     * per-harmonic R^2 contributions under the uncorrelated-term assumption.
+     * raw: 2 * sum_k |Z_k|^2 / (ws * chi2_ref), the sum of the per-harmonic
+     * R^2 contributions under the uncorrelated-term assumption.
      *
-     * NLL: normalize each harmonic power with
-     * amp_neff / (sum_m |w_m y_m|)^2, apply Wilkie's finite-sample
-     * correction to every harmonic, sum the corrected terms, and finish with
-     * the Erlang correction.
+     * corrected: normalize each harmonic power with
+     * Neff / (sum_m |w_m y_m|)^2, apply Wilkie's finite-sample correction to
+     * every harmonic, sum the corrected terms, then apply the Erlang
+     * correction.
+     *
+     * default: the same normalized harmonic powers and Erlang correction, but
+     * without the finite-sample Wilkie correction.
      */
     FLOAT standard_scale = DIV(FCAST(2.0), MUL(ws, chi2_ref));
-    FLOAT amp_neff = SUB(DIV(MUL(wy_sum_abs, wy_sum_abs), wy_sq_sum), FCAST(2.0));
-    FLOAT neff = SUB(DIV(MUL(ws, ws), sum_w2), FCAST(2.0));
-    FLOAT norm_neff = (TO_DOUBLE(amp_neff) > 0.0) ? amp_neff : neff;
+    FLOAT norm_neff = DIV(MUL(wy_sum_abs, wy_sum_abs), wy_sq_sum);
     FLOAT nll_scale = FCAST(0.0);
     if (TO_DOUBLE(norm_neff) > 0.0) nll_scale = DIV(norm_neff, MUL(wy_sum_abs, wy_sum_abs));
     if (!double_is_finite_bits(TO_DOUBLE(nll_scale)) || TO_DOUBLE(nll_scale) < 0.0) nll_scale = FCAST(0.0);

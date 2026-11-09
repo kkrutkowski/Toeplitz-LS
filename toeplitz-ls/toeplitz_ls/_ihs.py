@@ -7,23 +7,28 @@ harmonic and accumulates the squared magnitudes directly, so it never builds
 or solves the Toeplitz normal equations.  In practice it is usually slightly
 less accurate than FastChi2, but at least 3x less computationally expensive.
 
-Two statistics are available through ``normalization=``:
+Three statistics are available through ``normalization=``:
 
-``standard`` (default)
+``raw``
     Direct display statistic from the per-harmonic coefficient-of-determination
     estimates.  It is not a calibrated false-alarm probability; for
     ``nterms > 1`` this is a sum, not a bounded R^2, and may exceed 1.
-``nll``
+``corrected``
     Negative log false-alarm probability with Wilkie's (1983) finite-sample
     correction for the Rayleigh Z test applied to each harmonic, followed by
     the Erlang correction of the harmonic sum.
+``default`` (the default)
+    The same initial formula and Erlang correction as ``corrected``, but
+    without the finite-sample Wilkie correction.
 
 Unlike the FastChi2 wrappers these modules do not accept ``solver`` or
 ``autonan`` and do not return a condition array: IHS has no linear solve and
 no Toeplitz condition bound.
 
-The approximation is not suitable when ``nterms**4 > num_observations``; the
-Python wrappers emit a :class:`RuntimeWarning` in that case.
+The approximation is not suitable when ``nterms**4 > Neff``; the Python
+wrappers emit a :class:`RuntimeWarning` in that case.  The warning uses the
+raw-weight ``Neff`` from the FastChi2/TLS path, not the weighted-residual
+``Neff`` used inside the IHS NLL.
 """
 
 from __future__ import annotations
@@ -50,7 +55,14 @@ from ._fastchi2 import (
     _require_mpmath,
 )
 
-_IHS_NORMALIZATIONS = {"standard": 0, "nll": 2}
+_IHS_NORMALIZATIONS = {
+    "raw": 0,
+    "corrected": 2,
+    "default": 4,
+    # Legacy aliases, intentionally undocumented:
+    "standard": 0,
+    "nll": 2,
+}
 
 
 def _check_ihs_normalization(normalization):
@@ -61,15 +73,25 @@ def _check_ihs_normalization(normalization):
     if isinstance(normalization, int) and not isinstance(normalization, bool):
         if normalization in _IHS_NORMALIZATIONS.values():
             return normalization
-    raise ValueError("normalization must be 'standard' or 'nll'")
+    raise ValueError("normalization must be 'raw', 'corrected', or 'default'")
 
 
-def _warn_if_ihs_undersampled(num_observations, nterms):
+def _raw_neff(dy):
+    """Effective number of measurements from the raw weights, 1 / dy^2.
+
+    The IHS warning uses the same raw-weight Neff as the FastChi2/TLS path;
+    the NLL itself uses a different Neff built from the weighted y residuals.
+    """
+    w = 1.0 / np.asarray(dy, dtype=np.float64) ** 2
+    return float(w.sum() ** 2 / np.sum(w * w))
+
+
+def _warn_if_ihs_undersampled(n_eff, nterms):
     """Warn when the IHS approximation is outside its intended regime."""
-    if nterms**4 > num_observations:
+    if nterms**4 > n_eff:
         warnings.warn(
-            "IHS is not suitable when nterms**4 > num_observations "
-            f"(nterms={nterms}, observations={num_observations}); use the "
+            "IHS is not suitable when nterms**4 > Neff "
+            f"(nterms={nterms}, Neff={n_eff:.6g}); use the "
             "Toeplitz FastChi2 modules (tls/tlsf/tlsdd) or reduce nterms.",
             RuntimeWarning,
             stacklevel=3,
@@ -80,10 +102,10 @@ class ihsf:
     """Single-precision IHS periodogram wrapper."""
 
     @staticmethod
-    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="standard"):
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
         """Return the IHS power on the grid ``f0 + df * arange(Nf)``.
 
-        ``normalization`` accepts ``'standard'`` (default) or ``'nll'``.
+        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
         """
         normalization = _check_ihs_normalization(normalization)
         backend = _backend_id(backend)
@@ -91,7 +113,7 @@ class ihsf:
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
-        _warn_if_ihs_undersampled(t_arr.size, nterms)
+        _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float32)
 
         status = _load_library().tlsf_ihs(
@@ -111,10 +133,10 @@ class ihsf:
         return out
 
     @staticmethod
-    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="standard", nterms=3, backend="pswf43"):
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
         """Return automatic IHS frequency and power arrays.
 
-        ``normalization`` accepts ``'standard'`` (default) or ``'nll'``.
+        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
@@ -140,10 +162,10 @@ class ihs:
     """Double-precision IHS periodogram wrapper."""
 
     @staticmethod
-    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="standard"):
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
         """Return the IHS power on the grid ``f0 + df * arange(Nf)``.
 
-        ``normalization`` accepts ``'standard'`` (default) or ``'nll'``.
+        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
         """
         normalization = _check_ihs_normalization(normalization)
         backend = _backend_id(backend)
@@ -151,7 +173,7 @@ class ihs:
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
-        _warn_if_ihs_undersampled(t_arr.size, nterms)
+        _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float64)
 
         status = _load_library().tls_ihs(
@@ -171,10 +193,10 @@ class ihs:
         return out
 
     @staticmethod
-    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="standard", nterms=3, backend="pswf43"):
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
         """Return automatic double-precision IHS frequency and power arrays.
 
-        ``normalization`` accepts ``'standard'`` (default) or ``'nll'``.
+        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
@@ -200,10 +222,10 @@ class ihsdd:
     """Double-double IHS periodogram wrapper returning ``mpmath`` values."""
 
     @staticmethod
-    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="standard"):
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
         """Return high-precision IHS power.
 
-        ``normalization`` accepts ``'standard'`` (default) or ``'nll'``.
+        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
         """
         mp = _require_mpmath()
         normalization = _check_ihs_normalization(normalization)
@@ -233,7 +255,7 @@ class ihsdd:
         if any(value <= 0 for value in dy_mpf):
             raise ValueError("dy entries must be positive")
         _check_observation_count(len(t_mpf), nterms)
-        _warn_if_ihs_undersampled(len(t_mpf), nterms)
+        _warn_if_ihs_undersampled(_raw_neff(dy_mpf), nterms)
 
         t_dd = _as_dd_array(t_mpf)
         y_dd = _as_dd_array(y_mpf)
@@ -257,10 +279,10 @@ class ihsdd:
         return [_dd_to_mpf(out[i]) for i in range(Nf)]
 
     @staticmethod
-    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="standard", nterms=3, backend="pswf43"):
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
         """Return automatic high-precision IHS frequency and power lists.
 
-        ``normalization`` accepts ``'standard'`` (default) or ``'nll'``.
+        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
         """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)

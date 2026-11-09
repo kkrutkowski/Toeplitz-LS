@@ -57,9 +57,7 @@ def _ihs_reference(t, y, dy, freqs, nterms, normalization):
 
     wy_abs = np.abs(wy).sum()
     wy_sq = np.sum(wy * wy)
-    amp_neff = wy_abs * wy_abs / wy_sq - 2.0
-    neff = ws * ws / np.sum(w * w) - 2.0
-    norm_neff = amp_neff if amp_neff > 0.0 else neff
+    norm_neff = wy_abs * wy_abs / wy_sq
     nll_scale = norm_neff / (wy_abs * wy_abs)
 
     freqs = np.asarray(freqs, dtype=np.float64)
@@ -71,9 +69,13 @@ def _ihs_reference(t, y, dy, freqs, nterms, normalization):
         accumulated += raw
         corrected += _wilkie_correct(raw * nll_scale, norm_neff)
 
-    if normalization == "standard":
+    if normalization in ("raw", "standard"):
         return 2.0 * accumulated / (ws * chi2_ref)
-    return _erlang_correct(corrected, nterms)
+    if normalization in ("corrected", "nll"):
+        return _erlang_correct(corrected, nterms)
+    if normalization == "default":
+        return _erlang_correct(accumulated * nll_scale, nterms)
+    raise ValueError("unknown normalization: %s" % normalization)
 
 
 class TestIHS(unittest.TestCase):
@@ -92,7 +94,7 @@ class TestIHS(unittest.TestCase):
     def _freqs(self):
         return self.f0 + self.df * np.arange(self.nf, dtype=np.float64)
 
-    def test_standard_matches_direct_reference(self):
+    def test_raw_matches_direct_reference(self):
         for precision, mod, rtol in [
             ("ihsf", ihsf, 1e-4),
             ("ihs", ihs, 1e-9),
@@ -106,28 +108,28 @@ class TestIHS(unittest.TestCase):
                     self.y,
                     self.dy,
                     nterms=degree,
-                    normalization="standard",
+                    normalization="raw",
                 )
-                expected = _ihs_reference(self.t, self.y, self.dy, self._freqs(), degree, "standard")
+                expected = _ihs_reference(self.t, self.y, self.dy, self._freqs(), degree, "raw")
                 np.testing.assert_allclose(
                     power,
                     expected,
                     rtol=rtol,
                     atol=1e-7,
-                    err_msg=f"{precision} standard d={degree} mismatch",
+                    err_msg=f"{precision} raw d={degree} mismatch",
                 )
 
-    def test_standard_matches_gls_for_orthogonal_single_harmonic(self):
-        """At an orthogonal Fourier frequency IHS standard reduces to GLS R^2."""
+    def test_raw_matches_gls_for_orthogonal_single_harmonic(self):
+        """At an orthogonal Fourier frequency IHS raw reduces to GLS R^2."""
         m = 128
         t = np.arange(m, dtype=np.float64)
         frequency = 17.0 / m
         y = np.sin(2.0 * np.pi * frequency * t) + 0.5 * np.cos(2.0 * np.pi * frequency * t)
-        ihs_power = ihs.power(8, 1.0 / m, frequency, t, y, nterms=1, normalization="standard")
+        ihs_power = ihs.power(8, 1.0 / m, frequency, t, y, nterms=1, normalization="raw")
         tls_power = tls.power(8, 1.0 / m, frequency, t, y, nterms=1, normalization="standard")
         np.testing.assert_allclose(ihs_power[0], tls_power[0], rtol=1e-9, atol=1e-12)
 
-    def test_nll_and_standard_can_choose_different_peaks(self):
+    def test_corrected_and_raw_can_choose_different_peaks(self):
         """Per-harmonic Wilkie correction makes NLL non-monotonic in the sum."""
         rng = np.random.default_rng(seed=3)
         t = np.sort(rng.uniform(0.0, 50.0, 128))
@@ -138,12 +140,12 @@ class TestIHS(unittest.TestCase):
             + 1.5 * np.sin(2.0 * np.pi * 2.4 * t + 2.0)
             + rng.normal(0.0, 0.2, t.size)
         )
-        standard = ihs.power(500, 0.002, 0.1, t, y, dy, nterms=3, normalization="standard")
-        nll = ihs.power(500, 0.002, 0.1, t, y, dy, nterms=3, normalization="nll")
-        self.assertNotEqual(int(np.argmax(standard)), int(np.argmax(nll)))
-        self.assertAlmostEqual(0.1 + 0.002 * int(np.argmax(nll)), 0.8, places=12)
+        raw = ihs.power(500, 0.002, 0.1, t, y, dy, nterms=3, normalization="raw")
+        corrected = ihs.power(500, 0.002, 0.1, t, y, dy, nterms=3, normalization="corrected")
+        self.assertNotEqual(int(np.argmax(raw)), int(np.argmax(corrected)))
+        self.assertAlmostEqual(0.1 + 0.002 * int(np.argmax(corrected)), 0.8, places=12)
 
-    def test_nll_matches_direct_reference(self):
+    def test_corrected_matches_direct_reference(self):
         for precision, mod, rtol in [
             ("ihsf", ihsf, 2e-4),
             ("ihs", ihs, 1e-9),
@@ -157,18 +159,25 @@ class TestIHS(unittest.TestCase):
                     self.y,
                     self.dy,
                     nterms=degree,
-                    normalization="nll",
+                    normalization="corrected",
                 )
-                expected = _ihs_reference(self.t, self.y, self.dy, self._freqs(), degree, "nll")
+                expected = _ihs_reference(self.t, self.y, self.dy, self._freqs(), degree, "corrected")
                 np.testing.assert_allclose(
                     power,
                     expected,
                     rtol=rtol,
                     atol=1e-7,
-                    err_msg=f"{precision} nll d={degree} mismatch",
+                    err_msg=f"{precision} corrected d={degree} mismatch",
                 )
 
-    def test_standard_sums_single_harmonic_contributions(self):
+    def test_default_omits_the_wilkie_correction(self):
+        """Default is the initial formula + Erlang, without Wilkie."""
+        default = ihs.power(self.nf, self.df, self.f0, self.t, self.y, self.dy, nterms=2, normalization="default")
+        corrected = ihs.power(self.nf, self.df, self.f0, self.t, self.y, self.dy, nterms=2, normalization="corrected")
+        self.assertTrue(np.all(np.isfinite(default)))
+        self.assertFalse(np.allclose(default, corrected))
+
+    def test_raw_sums_single_harmonic_contributions(self):
         degree = 3
         total = ihs.power(
             self.nf,
@@ -178,7 +187,7 @@ class TestIHS(unittest.TestCase):
             self.y,
             self.dy,
             nterms=degree,
-            normalization="standard",
+            normalization="raw",
         )
         # Each nterms=k call returns the sum through harmonic k, so differences
         # recover the individual harmonic contributions.
@@ -190,7 +199,7 @@ class TestIHS(unittest.TestCase):
             self.y,
             self.dy,
             nterms=1,
-            normalization="standard",
+            normalization="raw",
         )
         for harmonic in range(2, degree + 1):
             current = ihs.power(
@@ -201,7 +210,7 @@ class TestIHS(unittest.TestCase):
                 self.y,
                 self.dy,
                 nterms=harmonic,
-                normalization="standard",
+                normalization="raw",
             )
             previous = ihs.power(
                 self.nf,
@@ -211,7 +220,7 @@ class TestIHS(unittest.TestCase):
                 self.y,
                 self.dy,
                 nterms=harmonic - 1,
-                normalization="standard",
+                normalization="raw",
             )
             summed += current - previous
         np.testing.assert_allclose(total, summed, rtol=1e-10, atol=1e-12)
@@ -225,7 +234,7 @@ class TestIHS(unittest.TestCase):
             ("ihsf", ihsf, 1e-4),
             ("ihs", ihs, 1e-9),
         ]:
-            for normalization in ["standard", "nll"]:
+            for normalization in ["raw", "corrected", "default"]:
                 power = mod.power(
                     nf,
                     self.df,
@@ -236,7 +245,7 @@ class TestIHS(unittest.TestCase):
                     normalization=normalization,
                 )
                 expected = _ihs_reference(self.t, self.y, dy, freqs, 2, normalization)
-                if normalization == "standard":
+                if normalization == "raw":
                     # nterms > 1 is a sum of per-harmonic contributions, not a
                     # bounded R^2; at least one bin here is legitimately > 1.
                     self.assertGreater(float(np.max(expected)), 1.0)
@@ -248,22 +257,22 @@ class TestIHS(unittest.TestCase):
                     err_msg=f"{precision} {normalization} multiblock mismatch",
                 )
 
-    def test_warns_when_nterms4_exceeds_observations(self):
-        """IHS is not suitable when d^4 > M; the wrapper must warn."""
+    def test_warns_when_nterms4_exceeds_neff(self):
+        """IHS is not suitable when d^4 > Neff; the wrapper must warn."""
         with self.assertWarns(RuntimeWarning):
             ihs.power(
                 16,
                 self.df,
                 self.f0,
-                self.t[:48],
-                self.y[:48],
-                self.dy[:48],
+                self.t[:16],
+                self.y[:16],
+                self.dy[:16],
                 nterms=3,
-                normalization="standard",
+                normalization="default",
             )
 
     def test_backends_agree(self):
-        for normalization in ["standard", "nll"]:
+        for normalization in ["raw", "corrected", "default"]:
             reference = None
             for backend in ["pswf43", "pswf21", "lra"]:
                 power = ihs.power(
@@ -291,7 +300,7 @@ class TestIHS(unittest.TestCase):
                     )
 
     def test_dd_matches_double(self):
-        for normalization in ["standard", "nll"]:
+        for normalization in ["raw", "corrected", "default"]:
             power_dd = ihsdd.power(
                 16,
                 self.df,
@@ -327,7 +336,7 @@ class TestIHS(unittest.TestCase):
 
     def test_autopower(self):
         for mod in [ihsf, ihs]:
-            for normalization in ["standard", "nll"]:
+            for normalization in ["raw", "corrected", "default"]:
                 freq, power = mod.autopower(
                     self.t,
                     self.y,
@@ -349,7 +358,7 @@ class TestIHS(unittest.TestCase):
             fmin=0.1,
             fmax=1.0,
             nterms=2,
-            normalization="nll",
+            normalization="corrected",
         )
         self.assertEqual(len(freq), len(power))
         self.assertTrue(all(mp.isfinite(value) for value in power))
@@ -369,11 +378,17 @@ class TestIHS(unittest.TestCase):
                         normalization=normalization,
                     )
                 message = str(ctx.exception)
-                self.assertIn("standard", message)
-                self.assertIn("nll", message)
+                self.assertIn("raw", message)
+                self.assertIn("corrected", message)
+                self.assertIn("default", message)
                 self.assertNotIn("anova", message)
                 self.assertNotIn("regularized", message)
 
+        self.assertEqual(_check_ihs_normalization("raw"), 0)
+        self.assertEqual(_check_ihs_normalization("corrected"), 2)
+        self.assertEqual(_check_ihs_normalization("default"), 4)
+        self.assertEqual(_check_ihs_normalization("standard"), 0)
+        self.assertEqual(_check_ihs_normalization("nll"), 2)
         with self.assertRaises(ValueError):
             _check_ihs_normalization(1)
         with self.assertRaises(ValueError):

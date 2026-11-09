@@ -42,7 +42,7 @@ t = np.linspace(0.0, 10.0, 128)
 y = np.sin(2.0 * np.pi * 0.7 * t)
 
 frequency, power = tls.autopower(t, y)
-frequency_ihs, power_ihs = ihs.autopower(t, y, normalization="nll")
+frequency_ihs, power_ihs = ihs.autopower(t, y, normalization="corrected")
 ```
 
 For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
@@ -54,7 +54,7 @@ For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
 - `"anova"` - ANOVA / `F` statistic, following Schwarzenberg-Czerny's convention.
 - `"nll"` - natural-log negative log false-alarm probability, `-ln(FAP)`;
   the direct Pochhammer/incomplete-beta statistic with its finite-sample
-  correction.
+  correction and the effective sample size `Neff` from the raw weights.
 
 The `cond` array returned with `autonan=False` is the condition upper bound
 `(2*nterms + 1) * P`, where `P` is Cybenko's reflection-coefficient product.
@@ -66,16 +66,20 @@ use one NuFFT per harmonic and no linear solve, and expose the same `power()` /
 `autopower()` shape. They are usually slightly less accurate than FastChi2, but
 at least 3x less computationally expensive. They support only:
 
-- `"standard"` - a direct display statistic from the normalized per-harmonic
+- `"raw"` - a direct display statistic from the normalized per-harmonic
   Rayleigh powers. It is not a calibrated false-alarm probability, and for
   `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
-- `"nll"` - the IHS negative log false-alarm probability. Each harmonic's
+- `"corrected"` - the IHS negative log false-alarm probability. Each harmonic's
   Rayleigh power gets Wilkie's (1983) finite-sample correction, then the
-  harmonic sum gets the Erlang correction. Use this for significance estimates.
+  harmonic sum gets the Erlang correction. `Neff` is computed from the
+  mean-subtracted weighted y values. Use this for significance estimates.
+- `"default"` (the default) - the initial formula and Erlang correction without
+  the finite-sample Wilkie correction.
 
 They do not accept `solver=` or `autonan=` and do not return a condition
-array. IHS is not suitable when `nterms^4 > M`; the wrappers emit a
-`RuntimeWarning` in that case.
+array. IHS is not suitable when `nterms^4 > Neff`, where `Neff` is the
+raw-weight effective sample size; the wrappers emit a `RuntimeWarning` in that
+case.
 
 The shared library is written almost exclusively in C and loaded with
 `ctypes.CDLL`, so independent `power()`/`autopower()` calls release the GIL and

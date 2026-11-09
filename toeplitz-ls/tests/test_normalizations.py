@@ -17,10 +17,16 @@ from toeplitz_ls._fastchi2 import _check_normalization
 PRIMARY_NORMALIZATIONS = ["standard", "anova", "nll", "regularized"]
 
 
-def _pochhammer_nll(r2, degree, num_observations, r2_max=1.0 - 1e-12):
+def _raw_neff(dy):
+    """Effective sample size from the raw weights, 1 / dy^2."""
+    w = 1.0 / (np.asarray(dy, dtype=np.float64) ** 2)
+    return float(w.sum() ** 2 / np.sum(w * w))
+
+
+def _pochhammer_nll(r2, degree, n_eff, r2_max=1.0 - 1e-12):
     """Reference implementation of the C Pochhammer NLL kernel."""
     r2 = np.clip(np.asarray(r2, dtype=np.float64), 0.0, r2_max)
-    b = 0.5 * (num_observations - (2 * degree + 1))
+    b = 0.5 * (n_eff - (2 * degree + 1))
     term0 = -b * np.log1p(-r2)
     if degree <= 1:
         return np.maximum(term0, 0.0)
@@ -34,18 +40,18 @@ def _pochhammer_nll(r2, degree, num_observations, r2_max=1.0 - 1e-12):
     return np.maximum(nll, 0.0)
 
 
-def _beta_nll(r2, degree, num_observations):
+def _beta_nll(r2, degree, n_eff):
     """Exact natural-log NLL via the regularized incomplete beta function."""
-    b = mp.mpf(num_observations - (2 * degree + 1)) / 2
+    b = mp.mpf(n_eff - (2 * degree + 1)) / 2
     r2 = mp.mpf(min(max(float(r2), 1.0e-15), 1.0 - 1.0e-15))
     p_value = mp.betainc(b, mp.mpf(degree), mp.mpf(0), mp.mpf(1) - r2, regularized=True)
     return -mp.log(p_value)
 
 
-def _cybenko_nll(kappa, degree, num_observations):
+def _cybenko_nll(kappa, degree, n_eff):
     """Python port of the ``d <= 2`` branch of ``nll_cybenko_scalar_d``."""
     d = float(degree)
-    m_count = float(num_observations)
+    m_count = float(n_eff)
     inv_m = 1.0 / m_count
     inv_m2 = inv_m * inv_m
 
@@ -98,10 +104,10 @@ def _laplace_combine(delta):
     return -math.log(inner)
 
 
-def _reference_regularized(r2, condition_bound, degree, num_observations, r2_max):
+def _reference_regularized(r2, condition_bound, degree, n_eff, r2_max):
     product = condition_bound / (2 * degree + 1)
-    nll_data = float(_pochhammer_nll(r2, degree, num_observations, r2_max=r2_max))
-    nll_cond = _cybenko_nll(product, degree, num_observations)
+    nll_data = float(_pochhammer_nll(r2, degree, n_eff, r2_max=r2_max))
+    nll_cond = _cybenko_nll(product, degree, n_eff)
     return _laplace_combine(nll_data - nll_cond)
 
 
@@ -118,6 +124,7 @@ class TestNormalizations(unittest.TestCase):
         cls.f0 = 0.1
         cls.df = 0.01
         cls.nf = 64
+        cls.neff = _raw_neff(cls.dy)
 
     def test_d1_gls_condition_and_normalizations(self):
         """Test d=1 (GLS) across all precisions and normalizations."""
@@ -525,7 +532,7 @@ class TestNormalizations(unittest.TestCase):
                             float(p_std[i]),
                             float(cond[i]),
                             degree,
-                            self.t.size,
+                            self.neff,
                             r2_max=r2_max,
                         )
                         for i in range(self.nf)
@@ -570,7 +577,7 @@ class TestNormalizations(unittest.TestCase):
                     solver=solver,
                 )
                 expected = np.asarray(
-                    [_beta_nll(float(r2), degree, self.t.size) for r2 in p_std],
+                    [_beta_nll(float(r2), degree, self.neff) for r2 in p_std],
                     dtype=np.float64,
                 )
                 np.testing.assert_allclose(

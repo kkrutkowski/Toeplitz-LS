@@ -21,19 +21,25 @@ enum { TLS_SOLVER_LEVINSON = 1, TLS_SOLVER_ZOHAR = 2, TLS_SOLVER_BAREISS = 3, TL
  * TLS_NORM_NLL          negative log false-alarm probability, natural log.
  * TLS_NORM_REGULARIZED  internal/reserved in 1.0; not part of the documented
  *                       public normalization set.
+ * TLS_NORM_IHS_DEFAULT  IHS-only: Erlang correction without the finite-sample
+ *                       Wilkie correction (the default IHS statistic).
  *
  * The Toeplitz solvers report the condition upper bound n * P, with
  * n = 2 * degree + 1 and P the Cybenko reflection-coefficient product.
  *
  * TLS_NORM_ASYMPTOTIC and TLS_NORM_BAYES are legacy aliases.
+ * TLS_NORM_IHS_RAW and TLS_NORM_IHS_CORRECTED are IHS-only aliases.
  */
 enum {
     TLS_NORM_STANDARD = 0,
     TLS_NORM_ANOVA = 1,
     TLS_NORM_NLL = 2,
     TLS_NORM_REGULARIZED = 3,
+    TLS_NORM_IHS_DEFAULT = 4,
     TLS_NORM_ASYMPTOTIC = TLS_NORM_ANOVA,
-    TLS_NORM_BAYES = TLS_NORM_REGULARIZED
+    TLS_NORM_BAYES = TLS_NORM_REGULARIZED,
+    TLS_NORM_IHS_RAW = TLS_NORM_STANDARD,
+    TLS_NORM_IHS_CORRECTED = TLS_NORM_NLL
 };
 
 TLS_API int tlsf_fastchi2(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
@@ -50,18 +56,17 @@ TLS_API int tlsdd_fastchi2(const dd_t *t, const dd_t *y, const dd_t *dy, int M, 
  *
  * The IHS path uses one NuFFT per harmonic (degree NuFFTs total) and
  * accumulates |sum_m w_m y_m exp(-2 pi i k f t_m)|^2 directly.  It does not
- * build or solve the Toeplitz normal equations.  Only two normalizations are
+ * build or solve the Toeplitz normal equations.  Three normalizations are
  * supported:
  *
- * TLS_NORM_STANDARD  sum of the uncorrelated per-harmonic R^2 estimates:
- *                    2 * sum_k |Z_k(f)|^2 / (sum_m w_m * chi2_ref).
- * TLS_NORM_NLL       IHS NLL: each harmonic power is normalized to the
- *                    Rayleigh scale and passed through Wilkie's finite-sample
- *                    correction before the harmonics are summed.  The sum is
- *                    then passed through the Erlang logarithmic correction
- *                    sum - ln(sum_{k=0}^{degree-1} sum^k / k!).
+ * TLS_NORM_IHS_RAW        sum of the normalized per-harmonic Rayleigh powers
+ *                         (no false-alarm calibration).
+ * TLS_NORM_IHS_CORRECTED  per-harmonic Wilkie finite-sample correction,
+ *                         followed by the Erlang correction.
+ * TLS_NORM_IHS_DEFAULT    Erlang correction only; the finite-sample correction
+ *                         is intentionally omitted.
  *
- * Both entry points return only the power array; IHS has no Toeplitz
+ * All three entry points return only the power array; IHS has no Toeplitz
  * condition bound.
  */
 TLS_API int tlsf_ihs(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,

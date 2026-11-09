@@ -34,7 +34,8 @@ variant, and `TOEPLITZ_LS_DISPATCH=list` prints the available variants.
 The package exposes two periodogram families. The FastChi2/AoVMH modules
 (`tlsf`, `tls`, `tlsdd`) use the Toeplitz least-squares solve. The IHS modules
 (`ihsf`, `ihs`, `ihsdd`) use the incoherent harmonic sum: one NuFFT per
-harmonic, no linear solve, and only the `standard` or `nll` statistic. Each
+harmonic, no linear solve, and only the `raw`, `corrected`, or `default`
+statistic. Each
 family has single-, double-, and double-double-precision variants. The single-
 and double-precision variants accept and return NumPy arrays. The double-double
 variants rely on compensated arithmetic and operate on a 106-bit mantissa; they
@@ -61,7 +62,8 @@ For `nterms = d` harmonics:
 - `"anova"` is the ANOVA `F` statistic in Schwarzenberg-Czerny's convention.
 - `"nll"` is the natural-log negative false-alarm probability, `-ln(FAP)`,
   computed from the direct Pochhammer/incomplete-beta statistic with its
-  finite-sample correction.
+  finite-sample correction and the effective sample size `Neff` from the raw
+  weights.
 
 The `cond` array returned when `autonan=False` is the Toeplitz condition upper
 bound `(2*nterms + 1) * P`, where `P` is the Cybenko reflection-coefficient
@@ -76,7 +78,7 @@ array:
 ```python
 from toeplitz_ls import ihs
 
-frequency, power = ihs.autopower(t, y, dy=None, nterms=3, normalization="nll")
+frequency, power = ihs.autopower(t, y, dy=None, nterms=3, normalization="corrected")
 ```
 
 IHS is a simplified formulation of a similar periodogram. It assumes that the
@@ -86,17 +88,21 @@ of `3d` and replaces the `O(d^2)` normal-equation solve with an `O(d)` power
 accumulation, so it is at least 3x less computationally expensive. In practice
 it is usually slightly less accurate than FastChi2.
 
-The two statistics are:
+The three statistics are:
 
-- `"standard"`: a direct display statistic built from the normalized
-  per-harmonic Rayleigh powers. It is not a calibrated false-alarm
-  probability, and for `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
-- `"nll"`: the negative log false-alarm probability. Each harmonic's Rayleigh
-  power is passed through Wilkie's (1983) finite-sample correction, and the
-  harmonic sum is then passed through the Erlang correction. Use this statistic
-  when a significance estimate is needed.
+- `"raw"`: a direct display statistic built from the normalized per-harmonic
+  Rayleigh powers. It is not a calibrated false-alarm probability, and for
+  `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
+- `"corrected"`: the negative log false-alarm probability. Each harmonic's
+  Rayleigh power is passed through Wilkie's (1983) finite-sample correction,
+  and the harmonic sum is then passed through the Erlang correction. `Neff` is
+  computed from the mean-subtracted weighted y values. Use this statistic when
+  a significance estimate is needed.
+- `"default"` (the default): the same initial formula and Erlang correction as
+  `"corrected"`, but without the finite-sample Wilkie correction.
 
-IHS is not suitable when `nterms^4 > M`; the Python wrappers emit a
+IHS is not suitable when `nterms^4 > Neff`, where `Neff` is the raw-weight
+effective sample size from the FastChi2/TLS path; the Python wrappers emit a
 `RuntimeWarning` in that case. Use the FastChi2 modules or reduce `nterms`.
 
 ## Free-threaded (GIL-free) Python support
