@@ -10,11 +10,13 @@ less accurate than FastChi2, but at least 3x less computationally expensive.
 Two statistics are available through ``normalization=``:
 
 ``standard`` (default)
-    Direct sum of the per-harmonic coefficient-of-determination estimates.
-    For ``nterms > 1`` this is a sum, not a bounded R^2, and may exceed 1.
+    Direct display statistic from the per-harmonic coefficient-of-determination
+    estimates.  It is not a calibrated false-alarm probability; for
+    ``nterms > 1`` this is a sum, not a bounded R^2, and may exceed 1.
 ``nll``
     Negative log false-alarm probability with Wilkie's (1983) finite-sample
-    correction for the Rayleigh Z test applied to each harmonic.
+    correction for the Rayleigh Z test applied to each harmonic, followed by
+    the Erlang correction of the harmonic sum.
 
 Unlike the FastChi2 wrappers these modules do not accept ``solver`` or
 ``autonan`` and do not return a condition array: IHS has no linear solve and

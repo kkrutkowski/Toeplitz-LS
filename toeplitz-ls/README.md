@@ -66,16 +66,19 @@ use one NuFFT per harmonic and no linear solve, and expose the same `power()` /
 `autopower()` shape. They are usually slightly less accurate than FastChi2, but
 at least 3x less computationally expensive. They support only:
 
-- `"standard"` (default) - a direct estimate from the per-harmonic powers. For
-  `nterms > 1` this is a sum, not a bounded `R^2`, and may exceed 1.
-- `"nll"` - the IHS negative log false-alarm probability, using Wilkie's (1983)
-  finite-sample correction for the Rayleigh Z test on each harmonic.
+- `"standard"` - a direct display statistic from the normalized per-harmonic
+  Rayleigh powers. It is not a calibrated false-alarm probability, and for
+  `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
+- `"nll"` - the IHS negative log false-alarm probability. Each harmonic's
+  Rayleigh power gets Wilkie's (1983) finite-sample correction, then the
+  harmonic sum gets the Erlang correction. Use this for significance estimates.
 
 They do not accept `solver=` or `autonan=` and do not return a condition
 array. IHS is not suitable when `nterms^4 > M`; the wrappers emit a
 `RuntimeWarning` in that case.
 
-The shared library is loaded with `ctypes.CDLL`, so CPython releases the GIL
-during the C calls. Independent `power()` or `autopower()` calls can therefore
-run concurrently from a `concurrent.futures.ThreadPoolExecutor` while the
-native calculation is executing.
+The shared library is written almost exclusively in C and loaded with
+`ctypes.CDLL`, so independent `power()`/`autopower()` calls release the GIL and
+can run in parallel from a `concurrent.futures.ThreadPoolExecutor`.
+Multithreading is expected to give major performance gains even on regular
+CPython; for optimum performance, use a free-threaded build (PEP 703).
