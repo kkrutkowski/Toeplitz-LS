@@ -5,7 +5,7 @@ from ._fastchi2 import DD, tls, tlsdd, tlsf, trim_mantissa
 from ._ihs import ihs, ihsdd, ihsf
 from .utils import Peak, Peaks, get_peaks
 
-__version__ = "1.0.0"
+__version__ = "1.0.0rc1"
 
 #: Manifest entry of the microarchitecture variant this process loaded.
 __dispatch__ = _dispatch.selected()
