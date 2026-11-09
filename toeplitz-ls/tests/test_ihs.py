@@ -12,7 +12,7 @@ import numpy as np
 from mpmath import mp
 
 from toeplitz_ls import ihs, ihsdd, ihsf, tls
-from toeplitz_ls._ihs import _check_ihs_normalization
+from toeplitz_ls._ihs import _check_ihs_normalization, _raw_neff
 
 
 def _wilkie_correct(power, n_eff):
@@ -256,6 +256,12 @@ class TestIHS(unittest.TestCase):
                     atol=1e-7,
                     err_msg=f"{precision} {normalization} multiblock mismatch",
                 )
+
+    def test_warning_neff_is_raw_weight_neff(self):
+        """The applicability warning uses raw weights, not weighted y."""
+        w = 1.0 / (self.dy * self.dy)
+        expected = float(w.sum() ** 2 / np.sum(w * w))
+        self.assertAlmostEqual(_raw_neff(self.dy), expected, places=12)
 
     def test_warns_when_nterms4_exceeds_neff(self):
         """IHS is not suitable when d^4 > Neff; the wrapper must warn."""

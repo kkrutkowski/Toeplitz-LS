@@ -1941,6 +1941,8 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         NUFFT_LRA_PRE((LRA_PLAN_T *)plan, x, M, block, NUFFT_RANK);
     }
 
+    /* All NLL and regularized calculations use the raw-weight effective
+     * sample size (sum w)^2 / sum(w^2), not the raw measurement count M. */
     const double neff_w = TO_DOUBLE(DIV(MUL(ws, ws), sum_w2));
     cybenko_model_t cyb = cybenko_model_init(degree, neff_w);
 #if defined(DOUBLE_DOUBLE)
@@ -2141,6 +2143,9 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
      * without the finite-sample Wilkie correction.
      */
     FLOAT standard_scale = DIV(FCAST(2.0), MUL(ws, chi2_ref));
+    /* IHS NLL uses the effective N of the mean-subtracted weighted y values,
+     * (sum |wy|)^2 / sum(wy^2), which differs from the raw-weight Neff used
+     * by FastChi2 and by the Python applicability warning. */
     FLOAT norm_neff = DIV(MUL(wy_sum_abs, wy_sum_abs), wy_sq_sum);
     FLOAT nll_scale = FCAST(0.0);
     if (TO_DOUBLE(norm_neff) > 0.0) nll_scale = DIV(norm_neff, MUL(wy_sum_abs, wy_sum_abs));
