@@ -214,17 +214,19 @@ harness, since the packaged object is a dylib rather than something to link
 against:
 
 ```sh
-zig cc -target x86_64-macos.11.0 -O2 harness_dlopen.c -o harness
-darling exec "$PWD/harness" \
-    "/Volumes/SystemRoot$PWD/.build/mac/site/toeplitz_ls/_lib/libtls-x86-64.so"
+zig cc -target x86_64-macos.11.0 -O2 tests/harness_dlopen.c -o .build/mac-harness/harness
+darling shell
+# Inside the Darling shell, with /path/to/Toeplitz-LS the absolute host path:
+/Volumes/SystemRoot/path/to/Toeplitz-LS/.build/mac-harness/harness \
+    "/Volumes/SystemRoot/path/to/Toeplitz-LS/.build/mac-harness/site/toeplitz_ls/_lib/libtls-x86-64.so"
 ```
 
-Two things to know about Darling: the executable must be named by its *host*
-path (the frontend stats it before entering the container), while arguments are
-resolved inside the container, where the host root appears at
-`/Volumes/SystemRoot`.  It is also very slow -- budget a minute or two per run
-and do not mistake the delay for a hang.  Darling is x86_64 only, so the arm64
-macOS wheel and both arm64 Windows DLLs can only be ABI-checked here.
+Use `darling shell` for every Darling test.  Bare `darling` and `darling exec`
+are much slower and can appear to hang; do not use them.  The executable must
+be named by its *host* path, while arguments are resolved inside the container,
+where the host root appears at `/Volumes/SystemRoot`.  Darling is x86_64 only,
+so the arm64 macOS wheel and both arm64 Windows DLLs can only be ABI-checked
+here.
 
 ### What has actually been executed
 
@@ -320,17 +322,19 @@ harness, since the packaged object is a dylib rather than something to link
 against:
 
 ```sh
-zig cc -target x86_64-macos.11.0 -O2 harness_dlopen.c -o harness
-darling exec "$PWD/harness" \
-    "/Volumes/SystemRoot$PWD/.build/mac/site/toeplitz_ls/_lib/libtls-x86-64.so"
+zig cc -target x86_64-macos.11.0 -O2 tests/harness_dlopen.c -o .build/mac-harness/harness
+darling shell
+# Inside the Darling shell, with /path/to/Toeplitz-LS the absolute host path:
+/Volumes/SystemRoot/path/to/Toeplitz-LS/.build/mac-harness/harness \
+    "/Volumes/SystemRoot/path/to/Toeplitz-LS/.build/mac-harness/site/toeplitz_ls/_lib/libtls-x86-64.so"
 ```
 
-Two things to know about Darling: the executable must be named by its *host*
-path (the frontend stats it before entering the container), while arguments are
-resolved inside the container, where the host root appears at
-`/Volumes/SystemRoot`.  It is also very slow -- budget a minute or two per run
-and do not mistake the delay for a hang.  Darling is x86_64 only, so the arm64
-macOS wheel and both arm64 Windows DLLs can only be ABI-checked here.
+Use `darling shell` for every Darling test.  Bare `darling` and `darling exec`
+are much slower and can appear to hang; do not use them.  The executable must
+be named by its *host* path, while arguments are resolved inside the container,
+where the host root appears at `/Volumes/SystemRoot`.  Darling is x86_64 only,
+so the arm64 macOS wheel and both arm64 Windows DLLs can only be ABI-checked
+here.
 
 ### What has actually been executed
 
