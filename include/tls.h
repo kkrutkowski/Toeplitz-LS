@@ -28,7 +28,7 @@ enum { TLS_SOLVER_LEVINSON = 1, TLS_SOLVER_ZOHAR = 2, TLS_SOLVER_BAREISS = 3, TL
  * n = 2 * degree + 1 and P the Cybenko reflection-coefficient product.
  *
  * TLS_NORM_ASYMPTOTIC and TLS_NORM_BAYES are legacy aliases.
- * TLS_NORM_IHS_RAW and TLS_NORM_IHS_CORRECTED are IHS-only aliases.
+ * TLS_NORM_IHS_RAW and TLS_NORM_IHS_NLL are the IHS-only aliases.
  */
 enum {
     TLS_NORM_STANDARD = 0,
@@ -39,7 +39,7 @@ enum {
     TLS_NORM_ASYMPTOTIC = TLS_NORM_ANOVA,
     TLS_NORM_BAYES = TLS_NORM_REGULARIZED,
     TLS_NORM_IHS_RAW = TLS_NORM_STANDARD,
-    TLS_NORM_IHS_CORRECTED = TLS_NORM_NLL
+    TLS_NORM_IHS_NLL = TLS_NORM_NLL
 };
 
 TLS_API int tlsf_fastchi2(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
@@ -61,7 +61,7 @@ TLS_API int tlsdd_fastchi2(const dd_t *t, const dd_t *y, const dd_t *dy, int M, 
  *
  * TLS_NORM_IHS_RAW        sum of the normalized per-harmonic Rayleigh powers
  *                         (no false-alarm calibration).
- * TLS_NORM_IHS_CORRECTED  per-harmonic Wilkie finite-sample correction,
+ * TLS_NORM_IHS_NLL        per-harmonic Wilkie finite-sample correction,
  *                         followed by the Erlang correction.
  * TLS_NORM_IHS_DEFAULT    Erlang correction only; the finite-sample correction
  *                         is intentionally omitted.

@@ -42,7 +42,7 @@ t = np.linspace(0.0, 10.0, 128)
 y = np.sin(2.0 * np.pi * 0.7 * t)
 
 frequency, power = tls.autopower(t, y)
-frequency_ihs, power_ihs = ihs.autopower(t, y, normalization="corrected")
+frequency_ihs, power_ihs = ihs.autopower(t, y, normalization="nll")
 ```
 
 For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
@@ -69,12 +69,13 @@ at least 3x less computationally expensive. They support only:
 - `"raw"` - a direct display statistic from the normalized per-harmonic
   Rayleigh powers. It is not a calibrated false-alarm probability, and for
   `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
-- `"corrected"` - the IHS negative log false-alarm probability. Each harmonic's
+- `"nll"` - the IHS negative log false-alarm probability. Each harmonic's
   Rayleigh power gets Wilkie's (1983) finite-sample correction, then the
   harmonic sum gets the Erlang correction. `Neff = (sum |wy|)^2 / sum(wy^2)`,
-  where `wy = w * (y - ymean)`. Use this for significance estimates.
+  where `wy = w * (y - ymean)`. Use this for reliable significance estimates.
 - `"default"` (the default) - the initial formula and Erlang correction without
-  the finite-sample Wilkie correction.
+  the finite-sample Wilkie correction. It still gives NLL estimates, just less
+  accurately.
 
 They do not accept `solver=` or `autonan=` and do not return a condition
 array. IHS is not suitable when `nterms^4 > Neff`, where `Neff` is the

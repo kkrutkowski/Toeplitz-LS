@@ -2134,7 +2134,7 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
      * raw: 2 * sum_k |Z_k|^2 / (ws * chi2_ref), the sum of the per-harmonic
      * R^2 contributions under the uncorrelated-term assumption.
      *
-     * corrected: normalize each harmonic power with
+     * nll: normalize each harmonic power with
      * Neff / (sum_m |w_m y_m|)^2, apply Wilkie's finite-sample correction to
      * every harmonic, sum the corrected terms, then apply the Erlang
      * correction.

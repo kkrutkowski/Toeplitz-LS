@@ -34,7 +34,7 @@ variant, and `TOEPLITZ_LS_DISPATCH=list` prints the available variants.
 The package exposes two periodogram families. The FastChi2/AoVMH modules
 (`tlsf`, `tls`, `tlsdd`) use the Toeplitz least-squares solve. The IHS modules
 (`ihsf`, `ihs`, `ihsdd`) use the incoherent harmonic sum: one NuFFT per
-harmonic, no linear solve, and only the `raw`, `corrected`, or `default`
+harmonic, no linear solve, and only the `raw`, `nll`, or `default`
 statistic. Each
 family has single-, double-, and double-double-precision variants. The single-
 and double-precision variants accept and return NumPy arrays. The double-double
@@ -77,7 +77,7 @@ array:
 ```python
 from toeplitz_ls import ihs
 
-frequency, power = ihs.autopower(t, y, dy=None, nterms=3, normalization="corrected")
+frequency, power = ihs.autopower(t, y, dy=None, nterms=3, normalization="nll")
 ```
 
 IHS is a simplified formulation of a similar periodogram. It assumes that the
@@ -92,13 +92,14 @@ The three statistics are:
 - `"raw"`: a direct display statistic built from the normalized per-harmonic
   Rayleigh powers. It is not a calibrated false-alarm probability, and for
   `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
-- `"corrected"`: the negative log false-alarm probability. Each harmonic's
-  Rayleigh power is passed through Wilkie's (1983) finite-sample correction,
-  and the harmonic sum is then passed through the Erlang correction.
+- `"nll"`: the negative log false-alarm probability. Each harmonic's Rayleigh
+  power is passed through Wilkie's (1983) finite-sample correction, and the
+  harmonic sum is then passed through the Erlang correction.
   `Neff = (sum |wy|)^2 / sum(wy^2)`, where `wy = w * (y - ymean)`. Use this
-  statistic when a significance estimate is needed.
+  statistic when a reliable significance estimate is needed.
 - `"default"` (the default): the same initial formula and Erlang correction as
-  `"corrected"`, but without the finite-sample Wilkie correction.
+  `"nll"`, but without the finite-sample Wilkie correction. This still produces
+  NLL estimates, just less accurately.
 
 IHS is not suitable when `nterms^4 > Neff`, where `Neff` is the raw-weight
 effective sample size from the FastChi2/TLS path; the Python wrappers emit a

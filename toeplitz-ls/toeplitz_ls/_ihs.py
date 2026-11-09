@@ -13,13 +13,15 @@ Three statistics are available through ``normalization=``:
     Direct display statistic from the per-harmonic coefficient-of-determination
     estimates.  It is not a calibrated false-alarm probability; for
     ``nterms > 1`` this is a sum, not a bounded R^2, and may exceed 1.
-``corrected``
+``nll``
     Negative log false-alarm probability with Wilkie's (1983) finite-sample
     correction for the Rayleigh Z test applied to each harmonic, followed by
-    the Erlang correction of the harmonic sum.
+    the Erlang correction of the harmonic sum.  Use this when a reliable
+    significance estimate is needed.
 ``default`` (the default)
-    The same initial formula and Erlang correction as ``corrected``, but
-    without the finite-sample Wilkie correction.
+    The same initial formula and Erlang correction as ``nll``, but without the
+    finite-sample Wilkie correction.  This still produces NLL estimates, just
+    less accurately.
 
 Unlike the FastChi2 wrappers these modules do not accept ``solver`` or
 ``autonan`` and do not return a condition array: IHS has no linear solve and
@@ -57,11 +59,10 @@ from ._fastchi2 import (
 
 _IHS_NORMALIZATIONS = {
     "raw": 0,
-    "corrected": 2,
-    "default": 4,
-    # Legacy aliases, intentionally undocumented:
-    "standard": 0,
     "nll": 2,
+    "default": 4,
+    # Legacy alias, intentionally undocumented:
+    "standard": 0,
 }
 
 
@@ -73,7 +74,7 @@ def _check_ihs_normalization(normalization):
     if isinstance(normalization, int) and not isinstance(normalization, bool):
         if normalization in _IHS_NORMALIZATIONS.values():
             return normalization
-    raise ValueError("normalization must be 'raw', 'corrected', or 'default'")
+    raise ValueError("normalization must be 'raw', 'nll', or 'default'")
 
 
 def _raw_neff(dy):
@@ -105,7 +106,7 @@ class ihsf:
     def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
         """Return the IHS power on the grid ``f0 + df * arange(Nf)``.
 
-        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
+        ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
         """
         normalization = _check_ihs_normalization(normalization)
         backend = _backend_id(backend)
@@ -136,7 +137,7 @@ class ihsf:
     def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
         """Return automatic IHS frequency and power arrays.
 
-        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
+        ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
@@ -165,7 +166,7 @@ class ihs:
     def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
         """Return the IHS power on the grid ``f0 + df * arange(Nf)``.
 
-        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
+        ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
         """
         normalization = _check_ihs_normalization(normalization)
         backend = _backend_id(backend)
@@ -196,7 +197,7 @@ class ihs:
     def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
         """Return automatic double-precision IHS frequency and power arrays.
 
-        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
+        ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
@@ -225,7 +226,7 @@ class ihsdd:
     def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
         """Return high-precision IHS power.
 
-        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
+        ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
         """
         mp = _require_mpmath()
         normalization = _check_ihs_normalization(normalization)
@@ -282,7 +283,7 @@ class ihsdd:
     def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
         """Return automatic high-precision IHS frequency and power lists.
 
-        ``normalization`` accepts ``'raw'``, ``'corrected'``, or ``'default'``.
+        ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
         """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)
