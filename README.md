@@ -62,8 +62,7 @@ For `nterms = d` harmonics:
 - `"anova"` is the ANOVA `F` statistic in Schwarzenberg-Czerny's convention.
 - `"nll"` is the natural-log negative false-alarm probability, `-ln(FAP)`,
   computed from the direct Pochhammer/incomplete-beta statistic with its
-  finite-sample correction and the effective sample size `Neff` from the raw
-  weights.
+  finite-sample correction. `Neff = (sum w)^2 / sum(w^2)` with `w = 1/dy^2`.
 
 The `cond` array returned when `autonan=False` is the Toeplitz condition upper
 bound `(2*nterms + 1) * P`, where `P` is the Cybenko reflection-coefficient
@@ -95,9 +94,9 @@ The three statistics are:
   `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
 - `"corrected"`: the negative log false-alarm probability. Each harmonic's
   Rayleigh power is passed through Wilkie's (1983) finite-sample correction,
-  and the harmonic sum is then passed through the Erlang correction. `Neff` is
-  computed from the mean-subtracted weighted y values. Use this statistic when
-  a significance estimate is needed.
+  and the harmonic sum is then passed through the Erlang correction.
+  `Neff = (sum |wy|)^2 / sum(wy^2)`, where `wy = w * (y - ymean)`. Use this
+  statistic when a significance estimate is needed.
 - `"default"` (the default): the same initial formula and Erlang correction as
   `"corrected"`, but without the finite-sample Wilkie correction.
 

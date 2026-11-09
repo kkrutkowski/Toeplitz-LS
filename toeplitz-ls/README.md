@@ -54,7 +54,7 @@ For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
 - `"anova"` - ANOVA / `F` statistic, following Schwarzenberg-Czerny's convention.
 - `"nll"` - natural-log negative log false-alarm probability, `-ln(FAP)`;
   the direct Pochhammer/incomplete-beta statistic with its finite-sample
-  correction and the effective sample size `Neff` from the raw weights.
+  correction. `Neff = (sum w)^2 / sum(w^2)` with `w = 1/dy^2`.
 
 The `cond` array returned with `autonan=False` is the condition upper bound
 `(2*nterms + 1) * P`, where `P` is Cybenko's reflection-coefficient product.
@@ -71,8 +71,8 @@ at least 3x less computationally expensive. They support only:
   `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
 - `"corrected"` - the IHS negative log false-alarm probability. Each harmonic's
   Rayleigh power gets Wilkie's (1983) finite-sample correction, then the
-  harmonic sum gets the Erlang correction. `Neff` is computed from the
-  mean-subtracted weighted y values. Use this for significance estimates.
+  harmonic sum gets the Erlang correction. `Neff = (sum |wy|)^2 / sum(wy^2)`,
+  where `wy = w * (y - ymean)`. Use this for significance estimates.
 - `"default"` (the default) - the initial formula and Erlang correction without
   the finite-sample Wilkie correction.
 
