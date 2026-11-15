@@ -1,8 +1,7 @@
 # Toeplitz-LS
 
 Reference implementation of the multiharmonic least-squares periodogram
-(AoVMH(W) / FastChi²) using a blocked NuFFT and a fast Toeplitz solver for
-complex coefficients.
+(AoVMH(W) / FastChi²) using a blocked NuFFT and a fast Toeplitz solver.
 
 ## Installation
 
