@@ -10,9 +10,9 @@ extra requires mpmath >= 1.0. Prebuilt wheels include runtime microarchitecture
 dispatch, so installing from PyPI is the recommended path:
 
 ```console
-pip install --pre Toeplitz-LS
+pip install Toeplitz-LS
 # or with mpmath for the double-double wrappers:
-pip install --pre "Toeplitz-LS[tlsdd]"
+pip install "Toeplitz-LS[tlsdd]"
 ```
 
 To build from source instead:
