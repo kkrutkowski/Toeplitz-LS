@@ -6,8 +6,17 @@ complex coefficients.
 
 ## Installation
 
-The current release is built from source. The package requires Python >= 3.8
-and NumPy >= 1.17.3; the optional `tlsdd` extra requires mpmath >= 1.0.
+The package requires Python >= 3.8 and NumPy >= 1.17.3; the optional `tlsdd`
+extra requires mpmath >= 1.0. Prebuilt wheels include runtime microarchitecture
+dispatch, so installing from PyPI is the recommended path:
+
+```console
+pip install Toeplitz-LS
+# or with mpmath for the double-double wrappers:
+pip install "Toeplitz-LS[tlsdd]"
+```
+
+To build from source instead:
 
 ```console
 git clone https://github.com/kkrutkowski/Toeplitz-LS.git --depth=1
@@ -16,6 +25,11 @@ make native        # or 'make generic' for a portable baseline
 cd ./toeplitz-ls
 pip3 install .     # use 'pip3 install ".[tlsdd]"' for the mpmath wrappers
 ```
+
+`make native` may be slightly faster thanks to custom-generated scaling
+constants and host tuning, though because release wheels ship multiple
+microarchitecture builds via runtime dispatch, that difference is generally
+insignificant.
 
 ## Supported platforms
 

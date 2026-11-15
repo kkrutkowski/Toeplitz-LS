@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "toeplitz-ls"
 version = "1.0.0rc1"
-description = "Fast Toeplitz least-squares periodogram (AoVMH / FastChi2 / IHS) with runtime microarchitecture dispatch."
+description = "The reference implementation of the Toeplitz formulation of the multiharmonic least-squares periodogram (AoVMH / FastChi2)."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Kacper Rutkowski" }]
