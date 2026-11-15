@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tls_tuning.h>
 
 /* =========================================================================
  * Triple-Precision Macro Engine
@@ -15,12 +16,49 @@
 #define PLAN_T PREFIX(plan)
 #define FALLBACK_PLAN_T FALLBACK_PREFIX(plan)
 
+/* Build-time depth of this precision pass: the runtime switch can only pick
+ * up to it, and only those fused kernels are compiled. */
+#if defined(DOUBLE_DOUBLE)
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_DD
+#elif defined(DOUBLE)
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_DOUBLE
+#else
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_FLOAT
+#endif
+
+/* Per-grid fusion-depth table measured by tests/bench_fuse --tune.  Each
+ * precision build selects its own array; a missing table simply means the
+ * per-precision default is used for every grid. */
+#ifdef NANOFFT_DEPTH_TABLE
+#    include <nanofft_depth_table.h>
+#    if defined(DOUBLE_DOUBLE)
+#        define NANOFFT_TUNED_DEPTH nanofft_depth_dd
+#    elif defined(DOUBLE)
+#        define NANOFFT_TUNED_DEPTH nanofft_depth_double
+#    else
+#        define NANOFFT_TUNED_DEPTH nanofft_depth_float
+#    endif
+#endif
+
+#define NANOFFT_EFFECTIVE_FUSE(fuse) ((fuse) < 1 ? 1 : ((fuse) > NANOFFT_FFT_FUSE_BUILD ? NANOFFT_FFT_FUSE_BUILD : (fuse)))
+
+typedef struct {
+    uint32_t i;
+    uint32_t j;
+} rev_pair;
+
 struct PLAN_T {
     uint32_t N;
+    int fuse;       /* radix-2 DIF stages fused per pass (1 = classically staged) */
+    int fuse_order; /* which end of the stage sequence gets the leftover pass */
+    int cobravo;    /* 1 = vectorized tile bit reversal, 0 = scalar in-tile swap */
     FLOAT *twiddle_real;
     FLOAT *twiddle_imag;
-    FLOAT *cobra_buffer_real;
+    FLOAT *cobra_buffer_real; /* two tiles: A at offset 0, B at BLOCK_ELEMS */
     FLOAT *cobra_buffer_imag;
+    int permute;     /* effective bit-reversal strategy for this plan */
+    rev_pair *pairs; /* lazily built swap-pair list, NULL until first use */
+    uint32_t npairs;
 };
 
 /* =========================================================================
@@ -28,11 +66,47 @@ struct PLAN_T {
  * ========================================================================= */
 
 static inline bool is_power_of_two(int N) { return (N > 0) && ((N & (N - 1)) == 0); }
-static inline uint32_t intmin(uint32_t a, uint32_t b) { return (a < b) ? a : b; }
-static inline uint32_t intmax(int32_t a, int32_t b) { return (a > b) ? a : b; }
+/* aligned_alloc() wants the size to be a multiple of the alignment.  The grid
+ * guard makes that automatic for the vectorized passes; this covers the
+ * one-lane double-double build on very short grids. */
+NANOFFT_UNUSED static inline size_t align_up(size_t bytes) { return (bytes + (size_t)NANOFFT_ALIGN - 1u) & ~((size_t)NANOFFT_ALIGN - 1u); }
+NANOFFT_UNUSED static inline uint32_t intmin(uint32_t a, uint32_t b) { return (a < b) ? a : b; }
+NANOFFT_UNUSED static inline uint32_t intmax(int32_t a, int32_t b) { return (a > b) ? a : b; }
 
 #define LOG_BLOCK_WIDTH 6
-#define BLOCK_WIDTH (1 << LOG_BLOCK_WIDTH)
+#define BLOCK_WIDTH (1u << LOG_BLOCK_WIDTH)
+#define BLOCK_ELEMS (BLOCK_WIDTH * BLOCK_WIDTH)
+
+/* The classic COBRA 64x64 tiling needs log2(N) >= 12.  A tile width of
+ * min(log2(N)/2, 6) runs the same algorithm down to log2(N) = 8, where the
+ * scalar in-place permutation stops paying off. */
+#define COBRAVO_MIN_LOG 8
+/* Measured crossover of the precomputed swap-pair walk (tests/bench_permute.c):
+ * below PAIRS_MIN_LOG the plain table shuffle wins, from PAIRS_MIN_LOG to
+ * PAIRS_MAX_LOG the pair list does, and above it the 4N-byte pair table leaves
+ * L1 and the tiled reversal takes over again. */
+#define PAIRS_MIN_LOG 6
+/* The pair table is 4N bytes whatever the element size, so the crossover only
+ * depends on where it leaves L1: 2^13 entries for 4-byte floats, 2^12 once the
+ * elements are 8 bytes wide (measured; see tests/bench_permute.c). */
+#if defined(DOUBLE) || defined(DOUBLE_DOUBLE)
+#    define PAIRS_MAX_LOG 12
+#else
+#    define PAIRS_MAX_LOG 13
+#endif
+#define COBRAVO_W4_LEN (1u << 8)  /* in-tile indices of a 16x16 tile */
+#define COBRAVO_W5_LEN (1u << 10) /* 32x32 */
+#define COBRAVO_W6_LEN (1u << 12) /* 64x64 */
+#define COBRAVO_IDX_LEN (COBRAVO_W4_LEN + COBRAVO_W5_LEN + COBRAVO_W6_LEN)
+
+/* Gather-emitted tiles for the real types; double-double keeps the scalar
+ * in-tile swap (its 16-byte elements have no gather). */
+#if !defined(DOUBLE_DOUBLE) && (defined(__AVX512F__) || defined(__AVX2__))
+#    define COBRAVO_GATHER 1
+#    include <immintrin.h>
+#else
+#    define COBRAVO_GATHER 0
+#endif
 
 static inline uint32_t intlog2(uint32_t input) {
     uint32_t output;
@@ -86,92 +160,266 @@ static inline void table_shuffle(FLOAT *real, FLOAT *imag, uint32_t log_n) {
     }
 }
 
-static inline void cobra_shuffle(FLOAT *real, FLOAT *imag, uint32_t log_n, FLOAT *buffer_real, FLOAT *buffer_imag) {
-    uint32_t num_b_bits = log_n - 2 * LOG_BLOCK_WIDTH;
-    uint32_t b_size = 1 << num_b_bits;
-    uint32_t shift_top = num_b_bits + LOG_BLOCK_WIDTH;
-
-    uint32_t rev6[BLOCK_WIDTH];
-    for (uint32_t i = 0; i < BLOCK_WIDTH; ++i) {
-        rev6[i] = bit_reverse_table[i] >> 2;
-    }
-
-    for (uint32_t b = 0; b < b_size; ++b) {
-        uint32_t b_rev = reverse_bits(b, num_b_bits);
-        uint32_t b_shifted = b << LOG_BLOCK_WIDTH;
-        uint32_t b_rev_shifted = b_rev << LOG_BLOCK_WIDTH;
-
-        for (uint32_t a = 0; a < BLOCK_WIDTH; ++a) {
-            uint32_t a_rev = rev6[a];
-            uint32_t a_shifted = a << shift_top;
-            uint32_t a_rev_shifted = a_rev << LOG_BLOCK_WIDTH;
-
-            for (uint32_t c = 0; c < BLOCK_WIDTH; ++c) {
-                uint32_t idx = a_shifted | b_shifted | c;
-                uint32_t buffer_idx = a_rev_shifted | c;
-
-                buffer_real[buffer_idx] = real[idx];
-                buffer_imag[buffer_idx] = imag[idx];
-            }
-        }
-
-        for (uint32_t c = 0; c < BLOCK_WIDTH; ++c) {
-            uint32_t c_rev = rev6[c];
-            uint32_t c_rev_shifted = c_rev << shift_top;
-
-            for (uint32_t a_rev = 0; a_rev < BLOCK_WIDTH; ++a_rev) {
-                uint32_t a = rev6[a_rev];
-                bool index_less_than_reverse = (a < c_rev) || (a == c_rev && b < b_rev) || (a == c_rev && b == b_rev && a_rev < c);
-
-                if (index_less_than_reverse) {
-                    uint32_t v_idx = c_rev_shifted | b_rev_shifted | a_rev;
-                    uint32_t b_idx = (a_rev << LOG_BLOCK_WIDTH) | c;
-
-                    FLOAT temp_real = real[v_idx];
-                    FLOAT temp_imag = imag[v_idx];
-
-                    real[v_idx] = buffer_real[b_idx];
-                    imag[v_idx] = buffer_imag[b_idx];
-
-                    buffer_real[b_idx] = temp_real;
-                    buffer_imag[b_idx] = temp_imag;
-                }
-            }
-        }
-
-        for (uint32_t a = 0; a < BLOCK_WIDTH; ++a) {
-            uint32_t a_rev = rev6[a];
-            uint32_t a_shifted = a << shift_top;
-
-            for (uint32_t c = 0; c < BLOCK_WIDTH; ++c) {
-                uint32_t c_rev = rev6[c];
-                bool index_less_than_reverse = (a < c_rev) || (a == c_rev && b < b_rev) || (a == c_rev && b == b_rev && a_rev < c);
-
-                if (index_less_than_reverse) {
-                    uint32_t v_idx = a_shifted | b_shifted | c;
-                    uint32_t b_idx = (a_rev << LOG_BLOCK_WIDTH) | c;
-
-                    FLOAT temp_real = real[v_idx];
-                    FLOAT temp_imag = imag[v_idx];
-
-                    real[v_idx] = buffer_real[b_idx];
-                    imag[v_idx] = buffer_imag[b_idx];
-
-                    buffer_real[b_idx] = temp_real;
-                    buffer_imag[b_idx] = temp_imag;
-                }
-            }
+static inline void table_shuffle_1d(FLOAT *values, uint32_t log_n) {
+    for (uint32_t i = 0; i < (1u << log_n); ++i) {
+        uint32_t j = reverse_bits(i, log_n);
+        if (j > i) {
+            FLOAT temp = values[i];
+            values[i] = values[j];
+            values[j] = temp;
         }
     }
 }
 
-inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N, FLOAT *buffer_real, FLOAT *buffer_imag) {
-    uint32_t order = intlog2(N);
-    if (order <= 2 * LOG_BLOCK_WIDTH) {
-        table_shuffle(real, imag, order);
-    } else {
-        cobra_shuffle(real, imag, order, buffer_real, buffer_imag);
+/* Swap pairs of the bit reversal, precomputed once per plan: unlike
+ * table_shuffle this walks only the N/2 - 1 pairs that actually exchange two
+ * elements, needs no bit arithmetic per element and has no per-element branch.
+ * The table is 8 bytes per pair (4N bytes total), so it is only built for the
+ * grid sizes where the microbenchmark shows it winning. */
+
+static inline void pair_shuffle(FLOAT *real, FLOAT *imag, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const FLOAT tr = real[i];
+        const FLOAT ti = imag[i];
+        real[i] = real[j];
+        imag[i] = imag[j];
+        real[j] = tr;
+        imag[j] = ti;
     }
+}
+
+static inline void pair_shuffle_1d(FLOAT *values, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const FLOAT t = values[i];
+        values[i] = values[j];
+        values[j] = t;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * COBRAVO tile bit reversal
+ *
+ * The index is split as (a | b | c), where a and c are the top and bottom w
+ * bits.  A 2w-bit reversal maps a <-> c, so every 2^w x 2^w tile is reversed
+ * inside a contiguous staging buffer and written to the mirrored b offset.
+ * Each row of a tile is at least one SIMD vector wide, so the staging buffer
+ * is loaded and stored with row-sized memcpy / vector moves.
+ * ------------------------------------------------------------------------- */
+
+#if COBRAVO_GATHER
+/* In-tile reversal indices of every supported tile width, packed back to back.
+ * Pure data derived from the fixed bit reversal, built by a constructor so no
+ * transform can observe a half-initialised table. */
+static int cobravo_gather_idx[COBRAVO_IDX_LEN] __attribute__((aligned(64)));
+
+static inline int *cobravo_idx_table(uint32_t w) {
+    if (w > 5u) return cobravo_gather_idx + COBRAVO_W4_LEN + COBRAVO_W5_LEN;
+    if (w == 5u) return cobravo_gather_idx + COBRAVO_W4_LEN;
+    return cobravo_gather_idx;
+}
+
+__attribute__((constructor)) static void cobravo_build_idx_table(void) {
+    for (uint32_t w = 4u; w <= (uint32_t)LOG_BLOCK_WIDTH; ++w) {
+        int *tab = cobravo_idx_table(w);
+        const uint32_t tile = 1u << (2u * w);
+        for (uint32_t i = 0; i < tile; ++i) tab[i] = (int)reverse_bits(i, 2u * w);
+    }
+}
+#else
+NANOFFT_UNUSED static inline int *cobravo_idx_table(uint32_t w) {
+    (void)w;
+    return NULL;
+}
+#endif
+
+static inline void cobravo_load_tile(const FLOAT *src, uint32_t b_shifted, uint32_t shift_top, uint32_t w, FLOAT *dst) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + (size_t)a * width, src + ((size_t)a << shift_top) + b_shifted, (size_t)width * sizeof(FLOAT));
+}
+
+static inline void cobravo_store_tile(const FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + ((size_t)a << shift_top) + b_shifted, src + (size_t)a * width, (size_t)width * sizeof(FLOAT));
+}
+
+#if COBRAVO_GATHER
+/* Destination positions are enumerated in order; the source index is the
+ * in-tile reversal, so one gather plus one contiguous store per vector. */
+static inline void cobravo_emit_tile_gather(const FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    const uint32_t row_mask = (1u << w) - 1u;
+    const int *idx = cobravo_idx_table(w);
+#    if defined(DOUBLE)
+#        if defined(__AVX512F__)
+    for (uint32_t v = 0; v < tile; v += 8u) {
+        const __m256i ix = _mm256_load_si256((const __m256i *)(const void *)(idx + v));
+        const __m512d x = _mm512_i32gather_pd(ix, src, 8);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm512_storeu_pd(dst + off, x);
+    }
+#        else
+    for (uint32_t v = 0; v < tile; v += 4u) {
+        const __m128i ix = _mm_load_si128((const __m128i *)(const void *)(idx + v));
+        const __m256d x = _mm256_i32gather_pd(src, ix, 8);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm256_storeu_pd(dst + off, x);
+    }
+#        endif
+#    else
+#        if defined(__AVX512F__)
+    for (uint32_t v = 0; v < tile; v += 16u) {
+        const __m512i ix = _mm512_load_si512((const void *)(idx + v));
+        const __m512 x = _mm512_i32gather_ps(ix, src, 4);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm512_storeu_ps(dst + off, x);
+    }
+#        else
+    for (uint32_t v = 0; v < tile; v += 8u) {
+        const __m256i ix = _mm256_load_si256((const __m256i *)(const void *)(idx + v));
+        const __m256 x = _mm256_i32gather_ps(src, ix, 4);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm256_storeu_ps(dst + off, x);
+    }
+#        endif
+#    endif
+}
+#endif /* COBRAVO_GATHER */
+
+static inline void cobravo_reverse_tile(FLOAT *tile_values, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    for (uint32_t i = 0; i < tile; ++i) {
+        const uint32_t j = reverse_bits(i, 2u * w);
+        if (j > i) {
+            const FLOAT temp = tile_values[i];
+            tile_values[i] = tile_values[j];
+            tile_values[j] = temp;
+        }
+    }
+}
+
+static inline void cobravo_emit_tile(FLOAT *src, FLOAT *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w, int vectorized) {
+#if COBRAVO_GATHER
+    /* The gather writes one contiguous vector per step and derives its offset
+     * from the first element, so it is only valid when a tile row holds a whole
+     * vector; narrower tiles must use the scalar swap below. */
+    if (vectorized && w >= 4u) {
+        cobravo_emit_tile_gather(src, dst, b_shifted, shift_top, w);
+        return;
+    }
+#else
+    (void)vectorized;
+#endif
+    cobravo_reverse_tile(src, w);
+    cobravo_store_tile(src, dst, b_shifted, shift_top, w);
+}
+
+static inline void cobravo_shuffle(FLOAT *real, FLOAT *imag, uint32_t log_n, FLOAT *bufA_real, FLOAT *bufA_imag, FLOAT *bufB_real, FLOAT *bufB_imag,
+                                   int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > (uint32_t)LOG_BLOCK_WIDTH) w = (uint32_t)LOG_BLOCK_WIDTH;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile(real, b_shifted, shift_top, w, bufA_real);
+        cobravo_load_tile(imag, b_shifted, shift_top, w, bufA_imag);
+        if (b != b_rev) {
+            cobravo_load_tile(real, b_rev_shifted, shift_top, w, bufB_real);
+            cobravo_load_tile(imag, b_rev_shifted, shift_top, w, bufB_imag);
+        }
+
+        cobravo_emit_tile(bufA_real, real, b_rev_shifted, shift_top, w, vectorized);
+        cobravo_emit_tile(bufA_imag, imag, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) {
+            cobravo_emit_tile(bufB_real, real, b_shifted, shift_top, w, vectorized);
+            cobravo_emit_tile(bufB_imag, imag, b_shifted, shift_top, w, vectorized);
+        }
+    }
+}
+
+static inline void cobravo_shuffle_1d(FLOAT *values, uint32_t log_n, FLOAT *bufA, FLOAT *bufB, int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > (uint32_t)LOG_BLOCK_WIDTH) w = (uint32_t)LOG_BLOCK_WIDTH;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile(values, b_shifted, shift_top, w, bufA);
+        if (b != b_rev) cobravo_load_tile(values, b_rev_shifted, shift_top, w, bufB);
+
+        cobravo_emit_tile(bufA, values, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) cobravo_emit_tile(bufB, values, b_shifted, shift_top, w, vectorized);
+    }
+}
+
+/* Build the swap-pair list on first use: one reverse_bits() sweep, then every
+ * later permutation of this plan is a branch-free walk over the pairs. */
+static void ensure_pairs(PLAN_T *plan) {
+    if (plan->pairs != NULL) return;
+    const uint32_t order = intlog2(plan->N);
+    const uint32_t capacity = plan->N / 2u;
+    rev_pair *pairs = (rev_pair *)nanofft_malloc((size_t)capacity * sizeof(rev_pair));
+    if (pairs == NULL) return;
+    uint32_t count = 0;
+    for (uint32_t i = 1; i < plan->N; ++i) {
+        const uint32_t j = reverse_bits(i, order);
+        if (j > i) {
+            pairs[count].i = i;
+            pairs[count].j = j;
+            ++count;
+        }
+    }
+    plan->pairs = pairs;
+    plan->npairs = count;
+}
+
+inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N, PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle(real, imag, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute != TLS_PERMUTE_COBRAVO) {
+        table_shuffle(real, imag, order);
+        return;
+    }
+    cobravo_shuffle(real, imag, order, plan->cobra_buffer_real, plan->cobra_buffer_imag, plan->cobra_buffer_real + BLOCK_ELEMS,
+                    plan->cobra_buffer_imag + BLOCK_ELEMS, plan->cobravo);
+}
+
+inline static void bit_reverse_permutation_1d(FLOAT *values, uint32_t N, PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle_1d(values, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute != TLS_PERMUTE_COBRAVO) {
+        table_shuffle_1d(values, order);
+        return;
+    }
+    cobravo_shuffle_1d(values, order, plan->cobra_buffer_real, plan->cobra_buffer_real + BLOCK_ELEMS, plan->cobravo);
 }
 
 /* =========================================================================
@@ -181,69 +429,88 @@ inline static void bit_reverse_permutation(FLOAT *real, FLOAT *imag, uint32_t N,
 #if INTERNAL_VEC_LEN == 16 || INTERNAL_VEC_LEN == 8 || INTERNAL_VEC_LEN == 4 || INTERNAL_VEC_LEN == 2
 #    define HAS_INTRA_VEC_PASS
 
+/*
+ * Stage permutations of the intra-vector pass.
+ *
+ * Each entry list is the single source of truth for the permutation and for
+ * its inverse, so the two orderings can never drift apart.  Entry `i` is the
+ * mask of stage `i`: forward it splits the lanes by a stride of
+ * 2^(log2(len)-1-i), the inverse puts them back.
+ */
 #    if INTERNAL_VEC_LEN == 16
 #        define W16_C1 ((FLOAT)0.9238795325112867)
 #        define W16_S1 ((FLOAT)0.3826834323650898)
 
-static const INTERNAL_VEC_INT permutations[4] __attribute__((aligned(64))) = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
-                                                                              {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15},
-                                                                              {0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15},
-                                                                              {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15}};
+#        define NANOFFT_PERM_ENTRIES(X)                                \
+            X(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) \
+            X(1, 0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15) \
+            X(2, 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15) \
+            X(3, 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15)
+#        define NANOFFT_INV_PERM_ENTRIES(X)                            \
+            X(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) \
+            X(1, 0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15) \
+            X(2, 0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15) \
+            X(3, 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
 
-static const INTERNAL_VEC_INT inv_permutations[4] __attribute__((aligned(64))) = {{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
-                                                                                  {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15},
-                                                                                  {0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15},
-                                                                                  {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15}};
+static const INTERNAL_VEC real_twiddles[4] __attribute__((aligned(64))) = {
+    {(FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2, W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)-NANOFFT_SQRT1_2, -W16_C1, (FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2,
+     W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)-NANOFFT_SQRT1_2, -W16_C1},
+    {(FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2,
+     (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2},
+    {(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0,
+     (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0},
+    {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0,
+     (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
 
-static const INTERNAL_VEC real_twiddles[4]
-    __attribute__((aligned(64))) = {{(FLOAT)1.0, W16_C1, (FLOAT)M_SQRT1_2, W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)-M_SQRT1_2, -W16_C1, (FLOAT)1.0, W16_C1,
-                                     (FLOAT)M_SQRT1_2, W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)-M_SQRT1_2, -W16_C1},
-                                    {(FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)-M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)-M_SQRT1_2,
-                                     (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)-M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)-M_SQRT1_2},
-                                    {(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0,
-                                     (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0},
-                                    {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0,
-                                     (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
-
-static const INTERNAL_VEC imag_twiddles[4]
-    __attribute__((aligned(64))) = {{(FLOAT)0.0, W16_S1, (FLOAT)M_SQRT1_2, W16_C1, (FLOAT)1.0, W16_C1, (FLOAT)M_SQRT1_2, W16_S1, (FLOAT)0.0, W16_S1,
-                                     (FLOAT)M_SQRT1_2, W16_C1, (FLOAT)1.0, W16_C1, (FLOAT)M_SQRT1_2, W16_S1},
-                                    {(FLOAT)0.0, (FLOAT)M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2,
-                                     (FLOAT)0.0, (FLOAT)M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2},
-                                    {(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0,
-                                     (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0},
-                                    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0,
-                                     (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+static const INTERNAL_VEC imag_twiddles[4] __attribute__((aligned(64))) = {
+    {(FLOAT)0.0, W16_S1, (FLOAT)NANOFFT_SQRT1_2, W16_C1, (FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2, W16_S1, (FLOAT)0.0, W16_S1, (FLOAT)NANOFFT_SQRT1_2, W16_C1,
+     (FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2, W16_S1},
+    {(FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0,
+     (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2},
+    {(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0,
+     (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0},
+    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0,
+     (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
-    INTERNAL_VEC tmp = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23});
-    *b = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31});
+    INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
+    *b = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31);
     *a = tmp;
 }
 
 #    elif INTERNAL_VEC_LEN == 8
-static const INTERNAL_VEC_INT permutations[3] __attribute__((aligned(64))) = {{0, 1, 2, 3, 4, 5, 6, 7}, {0, 1, 4, 5, 2, 3, 6, 7}, {0, 2, 4, 6, 1, 3, 5, 7}};
-static const INTERNAL_VEC_INT inv_permutations[3] __attribute__((aligned(64))) = {{0, 1, 2, 3, 4, 5, 6, 7}, {0, 1, 4, 5, 2, 3, 6, 7}, {0, 4, 1, 5, 2, 6, 3, 7}};
+#        define NANOFFT_PERM_ENTRIES(X)  \
+            X(0, 0, 1, 2, 3, 4, 5, 6, 7) \
+            X(1, 0, 1, 4, 5, 2, 3, 6, 7) \
+            X(2, 0, 2, 4, 6, 1, 3, 5, 7)
+#        define NANOFFT_INV_PERM_ENTRIES(X) \
+            X(0, 0, 1, 2, 3, 4, 5, 6, 7)    \
+            X(1, 0, 1, 4, 5, 2, 3, 6, 7)    \
+            X(2, 0, 4, 1, 5, 2, 6, 3, 7)
 
-static const INTERNAL_VEC real_twiddles[3]
-    __attribute__((aligned(64))) = {{(FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)-M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)-M_SQRT1_2},
-                                    {(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0},
-                                    {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
+static const INTERNAL_VEC real_twiddles[3] __attribute__((aligned(64))) = {
+    {(FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2},
+    {(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0},
+    {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
 
-static const INTERNAL_VEC imag_twiddles[3]
-    __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2, (FLOAT)0.0, (FLOAT)M_SQRT1_2, (FLOAT)1.0, (FLOAT)M_SQRT1_2},
-                                    {(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0},
-                                    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+static const INTERNAL_VEC imag_twiddles[3] __attribute__((aligned(64))) = {
+    {(FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2},
+    {(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0},
+    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
-    INTERNAL_VEC tmp = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){0, 1, 2, 3, 8, 9, 10, 11});
-    *b = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){4, 5, 6, 7, 12, 13, 14, 15});
+    INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 2, 3, 8, 9, 10, 11);
+    *b = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 4, 5, 6, 7, 12, 13, 14, 15);
     *a = tmp;
 }
 
 #    elif INTERNAL_VEC_LEN == 4
-static const INTERNAL_VEC_INT permutations[2] __attribute__((aligned(64))) = {{0, 1, 2, 3}, {0, 2, 1, 3}};
-static const INTERNAL_VEC_INT inv_permutations[2] __attribute__((aligned(64))) = {{0, 1, 2, 3}, {0, 2, 1, 3}};
+#        define NANOFFT_PERM_ENTRIES(X) \
+            X(0, 0, 1, 2, 3)            \
+            X(1, 0, 2, 1, 3)
+#        define NANOFFT_INV_PERM_ENTRIES(X) \
+            X(0, 0, 1, 2, 3)                \
+            X(1, 0, 2, 1, 3)
 
 static const INTERNAL_VEC real_twiddles[2]
     __attribute__((aligned(64))) = {{(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0}, {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
@@ -251,42 +518,152 @@ static const INTERNAL_VEC imag_twiddles[2]
     __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0}, {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
-    INTERNAL_VEC tmp = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){0, 1, 4, 5});
-    *b = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){2, 3, 6, 7});
+    INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 4, 5);
+    *b = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 2, 3, 6, 7);
     *a = tmp;
 }
 
 #    elif INTERNAL_VEC_LEN == 2
-static const INTERNAL_VEC_INT permutations[1] __attribute__((aligned(64))) = {{0, 1}};
-static const INTERNAL_VEC_INT inv_permutations[1] __attribute__((aligned(64))) = {{0, 1}};
+#        define NANOFFT_PERM_ENTRIES(X) X(0, 0, 1)
+#        define NANOFFT_INV_PERM_ENTRIES(X) X(0, 0, 1)
+
 static const INTERNAL_VEC real_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)1.0, (FLOAT)1.0}};
 static const INTERNAL_VEC imag_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
-    INTERNAL_VEC tmp = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){0, 2});
-    *b = __builtin_shuffle(*a, *b, (INTERNAL_VEC_INT){1, 3});
+    INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 2);
+    *b = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 1, 3);
     *a = tmp;
 }
 #    endif
 
+/*
+ * Forward and inverse lane permutation of one stage.  The masks are literals so
+ * the compiler folds each arm into one or two shuffle instructions; a mask held
+ * in a vector variable cannot be expressed portably, because clang provides
+ * only __builtin_shufflevector.  `idx` is a loop counter below log2(len) at
+ * every call site, so the switch is a jump table with a predicted target.
+ */
 static inline void nanofft_vec_perm(INTERNAL_VEC *a, INTERNAL_VEC *b, uint32_t idx) {
-    *a = __builtin_shuffle(*a, permutations[idx]);
-    *b = __builtin_shuffle(*b, permutations[idx]);
+    switch (idx) {
+#    define NANOFFT_PERM_CASE(i, ...)                                 \
+        case i:                                                       \
+            *a = NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, *a, __VA_ARGS__); \
+            *b = NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, *b, __VA_ARGS__); \
+            return;
+        NANOFFT_PERM_ENTRIES(NANOFFT_PERM_CASE)
+#    undef NANOFFT_PERM_CASE
+        default:
+            break;
+    }
 }
 
 static inline void nanofft_vec_inv_perm(INTERNAL_VEC *a, INTERNAL_VEC *b, uint32_t idx) {
-    *a = __builtin_shuffle(*a, inv_permutations[idx]);
-    *b = __builtin_shuffle(*b, inv_permutations[idx]);
+    switch (idx) {
+#    define NANOFFT_PERM_CASE(i, ...)                                 \
+        case i:                                                       \
+            *a = NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, *a, __VA_ARGS__); \
+            *b = NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, *b, __VA_ARGS__); \
+            return;
+        NANOFFT_INV_PERM_ENTRIES(NANOFFT_PERM_CASE)
+#    undef NANOFFT_PERM_CASE
+        default:
+            break;
+    }
 }
+
+#    undef NANOFFT_PERM_ENTRIES
+#    undef NANOFFT_INV_PERM_ENTRIES
 #endif
 
 /* =========================================================================
  * Core FFT kernels
  * ========================================================================= */
 
-static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N) {
-    uint32_t shift = 0;
+/*
+ * Radix-2^L DIF pass.
+ *
+ * A pass fusing L Sande-Tukey DIF stages with initial step `step` acts on the
+ * 2^L points at i + j + m*q (q = step >> L).  Stage t (0-based) pairs m with
+ * m + 2^(L-1-t) and applies the twiddle exp(-2 pi i * 2^t * (j + m*q) / step),
+ * which is exactly what the plain stage-at-a-time loop applies.  The plan's
+ * twiddle table stores, per pass and per stage, those factors with m as the
+ * outer and j the inner index, so a fused pass streams (2^L - 1) vectors per
+ * j-block instead of reloading the buffer once per stage.
+ */
+#define NANOFFT_FUSED_PASS_BODY(L)                                                                   \
+    {                                                                                                \
+        const uint32_t q = step >> (L);                                                              \
+        uint32_t base[1 << (L)];                                                                     \
+        {                                                                                            \
+            uint32_t acc = shift;                                                                    \
+            for (uint32_t t = 0; t < (L); ++t) {                                                     \
+                base[t] = acc;                                                                       \
+                acc += step >> (t + 1);                                                              \
+            }                                                                                        \
+        }                                                                                            \
+        for (uint32_t i = 0; i < n; i += step) {                                                     \
+            for (uint32_t j = 0; j < q; j += INTERNAL_VEC_LEN) {                                     \
+                INTERNAL_VEC vr[1 << (L)], vi[1 << (L)];                                             \
+                _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                \
+                    vr[m] = LOAD_VEC(&real[i + j + m * q]);                                          \
+                    vi[m] = LOAD_VEC(&imag[i + j + m * q]);                                          \
+                }                                                                                    \
+                _Pragma("GCC unroll 4") for (uint32_t t = 0; t < (L); ++t) {                         \
+                    const uint32_t h = 1u << ((L) - 1u - t);                                         \
+                    _Pragma("GCC unroll 16") for (uint32_t lo = 0; lo < (1u << (L)); lo += 2u * h) { \
+                        _Pragma("GCC unroll 8") for (uint32_t m = 0; m < h; ++m) {                   \
+                            const uint32_t a = lo + m, b = a + h;                                    \
+                            const INTERNAL_VEC wr = LOAD_VEC(&tw_r[base[t] + m * q + j]);            \
+                            const INTERNAL_VEC wi = LOAD_VEC(&tw_i[base[t] + m * q + j]);            \
+                            const INTERNAL_VEC sr = ADD(vr[a], vr[b]);                               \
+                            const INTERNAL_VEC si = ADD(vi[a], vi[b]);                               \
+                            const INTERNAL_VEC dr = SUB(vr[a], vr[b]);                               \
+                            const INTERNAL_VEC di = SUB(vi[a], vi[b]);                               \
+                            vr[a] = sr;                                                              \
+                            vi[a] = si;                                                              \
+                            vr[b] = SUB(MUL(dr, wr), MUL(di, wi));                                   \
+                            vi[b] = ADD(MUL(dr, wi), MUL(di, wr));                                   \
+                        }                                                                            \
+                    }                                                                                \
+                }                                                                                    \
+                _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                \
+                    STORE_VEC(&real[i + j + m * q], vr[m]);                                          \
+                    STORE_VEC(&imag[i + j + m * q], vi[m]);                                          \
+                }                                                                                    \
+            }                                                                                        \
+        }                                                                                            \
+    }
 
+static inline void sande_tukey_fused_pass(FLOAT *real, FLOAT *imag, const FLOAT *tw_r, const FLOAT *tw_i, uint32_t n, uint32_t step, uint32_t shift,
+                                          int layers) {
+    switch (layers) {
+        case 1:
+            NANOFFT_FUSED_PASS_BODY(1)
+            break;
+#if NANOFFT_FFT_FUSE_BUILD >= 2
+        case 2:
+            NANOFFT_FUSED_PASS_BODY(2)
+            break;
+#endif
+#if NANOFFT_FFT_FUSE_BUILD >= 3
+        case 3:
+            NANOFFT_FUSED_PASS_BODY(3)
+            break;
+#endif
+#if NANOFFT_FFT_FUSE_BUILD >= 4
+        case 4:
+            NANOFFT_FUSED_PASS_BODY(4)
+            break;
+#endif
+        default:
+            break;
+    }
+}
+
+/* Plain stage-at-a-time DIF (fuse == 1).  Kept separate from the fused kernel
+ * so the un-fused build behaves exactly like it always did. */
+static void sande_tukey_stages(FLOAT *real_signal, FLOAT *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N, uint32_t shift) {
     for (uint32_t step = N; step > INTERNAL_VEC_LEN; step >>= 1) {
         uint32_t half_step = step >> 1;
         for (uint32_t i = 0; i < N; i += step) {
@@ -310,7 +687,99 @@ static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const F
         }
         shift += half_step;
     }
+}
 
+/* One fused pass: `layers` Sande-Tukey stages starting at `step`, with its
+ * twiddle block starting at `shift`. */
+typedef struct {
+    uint32_t step;
+    uint32_t shift;
+    uint32_t layers;
+} fuse_pass;
+
+#define NANOFFT_MAX_PASSES 32
+
+/*
+ * The single source of truth for the pass sequence: the twiddle table
+ * generator and the transform both walk this array, so they cannot disagree
+ * about the layout.
+ *
+ * `stages` splits into stages / depth full passes plus one leftover pass.  With
+ * TLS_FFT_ORDER_END the leftover comes first and the deepest fusion lands on
+ * the last (cache-resident, shortest-stride) passes; the first DIF pass streams
+ * the whole array and is bandwidth bound, so it gets the shallowest one.
+ *
+ * Every pass keeps q = step >> layers >= INTERNAL_VEC_LEN, which is what makes
+ * every (grid, depth) pair in the supported range legal: the last pass always
+ * ends with q = INTERNAL_VEC_LEN exactly.
+ */
+static uint32_t fuse_schedule(uint32_t N, uint32_t stages, uint32_t depth, int order, fuse_pass *out) {
+    uint32_t step = N, shift = 0, n = 0;
+    const uint32_t remainder = stages % depth;
+    const uint32_t full = stages / depth;
+
+    if (order == TLS_FFT_ORDER_END && remainder) {
+        out[n++] = (fuse_pass){step, shift, remainder};
+        shift += step - (step >> remainder);
+        step >>= remainder;
+    }
+
+    for (uint32_t pass = 0; pass < full; ++pass) {
+        out[n++] = (fuse_pass){step, shift, depth};
+        shift += step - (step >> depth);
+        step >>= depth;
+    }
+
+    if (order != TLS_FFT_ORDER_END && remainder) out[n++] = (fuse_pass){step, shift, remainder};
+
+    return n;
+}
+
+/* Automatic depth for one grid: the tuned entry when the build carries a
+ * table and the entry is compiled into this build, else the build default. */
+int PREFIX(depth_for)(uint32_t N) {
+#ifdef NANOFFT_DEPTH_TABLE
+    const uint32_t order = intlog2(N);
+    if (order < 32u) {
+        const int tuned = (int)NANOFFT_TUNED_DEPTH[order];
+        if (tuned >= 1 && tuned <= NANOFFT_FFT_FUSE_BUILD) return tuned;
+    }
+#else
+    (void)N;
+#endif
+    return NANOFFT_FFT_FUSE_BUILD;
+}
+
+static uint32_t fused_stages(uint32_t N) {
+    const uint32_t log_n = intlog2(N);
+    const uint32_t log_v = (INTERNAL_VEC_LEN > 1) ? intlog2((uint32_t)INTERNAL_VEC_LEN) : 0;
+    return (log_n > log_v) ? log_n - log_v : 0;
+}
+
+static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N, int fuse,
+                                 int fuse_order) {
+    const uint32_t stages = fused_stages(N);
+    const uint32_t layers = (uint32_t)fuse;
+    uint32_t tail_shift = 0;
+
+    if (layers == 1) {
+        /* The plain transform leaves the same state the intra-vector pass
+         * expects; the scalar tail below is only reachable with one lane. */
+        sande_tukey_stages(real_signal, imag_signal, real_buffer, imag_buffer, N, 0);
+        goto intra_vector;
+    }
+
+    {
+        fuse_pass passes[NANOFFT_MAX_PASSES];
+        const uint32_t npass = fuse_schedule(N, stages, layers, fuse_order, passes);
+        for (uint32_t p = 0; p < npass; ++p) {
+            sande_tukey_fused_pass(real_signal, imag_signal, real_buffer, imag_buffer, N, passes[p].step, passes[p].shift, (int)passes[p].layers);
+            tail_shift = passes[p].shift + (passes[p].step - (passes[p].step >> passes[p].layers));
+        }
+        (void)tail_shift; /* only the one-lane scalar tail below reads it */
+    }
+
+intra_vector:;
 #ifdef HAS_INTRA_VEC_PASS
     for (uint32_t i = intmax(0, (int32_t)intlog2(INTERNAL_VEC_LEN) - (int32_t)intlog2(N)); i < (uint32_t)intlog2(INTERNAL_VEC_LEN); i++) {
         for (uint32_t j = 0; j < N; j += INTERNAL_VEC_LEN * 2) {
@@ -345,9 +814,10 @@ static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const F
         }
     }
 #else
-    for (uint32_t step = intmin(INTERNAL_VEC_LEN, N); step > 1; step >>= 1) {
-        uint32_t half_step = step >> 1;
-        for (uint32_t i = 0; i < N; i += step) {
+    uint32_t shift = tail_shift;
+    for (uint32_t tail = intmin(INTERNAL_VEC_LEN, N); tail > 1; tail >>= 1) {
+        uint32_t half_step = tail >> 1;
+        for (uint32_t i = 0; i < N; i += tail) {
             for (uint32_t j = 0; j < half_step; j++) {
                 FLOAT re = real_signal[i + j], ie = imag_signal[i + j];
                 FLOAT ro = real_signal[i + j + half_step], io = imag_signal[i + j + half_step];
@@ -365,21 +835,39 @@ static void sande_tukey_in_place(FLOAT *real_signal, FLOAT *imag_signal, const F
 #endif
 }
 
-static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer) {
-    uint32_t shift = 0;
-    for (uint32_t step = N; step > 1; step >>= 1) {
-        uint32_t half_step = step >> 1;
-        for (uint32_t j = 0; j < half_step; j++) {
+/* Twiddles of one fused pass: per stage t the (m, j) grid described above. */
+static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, FLOAT *real_buffer, FLOAT *imag_buffer) {
+    const uint32_t q = step >> layers;
+    uint32_t base = shift;
+    for (uint32_t t = 0; t < layers; ++t) {
+        const uint32_t half = step >> (t + 1);
+        const uint32_t groups = half / q; /* 2^(layers-1-t) */
+        const uint32_t mult = 1u << t;
+        for (uint32_t m = 0; m < groups; ++m) {
+            for (uint32_t j = 0; j < q; ++j) {
 #if defined(DOUBLE_DOUBLE)
-            dd_t angle = dd_div(dd_make(-(double)j, 0.0), dd_make((double)step, 0.0));
+                dd_t angle = dd_div(dd_make(-(double)(mult * (j + m * q)), 0.0), dd_make((double)step, 0.0));
 #else
-            double angle = -1.0 * j / step;
+                double angle = -1.0 * (double)(mult * (j + m * q)) / (double)step;
 #endif
-            real_buffer[shift + j] = M_COS2PI(angle);
-            imag_buffer[shift + j] = NEG(M_SIN2PI(angle));
+                real_buffer[base + m * q + j] = M_COS2PI(angle);
+                imag_buffer[base + m * q + j] = NEG(M_SIN2PI(angle));
+            }
         }
-        shift += half_step;
+        base += half;
     }
+}
+
+static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, int fuse, int fuse_order) {
+    const uint32_t stages = fused_stages(N);
+    const uint32_t layers = (uint32_t)fuse;
+    fuse_pass passes[NANOFFT_MAX_PASSES];
+    const uint32_t npass = fuse_schedule(N, stages, layers, fuse_order, passes);
+
+    for (uint32_t p = 0; p < npass; ++p) generate_fused_pass(passes[p].step, passes[p].shift, passes[p].layers, real_buffer, imag_buffer);
+
+    /* The remaining stages live inside one vector and use compile-time
+     * twiddles; nothing else is read from the table. */
 }
 
 /* =========================================================================
@@ -391,34 +879,73 @@ PLAN_T *PREFIX(make_plan)(uint32_t N) {
         fprintf(stderr, "Signal length must be a power of 2\n");
         exit(EXIT_FAILURE);
     }
+    /* The intra-vector tail loads two vectors per step, so anything shorter
+     * would read past the signal.  This also keeps N * sizeof(FLOAT) a
+     * multiple of NANOFFT_ALIGN, which aligned_alloc requires. */
+    if (N < 2u * (uint32_t)INTERNAL_VEC_LEN) {
+        fprintf(stderr, "Signal length must be at least %u (2 * the vector length)\n", 2u * (uint32_t)INTERNAL_VEC_LEN);
+        exit(EXIT_FAILURE);
+    }
 
-    PLAN_T *plan = (PLAN_T *)malloc(sizeof(PLAN_T));
+    PLAN_T *plan = (PLAN_T *)nanofft_malloc(sizeof(PLAN_T));
     plan->N = N;
+    {
+        /* 0 selects the build-time default: floor(log2(VEC_LEN)) stages, one
+         * less for the float pass, 2 for double-double. */
+        const int requested = tls_tuning_fft_fuse();
+        plan->fuse = (requested == TLS_TUNING_FFT_FUSE_AUTO) ? PREFIX(depth_for)(N) : NANOFFT_EFFECTIVE_FUSE(requested);
+    }
+    plan->fuse_order = tls_tuning_fft_order();
+    plan->cobravo = tls_tuning_cobravo();
+    plan->pairs = NULL;
+    plan->npairs = 0;
+    {
+        const uint32_t order = intlog2(N);
+        int mode = tls_tuning_permute();
+        if (mode == TLS_PERMUTE_AUTO) {
+            mode = (order < PAIRS_MIN_LOG) ? TLS_PERMUTE_TABLE : ((order <= PAIRS_MAX_LOG) ? TLS_PERMUTE_PAIRS : TLS_PERMUTE_COBRAVO);
+        }
+        /* The pair table costs 4N bytes: keep a forced request from allocating
+         * it for a whole monolithic grid, and keep a forced tiled reversal away
+         * from tile widths the vectorized emitter cannot address. */
+        if (mode == TLS_PERMUTE_PAIRS && order > PAIRS_MAX_LOG + 3u) mode = TLS_PERMUTE_COBRAVO;
+        if (mode == TLS_PERMUTE_COBRAVO && order < COBRAVO_MIN_LOG) mode = TLS_PERMUTE_TABLE;
+        plan->permute = mode;
+    }
 
-    plan->twiddle_real = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
-    plan->twiddle_imag = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
-    generate_buffer(N, plan->twiddle_real, plan->twiddle_imag);
+    plan->twiddle_real = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+    plan->twiddle_imag = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+    generate_buffer(N, plan->twiddle_real, plan->twiddle_imag, plan->fuse, plan->fuse_order);
 
-    size_t cobra_size = BLOCK_WIDTH * BLOCK_WIDTH * sizeof(FLOAT);
-    plan->cobra_buffer_real = (FLOAT *)aligned_alloc(64, cobra_size);
-    plan->cobra_buffer_imag = (FLOAT *)aligned_alloc(64, cobra_size);
+    size_t cobra_size = 2u * BLOCK_ELEMS * sizeof(FLOAT);
+    plan->cobra_buffer_real = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(cobra_size));
+    plan->cobra_buffer_imag = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(cobra_size));
 
     return plan;
 }
 
 void PREFIX(destroy_plan)(PLAN_T *plan) {
     if (plan) {
-        free(plan->twiddle_real);
-        free(plan->twiddle_imag);
-        free(plan->cobra_buffer_real);
-        free(plan->cobra_buffer_imag);
-        free(plan);
+        nanofft_aligned_free(plan->twiddle_real);
+        nanofft_aligned_free(plan->twiddle_imag);
+        nanofft_aligned_free(plan->cobra_buffer_real);
+        nanofft_aligned_free(plan->cobra_buffer_imag);
+        nanofft_aligned_free(plan->pairs);
+        nanofft_aligned_free(plan);
     }
 }
 
+void PREFIX(execute_raw)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
+    sande_tukey_in_place(real_signal, imag_signal, plan->twiddle_real, plan->twiddle_imag, plan->N, plan->fuse, plan->fuse_order);
+}
+
+void PREFIX(permute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) { bit_reverse_permutation(real_signal, imag_signal, plan->N, plan); }
+
+void PREFIX(permute_1d)(PLAN_T *plan, FLOAT *values) { bit_reverse_permutation_1d(values, plan->N, plan); }
+
 void PREFIX(execute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
-    sande_tukey_in_place(real_signal, imag_signal, plan->twiddle_real, plan->twiddle_imag, plan->N);
-    bit_reverse_permutation(real_signal, imag_signal, plan->N, plan->cobra_buffer_real, plan->cobra_buffer_imag);
+    PREFIX(execute_raw)(plan, real_signal, imag_signal);
+    PREFIX(permute)(plan, real_signal, imag_signal);
 }
 
 /* =========================================================================
@@ -440,33 +967,70 @@ __attribute__((weak)) FALLBACK_PLAN_T *FALLBACK_PREFIX(make_plan)(uint32_t N) {
 
 __attribute__((weak)) void FALLBACK_PREFIX(destroy_plan)(FALLBACK_PLAN_T *plan) { PREFIX(destroy_plan)((PLAN_T *)plan); }
 
-__attribute__((weak)) void FALLBACK_PREFIX(execute)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
+__attribute__((weak)) void FALLBACK_PREFIX(execute_raw)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
     static bool warned = false;
     if (!warned) {
         fprintf(stderr,
                 "[nanofft warning] %s is missing. Falling back to %s. "
                 "Expect severe performance degradation due to array casting!\n",
-                STR(FALLBACK_PREFIX(execute)), STR(PREFIX(execute)));
+                STR(FALLBACK_PREFIX(execute_raw)), STR(PREFIX(execute_raw)));
         warned = true;
     }
 
     uint32_t N = ((PLAN_T *)plan)->N;
 
-    FLOAT *temp_r = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
-    FLOAT *temp_i = (FLOAT *)aligned_alloc(64, N * sizeof(FLOAT));
+    FLOAT *temp_r = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+    FLOAT *temp_i = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
 
     for (uint32_t i = 0; i < N; ++i) {
         temp_r[i] = FROM_FALLBACK(real[i]);
         temp_i[i] = FROM_FALLBACK(imag[i]);
     }
 
-    PREFIX(execute)((PLAN_T *)plan, temp_r, temp_i);
+    PREFIX(execute_raw)((PLAN_T *)plan, temp_r, temp_i);
 
     for (uint32_t i = 0; i < N; ++i) {
         real[i] = TO_FALLBACK(temp_r[i]);
         imag[i] = TO_FALLBACK(temp_i[i]);
     }
 
-    free(temp_r);
-    free(temp_i);
+    nanofft_aligned_free(temp_r);
+    nanofft_aligned_free(temp_i);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(execute)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
+    FALLBACK_PREFIX(execute_raw)(plan, real, imag);
+    FALLBACK_PREFIX(permute)(plan, real, imag);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(permute)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *real, FALLBACK_FLOAT *imag) {
+    uint32_t N = ((PLAN_T *)plan)->N;
+    FLOAT *temp_r = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+    FLOAT *temp_i = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+
+    for (uint32_t i = 0; i < N; ++i) {
+        temp_r[i] = FROM_FALLBACK(real[i]);
+        temp_i[i] = FROM_FALLBACK(imag[i]);
+    }
+
+    PREFIX(permute)((PLAN_T *)plan, temp_r, temp_i);
+
+    for (uint32_t i = 0; i < N; ++i) {
+        real[i] = TO_FALLBACK(temp_r[i]);
+        imag[i] = TO_FALLBACK(temp_i[i]);
+    }
+
+    nanofft_aligned_free(temp_r);
+    nanofft_aligned_free(temp_i);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(permute_1d)(FALLBACK_PLAN_T *plan, FALLBACK_FLOAT *values) {
+    uint32_t N = ((PLAN_T *)plan)->N;
+    FLOAT *temp = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+
+    for (uint32_t i = 0; i < N; ++i) temp[i] = FROM_FALLBACK(values[i]);
+    PREFIX(permute_1d)((PLAN_T *)plan, temp);
+    for (uint32_t i = 0; i < N; ++i) values[i] = TO_FALLBACK(temp[i]);
+
+    nanofft_aligned_free(temp);
 }

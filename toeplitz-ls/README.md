@@ -8,13 +8,13 @@ library built by the parent project.
 From the repository root, build either shared-library variant:
 
 ```sh
-make lib-generic
+make generic
 ```
 
 or:
 
 ```sh
-make lib-native
+make native
 ```
 
 Both targets build `lib/tls.so` and copy the same shared object into this
@@ -25,8 +25,8 @@ cd toeplitz-ls
 pip install .
 ```
 
-NumPy is required. The double-double wrapper imports `mpmath` only when `tlsdd`
-is used; install it with:
+NumPy >= 1.17.3 is required. The double-double wrapper imports `mpmath` only
+when `tlsdd` is used; install mpmath >= 1.0 with:
 
 ```sh
 pip install ".[tlsdd]"
@@ -48,34 +48,42 @@ frequency_ihs, power_ihs = ihs.autopower(t, y, normalization="nll")
 For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
 `autopower()` accept `normalization=`:
 
-- `"standard"` (default) - coefficient of determination `R^2`.
+- `"standard"` (default) - coefficient of determination `R^2` of the full
+  model. Values at or above 1 are numerical artefacts of an ill-conditioned
+  solve and are reported as 0.
 - `"anova"` - ANOVA / `F` statistic, following Schwarzenberg-Czerny's convention.
 - `"nll"` - natural-log negative log false-alarm probability, `-ln(FAP)`;
-  the exact Pochhammer/incomplete-beta statistic for FastChi2.
-- `"regularized"` - Laplace-regularized Cybenko statistic, matching
-  ihsnpeaks' `bayes` (Relative Evidence Ratio). For `nterms > 1` it requires
-  a Toeplitz solver (`levinson`, `zohar`, or `bareiss`).
+  the direct Pochhammer/incomplete-beta statistic with its finite-sample
+  correction. `Neff = (sum w)^2 / sum(w^2)` with `w = 1/dy^2`.
 
 The `cond` array returned with `autonan=False` is the condition upper bound
-`(2*nterms + 1) * P`, where `P` is Cybenko's reflection-coefficient product;
-`"regularized"` uses `P`, not the bound. See the parent README for the
-formulas.
+`(2*nterms + 1) * P`, where `P` is Cybenko's reflection-coefficient product.
 
-The IHS modules (`ihsf`, `ihs`, `ihsdd`) are a simpler alternative that uses
-one NuFFT per harmonic and no linear solve. They expose the same `power()` /
-`autopower()` shape but support only:
+The IHS modules (`ihsf`, `ihs`, `ihsdd`) are a simplified formulation of a
+similar periodogram. They assume that the harmonic frequencies are independent
+(a regression from the standard least-squares periodogram) but not orthogonal,
+use one NuFFT per harmonic and no linear solve, and expose the same `power()` /
+`autopower()` shape. They are usually slightly less accurate than FastChi2, but
+at least 3x less computationally expensive. They support only:
 
-- `"standard"` (default) - sum of the uncorrelated per-harmonic `R^2`
-  contributions.
-- `"nll"` - the IHS negative log false-alarm probability, using Wilkie's
-  finite-sample correction on each harmonic followed by the Erlang
-  logarithmic correction.
+- `"raw"` - a direct display statistic from the normalized per-harmonic
+  Rayleigh powers. It is not a calibrated false-alarm probability, and for
+  `nterms > 1` it is not a bounded `R^2`; it may exceed 1.
+- `"nll"` - the IHS negative log false-alarm probability. Each harmonic's
+  Rayleigh power gets Wilkie's (1983) finite-sample correction, then the
+  harmonic sum gets the Erlang correction. `Neff = (sum |wy|)^2 / sum(wy^2)`,
+  where `wy = w * (y - ymean)`. Use this for reliable significance estimates.
+- `"default"` (the default) - the initial formula and Erlang correction without
+  the finite-sample Wilkie correction. It still gives NLL estimates, just less
+  accurately.
 
 They do not accept `solver=` or `autonan=` and do not return a condition
-array. Under uniformly sampled observation times their statistical efficiency
-is approximately `2/pi` of the full chi-square periodogram.
+array. IHS is not suitable when `nterms^4 > Neff`, where `Neff` is the
+raw-weight effective sample size; the wrappers emit a `RuntimeWarning` in that
+case.
 
-The shared library is loaded with `ctypes.CDLL`, so CPython releases the GIL
-during the C calls. Independent `power()` or `autopower()` calls can therefore
-run concurrently from a `concurrent.futures.ThreadPoolExecutor` while the
-native calculation is executing.
+The shared library is written almost exclusively in C and loaded with
+`ctypes.CDLL`, so independent `power()`/`autopower()` calls release the GIL and
+can run in parallel from a `concurrent.futures.ThreadPoolExecutor`.
+Multithreading is expected to give major performance gains even on regular
+CPython; for optimum performance, use a free-threaded build (PEP 703).

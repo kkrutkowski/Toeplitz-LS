@@ -1,0 +1,43 @@
+# Ruff configuration for the Python half of the library.
+#
+# Kept close to .clang-format on purpose: the same 160-column budget, 4-space
+# indentation and double quotes, so a function reads the same whichever
+# language it is written in.
+line-length = 160
+target-version = "py38"
+
+extend-exclude = [
+    ".toolchains",
+    ".xwin-cache",
+    ".build",
+    "dist",
+    "examples",
+    "paper_repro",
+    "probes",
+    "**/__pycache__",
+]
+
+# Vendored code and scratch areas are never reformatted: the astropy
+# implementations under examples/ belong to astropy, and paper_repro/,
+# probes/, build/ and dist/ are generated or deliberately left alone.
+
+[format]
+# ruff indents with 4 spaces (its only style), matching IndentWidth: 4.
+quote-style = "double"
+line-ending = "lf"
+docstring-code-format = true
+
+[lint]
+# Pyflakes + import order + the syntax errors the C side would catch anyway.
+select = ["E4", "E7", "E9", "F", "I"]
+# The formatter owns line length; E501 would fight it.
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# The tests put the package directory on sys.path before importing it, which is
+# the point of the file; E402 would fight that.
+"toeplitz-ls/tests/*" = ["E402"]
+
+[lint.isort]
+# Matches the .clang-format include categories: stdlib, third party, local.
+known-first-party = ["toeplitz_ls", "dispatch"]

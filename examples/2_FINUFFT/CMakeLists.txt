@@ -56,17 +56,17 @@ target_compile_definitions(tls_utils PRIVATE MAX_TWIDDLE_REUSE=${TLS_MAX_TWIDDLE
 target_include_directories(tls_utils PRIVATE ../../include)
 
 # Variant 1: DOUBLE_DOUBLE (-D DOUBLE_DOUBLE)
-add_library(tlsdd_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c)
+add_library(tlsdd_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c ${TLS_SRC_DIR}/tuning.c)
 target_compile_definitions(tlsdd_nufft1 PRIVATE DOUBLE_DOUBLE)
 target_include_directories(tlsdd_nufft1 PRIVATE ../../include)
 
 # Variant 2: DOUBLE (-D DOUBLE)
-add_library(tls_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c)
+add_library(tls_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c ${TLS_SRC_DIR}/tuning.c)
 target_compile_definitions(tls_nufft1 PRIVATE DOUBLE)
 target_include_directories(tls_nufft1 PRIVATE ../../include)
 
 # Variant 3: FLOAT (No custom definitions)
-add_library(tlsf_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c)
+add_library(tlsf_nufft1 OBJECT ${TLS_SRC_DIR}/nanofft.c ${TLS_SRC_DIR}/nufft1.c ${TLS_SRC_DIR}/tuning.c)
 target_include_directories(tlsf_nufft1 PRIVATE ../../include)
 
 # Native scaling generators. These mirror the root Makefile flow: build one
