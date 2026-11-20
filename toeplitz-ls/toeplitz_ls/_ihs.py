@@ -55,6 +55,7 @@ from ._fastchi2 import (
     _prepare_numpy_inputs,
     _raise_status,
     _require_mpmath,
+    _spreading_id,
 )
 
 _IHS_NORMALIZATIONS = {
@@ -103,13 +104,15 @@ class ihsf:
     """Single-precision IHS periodogram wrapper."""
 
     @staticmethod
-    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default", spreading="auto"):
         """Return the IHS power on the grid ``f0 + df * arange(Nf)``.
 
         ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
+        ``spreading`` accepts ``'auto'`` (default), ``'minmax'``, or ``'piecewise'``.
         """
         normalization = _check_ihs_normalization(normalization)
         backend = _backend_id(backend)
+        spreading = _spreading_id(spreading)
         min_Nf = 32 if backend == _BACKENDS["lra"] else 16
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float32)
@@ -117,7 +120,7 @@ class ihsf:
         _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float32)
 
-        status = _load_library().tlsf_ihs(
+        status = _load_library().tlsf_ihs_spread(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -128,18 +131,21 @@ class ihsf:
             nterms,
             backend,
             normalization,
+            spreading,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         )
-        _raise_status("tlsf_ihs", status)
+        _raise_status("tlsf_ihs_spread", status)
         return out
 
     @staticmethod
-    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43", spreading="auto"):
         """Return automatic IHS frequency and power arrays.
 
         ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
+        ``spreading`` accepts ``'auto'`` (default), ``'minmax'``, or ``'piecewise'``.
         """
         nterms = _check_int("nterms", nterms, 1)
+        _spreading_id(spreading)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -154,6 +160,7 @@ class ihsf:
             dy_arr,
             backend=backend,
             normalization=normalization,
+            spreading=spreading,
             nterms=nterms,
         )
         return frequency, result
@@ -163,13 +170,15 @@ class ihs:
     """Double-precision IHS periodogram wrapper."""
 
     @staticmethod
-    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default", spreading="auto"):
         """Return the IHS power on the grid ``f0 + df * arange(Nf)``.
 
         ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
+        ``spreading`` accepts ``'auto'`` (default), ``'minmax'``, or ``'piecewise'``.
         """
         normalization = _check_ihs_normalization(normalization)
         backend = _backend_id(backend)
+        spreading = _spreading_id(spreading)
         min_Nf = 32 if backend == _BACKENDS["lra"] else 8
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
@@ -177,7 +186,7 @@ class ihs:
         _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float64)
 
-        status = _load_library().tls_ihs(
+        status = _load_library().tls_ihs_spread(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -188,18 +197,21 @@ class ihs:
             nterms,
             backend,
             normalization,
+            spreading,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
         )
-        _raise_status("tls_ihs", status)
+        _raise_status("tls_ihs_spread", status)
         return out
 
     @staticmethod
-    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43", spreading="auto"):
         """Return automatic double-precision IHS frequency and power arrays.
 
         ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
+        ``spreading`` accepts ``'auto'`` (default), ``'minmax'``, or ``'piecewise'``.
         """
         nterms = _check_int("nterms", nterms, 1)
+        _spreading_id(spreading)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -214,6 +226,7 @@ class ihs:
             dy_arr,
             backend=backend,
             normalization=normalization,
+            spreading=spreading,
             nterms=nterms,
         )
         return frequency, result
@@ -223,13 +236,15 @@ class ihsdd:
     """Double-double IHS periodogram wrapper returning ``mpmath`` values."""
 
     @staticmethod
-    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default"):
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default", spreading="auto"):
         """Return high-precision IHS power.
 
         ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
+        ``spreading`` accepts ``'auto'`` (default) or ``'minmax'``.
         """
         mp = _require_mpmath()
         normalization = _check_ihs_normalization(normalization)
+        spreading = _spreading_id(spreading, allow_piecewise=False)
         Nf = _check_int("Nf", Nf, 1)
         nterms = _check_int("nterms", nterms, 1)
         df_mpf = mp.mpf(df)
@@ -263,7 +278,7 @@ class ihsdd:
         dy_dd = _as_dd_array(dy_mpf)
         out = (DD * Nf)()
 
-        status = _load_library().tlsdd_ihs(
+        status = _load_library().tlsdd_ihs_spread(
             t_dd,
             y_dd,
             dy_dd,
@@ -274,19 +289,22 @@ class ihsdd:
             nterms,
             backend,
             normalization,
+            spreading,
             out,
         )
-        _raise_status("tlsdd_ihs", status)
+        _raise_status("tlsdd_ihs_spread", status)
         return [_dd_to_mpf(out[i]) for i in range(Nf)]
 
     @staticmethod
-    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43"):
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43", spreading="auto"):
         """Return automatic high-precision IHS frequency and power lists.
 
         ``normalization`` accepts ``'raw'``, ``'nll'``, or ``'default'``.
+        ``spreading`` accepts ``'auto'`` (default) or ``'minmax'``.
         """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)
+        _spreading_id(spreading, allow_piecewise=False)
         t_mpf = _as_mpf_list(x, "x")
         y_mpf = _as_mpf_list(y, "y")
         if dy is None:
@@ -314,6 +332,7 @@ class ihsdd:
             dy_mpf,
             backend=backend,
             normalization=normalization,
+            spreading=spreading,
             nterms=nterms,
         )
         return frequency, result

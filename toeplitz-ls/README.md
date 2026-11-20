@@ -50,7 +50,7 @@ For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
 
 - `"standard"` (default) - coefficient of determination `R^2` of the full
   model. Values at or above 1 are numerical artefacts of an ill-conditioned
-  solve and are reported as 0.
+  solve and are reported as NaN.
 - `"anova"` - ANOVA / `F` statistic, following Schwarzenberg-Czerny's convention.
 - `"nll"` - natural-log negative log false-alarm probability, `-ln(FAP)`;
   the direct Pochhammer/incomplete-beta statistic with its finite-sample
@@ -58,6 +58,11 @@ For the FastChi2 modules (`tlsf`, `tls`, `tlsdd`), `power()` and
 
 The `cond` array returned with `autonan=False` is the condition upper bound
 `(2*nterms + 1) * P`, where `P` is Cybenko's reflection-coefficient product.
+
+For the PSWF backends (`"pswf43"`, `"pswf21"`), `power()` and `autopower()`
+also accept `spreading=`: `"auto"` (default, selects from the calibrated cost
+model), `"minmax"` (precomputed minmax-polynomial weights), or `"piecewise"`
+(vectorized on-the-fly piecewise polynomials; single and double precision only).
 
 The IHS modules (`ihsf`, `ihs`, `ihsdd`) are a simplified formulation of a
 similar periodogram. They assume that the harmonic frequencies are independent

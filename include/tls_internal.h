@@ -30,6 +30,7 @@ enum {
  * TLS_*_nufft_pswf_slots_available() reports.
  */
 #define TLS_INTERNAL_PSWF_DECL(prefix, type, plan_type)                                                                                                     \
+    TLS_API plan_type *prefix##_nufft_pswf_initialize_mode(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode);   \
     TLS_API void prefix##_nufft_pswf_execute_mode(plan_type *plan, const type *y_real, const type *y_imag, type *out_real, type *out_imag, int freq_factor, \
                                                   int mode);                                                                                                \
     TLS_API int prefix##_nufft_pswf_slots_available(plan_type *plan);                                                                                       \
@@ -40,6 +41,9 @@ TLS_INTERNAL_PSWF_DECL(tls, double, tls_nufft_pswf_plan)
 TLS_INTERNAL_PSWF_DECL(tlsdd, dd_t, tlsdd_nufft_pswf_plan)
 
 #undef TLS_INTERNAL_PSWF_DECL
+
+TLS_API int tlsf_nufft_pswf_bench_ppoly_gen(int w, const char upsamp[2], int reps);
+TLS_API int tls_nufft_pswf_bench_ppoly_gen(int w, const char upsamp[2], int reps);
 
 /* chi2per reports the size of the work arrays it allocated (benchmark stats). */
 TLS_API void tls_tuning_report_work_bytes(unsigned long long bytes);

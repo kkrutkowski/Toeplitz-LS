@@ -12,6 +12,17 @@ enum { TLS_UTIL_OK = 0, TLS_UTIL_ERR_ARGUMENT = -1, TLS_UTIL_ERR_ALLOC = -3 };
 
 TLS_API double tls_approximate_cost(int N, int M, int block, int degree, double alpha, double beta, double gamma, int backend);
 TLS_API int tls_optimize_plan_size(int N, int M, int degree, double alpha, double beta, double gamma, int backend);
+
+typedef struct {
+    int block;
+    int spread_mode;
+    double cost;
+} tls_pswf_plan_choice;
+
+TLS_API double tls_approximate_pswf_cost(int N, int M, int block, int degree, int is_ihs, int backend, double alpha, double beta, double gamma, double pre_m,
+                                         double const_cost);
+TLS_API tls_pswf_plan_choice tls_optimize_pswf_plan(int N, int M, int degree, int is_ihs, int backend, double alpha, double gamma, double beta_mm,
+                                                    double pre_mm, double beta_pp, double pre_pp, double ppoly_const, int forced_spread_mode);
 TLS_API int tls_pswf43_plan_len_from_base(int base_len);
 TLS_API int tls_pswf43_output_len_for_plan(int plan_len);
 TLS_API int tls_twiddle_ladder_levels(int N, int block);

@@ -228,14 +228,17 @@ def _peak_capacity(num_samples: int, num_peaks) -> int:
 
 
 def get_peaks(freq, power, cond=None, threshold=0, num_peaks=25, *, x=None, nterms=None) -> Peaks:
-    """Return strict local maxima refined by quadratic interpolation.
+    """Return local maxima refined by quadratic interpolation (or plateau midpoints).
 
-    A sample at index ``i`` is considered a peak when all three neighboring
-    power samples are finite, ``power[i] > power[i - 1]``,
-    ``power[i] > power[i + 1]``, and ``power[i] > threshold``. NaN samples
-    are ignored for peak detection. The returned peaks are sorted by
-    interpolated power in descending order. By default only the strongest
-    25 peaks are returned; pass ``num_peaks=None`` to return all peaks.
+    A strict single-sample peak at index ``i`` (finite neighbors,
+    ``power[i] > power[i - 1]``, ``power[i] > power[i + 1]``, and
+    ``power[i] > threshold``) is refined with a 3-point quadratic fit. A
+    flat-topped plateau of equal finite values ``power[l] == ... == power[r]``
+    bounded by strictly lower finite neighbors and above ``threshold`` is
+    reported once at the midpoint frequency ``0.5 * (freq[l] + freq[r])``. NaN
+    samples are ignored for peak detection. The returned peaks are sorted by
+    power in descending order. By default only the strongest 25 peaks are
+    returned; pass ``num_peaks=None`` to return all peaks.
     """
 
     freq_decimals = _infer_freq_decimals(freq, x=x, nterms=nterms)

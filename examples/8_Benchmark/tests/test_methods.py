@@ -126,6 +126,18 @@ class ComparisonMethodTests(unittest.TestCase):
             ((1 << 24) - 1) // 220,
         )
 
+    def test_make_frequency_grid_explicit_fmin(self):
+        grid = make_frequency_grid(self.t, fmin=0.3, fmax=0.65, oversampling=5, nterms=2)
+        self.assertGreaterEqual(grid.f0, 0.3)
+        self.assertLess(grid.f0 - grid.df, 0.3)
+        self.assertLessEqual(float(grid.frequency[-1]), 0.65)
+
+        short_t = np.linspace(0.0, 0.05, 16)
+        short_grid = make_frequency_grid(short_t, fmin=0.5, fmax=5.0, oversampling=5, nterms=3)
+        self.assertGreaterEqual(short_grid.f0, 0.5)
+        self.assertLess(short_grid.f0 - short_grid.df, 0.5)
+        self.assertLessEqual(float(short_grid.frequency[-1]), 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()

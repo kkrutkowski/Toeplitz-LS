@@ -89,6 +89,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define NUFFT_LRA_EXEC tls_nufft_lra_execute
 #        define NUFFT_LRA_FREE tls_nufft_free_lra_plan
 #        define NUFFT_PSWF_INIT tls_nufft_pswf_initialize
+#        define NUFFT_PSWF_INIT_MODE tls_nufft_pswf_initialize_mode
 #        define NUFFT_PSWF_PRE tls_nufft_pswf_precompute
 #        define NUFFT_PSWF_EXEC tls_nufft_pswf_execute
 #        define NUFFT_PSWF_FREE tls_nufft_free_pswf_plan
@@ -109,6 +110,14 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF21_GAMMA D_PSWF21_GAMMA
 #        define CHI2_PSWF43_BETA D_PSWF43_BETA
 #        define CHI2_PSWF43_GAMMA D_PSWF43_GAMMA
+#        define CHI2_PSWF21_PRE D_PSWF21_PRE
+#        define CHI2_PSWF21_PPOLY_BETA D_PSWF21_PPOLY_BETA
+#        define CHI2_PSWF21_PPOLY_PRE D_PSWF21_PPOLY_PRE
+#        define CHI2_PSWF21_PPOLY_CONST D_PSWF21_PPOLY_CONST
+#        define CHI2_PSWF43_PRE D_PSWF43_PRE
+#        define CHI2_PSWF43_PPOLY_BETA D_PSWF43_PPOLY_BETA
+#        define CHI2_PSWF43_PPOLY_PRE D_PSWF43_PPOLY_PRE
+#        define CHI2_PSWF43_PPOLY_CONST D_PSWF43_PPOLY_CONST
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 1e13
 #        define COND_SINGULARITY_THRESHOLD_ZOHAR 1e13
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 1e13
@@ -121,6 +130,7 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define NUFFT_LRA_EXEC tlsf_nufft_lra_execute
 #        define NUFFT_LRA_FREE tlsf_nufft_free_lra_plan
 #        define NUFFT_PSWF_INIT tlsf_nufft_pswf_initialize
+#        define NUFFT_PSWF_INIT_MODE tlsf_nufft_pswf_initialize_mode
 #        define NUFFT_PSWF_PRE tlsf_nufft_pswf_precompute
 #        define NUFFT_PSWF_EXEC tlsf_nufft_pswf_execute
 #        define NUFFT_PSWF_FREE tlsf_nufft_free_pswf_plan
@@ -141,6 +151,14 @@ static inline NUFFT_INPUT_T time_to_nufft_input(TIME_INPUT_T x) { return x; }
 #        define CHI2_PSWF21_GAMMA F_PSWF21_GAMMA
 #        define CHI2_PSWF43_BETA F_PSWF43_BETA
 #        define CHI2_PSWF43_GAMMA F_PSWF43_GAMMA
+#        define CHI2_PSWF21_PRE F_PSWF21_PRE
+#        define CHI2_PSWF21_PPOLY_BETA F_PSWF21_PPOLY_BETA
+#        define CHI2_PSWF21_PPOLY_PRE F_PSWF21_PPOLY_PRE
+#        define CHI2_PSWF21_PPOLY_CONST F_PSWF21_PPOLY_CONST
+#        define CHI2_PSWF43_PRE F_PSWF43_PRE
+#        define CHI2_PSWF43_PPOLY_BETA F_PSWF43_PPOLY_BETA
+#        define CHI2_PSWF43_PPOLY_PRE F_PSWF43_PPOLY_PRE
+#        define CHI2_PSWF43_PPOLY_CONST F_PSWF43_PPOLY_CONST
 #        define COND_SINGULARITY_THRESHOLD_LEVINSON 5e5
 #        define COND_SINGULARITY_THRESHOLD_ZOHAR 5e5
 #        define COND_SINGULARITY_THRESHOLD_BAREISS 5e5
@@ -210,6 +228,16 @@ static inline int condition_bound_is_invalid(FLOAT bound) {
 #endif
 }
 
+static inline int power_is_nan(FLOAT value) {
+#if defined(DOUBLE_DOUBLE)
+    return double_is_nan_bits(value.hi) || double_is_nan_bits(value.lo);
+#elif defined(DOUBLE)
+    return double_is_nan_bits(value);
+#else
+    return float_is_nan_bits(value);
+#endif
+}
+
 static inline int double_is_finite_bits(double value) {
     union {
         double f;
@@ -224,6 +252,16 @@ static inline NANOFFT_UNUSED int float_is_finite_bits(float value) {
         uint32_t u;
     } bits = {value};
     return (bits.u & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+
+static inline int power_is_finite(FLOAT value) {
+#if defined(DOUBLE_DOUBLE)
+    return double_is_finite_bits(value.hi) && double_is_finite_bits(value.lo);
+#elif defined(DOUBLE)
+    return double_is_finite_bits(value);
+#else
+    return float_is_finite_bits(value);
+#endif
 }
 
 typedef struct {
@@ -390,13 +428,16 @@ static inline dd_t compute_bayes_laplace_dd(dd_t delta) {
 
 static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
                                           FLOAT b) {
-    /* Invalid explained chi^2: non-positive, NaN/Inf, or at/above the total.
-     * Report exactly zero so that such a bin cannot win the peak search. */
-    const double dot_d = TO_DOUBLE(dot);
-    const double ref_d = TO_DOUBLE(chi2_ref);
-    if (!(dot_d > 0.0) || !(dot_d < ref_d)) return FCAST(0.0);
+    /* Non-finite explained chi^2 or R^2 >= 1 is a numerical artefact of an
+     * unstable solve: report NaN so it cannot be mistaken for zero power.
+     * Finite non-positive values (e.g. near-zero rounding) report 0. */
+    if (!double_is_finite_bits(dot.hi) || !double_is_finite_bits(dot.lo)) return chi2_nan();
+    if (dot.hi > chi2_ref.hi || (dot.hi == chi2_ref.hi && dot.lo >= chi2_ref.lo)) return chi2_nan();
+    if (dot.hi < 0.0 || (dot.hi == 0.0 && dot.lo <= 0.0)) return FCAST(0.0);
+    dd_t r2 = DIV(dot, chi2_ref);
+    if (!double_is_finite_bits(r2.hi) || !double_is_finite_bits(r2.lo) || r2.hi >= 1.0) return chi2_nan();
     if (normalization == TLS_NORM_STANDARD) {
-        return DIV(dot, chi2_ref);
+        return r2;
     } else if (normalization == TLS_NORM_ANOVA) {
         double d1 = 2.0 * (double)degree + 1.0;
         double d2 = (double)M - 1.0 - d1;
@@ -404,10 +445,8 @@ static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condi
         if (residual.hi <= 1e-32) residual = dd_make(1e-32, 0.0);
         return dd_div(dd_mul(dd_make(d2, 0.0), dot), dd_mul(dd_make(d1, 0.0), residual));
     } else if (normalization == TLS_NORM_NLL) {
-        dd_t r2 = DIV(dot, chi2_ref);
         return nll_exact_pochhammer_dd(degree, r2, b);
     } else { /* TLS_NORM_REGULARIZED */
-        dd_t r2 = DIV(dot, chi2_ref);
         dd_t nll_r2 = nll_exact_pochhammer_dd(degree, r2, b);
         /* condition_bound is (2 * degree + 1) * P; NLL uses the product P. */
         dd_t kappa = dd_div(condition_bound, dd_make((double)(2 * degree + 1), 0.0));
@@ -501,13 +540,15 @@ static inline double compute_bayes_laplace_d(double delta) {
 
 static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
                                           FLOAT b) {
-    /* Invalid explained chi^2: non-positive, NaN/Inf, or at/above the total.
-     * Report exactly zero so that such a bin cannot win the peak search. */
-    const double dot_d = TO_DOUBLE(dot);
-    const double ref_d = TO_DOUBLE(chi2_ref);
-    if (!(dot_d > 0.0) || !(dot_d < ref_d)) return FCAST(0.0);
+    /* Non-finite explained chi^2 or R^2 >= 1 is a numerical artefact of an
+     * unstable solve: report NaN so it cannot be mistaken for zero power.
+     * Finite non-positive values (e.g. near-zero rounding) report 0. */
+    if (!double_is_finite_bits(dot) || dot >= chi2_ref) return chi2_nan();
+    if (dot <= 0.0) return FCAST(0.0);
+    double r2 = dot / chi2_ref;
+    if (!double_is_finite_bits(r2) || r2 >= 1.0) return chi2_nan();
     if (normalization == TLS_NORM_STANDARD) {
-        return dot / chi2_ref;
+        return r2;
     } else if (normalization == TLS_NORM_ANOVA) {
         double d1 = 2.0 * (double)degree + 1.0;
         double d2 = (double)M - 1.0 - d1;
@@ -515,10 +556,8 @@ static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condi
         if (residual < 1e-32) residual = 1e-32;
         return (d2 * dot) / (d1 * residual);
     } else if (normalization == TLS_NORM_NLL) {
-        double r2 = dot / chi2_ref;
         return nll_exact_pochhammer_scalar_d(degree, r2, b);
     } else { /* TLS_NORM_REGULARIZED */
-        double r2 = dot / chi2_ref;
         double nll_r2 = nll_exact_pochhammer_scalar_d(degree, r2, b);
         /* condition_bound is (2 * degree + 1) * P; NLL uses the product P. */
         double kappa = condition_bound / (double)(2 * degree + 1);
@@ -615,13 +654,15 @@ static inline float compute_bayes_laplace_f(float delta) {
 
 static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condition_bound, int normalization, int degree, int M, const cybenko_model_t *cyb,
                                           FLOAT b) {
-    /* Invalid explained chi^2: non-positive, NaN/Inf, or at/above the total.
-     * Report exactly zero so that such a bin cannot win the peak search. */
-    const double dot_d = TO_DOUBLE(dot);
-    const double ref_d = TO_DOUBLE(chi2_ref);
-    if (!(dot_d > 0.0) || !(dot_d < ref_d)) return FCAST(0.0);
+    /* Non-finite explained chi^2 or R^2 >= 1 is a numerical artefact of an
+     * unstable solve: report NaN so it cannot be mistaken for zero power.
+     * Finite non-positive values (e.g. near-zero rounding) report 0. */
+    if (!float_is_finite_bits(dot) || dot >= chi2_ref) return chi2_nan();
+    if (dot <= 0.0f) return FCAST(0.0);
+    float r2 = dot / chi2_ref;
+    if (!float_is_finite_bits(r2) || r2 >= 1.0f) return chi2_nan();
     if (normalization == TLS_NORM_STANDARD) {
-        return dot / chi2_ref;
+        return r2;
     } else if (normalization == TLS_NORM_ANOVA) {
         float d1 = 2.0f * (float)degree + 1.0f;
         float d2 = (float)M - 1.0f - d1;
@@ -629,10 +670,8 @@ static inline FLOAT normalize_power_entry(FLOAT dot, FLOAT chi2_ref, FLOAT condi
         if (residual < 1e-32f) residual = 1e-32f;
         return (d2 * dot) / (d1 * residual);
     } else if (normalization == TLS_NORM_NLL) {
-        float r2 = dot / chi2_ref;
         return nll_exact_pochhammer_scalar_f(degree, r2, b);
     } else { /* TLS_NORM_REGULARIZED */
-        float r2 = dot / chi2_ref;
         float nll_r2 = nll_exact_pochhammer_scalar_f(degree, r2, b);
         /* condition_bound is (2 * degree + 1) * P; NLL uses the product P. */
         float kappa = condition_bound / (float)(2 * degree + 1);
@@ -1124,6 +1163,7 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
      * for standard/anova/nll on the common autonan=True path.
      */
     const bool need_cond = (normalization == TLS_NORM_REGULARIZED) || (cond != NULL);
+    int nan_count = 0;
 
     for (int idx = 0; idx < N; ++idx) {
         FLOAT S = Sw[(size_t)N + idx];
@@ -1202,9 +1242,10 @@ static int gls_impl(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FL
             if (cond) cond[idx] = condition_bound;
         }
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, 1, M, cyb, b);
+        if (!cond && power_is_nan(power[idx])) ++nan_count;
     }
 
-    return CHI2PER_OK;
+    return cond ? CHI2PER_OK : nan_count;
 }
 
 #if defined(DOUBLE_DOUBLE)
@@ -1254,6 +1295,7 @@ static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLO
         FLOAT dot = FCAST(0.0);
         for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
+        if (!cond && power_is_nan(power[idx])) ++nan_count;
     }
 
     nanofft_aligned_free(XTX);
@@ -1313,6 +1355,7 @@ static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOA
         FLOAT dot = FCAST(0.0);
         for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
+        if (!cond && power_is_nan(power[idx])) ++nan_count;
     }
 
     nanofft_aligned_free(XTX);
@@ -1464,6 +1507,7 @@ static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *S
 
         FLOAT dot = Xr[0];
         power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
+        if (!cond && power_is_nan(power[idx])) ++nan_count;
     }
 
     nanofft_aligned_free(Rr);
@@ -1618,6 +1662,7 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
                 dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
             }
             power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            if (!cond && power_is_nan(power[idx])) ++nan_count;
         }
     }
 
@@ -1694,6 +1739,7 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
                 dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
             }
             power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            if (!cond && power_is_nan(power[idx])) ++nan_count;
         }
     }
 
@@ -1822,6 +1868,7 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
             FLOAT dot = Xr[0][lane];
 #    endif
             power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            if (!cond && power_is_nan(power[idx])) ++nan_count;
         }
     }
 
@@ -1829,10 +1876,14 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
 }
 #endif
 
-int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
-                          int normalization, FLOAT *power, FLOAT *cond) {
+int CHI2_PREFIX(fastchi2_spread)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend,
+                                 int solver, int normalization, int spreading, FLOAT *power, FLOAT *cond) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
     if (normalization < TLS_NORM_STANDARD || normalization > TLS_NORM_REGULARIZED) return CHI2PER_ERR_ARGUMENT;
+    if (spreading < TLS_SPREAD_AUTO || spreading > TLS_SPREAD_PIECEWISE) return CHI2PER_ERR_ARGUMENT;
+#if defined(DOUBLE_DOUBLE)
+    if (spreading == TLS_SPREAD_PIECEWISE) return CHI2PER_ERR_ARGUMENT;
+#endif
     if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
     if (degree != 1 && solver != CHI2PER_SOLVER_LEVINSON && solver != CHI2PER_SOLVER_ZOHAR && solver != CHI2PER_SOLVER_BAREISS &&
         solver != CHI2PER_SOLVER_LDLT && solver != CHI2PER_SOLVER_SVD)
@@ -1842,6 +1893,24 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
 
     bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
     bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
+    int plan_block;
+#if !defined(DOUBLE_DOUBLE)
+    int spread_mode = TLS_SPREAD_MINMAX;
+    if (use_pswf) {
+        double beta_mm = use_pswf43 ? CHI2_PSWF43_BETA : CHI2_PSWF21_BETA;
+        double gamma = use_pswf43 ? CHI2_PSWF43_GAMMA : CHI2_PSWF21_GAMMA;
+        double pre_mm = use_pswf43 ? CHI2_PSWF43_PRE : CHI2_PSWF21_PRE;
+        double beta_pp = use_pswf43 ? CHI2_PSWF43_PPOLY_BETA : CHI2_PSWF21_PPOLY_BETA;
+        double pre_pp = use_pswf43 ? CHI2_PSWF43_PPOLY_PRE : CHI2_PSWF21_PPOLY_PRE;
+        double ppoly_const = use_pswf43 ? CHI2_PSWF43_PPOLY_CONST : CHI2_PSWF21_PPOLY_CONST;
+        tls_pswf_plan_choice choice =
+            tls_optimize_pswf_plan(N, M, degree, 0, backend, CHI2_ALPHA, gamma, beta_mm, pre_mm, beta_pp, pre_pp, ppoly_const, spreading);
+        plan_block = choice.block;
+        spread_mode = choice.spread_mode;
+    } else {
+        plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, CHI2_LRA_BETA, CHI2_LRA_GAMMA, backend);
+    }
+#else
     double beta = CHI2_LRA_BETA;
     double gamma = CHI2_LRA_GAMMA;
     if (use_pswf43) {
@@ -1851,7 +1920,8 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         beta = CHI2_PSWF21_BETA;
         gamma = CHI2_PSWF21_GAMMA;
     }
-    int plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
+    plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
+#endif
     if (use_pswf43) plan_block = tls_pswf43_plan_len_from_base(plan_block);
     int block = use_pswf43 ? tls_pswf43_output_len_for_plan(plan_block) : plan_block;
     int ladder_levels = tls_twiddle_ladder_levels(N, block);
@@ -1919,14 +1989,22 @@ int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     }
 
     if (backend == CHI2PER_BACKEND_PSWF43) {
+#if !defined(DOUBLE_DOUBLE)
+        plan = NUFFT_PSWF_INIT_MODE(M, plan_block, NUFFT_W43, df, max_factor, "43", spread_mode);
+#else
         plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W43, df, max_factor, "43");
+#endif
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
         }
         NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
     } else if (backend == CHI2PER_BACKEND_PSWF21) {
+#if !defined(DOUBLE_DOUBLE)
+        plan = NUFFT_PSWF_INIT_MODE(M, plan_block, NUFFT_W21, df, max_factor, "21", spread_mode);
+#else
         plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W21, df, max_factor, "21");
+#endif
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
@@ -2054,15 +2132,47 @@ cleanup:
     return status;
 }
 
-int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
-                     FLOAT *power) {
+int CHI2_PREFIX(fastchi2)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                          int normalization, FLOAT *power, FLOAT *cond) {
+#if defined(DOUBLE_DOUBLE)
+    int spreading = TLS_SPREAD_MINMAX;
+#else
+    int spreading = tls_tuning_spread();
+#endif
+    return CHI2_PREFIX(fastchi2_spread)(t, y, dy, M, f0, df, N, degree, backend, solver, normalization, spreading, power, cond);
+}
+
+int CHI2_PREFIX(ihs_spread)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend,
+                            int normalization, int spreading, FLOAT *power) {
     if (!t || !y || !dy || !power || M <= 0 || N <= 0 || degree <= 0 || f0 < 0.0 || df <= 0.0) return CHI2PER_ERR_ARGUMENT;
     if (normalization != TLS_NORM_STANDARD && normalization != TLS_NORM_NLL && normalization != TLS_NORM_IHS_DEFAULT) return CHI2PER_ERR_ARGUMENT;
+    if (spreading < TLS_SPREAD_AUTO || spreading > TLS_SPREAD_PIECEWISE) return CHI2PER_ERR_ARGUMENT;
+#if defined(DOUBLE_DOUBLE)
+    if (spreading == TLS_SPREAD_PIECEWISE) return CHI2PER_ERR_ARGUMENT;
+#endif
     if (backend != CHI2PER_BACKEND_PSWF43 && backend != CHI2PER_BACKEND_PSWF21 && backend != CHI2PER_BACKEND_LRA) return CHI2PER_ERR_BACKEND;
     if (M < 2 * degree + 2) return CHI2PER_ERR_DEGENERATE;
 
     bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
     bool use_pswf43 = (backend == CHI2PER_BACKEND_PSWF43);
+    int plan_block;
+#if !defined(DOUBLE_DOUBLE)
+    int spread_mode = TLS_SPREAD_MINMAX;
+    if (use_pswf) {
+        double beta_mm = use_pswf43 ? CHI2_PSWF43_BETA : CHI2_PSWF21_BETA;
+        double gamma = use_pswf43 ? CHI2_PSWF43_GAMMA : CHI2_PSWF21_GAMMA;
+        double pre_mm = use_pswf43 ? CHI2_PSWF43_PRE : CHI2_PSWF21_PRE;
+        double beta_pp = use_pswf43 ? CHI2_PSWF43_PPOLY_BETA : CHI2_PSWF21_PPOLY_BETA;
+        double pre_pp = use_pswf43 ? CHI2_PSWF43_PPOLY_PRE : CHI2_PSWF21_PPOLY_PRE;
+        double ppoly_const = use_pswf43 ? CHI2_PSWF43_PPOLY_CONST : CHI2_PSWF21_PPOLY_CONST;
+        tls_pswf_plan_choice choice =
+            tls_optimize_pswf_plan(N, M, degree, 1, backend, CHI2_ALPHA, gamma, beta_mm, pre_mm, beta_pp, pre_pp, ppoly_const, spreading);
+        plan_block = choice.block;
+        spread_mode = choice.spread_mode;
+    } else {
+        plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, CHI2_LRA_BETA, CHI2_LRA_GAMMA, backend);
+    }
+#else
     double beta = CHI2_LRA_BETA;
     double gamma = CHI2_LRA_GAMMA;
     if (use_pswf43) {
@@ -2072,7 +2182,8 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
         beta = CHI2_PSWF21_BETA;
         gamma = CHI2_PSWF21_GAMMA;
     }
-    int plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
+    plan_block = tls_optimize_plan_size(N, M, degree, CHI2_ALPHA, beta, gamma, backend);
+#endif
     if (use_pswf43) plan_block = tls_pswf43_plan_len_from_base(plan_block);
     int block = use_pswf43 ? tls_pswf43_output_len_for_plan(plan_block) : plan_block;
     int ladder_levels = tls_twiddle_ladder_levels(N, block);
@@ -2152,14 +2263,22 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
     if (!double_is_finite_bits(TO_DOUBLE(nll_scale)) || TO_DOUBLE(nll_scale) < 0.0) nll_scale = FCAST(0.0);
 
     if (backend == CHI2PER_BACKEND_PSWF43) {
+#if !defined(DOUBLE_DOUBLE)
+        plan = NUFFT_PSWF_INIT_MODE(M, plan_block, NUFFT_W43, df, degree, "43", spread_mode);
+#else
         plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W43, df, degree, "43");
+#endif
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
         }
         NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
     } else if (backend == CHI2PER_BACKEND_PSWF21) {
+#if !defined(DOUBLE_DOUBLE)
+        plan = NUFFT_PSWF_INIT_MODE(M, plan_block, NUFFT_W21, df, degree, "21", spread_mode);
+#else
         plan = NUFFT_PSWF_INIT(M, plan_block, NUFFT_W21, df, degree, "21");
+#endif
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
@@ -2193,7 +2312,7 @@ int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int
                 power[idx] = MUL(power[idx], standard_scale);
                 /* nterms == 1 is a true R^2.  nterms > 1 is a sum of
                  * per-harmonic contributions and may legitimately exceed 1. */
-                if (degree == 1 && !(TO_DOUBLE(power[idx]) < 1.0)) power[idx] = FCAST(0.0);
+                if (degree == 1 && (!power_is_finite(power[idx]) || TO_DOUBLE(power[idx]) >= 1.0)) power[idx] = chi2_nan();
             }
         } else {
             for (int idx = 0; idx < N; ++idx) {
@@ -2216,4 +2335,14 @@ cleanup:
     nanofft_aligned_free(out_i);
     block_ladder_free(&ladder);
     return status;
+}
+
+int CHI2_PREFIX(ihs)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                     FLOAT *power) {
+#if defined(DOUBLE_DOUBLE)
+    int spreading = TLS_SPREAD_MINMAX;
+#else
+    int spreading = tls_tuning_spread();
+#endif
+    return CHI2_PREFIX(ihs_spread)(t, y, dy, M, f0, df, N, degree, backend, normalization, spreading, power);
 }

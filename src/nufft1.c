@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tls.h>
 #include <tls_internal.h>
+#include <tls_tuning.h>
 
 /* =========================================================================
  * Common Helpers
@@ -741,6 +743,12 @@ struct PFX(pswf_plan) {
     FLOAT alpha;
     int num_factors;
     double df;
+    int use_ppoly;
+    int ppoly_nc;
+    int ppoly_stride;
+    FLOAT *ppoly_coeffs;
+    int *spread_first_idx;
+    FLOAT *spread_z;
     int *spread_base_idx;
     FLOAT *spread_weight;
     FLOAT *deconv, *shift_r, *shift_i;
@@ -859,7 +867,531 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
 #endif
 }
 
-struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2]) {
+#if !defined(DOUBLE_DOUBLE)
+
+enum { PSWF_PROL_MAX_M = 160, PSWF_PPOLY_MAX_NC = 16 };
+
+static inline double PFX(hypot2_safe)(double a, double b) {
+    double aa = fabs(a);
+    double bb = fabs(b);
+    if (aa < bb) {
+        double tmp = aa;
+        aa = bb;
+        bb = tmp;
+    }
+    if (aa == 0.0) return 0.0;
+    double r = bb / aa;
+    return aa * sqrt(1.0 + r * r);
+}
+
+/* Implicit-shift QL for eigenvalues of a symmetric tridiagonal matrix
+ * (diag d[0..m-1], subdiag e[0..m-2] with e[m-1] = 0). */
+static bool PFX(prol_tql1)(int m, double *d, double *e) {
+    e[m - 1] = 0.0;
+    for (int l = 0; l < m; ++l) {
+        int iter = 0;
+        for (;;) {
+            int k = l;
+            while (k < m - 1) {
+                double dd = fabs(d[k]) + fabs(d[k + 1]);
+                if (fabs(e[k]) <= DBL_EPSILON * dd) break;
+                ++k;
+            }
+            if (k == l) break;
+            if (++iter > 40) return false;
+
+            double g = (d[l + 1] - d[l]) / (2.0 * e[l]);
+            double r = PFX(hypot2_safe)(g, 1.0);
+            double shift = (g >= 0.0) ? (g + r) : (g - r);
+            g = d[k] - d[l] + e[l] / shift;
+
+            double s = 1.0;
+            double c = 1.0;
+            double p = 0.0;
+            int broken = 0;
+            for (int i = k - 1; i >= l; --i) {
+                double f = s * e[i];
+                double b = c * e[i];
+                r = PFX(hypot2_safe)(f, g);
+                e[i + 1] = r;
+                if (r == 0.0) {
+                    d[i + 1] -= p;
+                    e[k] = 0.0;
+                    broken = 1;
+                    break;
+                }
+                s = f / r;
+                c = g / r;
+                g = d[i + 1] - p;
+                r = (d[i] - g) * s + 2.0 * c * b;
+                p = s * r;
+                d[i + 1] = g + p;
+                g = c * r - b;
+            }
+            if (!broken) {
+                d[l] -= p;
+                e[l] = g;
+                e[k] = 0.0;
+            }
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    int n_terms;
+    double leg_c[PSWF_PROL_MAX_M];
+    double rec_a[PSWF_PROL_MAX_M];
+    double rec_b[PSWF_PROL_MAX_M];
+    double rec_c[PSWF_PROL_MAX_M];
+    double inv_val0;
+} PFX(pswf_leg_data);
+
+/* Exact Legendre-basis eigensolver for the zeroth prolate spheroidal wave
+ * function psi_0^c(x) on [-1, 1], normalized so psi_0^c(0) = 1. */
+static bool PFX(pswf_leg_init)(PFX(pswf_leg_data) * out, double c) {
+    static const int ns[20] = {48, 64, 80, 92, 106, 120, 130, 144, 156, 168, 178, 190, 202, 214, 224, 236, 248, 258, 268, 280};
+    int n_full;
+    if (c < 200.0) {
+        int idx = (int)(c / 10.0);
+        if (idx < 0) idx = 0;
+        if (idx > 19) idx = 19;
+        n_full = ns[idx];
+    } else {
+        n_full = (int)(c * 1.5);
+    }
+    int m = (n_full + 1) / 2;
+    if (m < 24) m = 24;
+    if (m > PSWF_PROL_MAX_M) m = PSWF_PROL_MAX_M;
+
+    double diag[PSWF_PROL_MAX_M];
+    double off[PSWF_PROL_MAX_M];
+    double d_work[PSWF_PROL_MAX_M];
+    double e_work[PSWF_PROL_MAX_M];
+
+    double c2 = c * c;
+    double max_entry = 0.0;
+    for (int i = 0; i < m; ++i) {
+        double k = 2.0 * (double)i;
+        double beta0 = (i == 0) ? (1.0 / 3.0) : (((k + 1.0) * (k + 1.0) / (2.0 * k + 3.0) + k * k / (2.0 * k - 1.0)) / (2.0 * k + 1.0));
+        diag[i] = k * (k + 1.0) + c2 * beta0;
+        if (fabs(diag[i]) > max_entry) max_entry = fabs(diag[i]);
+        if (i < m - 1) {
+            double gamma0 = (k + 1.0) * (k + 2.0) / ((2.0 * k + 1.0) * (2.0 * k + 3.0));
+            double scale = sqrt((k + 0.5) / (k + 2.5));
+            off[i] = c2 * gamma0 * scale;
+            if (fabs(off[i]) > max_entry) max_entry = fabs(off[i]);
+        } else {
+            off[i] = 0.0;
+        }
+        d_work[i] = diag[i];
+        e_work[i] = off[i];
+    }
+
+    if (!PFX(prol_tql1)(m, d_work, e_work)) return false;
+
+    double lambda = d_work[0];
+    for (int i = 1; i < m; ++i) {
+        if (d_work[i] < lambda) lambda = d_work[i];
+    }
+
+    /* Tridiagonal LU with partial pivoting on (T - lambda * I) for inverse iteration. */
+    double u0[PSWF_PROL_MAX_M];
+    double u1[PSWF_PROL_MAX_M];
+    double u2[PSWF_PROL_MAX_M];
+    double lfac[PSWF_PROL_MAX_M];
+    unsigned char swap_row[PSWF_PROL_MAX_M];
+
+    double sub_next = (m > 1) ? off[0] : 0.0;
+    double cur0 = diag[0] - lambda;
+    double cur1 = (m > 1) ? off[0] : 0.0;
+    double piv_floor = (max_entry > 0.0 ? max_entry : 1.0) * 1e-30;
+
+    for (int i = 0; i < m - 1; ++i) {
+        double next0 = diag[i + 1] - lambda;
+        double next1 = (i + 2 < m) ? off[i + 1] : 0.0;
+        if (fabs(sub_next) > fabs(cur0)) {
+            swap_row[i] = 1;
+            u0[i] = sub_next;
+            u1[i] = next0;
+            u2[i] = next1;
+            double fac = cur0 / u0[i];
+            lfac[i] = fac;
+            cur0 = cur1 - fac * u1[i];
+            cur1 = -fac * u2[i];
+        } else {
+            swap_row[i] = 0;
+            if (fabs(cur0) < piv_floor) cur0 = (cur0 >= 0.0) ? piv_floor : -piv_floor;
+            u0[i] = cur0;
+            u1[i] = cur1;
+            u2[i] = 0.0;
+            double fac = sub_next / u0[i];
+            lfac[i] = fac;
+            cur0 = next0 - fac * u1[i];
+            cur1 = next1;
+        }
+        sub_next = (i + 2 < m) ? off[i + 1] : 0.0;
+    }
+    if (fabs(cur0) < piv_floor) cur0 = (cur0 >= 0.0) ? piv_floor : -piv_floor;
+    u0[m - 1] = cur0;
+    u1[m - 1] = 0.0;
+    u2[m - 1] = 0.0;
+    swap_row[m - 1] = 0;
+    lfac[m - 1] = 0.0;
+
+    double vec[PSWF_PROL_MAX_M];
+    for (int i = 0; i < m; ++i) vec[i] = 1.0 / (double)(i + 1);
+
+    for (int it = 0; it < 4; ++it) {
+        for (int i = 0; i < m - 1; ++i) {
+            if (swap_row[i]) {
+                double tmp = vec[i];
+                vec[i] = vec[i + 1];
+                vec[i + 1] = tmp;
+            }
+            vec[i + 1] -= lfac[i] * vec[i];
+        }
+        vec[m - 1] /= u0[m - 1];
+        if (m >= 2) vec[m - 2] = (vec[m - 2] - u1[m - 2] * vec[m - 1]) / u0[m - 2];
+        for (int i = m - 3; i >= 0; --i) vec[i] = (vec[i] - u1[i] * vec[i + 1] - u2[i] * vec[i + 2]) / u0[i];
+
+        double norm2 = 0.0;
+        for (int i = 0; i < m; ++i) norm2 += vec[i] * vec[i];
+        if (!(norm2 > 0.0)) return false;
+        double inv_norm = 1.0 / sqrt(norm2);
+        for (int i = 0; i < m; ++i) vec[i] *= inv_norm;
+    }
+
+    double max_c = 0.0;
+    for (int i = 0; i < m; ++i) {
+        out->leg_c[i] = vec[i] * sqrt(2.0 * (double)i + 0.5);
+        double ac = fabs(out->leg_c[i]);
+        if (ac > max_c) max_c = ac;
+    }
+    if (!(max_c > 0.0)) return false;
+
+    int n_terms = m;
+    double trim_tol = max_c * 1e-16;
+    while (n_terms > 1 && fabs(out->leg_c[n_terms - 1]) <= trim_tol) --n_terms;
+    out->n_terms = n_terms;
+
+    /* 2-step even-Legendre recurrence coefficients for P_{2(i+1)}(x) from P_{2i}, P_{2(i-1)}. */
+    for (int i = 1; i < n_terms - 1; ++i) {
+        double n = 2.0 * (double)i;
+        double denom_a = (n + 2.0) * (n + 1.0);
+        double denom_bc = denom_a * (2.0 * n - 1.0);
+        out->rec_a[i] = (2.0 * n + 3.0) * (2.0 * n + 1.0) / denom_a;
+        out->rec_b[i] = -(2.0 * n + 1.0) * (2.0 * n * n + 2.0 * n - 1.0) / denom_bc;
+        out->rec_c[i] = -n * (n - 1.0) * (2.0 * n + 3.0) / denom_bc;
+    }
+
+    out->inv_val0 = 1.0;
+    double val0 = out->leg_c[0];
+    if (n_terms > 1) {
+        double p_prev = 1.0;
+        double p_curr = -0.5;
+        val0 += out->leg_c[1] * p_curr;
+        for (int i = 1; i < n_terms - 1; ++i) {
+            double p_next = out->rec_b[i] * p_curr + out->rec_c[i] * p_prev;
+            val0 += out->leg_c[i + 1] * p_next;
+            p_prev = p_curr;
+            p_curr = p_next;
+        }
+    }
+    if (fabs(val0) < 1e-30) return false;
+    out->inv_val0 = 1.0 / val0;
+    return true;
+}
+
+static inline double PFX(pswf_leg_eval)(const PFX(pswf_leg_data) * data, double x) {
+    double x2 = x * x;
+    double sum = data->leg_c[0];
+    if (data->n_terms > 1) {
+        double p_prev = 1.0;
+        double p_curr = 1.5 * x2 - 0.5;
+        sum += data->leg_c[1] * p_curr;
+        for (int i = 1; i < data->n_terms - 1; ++i) {
+            double p_next = (data->rec_a[i] * x2 + data->rec_b[i]) * p_curr + data->rec_c[i] * p_prev;
+            sum += data->leg_c[i + 1] * p_next;
+            p_prev = p_curr;
+            p_curr = p_next;
+        }
+    }
+    return sum * data->inv_val0;
+}
+
+/* Build transposed piecewise-polynomial coefficients on [-1, 1] for w equal
+ * panels via Type-1 Chebyshev interpolation of exact Legendre psi_0^c.
+ * Output layout: coeffs[k * stride + j] with k=0 highest power, k=nc-1 const,
+ * nc always even in [4, PSWF_PPOLY_MAX_NC], tail lanes [w..stride-1] zeroed. */
+static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stride, FLOAT **out_coeffs) {
+    if (w < 1 || w > PSWF_MAX_W) return false;
+
+    double c = NANOFFT_PI * (double)w * (mode43 ? 0.625 : 0.75) - 0.05;
+    PFX(pswf_leg_data) leg;
+    if (!PFX(pswf_leg_init)(&leg, c)) return false;
+
+    int nc_fit = w + 3;
+    if (nc_fit > PSWF_PPOLY_MAX_NC) nc_fit = PSWF_PPOLY_MAX_NC;
+    if (nc_fit < 4) nc_fit = 4;
+
+    double nodes[PSWF_PPOLY_MAX_NC];
+    for (int k = 0; k < nc_fit; ++k) {
+        nodes[k] = cos(NANOFFT_PI * (double)(2 * k + 1) / (double)(2 * nc_fit));
+    }
+
+    int half_w = (w + 1) / 2;
+    double panel_mono[PSWF_MAX_W][PSWF_PPOLY_MAX_NC];
+#    if defined(DOUBLE)
+    const double tol = 1e-15;
+#    else
+    const double tol = 1e-7;
+#    endif
+    const double cutoff = tol * 0.05;
+    int nc_needed = 4;
+
+    double inv_w = 1.0 / (double)w;
+    for (int j = 0; j < half_w; ++j) {
+        double shift = (double)(2 * j + 1 - w);
+        double dd[PSWF_PPOLY_MAX_NC];
+        for (int k = 0; k < nc_fit; ++k) {
+            double z = (nodes[k] + shift) * inv_w;
+            dd[k] = PFX(pswf_leg_eval)(&leg, z);
+        }
+        /* Newton divided differences in place. */
+        for (int step = 1; step < nc_fit; ++step) {
+            for (int k = nc_fit - 1; k >= step; --k) {
+                dd[k] = (dd[k] - dd[k - 1]) / (nodes[k] - nodes[k - step]);
+            }
+        }
+        /* Convert Newton form to ascending monomial coefficients mono[0..nc_fit-1]. */
+        double mono[PSWF_PPOLY_MAX_NC];
+        for (int k = 0; k < nc_fit; ++k) mono[k] = 0.0;
+        mono[0] = dd[nc_fit - 1];
+        for (int step = nc_fit - 2; step >= 0; --step) {
+            double xk = nodes[step];
+            for (int k = nc_fit - 1; k >= 1; --k) mono[k] = mono[k - 1] - xk * mono[k];
+            mono[0] = dd[step] - xk * mono[0];
+        }
+
+        int deg_j = nc_fit - 1;
+        while (deg_j >= 4 && fabs(mono[deg_j]) < cutoff) --deg_j;
+        if (deg_j + 1 > nc_needed) nc_needed = deg_j + 1;
+
+        for (int k = 0; k < nc_fit; ++k) panel_mono[j][k] = mono[k];
+        int mirror = w - 1 - j;
+        if (mirror != j) {
+            for (int k = 0; k < nc_fit; ++k) panel_mono[mirror][k] = (k & 1) ? -mono[k] : mono[k];
+        }
+    }
+
+    /* Keep nc even so the symmetric Horner split (k_odd / k_even) is branch-free. */
+    int nc = nc_needed;
+    if (nc & 1) ++nc;
+    if (nc > PSWF_PPOLY_MAX_NC) nc = PSWF_PPOLY_MAX_NC;
+
+    int stride = PFX(round_up_int)(w, INTERNAL_VEC_LEN);
+    FLOAT *coeffs = NULL;
+    if (out_coeffs) {
+        coeffs = PFX(allocate_aligned)((size_t)nc * (size_t)stride);
+        if (!coeffs) return false;
+        memset(coeffs, 0, (size_t)nc * (size_t)stride * sizeof(FLOAT));
+        for (int k = 0; k < nc; ++k) {
+            int power = (nc - 1) - k;
+            for (int j = 0; j < w; ++j) {
+                double val = (power < nc_fit) ? panel_mono[j][power] : 0.0;
+                coeffs[(size_t)k * (size_t)stride + (size_t)j] = FCAST(val);
+            }
+        }
+        *out_coeffs = coeffs;
+    }
+    *out_nc = nc;
+    *out_stride = stride;
+    return true;
+}
+
+static inline FLOAT PFX(ppoly_eval_scalar)(FLOAT z, int w, int nc, int stride, const FLOAT *coeffs) {
+    double zd = (double)z;
+    if (zd < -1.0) zd = -1.0;
+    if (zd > 1.0) zd = 1.0;
+    double s = 0.5 * (double)w * (zd + 1.0);
+    int j = (int)floor(s);
+    if (j < 0) j = 0;
+    if (j >= w) j = w - 1;
+    FLOAT u = FCAST((double)w * zd - (double)(2 * j + 1 - w));
+    FLOAT val = coeffs[j];
+    for (int k = 1; k < nc; ++k) val = M_FMA(val, u, coeffs[(size_t)k * (size_t)stride + (size_t)j]);
+    return val;
+}
+
+int PFX(pswf_bench_ppoly_gen)(int w, const char upsamp[2], int reps) {
+    if (!upsamp || reps <= 0) return -1;
+    bool mode21 = (upsamp[0] == '2' && upsamp[1] == '1');
+    bool mode43 = (upsamp[0] == '4' && upsamp[1] == '3');
+    if (!mode21 && !mode43) return -1;
+    int nc = 0;
+    int stride = 0;
+    for (int r = 0; r < reps; ++r) {
+        FLOAT *coeffs = NULL;
+        if (!PFX(pswf_build_ppoly)(w, mode43, &nc, &stride, &coeffs)) return -1;
+        nanofft_aligned_free(coeffs);
+    }
+    return nc;
+}
+
+static inline INTERNAL_VEC PFX(load_vec_u)(const FLOAT *p) {
+    INTERNAL_VEC v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline void PFX(store_vec_u)(FLOAT *p, INTERNAL_VEC v) { memcpy(p, &v, sizeof(v)); }
+
+static inline INTERNAL_VEC PFX(rev_vec)(INTERNAL_VEC v) {
+#    if INTERNAL_VEC_LEN == 2
+    return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 1, 0);
+#    elif INTERNAL_VEC_LEN == 4
+    return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 3, 2, 1, 0);
+#    elif INTERNAL_VEC_LEN == 8
+    return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 7, 6, 5, 4, 3, 2, 1, 0);
+#    elif INTERNAL_VEC_LEN == 16
+    return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+#    else
+    INTERNAL_VEC out;
+    for (int i = 0; i < INTERNAL_VEC_LEN; ++i) out[i] = v[INTERNAL_VEC_LEN - 1 - i];
+    return out;
+#    endif
+}
+
+static inline void PFX(scatter_vec_u)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NANOFFT_RESTRICT fi, int idx, INTERNAL_VEC v_sy_r, INTERNAL_VEC v_sy_i,
+                                      INTERNAL_VEC kval) {
+    INTERNAL_VEC gr = PFX(load_vec_u)(&fr[idx]);
+    INTERNAL_VEC gi = PFX(load_vec_u)(&fi[idx]);
+    PFX(store_vec_u)(&fr[idx], ADD(gr, MUL(v_sy_r, kval)));
+    PFX(store_vec_u)(&fi[idx], ADD(gi, MUL(v_sy_i, kval)));
+}
+
+/* Vectorized symmetric even/odd Horner evaluation fused directly with grid
+ * scatter-add (no stack scratch buffer, no partial-overlap store-forwarding
+ * stalls, no wasted padded-tail RMWs).  Requires nc even >= 2. */
+static inline void PFX(ppoly_spread_point)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NANOFFT_RESTRICT fi, const FLOAT *NANOFFT_RESTRICT coeffs, int first, FLOAT u,
+                                           FLOAT sy_r, FLOAT sy_i, int w, int nc, int stride) {
+    const INTERNAL_VEC v_u = (INTERNAL_VEC){} + u;
+    const INTERNAL_VEC v_u2 = MUL(v_u, v_u);
+    const INTERNAL_VEC v_sy_r = (INTERNAL_VEC){} + sy_r;
+    const INTERNAL_VEC v_sy_i = (INTERNAL_VEC){} + sy_i;
+    const int V = INTERNAL_VEC_LEN;
+
+    if (w <= V) {
+        INTERNAL_VEC k_odd = LOAD_VEC(&coeffs[0]);
+        INTERNAL_VEC k_even = LOAD_VEC(&coeffs[stride]);
+        for (int k = 2; k < nc; k += 2) {
+            k_odd = ADD(MUL(k_odd, v_u2), LOAD_VEC(&coeffs[(size_t)k * (size_t)stride]));
+            k_even = ADD(MUL(k_even, v_u2), LOAD_VEC(&coeffs[(size_t)(k + 1) * (size_t)stride]));
+        }
+        PFX(scatter_vec_u)(fr, fi, first, v_sy_r, v_sy_i, ADD(k_even, MUL(v_u, k_odd)));
+        return;
+    }
+
+    const int n_sym = (w / 2) / V;
+    const int mid = n_sym * V;
+    const int rem = w - 2 * mid;
+
+    for (int ii = 0; ii < mid; ii += V) {
+        INTERNAL_VEC k_odd = LOAD_VEC(&coeffs[ii]);
+        INTERNAL_VEC k_even = LOAD_VEC(&coeffs[(size_t)stride + (size_t)ii]);
+        for (int k = 2; k < nc; k += 2) {
+            k_odd = ADD(MUL(k_odd, v_u2), LOAD_VEC(&coeffs[(size_t)k * (size_t)stride + (size_t)ii]));
+            k_even = ADD(MUL(k_even, v_u2), LOAD_VEC(&coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)ii]));
+        }
+        INTERNAL_VEC u_odd = MUL(v_u, k_odd);
+        PFX(scatter_vec_u)(fr, fi, first + ii, v_sy_r, v_sy_i, ADD(k_even, u_odd));
+        PFX(scatter_vec_u)(fr, fi, first + (w - ii - V), v_sy_r, v_sy_i, PFX(rev_vec)(SUB(k_even, u_odd)));
+    }
+
+    if (rem == 0) return;
+
+    if (rem == 1) {
+        FLOAT u2 = MUL(u, u);
+        FLOAT ke = coeffs[(size_t)stride + (size_t)mid];
+        for (int k = 3; k < nc; k += 2) ke = ADD(MUL(ke, u2), coeffs[(size_t)k * (size_t)stride + (size_t)mid]);
+        fr[first + mid] = ADD(fr[first + mid], MUL(sy_r, ke));
+        fi[first + mid] = ADD(fi[first + mid], MUL(sy_i, ke));
+        return;
+    }
+
+    if (rem == 2) {
+        FLOAT u2 = MUL(u, u);
+        FLOAT ko = coeffs[mid];
+        FLOAT ke = coeffs[(size_t)stride + (size_t)mid];
+        for (int k = 2; k < nc; k += 2) {
+            ko = ADD(MUL(ko, u2), coeffs[(size_t)k * (size_t)stride + (size_t)mid]);
+            ke = ADD(MUL(ke, u2), coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)mid]);
+        }
+        FLOAT uo = MUL(u, ko);
+        FLOAT kl = ADD(ke, uo);
+        FLOAT kr = SUB(ke, uo);
+        fr[first + mid] = ADD(fr[first + mid], MUL(sy_r, kl));
+        fi[first + mid] = ADD(fi[first + mid], MUL(sy_i, kl));
+        fr[first + mid + 1] = ADD(fr[first + mid + 1], MUL(sy_r, kr));
+        fi[first + mid + 1] = ADD(fi[first + mid + 1], MUL(sy_i, kr));
+        return;
+    }
+
+    if (rem >= V) {
+        INTERNAL_VEC k_odd = LOAD_VEC(&coeffs[mid]);
+        INTERNAL_VEC k_even = LOAD_VEC(&coeffs[(size_t)stride + (size_t)mid]);
+        for (int k = 2; k < nc; k += 2) {
+            k_odd = ADD(MUL(k_odd, v_u2), LOAD_VEC(&coeffs[(size_t)k * (size_t)stride + (size_t)mid]));
+            k_even = ADD(MUL(k_even, v_u2), LOAD_VEC(&coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)mid]));
+        }
+        INTERNAL_VEC u_odd = MUL(v_u, k_odd);
+        PFX(scatter_vec_u)(fr, fi, first + mid, v_sy_r, v_sy_i, ADD(k_even, u_odd));
+        if (rem > V) {
+            INTERNAL_VEC v_sym = SUB(k_even, u_odd);
+            int tail = rem - V;
+            for (int t = 0; t < tail; ++t) {
+                FLOAT kt = v_sym[t];
+                int idx = first + w - mid - 1 - t;
+                fr[idx] = ADD(fr[idx], MUL(sy_r, kt));
+                fi[idx] = ADD(fi[idx], MUL(sy_i, kt));
+            }
+        }
+        return;
+    }
+
+    /* Fallback for rare 2 < rem < V (e.g., non-standard odd/small w). */
+    FLOAT u2 = MUL(u, u);
+    for (int j = 0; j < rem / 2; ++j) {
+        int col = mid + j;
+        FLOAT ko = coeffs[col];
+        FLOAT ke = coeffs[(size_t)stride + (size_t)col];
+        for (int k = 2; k < nc; k += 2) {
+            ko = ADD(MUL(ko, u2), coeffs[(size_t)k * (size_t)stride + (size_t)col]);
+            ke = ADD(MUL(ke, u2), coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)col]);
+        }
+        FLOAT uo = MUL(u, ko);
+        FLOAT kl = ADD(ke, uo);
+        FLOAT kr = SUB(ke, uo);
+        int idx_l = first + col;
+        int idx_r = first + w - 1 - col;
+        fr[idx_l] = ADD(fr[idx_l], MUL(sy_r, kl));
+        fi[idx_l] = ADD(fi[idx_l], MUL(sy_i, kl));
+        fr[idx_r] = ADD(fr[idx_r], MUL(sy_r, kr));
+        fi[idx_r] = ADD(fi[idx_r], MUL(sy_i, kr));
+    }
+    if (rem & 1) {
+        int col = mid + rem / 2;
+        FLOAT ke = coeffs[(size_t)stride + (size_t)col];
+        for (int k = 3; k < nc; k += 2) ke = ADD(MUL(ke, u2), coeffs[(size_t)k * (size_t)stride + (size_t)col]);
+        fr[first + col] = ADD(fr[first + col], MUL(sy_r, ke));
+        fi[first + col] = ADD(fi[first + col], MUL(sy_i, ke));
+    }
+}
+
+#endif /* !defined(DOUBLE_DOUBLE) */
+
+struct PFX(pswf_plan) * PFX(pswf_initialize_mode)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode) {
     if (!upsamp) return NULL;
 
     bool mode21 = (upsamp[0] == '2' && upsamp[1] == '1');
@@ -880,17 +1412,35 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     plan->num_factors = freq_factor;
     plan->df = df;
     plan->Nfft = next_fast_len(2 * N);
-    plan->spread_stride = PFX(round_up_int)(plan->w + INTERNAL_VEC_LEN - 1, INTERNAL_VEC_LEN);
-    plan->spread_pad = plan->spread_stride;
-    plan->fft_alloc_len = plan->Nfft + plan->spread_pad;
     plan->alpha = DIV(MUL(FCAST(plan->w), FCONST(0.5)), FCAST(plan->Nfft));
 
-    plan->spread_base_idx = (int *)nanofft_malloc((size_t)Mpoints * freq_factor * sizeof(int));
-    plan->spread_weight = PFX(allocate_aligned)((size_t)Mpoints * plan->spread_stride * freq_factor);
+#if !defined(DOUBLE_DOUBLE)
+    if (spread_mode == TLS_SPREAD_PIECEWISE) {
+        if (PFX(pswf_build_ppoly)(w, mode43, &plan->ppoly_nc, &plan->ppoly_stride, &plan->ppoly_coeffs)) {
+            plan->use_ppoly = 1;
+        }
+    }
+#else
+    (void)spread_mode;
+#endif
+
+    if (plan->use_ppoly) {
+        plan->spread_stride = plan->ppoly_stride;
+        plan->spread_pad = plan->ppoly_stride;
+        plan->fft_alloc_len = plan->Nfft + plan->spread_pad;
+        plan->spread_first_idx = (int *)nanofft_malloc((size_t)Mpoints * (size_t)freq_factor * sizeof(int));
+        plan->spread_z = (FLOAT *)nanofft_malloc((size_t)Mpoints * (size_t)freq_factor * sizeof(FLOAT));
+    } else {
+        plan->spread_stride = PFX(round_up_int)(plan->w + INTERNAL_VEC_LEN - 1, INTERNAL_VEC_LEN);
+        plan->spread_pad = plan->spread_stride;
+        plan->fft_alloc_len = plan->Nfft + plan->spread_pad;
+        plan->spread_base_idx = (int *)nanofft_malloc((size_t)Mpoints * (size_t)freq_factor * sizeof(int));
+        plan->spread_weight = PFX(allocate_aligned)((size_t)Mpoints * (size_t)plan->spread_stride * (size_t)freq_factor);
+    }
     plan->deconv = (FLOAT *)nanofft_malloc((size_t)plan->Nout * sizeof(FLOAT));
 
-    plan->shift_r = (FLOAT *)nanofft_malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
-    plan->shift_i = (FLOAT *)nanofft_malloc((size_t)Mpoints * freq_factor * sizeof(FLOAT));
+    plan->shift_r = (FLOAT *)nanofft_malloc((size_t)Mpoints * (size_t)freq_factor * sizeof(FLOAT));
+    plan->shift_i = (FLOAT *)nanofft_malloc((size_t)Mpoints * (size_t)freq_factor * sizeof(FLOAT));
 
     plan->fft_real = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
     plan->fft_imag = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
@@ -903,6 +1453,11 @@ struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double d
     plan->slot_deconv = PFX(allocate_aligned)((size_t)plan->slots);
     plan->perm_scratch = PFX(allocate_aligned)((size_t)plan->slots);
     return plan;
+}
+
+struct PFX(pswf_plan) * PFX(pswf_initialize)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2]) {
+    int mode = (tls_tuning_spread() == TLS_SPREAD_PIECEWISE) ? TLS_SPREAD_PIECEWISE : TLS_SPREAD_MINMAX;
+    return PFX(pswf_initialize_mode)(Mpoints, N, w, df, freq_factor, upsamp, mode);
 }
 
 /* =========================================================================
@@ -980,7 +1535,15 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     FLOAT *precomp_vals = PFX(allocate_aligned)(num_gl_nodes);
 
     PFX(get_lege_roots)(num_gl_nodes, gl_nodes, gl_weights);
+#if !defined(DOUBLE_DOUBLE)
+    if (plan->use_ppoly) {
+        for (int j = 0; j < p; ++j) precomp_vals[j] = PFX(ppoly_eval_scalar)(gl_nodes[j], plan->w, plan->ppoly_nc, plan->ppoly_stride, plan->ppoly_coeffs);
+    } else {
+        PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w, mode43);
+    }
+#else
     PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w, mode43);
+#endif
 
     for (int j = 0; j < p; ++j) precomp_vals[j] = MUL(gl_weights[j], precomp_vals[j]);
 
@@ -1004,14 +1567,13 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         int k_factor = f_idx + 1;
         size_t offset_shift = (size_t)f_idx * plan->Mpoints;
         size_t offset_base = (size_t)f_idx * plan->Mpoints;
-        size_t offset_spread = offset_base * plan->spread_stride;
-
         FLOAT *current_shift_r = plan->shift_r + offset_shift;
         FLOAT *current_shift_i = plan->shift_i + offset_shift;
-        int *current_spread_base_idx = plan->spread_base_idx + offset_base;
-        FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
 
 #if defined(DOUBLE_DOUBLE)
+        size_t offset_spread = offset_base * plan->spread_stride;
+        int *current_spread_base_idx = plan->spread_base_idx + offset_base;
+        FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
         int phase_shift = mode43 ? plan->output_shift / 3 : plan->output_shift;
         PFX(ff_t) out_shift_ff = PFX(ff_make)(FCAST(phase_shift), FCAST(0.0));
         PFX(ff_t) n_ff = PFX(ff_make)(FCAST(plan->Nfft), FCAST(0.0));
@@ -1062,44 +1624,83 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
         double out_shift = (double)plan->output_shift;
         double n_fft = (double)plan->Nfft;
 
-        for (int m = 0; m < plan->Mpoints; ++m) {
-            double xm = x[m] * plan->df * k_factor;
+        if (plan->use_ppoly) {
+            int *current_first_idx = plan->spread_first_idx + offset_base;
+            FLOAT *current_z = plan->spread_z + offset_base;
+            double half_w = (double)plan->w * 0.5;
+            double w_minus_1 = (double)(plan->w - 1);
+
+            for (int m = 0; m < plan->Mpoints; ++m) {
+                double xm = x[m] * plan->df * k_factor;
 
 #    if defined(DOUBLE)
-            if (mode43) {
-                double phase = xm * (double)(plan->output_shift / 3);
-                double c = cos2pi(phase);
-                double s = sin2pi(phase);
-                nanofft_triple_angle(c, s, &current_shift_r[m], &current_shift_i[m]);
-            } else {
+                if (mode43) {
+                    double phase = xm * (double)(plan->output_shift / 3);
+                    double c = cos2pi(phase);
+                    double s = sin2pi(phase);
+                    nanofft_triple_angle(c, s, &current_shift_r[m], &current_shift_i[m]);
+                } else {
 #    endif
-                double phase = xm * out_shift;
-                double p_int = (double)((int)phase);
-                double phase_frac = phase - p_int;
-                current_shift_r[m] = M_COS2PI(FCAST(phase_frac));
-                current_shift_i[m] = M_SIN2PI(FCAST(phase_frac));
+                    double phase = xm * out_shift;
+                    double p_int = (double)((int)phase);
+                    double phase_frac = phase - p_int;
+                    current_shift_r[m] = M_COS2PI(FCAST(phase_frac));
+                    current_shift_i[m] = M_SIN2PI(FCAST(phase_frac));
 #    if defined(DOUBLE)
-            }
+                }
 #    endif
 
-            double x_n = xm * n_fft;
-            int m_left = (int)ceil(x_n - (double)plan->w * 0.5);
-
-            for (int l = 0; l < plan->w; ++l) {
-                int idx = m_left + l;
-                double dist = (double)idx - x_n;
-                z_buf[l] = FCAST((2.0 * dist) / (double)plan->w);
+                double x_n = xm * n_fft;
+                int m_left = (int)ceil(x_n - half_w);
+                double u = 2.0 * ((double)m_left - x_n) + w_minus_1;
+                if (u < -1.0) u = -1.0;
+                if (u > 1.0) u = 1.0;
+                current_first_idx[m] = PFX(positive_mod_int)(m_left, plan->Nfft);
+                current_z[m] = FCAST(u);
             }
+        } else {
+            size_t offset_spread = offset_base * plan->spread_stride;
+            int *current_spread_base_idx = plan->spread_base_idx + offset_base;
+            FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
+            for (int m = 0; m < plan->Mpoints; ++m) {
+                double xm = x[m] * plan->df * k_factor;
 
-            PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
+#    if defined(DOUBLE)
+                if (mode43) {
+                    double phase = xm * (double)(plan->output_shift / 3);
+                    double c = cos2pi(phase);
+                    double s = sin2pi(phase);
+                    nanofft_triple_angle(c, s, &current_shift_r[m], &current_shift_i[m]);
+                } else {
+#    endif
+                    double phase = xm * out_shift;
+                    double p_int = (double)((int)phase);
+                    double phase_frac = phase - p_int;
+                    current_shift_r[m] = M_COS2PI(FCAST(phase_frac));
+                    current_shift_i[m] = M_SIN2PI(FCAST(phase_frac));
+#    if defined(DOUBLE)
+                }
+#    endif
 
-            int first = PFX(positive_mod_int)(m_left, plan->Nfft);
-            int base = first - (first % INTERNAL_VEC_LEN);
-            int lane_offset = first - base;
-            size_t w_base = (size_t)m * plan->spread_stride;
-            current_spread_base_idx[m] = base;
-            for (int l = 0; l < plan->spread_stride; ++l) current_spread_weight[w_base + l] = FCAST(0.0);
-            for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + lane_offset + l] = kval_buf[l];
+                double x_n = xm * n_fft;
+                int m_left = (int)ceil(x_n - (double)plan->w * 0.5);
+
+                for (int l = 0; l < plan->w; ++l) {
+                    int idx = m_left + l;
+                    double dist = (double)idx - x_n;
+                    z_buf[l] = FCAST((2.0 * dist) / (double)plan->w);
+                }
+
+                PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
+
+                int first = PFX(positive_mod_int)(m_left, plan->Nfft);
+                int base = first - (first % INTERNAL_VEC_LEN);
+                int lane_offset = first - base;
+                size_t w_base = (size_t)m * plan->spread_stride;
+                current_spread_base_idx[m] = base;
+                for (int l = 0; l < plan->spread_stride; ++l) current_spread_weight[w_base + l] = FCAST(0.0);
+                for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + lane_offset + l] = kval_buf[l];
+            }
         }
 #endif
     }
@@ -1166,44 +1767,66 @@ void PFX(pswf_execute_mode)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, c
 
     size_t offset_shift = (size_t)f_idx * plan->Mpoints;
     size_t offset_base = (size_t)f_idx * plan->Mpoints;
-    size_t offset_spread = offset_base * plan->spread_stride;
-
     FLOAT *current_shift_r = plan->shift_r + offset_shift;
     FLOAT *current_shift_i = plan->shift_i + offset_shift;
-    int *current_spread_base_idx = plan->spread_base_idx + offset_base;
-    FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
 
     memset(plan->fft_real, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
     memset(plan->fft_imag, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
 
-    for (int m = 0; m < plan->Mpoints; ++m) {
-        FLOAT yr = y_real[m], yi = y_imag[m];
-        FLOAT sr = current_shift_r[m], si = current_shift_i[m];
-        FLOAT sy_r = SUB(MUL(yr, sr), MUL(yi, si));
-        FLOAT sy_i = ADD(MUL(yr, si), MUL(yi, sr));
-        int base = current_spread_base_idx[m];
-        size_t w_base = (size_t)m * plan->spread_stride;
+#if !defined(DOUBLE_DOUBLE)
+    if (plan->use_ppoly) {
+        const int *current_first_idx = plan->spread_first_idx + offset_base;
+        const FLOAT *current_z = plan->spread_z + offset_base;
+        const FLOAT *coeffs = plan->ppoly_coeffs;
+        const int w = plan->w;
+        const int nc = plan->ppoly_nc;
+        const int stride = plan->ppoly_stride;
+        FLOAT *NANOFFT_RESTRICT fr = plan->fft_real;
+        FLOAT *NANOFFT_RESTRICT fi = plan->fft_imag;
+
+        for (int m = 0; m < plan->Mpoints; ++m) {
+            FLOAT yr = y_real[m], yi = y_imag[m];
+            FLOAT sr = current_shift_r[m], si = current_shift_i[m];
+            FLOAT sy_r = SUB(MUL(yr, sr), MUL(yi, si));
+            FLOAT sy_i = ADD(MUL(yr, si), MUL(yi, sr));
+            PFX(ppoly_spread_point)(fr, fi, coeffs, current_first_idx[m], current_z[m], sy_r, sy_i, w, nc, stride);
+        }
+    } else
+#endif
+    {
+        size_t offset_spread = offset_base * plan->spread_stride;
+        int *current_spread_base_idx = plan->spread_base_idx + offset_base;
+        FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
+
+        for (int m = 0; m < plan->Mpoints; ++m) {
+            FLOAT yr = y_real[m], yi = y_imag[m];
+            FLOAT sr = current_shift_r[m], si = current_shift_i[m];
+            FLOAT sy_r = SUB(MUL(yr, sr), MUL(yi, si));
+            FLOAT sy_i = ADD(MUL(yr, si), MUL(yi, sr));
+            int base = current_spread_base_idx[m];
+            size_t w_base = (size_t)m * plan->spread_stride;
 
 #if INTERNAL_VEC_LEN > 1
-        INTERNAL_VEC v_sy_r = (INTERNAL_VEC){} + sy_r;
-        INTERNAL_VEC v_sy_i = (INTERNAL_VEC){} + sy_i;
+            INTERNAL_VEC v_sy_r = (INTERNAL_VEC){} + sy_r;
+            INTERNAL_VEC v_sy_i = (INTERNAL_VEC){} + sy_i;
 
-        for (int l = 0; l < plan->spread_stride; l += INTERNAL_VEC_LEN) {
-            int idx = base + l;
-            INTERNAL_VEC kval = LOAD_VEC(&current_spread_weight[w_base + l]);
-            INTERNAL_VEC gr = LOAD_VEC(&plan->fft_real[idx]);
-            INTERNAL_VEC gi = LOAD_VEC(&plan->fft_imag[idx]);
-            STORE_VEC(&plan->fft_real[idx], ADD(gr, MUL(v_sy_r, kval)));
-            STORE_VEC(&plan->fft_imag[idx], ADD(gi, MUL(v_sy_i, kval)));
-        }
+            for (int l = 0; l < plan->spread_stride; l += INTERNAL_VEC_LEN) {
+                int idx = base + l;
+                INTERNAL_VEC kval = LOAD_VEC(&current_spread_weight[w_base + l]);
+                INTERNAL_VEC gr = LOAD_VEC(&plan->fft_real[idx]);
+                INTERNAL_VEC gi = LOAD_VEC(&plan->fft_imag[idx]);
+                STORE_VEC(&plan->fft_real[idx], ADD(gr, MUL(v_sy_r, kval)));
+                STORE_VEC(&plan->fft_imag[idx], ADD(gi, MUL(v_sy_i, kval)));
+            }
 #else
-        for (int l = 0; l < plan->spread_stride; ++l) {
-            int idx = base + l;
-            FLOAT kval = current_spread_weight[w_base + l];
-            plan->fft_real[idx] = ADD(plan->fft_real[idx], MUL(sy_r, kval));
-            plan->fft_imag[idx] = ADD(plan->fft_imag[idx], MUL(sy_i, kval));
-        }
+            for (int l = 0; l < plan->spread_stride; ++l) {
+                int idx = base + l;
+                FLOAT kval = current_spread_weight[w_base + l];
+                plan->fft_real[idx] = ADD(plan->fft_real[idx], MUL(sy_r, kval));
+                plan->fft_imag[idx] = ADD(plan->fft_imag[idx], MUL(sy_i, kval));
+            }
 #endif
+        }
     }
 
     for (int i = 0; i < plan->spread_pad; ++i) {
@@ -1236,6 +1859,9 @@ void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const 
 
 void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     if (!plan) return;
+    nanofft_aligned_free(plan->ppoly_coeffs);
+    nanofft_aligned_free(plan->spread_first_idx);
+    nanofft_aligned_free(plan->spread_z);
     nanofft_aligned_free(plan->spread_base_idx);
     nanofft_aligned_free(plan->spread_weight);
     nanofft_aligned_free(plan->deconv);

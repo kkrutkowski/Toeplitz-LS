@@ -5,7 +5,7 @@ normalizations:
 
 ``standard`` (default)
     Coefficient of determination :math:`R^2`.  Values at or above 1 are
-    numerical artefacts of an ill-conditioned solve and are reported as 0.
+    numerical artefacts of an ill-conditioned solve and are reported as NaN.
 ``anova``
     ANOVA / F statistic, following Schwarzenberg-Czerny's convention.
 ``nll``
@@ -39,6 +39,7 @@ from ._dispatch import load as _load_native
 HERE = Path(__file__).resolve().parent
 
 _BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
+_SPREADINGS = {"auto": 0, "minmax": 1, "piecewise": 2}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4, "svd": 5}
 _NORMALIZATIONS = {
     "standard": 0,
@@ -182,6 +183,107 @@ def _load_library():
     ]
     lib.tlsdd_ihs.restype = ctypes.c_int
 
+    lib.tlsf_fastchi2_spread.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsf_fastchi2_spread.restype = ctypes.c_int
+
+    lib.tls_fastchi2_spread.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.tls_fastchi2_spread.restype = ctypes.c_int
+
+    lib.tlsdd_fastchi2_spread.argtypes = [
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+    ]
+    lib.tlsdd_fastchi2_spread.restype = ctypes.c_int
+
+    lib.tlsf_ihs_spread.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsf_ihs_spread.restype = ctypes.c_int
+
+    lib.tls_ihs_spread.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.tls_ihs_spread.restype = ctypes.c_int
+
+    lib.tlsdd_ihs_spread.argtypes = [
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(DD),
+    ]
+    lib.tlsdd_ihs_spread.restype = ctypes.c_int
     _LIB = lib
     return lib
 
@@ -192,6 +294,16 @@ def _backend_id(backend):
         if key in _BACKENDS:
             return _BACKENDS[key]
     raise ValueError("backend must be 'pswf43', 'pswf21', or 'lra'")
+
+
+def _spreading_id(spreading, *, allow_piecewise=True):
+    if isinstance(spreading, str):
+        key = spreading.strip().lower()
+        if key in _SPREADINGS:
+            if key == "piecewise" and not allow_piecewise:
+                raise ValueError("spreading='piecewise' is not supported in double-double precision; use 'auto' or 'minmax'")
+            return _SPREADINGS[key]
+    raise ValueError("spreading must be 'auto', 'minmax', or 'piecewise'")
 
 
 def _solver_id(solver):
@@ -276,7 +388,7 @@ def _auto_grid(delta_t, fmin, fmax, oversampling, nterms):
         fmin = _check_finite("fmin", fmin)
         if fmin < 0.0:
             raise ValueError("fmin must be non-negative")
-        first_multiple = math.ceil((fmin / delta_t) / df)
+        first_multiple = math.ceil(fmin / df)
 
     f0 = first_multiple * df
     Nf = math.floor((max_frequency - f0) / df) + 1
@@ -374,16 +486,19 @@ class tlsf:
         solver=None,
         nterms=3,
         normalization="standard",
+        spreading="auto",
         *,
         autonan=True,
     ):
         """Return periodogram power on the grid ``f0 + df * arange(Nf)``.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``.
+        ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
+        or ``'piecewise'``.
         """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
+        spreading = _spreading_id(spreading)
         min_Nf = 32 if backend == _BACKENDS["lra"] else 16
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         solver = _solver_id_for_nterms(solver, nterms)
@@ -393,7 +508,7 @@ class tlsf:
         cond = None if autonan else np.empty(Nf, dtype=np.float32)
         cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        status = _load_library().tlsf_fastchi2(
+        status = _load_library().tlsf_fastchi2_spread(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -405,10 +520,11 @@ class tlsf:
             backend,
             solver,
             normalization,
+            spreading,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             cond_ptr,
         )
-        _raise_status("tlsf_fastchi2", status)
+        _raise_status("tlsf_fastchi2_spread", status)
         power = out
         if autonan:
             return power
@@ -426,16 +542,19 @@ class tlsf:
         nterms=3,
         backend="pswf43",
         solver=None,
+        spreading="auto",
         *,
         autonan=True,
     ):
         """Return automatic frequency and power arrays.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``.
+        ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
+        or ``'piecewise'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
+        _spreading_id(spreading)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -451,6 +570,7 @@ class tlsf:
             backend=backend,
             solver=solver,
             normalization=normalization,
+            spreading=spreading,
             nterms=nterms,
             autonan=autonan,
         )
@@ -475,16 +595,19 @@ class tls:
         solver=None,
         nterms=3,
         normalization="standard",
+        spreading="auto",
         *,
         autonan=True,
     ):
         """Return periodogram power on the grid ``f0 + df * arange(Nf)``.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``.
+        ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
+        or ``'piecewise'``.
         """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
+        spreading = _spreading_id(spreading)
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=8)
         solver = _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
@@ -493,7 +616,7 @@ class tls:
         cond = None if autonan else np.empty(Nf, dtype=np.float64)
         cond_ptr = ctypes.POINTER(ctypes.c_double)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
 
-        status = _load_library().tls_fastchi2(
+        status = _load_library().tls_fastchi2_spread(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -505,10 +628,11 @@ class tls:
             backend,
             solver,
             normalization,
+            spreading,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             cond_ptr,
         )
-        _raise_status("tls_fastchi2", status)
+        _raise_status("tls_fastchi2_spread", status)
         power = out
         if autonan:
             return power
@@ -526,16 +650,19 @@ class tls:
         nterms=3,
         backend="pswf43",
         solver=None,
+        spreading="auto",
         *,
         autonan=True,
     ):
         """Return automatic double-precision frequency and power arrays.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``.
+        ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
+        or ``'piecewise'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
+        _spreading_id(spreading)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -551,6 +678,7 @@ class tls:
             backend=backend,
             solver=solver,
             normalization=normalization,
+            spreading=spreading,
             nterms=nterms,
             autonan=autonan,
         )
@@ -575,16 +703,18 @@ class tlsdd:
         solver=None,
         nterms=3,
         normalization="standard",
+        spreading="auto",
         *,
         autonan=True,
     ):
         """Return high-precision periodogram power.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``.
+        ``'nll'``. ``spreading`` accepts ``'auto'`` (default) or ``'minmax'``.
         """
         mp = _require_mpmath()
         normalization = _check_normalization(normalization)
+        spreading = _spreading_id(spreading, allow_piecewise=False)
         Nf = _check_int("Nf", Nf, 1)
         nterms = _check_int("nterms", nterms, 1)
         df_mpf = mp.mpf(df)
@@ -620,7 +750,7 @@ class tlsdd:
         cond = None if autonan else (DD * Nf)()
         cond_ptr = ctypes.POINTER(DD)() if cond is None else cond
 
-        status = _load_library().tlsdd_fastchi2(
+        status = _load_library().tlsdd_fastchi2_spread(
             t_dd,
             y_dd,
             dy_dd,
@@ -632,10 +762,11 @@ class tlsdd:
             backend,
             solver,
             normalization,
+            spreading,
             out,
             cond_ptr,
         )
-        _raise_status("tlsdd_fastchi2", status)
+        _raise_status("tlsdd_fastchi2_spread", status)
         power = [_dd_to_mpf(out[i]) for i in range(Nf)]
         if autonan:
             return power
@@ -654,17 +785,19 @@ class tlsdd:
         nterms=3,
         backend="pswf43",
         solver=None,
+        spreading="auto",
         *,
         autonan=True,
     ):
         """Return automatic high-precision frequency and power lists.
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
-        ``'nll'``.
+        ``'nll'``. ``spreading`` accepts ``'auto'`` (default) or ``'minmax'``.
         """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
+        _spreading_id(spreading, allow_piecewise=False)
         t_mpf = _as_mpf_list(x, "x")
         y_mpf = _as_mpf_list(y, "y")
         if dy is None:
@@ -693,6 +826,7 @@ class tlsdd:
             backend=backend,
             solver=solver,
             normalization=normalization,
+            spreading=spreading,
             nterms=nterms,
             autonan=autonan,
         )

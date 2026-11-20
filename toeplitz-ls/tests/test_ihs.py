@@ -124,9 +124,11 @@ class TestIHS(unittest.TestCase):
         m = 128
         t = np.arange(m, dtype=np.float64)
         frequency = 17.0 / m
-        y = np.sin(2.0 * np.pi * frequency * t) + 0.5 * np.cos(2.0 * np.pi * frequency * t)
+        other_frequency = 23.0 / m
+        y = np.sin(2.0 * np.pi * frequency * t) + 0.5 * np.cos(2.0 * np.pi * frequency * t) + 0.4 * np.sin(2.0 * np.pi * other_frequency * t)
         ihs_power = ihs.power(8, 1.0 / m, frequency, t, y, nterms=1, normalization="raw")
         tls_power = tls.power(8, 1.0 / m, frequency, t, y, nterms=1, normalization="standard")
+        self.assertGreater(float(ihs_power[0]), 0.8)
         np.testing.assert_allclose(ihs_power[0], tls_power[0], rtol=1e-9, atol=1e-12)
 
     def test_nll_and_raw_can_choose_different_peaks(self):
@@ -356,6 +358,8 @@ class TestIHS(unittest.TestCase):
                 self.assertEqual(len(freq), len(power))
                 self.assertTrue(np.all(np.isfinite(power)))
                 self.assertTrue(np.all(power >= 0.0))
+                self.assertGreaterEqual(float(freq[0]), 0.1)
+                self.assertLessEqual(float(freq[-1]), 2.0)
 
         freq, power = ihsdd.autopower(
             self.t[:32],
@@ -368,6 +372,8 @@ class TestIHS(unittest.TestCase):
         )
         self.assertEqual(len(freq), len(power))
         self.assertTrue(all(mp.isfinite(value) for value in power))
+        self.assertGreaterEqual(float(freq[0]), 0.1)
+        self.assertLessEqual(float(freq[-1]), 1.0)
 
     def test_invalid_normalizations(self):
         for mod in [ihsf, ihs]:

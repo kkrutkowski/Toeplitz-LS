@@ -74,7 +74,7 @@ For `nterms = d` harmonics:
 
 - `"standard"` is the coefficient of determination `R^2` of the full model.
   Values at or above 1 are numerical artefacts of an ill-conditioned solve and
-  are reported as 0.
+  are reported as NaN.
 - `"anova"` is the ANOVA `F` statistic in A. Schwarzenberg-Czerny's convention.
 - `"nll"` is the natural-log negative false-alarm probability, `-ln(FAP)`,
   computed from the direct Pochhammer/incomplete-beta statistic with its
@@ -83,6 +83,17 @@ For `nterms = d` harmonics:
 The `cond` array returned when `autonan=False` is the Toeplitz condition upper
 bound `(2*nterms + 1) * P`, where `P` is the Cybenko reflection-coefficient
 product.
+
+## Spreading algorithms
+
+For the PSWF backends (`"pswf43"`, `"pswf21"`), `power()` and `autopower()`
+accept `spreading=`:
+
+| value | behavior |
+|---|---|
+| `"auto"` (default) | selects `"minmax"` or `"piecewise"` from the calibrated cost model for the problem size and CPU vector width |
+| `"minmax"` | precomputes per-point minmax-polynomial PSWF0 weights once before block execution |
+| `"piecewise"` | evaluates vectorized piecewise polynomials on the fly during spreading, avoiding weight-table precomputation and memory traffic (single and double precision only) |
 
 ## IHS periodogram
 
@@ -168,6 +179,7 @@ freq, r2 = tls.autopower(
     nterms=1,  # generalized Scargle periodogram
     oversampling=5,  # frequency density, relative to a dense, uniform FFT
     backend="pswf43",  # or "pswf21", "lra"
+    spreading="auto",  # or "minmax", "piecewise"
     normalization="standard",  # or "anova", "nll"
 )
 

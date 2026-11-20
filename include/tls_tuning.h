@@ -2,6 +2,7 @@
 #define TLS_TUNING_H
 
 #include <nanofft.h>
+#include <tls.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +63,13 @@ enum {
     TLS_PERMUTE_PAIRS = 2,
     TLS_PERMUTE_COBRAVO = 3,
 };
+
+/* PSWF spreading algorithm default when using the non-_spread C entry points:
+ * TLS_SPREAD_AUTO (0) = cost-model choice, TLS_SPREAD_MINMAX (1) = precomputed
+ * minmax polynomial weights, TLS_SPREAD_PIECEWISE (2) = on-the-fly vectorized
+ * piecewise polynomial evaluation. */
+TLS_API int tls_tuning_spread(void);
+TLS_API void tls_tuning_set_spread(int mode);
 
 /* Bytes of periodogram work arrays allocated by the most recent fastchi2 call. */
 TLS_API unsigned long long tls_tuning_work_bytes(void);

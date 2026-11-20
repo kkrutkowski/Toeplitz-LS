@@ -15,11 +15,13 @@
 
 #include <math.h>
 #include <nanofft.h>
+#include <scaling.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <tls.h>
 #include <tls_tuning.h>
+#include <utils.h>
 
 static int failures = 0;
 static int dump_mode = 0;
@@ -318,6 +320,156 @@ static void run_dd_case(const char *name, int M, int N, int degree, int backend,
     free(yd);
 }
 
+static void run_spread_fastchi2_f(const char *name, int M, int N, int degree, int backend, int norm) {
+    double *t = (double *)test_alloc((size_t)M * sizeof(double));
+    double *y = (double *)test_alloc((size_t)M * sizeof(double));
+    float *fy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *dy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *pmm = (float *)test_alloc((size_t)N * sizeof(float));
+    float *ppp = (float *)test_alloc((size_t)N * sizeof(float));
+    float *pauto = (float *)test_alloc((size_t)N * sizeof(float));
+    float *cmm = (float *)test_alloc((size_t)N * sizeof(float));
+    float *cpp = (float *)test_alloc((size_t)N * sizeof(float));
+
+    make_curve(M, t, y);
+    for (int m = 0; m < M; ++m) {
+        fy[m] = (float)y[m];
+        dy[m] = (float)(0.1 + 0.02 * urand());
+    }
+
+    for (int defer = 0; defer <= 1; ++defer) {
+        tls_tuning_set_defer(defer);
+        int smm = tlsf_fastchi2_spread(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, TLS_SOLVER_LEVINSON, norm, TLS_SPREAD_MINMAX, pmm, cmm);
+        int spp = tlsf_fastchi2_spread(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, TLS_SOLVER_LEVINSON, norm, TLS_SPREAD_PIECEWISE, ppp, cpp);
+        int sauto = tlsf_fastchi2_spread(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, TLS_SOLVER_LEVINSON, norm, TLS_SPREAD_AUTO, pauto, NULL);
+        CHECK(smm == 0 && spp == 0 && sauto >= 0, "%s (defer=%d): status mm=%d pp=%d auto=%d", name, defer, smm, spp, sauto);
+        CHECK(same_values(pmm, ppp, N, 2e-4, 2e-5), "%s (defer=%d): float minmax vs piecewise power mismatch", name, defer);
+        CHECK(same_values(cmm, cpp, N, 2e-3, 1e-4), "%s (defer=%d): float minmax vs piecewise cond mismatch", name, defer);
+        CHECK(same_values(pmm, pauto, N, 2e-4, 2e-5), "%s (defer=%d): float minmax vs auto power mismatch", name, defer);
+    }
+
+    free(t);
+    free(y);
+    free(fy);
+    free(dy);
+    free(pmm);
+    free(ppp);
+    free(pauto);
+    free(cmm);
+    free(cpp);
+}
+
+static void run_spread_fastchi2_d(const char *name, int M, int N, int degree, int backend, int norm) {
+    double *t = (double *)test_alloc((size_t)M * sizeof(double));
+    double *y = (double *)test_alloc((size_t)M * sizeof(double));
+    double *dy = (double *)test_alloc((size_t)M * sizeof(double));
+    double *pmm = (double *)test_alloc((size_t)N * sizeof(double));
+    double *ppp = (double *)test_alloc((size_t)N * sizeof(double));
+    double *pauto = (double *)test_alloc((size_t)N * sizeof(double));
+
+    make_curve(M, t, y);
+    for (int m = 0; m < M; ++m) dy[m] = 0.1 + 0.02 * urand();
+
+    for (int defer = 0; defer <= 1; ++defer) {
+        tls_tuning_set_defer(defer);
+        int smm = tls_fastchi2_spread(t, y, dy, M, 0.001, 0.0005, N, degree, backend, TLS_SOLVER_LEVINSON, norm, TLS_SPREAD_MINMAX, pmm, NULL);
+        int spp = tls_fastchi2_spread(t, y, dy, M, 0.001, 0.0005, N, degree, backend, TLS_SOLVER_LEVINSON, norm, TLS_SPREAD_PIECEWISE, ppp, NULL);
+        int sauto = tls_fastchi2_spread(t, y, dy, M, 0.001, 0.0005, N, degree, backend, TLS_SOLVER_LEVINSON, norm, TLS_SPREAD_AUTO, pauto, NULL);
+        CHECK(smm >= 0 && spp >= 0 && sauto >= 0, "%s (defer=%d): status mm=%d pp=%d auto=%d", name, defer, smm, spp, sauto);
+        CHECK(same_values_d(pmm, ppp, N, 1e-11, 1e-13), "%s (defer=%d): double minmax vs piecewise power mismatch", name, defer);
+        CHECK(same_values_d(pmm, pauto, N, 1e-11, 1e-13), "%s (defer=%d): double minmax vs auto power mismatch", name, defer);
+    }
+
+    free(t);
+    free(y);
+    free(dy);
+    free(pmm);
+    free(ppp);
+    free(pauto);
+}
+
+static void run_spread_ihs(const char *name, int M, int N, int degree, int backend, int norm) {
+    double *t = (double *)test_alloc((size_t)M * sizeof(double));
+    double *y = (double *)test_alloc((size_t)M * sizeof(double));
+    double *dy = (double *)test_alloc((size_t)M * sizeof(double));
+    float *fy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *fdy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *fpmm = (float *)test_alloc((size_t)N * sizeof(float));
+    float *fppp = (float *)test_alloc((size_t)N * sizeof(float));
+    double *dpmm = (double *)test_alloc((size_t)N * sizeof(double));
+    double *dppp = (double *)test_alloc((size_t)N * sizeof(double));
+
+    make_curve(M, t, y);
+    for (int m = 0; m < M; ++m) {
+        dy[m] = 0.1 + 0.02 * urand();
+        fy[m] = (float)y[m];
+        fdy[m] = (float)dy[m];
+    }
+
+    tls_tuning_set_defer(1);
+    int sf0 = tlsf_ihs_spread(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, norm, TLS_SPREAD_MINMAX, fpmm);
+    int sf1 = tlsf_ihs_spread(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, norm, TLS_SPREAD_PIECEWISE, fppp);
+    int sd0 = tls_ihs_spread(t, y, dy, M, 0.001, 0.0005, N, degree, backend, norm, TLS_SPREAD_MINMAX, dpmm);
+    int sd1 = tls_ihs_spread(t, y, dy, M, 0.001, 0.0005, N, degree, backend, norm, TLS_SPREAD_PIECEWISE, dppp);
+    CHECK(sf0 == 0 && sf1 == 0 && sd0 == 0 && sd1 == 0, "%s: ihs status f=(%d,%d) d=(%d,%d)", name, sf0, sf1, sd0, sd1);
+    CHECK(same_values(fpmm, fppp, N, 2e-4, 2e-5), "%s: float IHS minmax vs piecewise mismatch", name);
+    CHECK(same_values_d(dpmm, dppp, N, 1e-11, 1e-13), "%s: double IHS minmax vs piecewise mismatch", name);
+
+    free(t);
+    free(y);
+    free(dy);
+    free(fy);
+    free(fdy);
+    free(fpmm);
+    free(fppp);
+    free(dpmm);
+    free(dppp);
+}
+
+static void run_spread_policy_and_errors(void) {
+    /* Optimizer dynamic switch: small M -> minmax, large M + moderate N -> piecewise. */
+    tls_pswf_plan_choice c_small_d = tls_optimize_pswf_plan(8192, 64, 1, 0, TLS_BACKEND_PSWF43, D_ALPHA, D_PSWF43_GAMMA, D_PSWF43_BETA, D_PSWF43_PRE,
+                                                            D_PSWF43_PPOLY_BETA, D_PSWF43_PPOLY_PRE, D_PSWF43_PPOLY_CONST, TLS_SPREAD_AUTO);
+    tls_pswf_plan_choice c_large_d = tls_optimize_pswf_plan(8192, 60000, 3, 0, TLS_BACKEND_PSWF43, D_ALPHA, D_PSWF43_GAMMA, D_PSWF43_BETA, D_PSWF43_PRE,
+                                                            D_PSWF43_PPOLY_BETA, D_PSWF43_PPOLY_PRE, D_PSWF43_PPOLY_CONST, TLS_SPREAD_AUTO);
+    tls_pswf_plan_choice c_large_f = tls_optimize_pswf_plan(8192, 60000, 3, 0, TLS_BACKEND_PSWF43, F_ALPHA, F_PSWF43_GAMMA, F_PSWF43_BETA, F_PSWF43_PRE,
+                                                            F_PSWF43_PPOLY_BETA, F_PSWF43_PPOLY_PRE, F_PSWF43_PPOLY_CONST, TLS_SPREAD_AUTO);
+    tls_pswf_plan_choice c_forced_mm = tls_optimize_pswf_plan(8192, 60000, 3, 0, TLS_BACKEND_PSWF43, D_ALPHA, D_PSWF43_GAMMA, D_PSWF43_BETA, D_PSWF43_PRE,
+                                                              D_PSWF43_PPOLY_BETA, D_PSWF43_PPOLY_PRE, D_PSWF43_PPOLY_CONST, TLS_SPREAD_MINMAX);
+    tls_pswf_plan_choice c_forced_pp = tls_optimize_pswf_plan(8192, 64, 1, 0, TLS_BACKEND_PSWF43, D_ALPHA, D_PSWF43_GAMMA, D_PSWF43_BETA, D_PSWF43_PRE,
+                                                              D_PSWF43_PPOLY_BETA, D_PSWF43_PPOLY_PRE, D_PSWF43_PPOLY_CONST, TLS_SPREAD_PIECEWISE);
+
+    CHECK(c_small_d.spread_mode == TLS_SPREAD_MINMAX, "optimizer should pick MINMAX for M=64, N=8192, d=1 (got %d)", c_small_d.spread_mode);
+    CHECK(c_large_d.spread_mode == TLS_SPREAD_PIECEWISE, "optimizer should pick PIECEWISE for double M=60000, N=8192, d=3 (got %d)", c_large_d.spread_mode);
+    CHECK(c_large_f.spread_mode == TLS_SPREAD_PIECEWISE, "optimizer should pick PIECEWISE for float M=60000, N=8192, d=3 (got %d)", c_large_f.spread_mode);
+    CHECK(c_forced_mm.spread_mode == TLS_SPREAD_MINMAX, "optimizer should honour forced MINMAX");
+    CHECK(c_forced_pp.spread_mode == TLS_SPREAD_PIECEWISE, "optimizer should honour forced PIECEWISE");
+
+    /* Invalid spreading argument and double-double rejection of PIECEWISE. */
+    double t[16], y[16], dy[16], p[16];
+    float fy[16], fdy[16], fp[16];
+    dd_t dt[16], ddy_y[16], ddy[16], dp[16];
+    for (int i = 0; i < 16; ++i) {
+        t[i] = (double)i;
+        y[i] = sin((double)i);
+        dy[i] = 0.1;
+        fy[i] = (float)y[i];
+        fdy[i] = 0.1f;
+        dt[i] = dd_make(t[i], 0.0);
+        ddy_y[i] = dd_make(y[i], 0.0);
+        ddy[i] = dd_make(0.1, 0.0);
+    }
+    CHECK(tlsf_fastchi2_spread(t, fy, fdy, 16, 0.01, 0.01, 16, 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, 99, fp, NULL) == TLS_ERR_ARGUMENT,
+          "tlsf_fastchi2_spread should reject invalid spreading");
+    CHECK(tls_ihs_spread(t, y, dy, 16, 0.01, 0.01, 16, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD, -1, p) == TLS_ERR_ARGUMENT,
+          "tls_ihs_spread should reject invalid spreading");
+    CHECK(tlsdd_fastchi2_spread(dt, ddy_y, ddy, 16, 0.01, 0.01, 16, 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_PIECEWISE, dp,
+                                NULL) == TLS_ERR_ARGUMENT,
+          "tlsdd_fastchi2_spread should reject PIECEWISE");
+    CHECK(tlsdd_ihs_spread(dt, ddy_y, ddy, 16, 0.01, 0.01, 16, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD, TLS_SPREAD_PIECEWISE, dp) == TLS_ERR_ARGUMENT,
+          "tlsdd_ihs_spread should reject PIECEWISE");
+}
+
 int main(int argc, char **argv) {
     dump_mode = (argc > 1 && strcmp(argv[1], "--dump") == 0);
 
@@ -350,6 +502,23 @@ int main(int argc, char **argv) {
     printf("check_periodogram: double-double\n");
     run_dd_case("gls_d1", 200, 256, 1, 1, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD);
     run_dd_case("d2", 220, 256, 2, 1, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD);
+
+    printf("check_periodogram: piecewise vs minmax PSWF spreading\n");
+    run_spread_fastchi2_f("f_pswf43_d1", 500, 512, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD);
+    run_spread_fastchi2_f("f_pswf21_d1", 500, 512, 1, TLS_BACKEND_PSWF21, TLS_NORM_STANDARD);
+    run_spread_fastchi2_f("f_pswf43_d3", 600, 1024, 3, TLS_BACKEND_PSWF43, TLS_NORM_NLL);
+    run_spread_fastchi2_f("f_pswf21_d3", 600, 1024, 3, TLS_BACKEND_PSWF21, TLS_NORM_STANDARD);
+    run_spread_fastchi2_f("f_pswf43_largeM", 16384, 4096, 3, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD);
+    run_spread_fastchi2_d("d_pswf43_d1", 500, 512, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD);
+    run_spread_fastchi2_d("d_pswf21_d1", 500, 512, 1, TLS_BACKEND_PSWF21, TLS_NORM_STANDARD);
+    run_spread_fastchi2_d("d_pswf43_d3", 600, 1024, 3, TLS_BACKEND_PSWF43, TLS_NORM_NLL);
+    run_spread_fastchi2_d("d_pswf21_d3", 600, 1024, 3, TLS_BACKEND_PSWF21, TLS_NORM_STANDARD);
+    run_spread_fastchi2_d("d_pswf43_largeM", 16384, 4096, 3, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD);
+    run_spread_ihs("ihs_pswf43_d1", 500, 512, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD);
+    run_spread_ihs("ihs_pswf21_d3", 600, 1024, 3, TLS_BACKEND_PSWF21, TLS_NORM_NLL);
+    run_spread_ihs("ihs_pswf43_d3", 600, 1024, 3, TLS_BACKEND_PSWF43, TLS_NORM_IHS_DEFAULT);
+    run_spread_policy_and_errors();
+    tls_tuning_set_spread(TLS_SPREAD_AUTO);
 
     tls_tuning_set_defer(TLS_TUNING_DEFER_DEFAULT);
     tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);

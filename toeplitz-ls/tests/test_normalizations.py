@@ -167,6 +167,17 @@ class TestNormalizations(unittest.TestCase):
                 )
                 self.assertTrue(np.all(np.isnan(power) | ((power >= 0.0) & (power < 1.0))))
 
+    def test_r2_at_or_above_one_reports_nan(self):
+        """Bins whose explained chi^2 reaches/exceeds chi2_ref report NaN, not 0."""
+        t = np.linspace(0.0, 10.0, 128, dtype=np.float64)
+        y = np.sin(2.0 * np.pi * 0.7 * t)
+        for degree in (1, 3):
+            for norm in ("standard", "anova", "nll"):
+                p_auto = tls.power(32, 0.01, 0.65, t, y, nterms=degree, normalization=norm, autonan=True)
+                self.assertTrue(np.isnan(p_auto[5]), f"d={degree} norm={norm} autonan=True expected NaN, got {p_auto[5]}")
+                p_raw, _cond = tls.power(32, 0.01, 0.65, t, y, nterms=degree, normalization=norm, autonan=False)
+                self.assertTrue(np.isnan(p_raw[5]), f"d={degree} norm={norm} autonan=False expected NaN, got {p_raw[5]}")
+
     def test_d1_fast_path_matches_condition_path(self):
         """The fast path must not change power when cond is not requested."""
         # -ffast-math may reassociate the simpler fast loop, so allow a few ULP;
@@ -326,6 +337,8 @@ class TestNormalizations(unittest.TestCase):
             self.assertTrue(len(freq) > 0)
             self.assertEqual(len(freq), len(power))
             self.assertTrue(np.all(np.isfinite(power)))
+            self.assertGreaterEqual(float(freq[0]), 0.1)
+            self.assertLessEqual(float(freq[-1]), 2.0)
 
     def test_legacy_aliases(self):
         """Verify anova/asymptotic and regularized/bayes are exact aliases."""

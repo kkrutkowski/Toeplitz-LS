@@ -11,6 +11,7 @@
 #include <nanofft.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <tls.h>
 #include <utils.h>
 
 #ifndef MAX_TWIDDLE_REUSE
@@ -73,6 +74,61 @@ int tls_optimize_plan_size(int N, int M, int degree, double alpha, double beta, 
         best = next_cost;
     }
     return block;
+}
+
+double tls_approximate_pswf_cost(int N, int M, int block, int degree, int is_ihs, int backend, double alpha, double beta, double gamma, double pre_m,
+                                 double const_cost) {
+    int block_eff = block;
+    if (backend == TLS_BACKEND_PSWF43) block_eff += block_eff >> 1;
+    if (block_eff <= 0) block_eff = 1;
+
+    int d = (degree > 0) ? degree : 1;
+    double n_blocks = ceil((double)N / (double)block_eff);
+    if (n_blocks < 1.0) n_blocks = 1.0;
+    double n_factors = is_ihs ? (double)d : (double)(2 * d);
+    double n_execs = is_ihs ? (double)d : (double)(3 * d);
+
+    double fft_cost = n_execs * n_blocks * (double)block_eff * pow((double)block, alpha);
+    double deconv_cost = gamma * (double)block_eff;
+    double pre_cost = pre_m * n_factors * (double)M;
+    double exec_cost = beta * n_execs * n_blocks * (double)M;
+    return fft_cost + deconv_cost + const_cost + pre_cost + exec_cost;
+}
+
+static tls_pswf_plan_choice tls_optimize_pswf_single_mode(int N, int M, int degree, int is_ihs, int backend, double alpha, double beta, double gamma,
+                                                          double pre_m, double const_cost, int spread_mode) {
+    const int min_block = 128;
+    int n_cap = bitceil((double)N);
+    if (n_cap < min_block) n_cap = min_block;
+    if (n_cap > (1 << 29)) n_cap = (1 << 29);
+
+    tls_pswf_plan_choice best;
+    best.block = min_block;
+    best.spread_mode = spread_mode;
+    best.cost = tls_approximate_pswf_cost(N, M, min_block, degree, is_ihs, backend, alpha, beta, gamma, pre_m, const_cost);
+
+    for (int block = min_block << 1; block <= n_cap; block <<= 1) {
+        double c = tls_approximate_pswf_cost(N, M, block, degree, is_ihs, backend, alpha, beta, gamma, pre_m, const_cost);
+        if (c < best.cost) {
+            best.block = block;
+            best.cost = c;
+        }
+        if (block == (1 << 29)) break;
+    }
+    return best;
+}
+
+tls_pswf_plan_choice tls_optimize_pswf_plan(int N, int M, int degree, int is_ihs, int backend, double alpha, double gamma, double beta_mm, double pre_mm,
+                                            double beta_pp, double pre_pp, double ppoly_const, int forced_spread_mode) {
+    if (forced_spread_mode == TLS_SPREAD_MINMAX) {
+        return tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_mm, gamma, pre_mm, 0.0, TLS_SPREAD_MINMAX);
+    }
+    if (forced_spread_mode == TLS_SPREAD_PIECEWISE) {
+        return tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_pp, gamma, pre_pp, ppoly_const, TLS_SPREAD_PIECEWISE);
+    }
+    tls_pswf_plan_choice mm = tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_mm, gamma, pre_mm, 0.0, TLS_SPREAD_MINMAX);
+    tls_pswf_plan_choice pp = tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_pp, gamma, pre_pp, ppoly_const, TLS_SPREAD_PIECEWISE);
+    return (pp.cost < mm.cost) ? pp : mm;
 }
 
 int tls_pswf43_plan_len_from_base(int base_len) {
@@ -206,6 +262,11 @@ static inline FLOAT TLS(quadratic_value)(FLOAT x, FLOAT x0, FLOAT y0, FLOAT x1, 
     return ADD(y0, ADD(MUL(slope01, SUB(x, x0)), MUL(MUL(curvature, SUB(x, x0)), SUB(x, x1))));
 }
 
+static inline FLOAT TLS(linear_interp)(FLOAT x, FLOAT x0, FLOAT y0, FLOAT x1, FLOAT y1) {
+    FLOAT t = DIV(SUB(x, x0), SUB(x1, x0));
+    return ADD(y0, MUL(t, SUB(y1, y0)));
+}
+
 static void TLS(insert_peak)(TLS(peak) peak, FLOAT *out_freq, FLOAT *out_power, FLOAT *out_cond, int has_cond, int *count, int max_peaks) {
     if (max_peaks <= 0) return;
     if (*count == max_peaks && FLOAT_CMP(peak.power, out_power[max_peaks - 1]) <= 0) return;
@@ -246,26 +307,65 @@ int TLS(get_peaks)(const FLOAT *freq, const FLOAT *power, const FLOAT *cond, int
         FLOAT p1 = power[idx];
         FLOAT p2 = power[idx + 1];
         if (!FLOAT_IS_FINITE(p0) || !FLOAT_IS_FINITE(p1) || !FLOAT_IS_FINITE(p2)) continue;
-        if (!(FLOAT_CMP(p1, p0) > 0 && FLOAT_CMP(p1, p2) > 0 && FLOAT_CMP(p1, threshold) > 0)) continue;
+        if (!(FLOAT_CMP(p1, p0) > 0 && FLOAT_CMP(p1, threshold) > 0)) continue;
 
-        FLOAT vertex_freq;
-        FLOAT vertex_power;
-        TLS(quadratic_vertex)(freq[idx - 1], p0, freq[idx], p1, freq[idx + 1], p2, &vertex_freq, &vertex_power);
-        TLS(peak) peak;
-        peak.freq = vertex_freq;
-        peak.power = vertex_power;
-        NANOFFT_DIAG_PUSH_NAN
-        peak.cond = FLOAT_NAN;
-        NANOFFT_DIAG_POP
-        if (cond) {
-            FLOAT c0 = cond[idx - 1];
-            FLOAT c1 = cond[idx];
-            FLOAT c2 = cond[idx + 1];
-            if (FLOAT_IS_FINITE(c0) && FLOAT_IS_FINITE(c1) && FLOAT_IS_FINITE(c2)) {
-                peak.cond = TLS(quadratic_value)(vertex_freq, freq[idx - 1], c0, freq[idx], c1, freq[idx + 1], c2);
+        int cmp_right = FLOAT_CMP(p1, p2);
+        if (cmp_right > 0) {
+            FLOAT vertex_freq;
+            FLOAT vertex_power;
+            TLS(quadratic_vertex)(freq[idx - 1], p0, freq[idx], p1, freq[idx + 1], p2, &vertex_freq, &vertex_power);
+            TLS(peak) peak;
+            peak.freq = vertex_freq;
+            peak.power = vertex_power;
+            NANOFFT_DIAG_PUSH_NAN
+            peak.cond = FLOAT_NAN;
+            NANOFFT_DIAG_POP
+            if (cond) {
+                FLOAT c0 = cond[idx - 1];
+                FLOAT c1 = cond[idx];
+                FLOAT c2 = cond[idx + 1];
+                if (FLOAT_IS_FINITE(c0) && FLOAT_IS_FINITE(c1) && FLOAT_IS_FINITE(c2)) {
+                    peak.cond = TLS(quadratic_value)(vertex_freq, freq[idx - 1], c0, freq[idx], c1, freq[idx + 1], c2);
+                }
             }
+            TLS(insert_peak)(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
+        } else if (cmp_right == 0) {
+            int end = idx + 1;
+            while (end + 1 < n && FLOAT_IS_FINITE(power[end + 1]) && FLOAT_CMP(power[end + 1], p1) == 0) {
+                ++end;
+            }
+            if (end + 1 < n && FLOAT_IS_FINITE(power[end + 1]) && FLOAT_CMP(p1, power[end + 1]) > 0) {
+                FLOAT mid_freq = MUL(FCONST(0.5), ADD(freq[idx], freq[end]));
+                TLS(peak) peak;
+                peak.freq = mid_freq;
+                peak.power = p1;
+                NANOFFT_DIAG_PUSH_NAN
+                peak.cond = FLOAT_NAN;
+                NANOFFT_DIAG_POP
+                if (cond) {
+                    int all_finite = 1;
+                    for (int k = idx; k <= end; ++k) {
+                        if (!FLOAT_IS_FINITE(cond[k])) {
+                            all_finite = 0;
+                            break;
+                        }
+                    }
+                    if (all_finite) {
+                        int lo = idx;
+                        while (lo + 1 < end && FLOAT_CMP(freq[lo + 1], mid_freq) < 0) {
+                            ++lo;
+                        }
+                        if (FLOAT_CMP(freq[lo + 1], mid_freq) == 0) {
+                            peak.cond = cond[lo + 1];
+                        } else {
+                            peak.cond = TLS(linear_interp)(mid_freq, freq[lo], cond[lo], freq[lo + 1], cond[lo + 1]);
+                        }
+                    }
+                }
+                TLS(insert_peak)(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
+            }
+            idx = end;
         }
-        TLS(insert_peak)(peak, out_freq, out_power, out_cond, cond != NULL, &count, max_peaks);
     }
 
     *out_count = count;

@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <tls.h>
+#include <tls_internal.h>
 
 /* ---------------------------------------------------------------------------
  * Intercept aligned_alloc to enforce safe SIMD memory padding.
@@ -54,6 +56,8 @@ static double get_time_sec(void) {
 #    define NUFFT_LRA_EXEC tls_nufft_lra_execute
 #    define NUFFT_LRA_FREE tls_nufft_free_lra_plan
 #    define NUFFT_PSWF_INIT tls_nufft_pswf_initialize
+#    define NUFFT_PSWF_INIT_MODE tls_nufft_pswf_initialize_mode
+#    define NUFFT_PSWF_BENCH_PPOLY tls_nufft_pswf_bench_ppoly_gen
 #    define NUFFT_PSWF_PRE tls_nufft_pswf_precompute
 #    define NUFFT_PSWF_EXEC tls_nufft_pswf_execute
 #    define NUFFT_PSWF_FREE tls_nufft_free_pswf_plan
@@ -68,6 +72,8 @@ static double get_time_sec(void) {
 #    define NUFFT_LRA_EXEC tlsf_nufft_lra_execute
 #    define NUFFT_LRA_FREE tlsf_nufft_free_lra_plan
 #    define NUFFT_PSWF_INIT tlsf_nufft_pswf_initialize
+#    define NUFFT_PSWF_INIT_MODE tlsf_nufft_pswf_initialize_mode
+#    define NUFFT_PSWF_BENCH_PPOLY tlsf_nufft_pswf_bench_ppoly_gen
 #    define NUFFT_PSWF_PRE tlsf_nufft_pswf_precompute
 #    define NUFFT_PSWF_EXEC tlsf_nufft_pswf_execute
 #    define NUFFT_PSWF_FREE tlsf_nufft_free_pswf_plan
@@ -515,6 +521,174 @@ int main(int argc, char **argv) {
         printf("[beta  PSWF43] exec/run = %e s | beta  = %.6f\n", t_exec, beta_pswf43);
     }
 
+#if !defined(DOUBLE_DOUBLE)
+    /* =========================================================================
+     * Phase 5: PSWF spreading comparison (minmax vs on-the-fly piecewise)
+     *
+     * Measures:
+     *   - ppoly_const: constant runtime piecewise-polynomial table generation
+     *   - pre_mm / pre_pp: O(M) per-factor precompute cost (excluding deconv)
+     *   - beta_pp: O(M) per-execute spreading + rotation cost for piecewise
+     * ======================================================================= */
+    double pre_pswf21 = 0.0, pre_pswf43 = 0.0;
+    double beta_pp_pswf21 = 0.0, beta_pp_pswf43 = 0.0;
+    double pre_pp_pswf21 = 0.0, pre_pp_pswf43 = 0.0;
+    double ppoly_const_pswf21 = 0.0, ppoly_const_pswf43 = 0.0;
+
+    /* --- Piecewise table generation constant cost --- */
+    {
+        const int gen_wups = 16;
+        const int gen_reps = 256;
+        NUFFT_PSWF_BENCH_PPOLY(w21, "21", gen_wups);
+        double t0 = get_time_sec();
+        NUFFT_PSWF_BENCH_PPOLY(w21, "21", gen_reps);
+        double t_gen21 = (get_time_sec() - t0) / (double)gen_reps;
+        ppoly_const_pswf21 = t_gen21 / unit_pswf21;
+        printf("[ppoly PSWF21] gen/run = %e s | const = %.6f\n", t_gen21, ppoly_const_pswf21);
+
+        NUFFT_PSWF_BENCH_PPOLY(w43, "43", gen_wups);
+        t0 = get_time_sec();
+        NUFFT_PSWF_BENCH_PPOLY(w43, "43", gen_reps);
+        double t_gen43 = (get_time_sec() - t0) / (double)gen_reps;
+        ppoly_const_pswf43 = t_gen43 / unit_pswf43;
+        printf("[ppoly PSWF43] gen/run = %e s | const = %.6f\n", t_gen43, ppoly_const_pswf43);
+    }
+
+    /* --- O(M) precompute cost: minmax vs piecewise --- */
+    {
+        const int pre_wups = 4;
+        const int pre_reps = 16;
+
+        /* PSWF21 minmax pre */
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_MODE(M_beta, N_beta, w21, df, freq_factor, "21", TLS_SPREAD_MINMAX);
+        for (int i = 0; i < pre_wups; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        double t0 = get_time_sec();
+        for (int i = 0; i < pre_reps; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        double t_pre_mm21 = (get_time_sec() - t0) / (double)pre_reps;
+        NUFFT_PSWF_FREE(plan);
+        double t_dec21 = gamma_pswf21 * (double)N_beta * unit_pswf21;
+        if (t_pre_mm21 > t_dec21) t_pre_mm21 -= t_dec21;
+        pre_pswf21 = t_pre_mm21 / ((double)M_beta * unit_pswf21);
+
+        /* PSWF21 piecewise pre */
+        plan = NUFFT_PSWF_INIT_MODE(M_beta, N_beta, w21, df, freq_factor, "21", TLS_SPREAD_PIECEWISE);
+        for (int i = 0; i < pre_wups; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        t0 = get_time_sec();
+        for (int i = 0; i < pre_reps; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        double t_pre_pp21 = (get_time_sec() - t0) / (double)pre_reps;
+        NUFFT_PSWF_FREE(plan);
+        if (t_pre_pp21 > t_dec21) t_pre_pp21 -= t_dec21;
+        pre_pp_pswf21 = t_pre_pp21 / ((double)M_beta * unit_pswf21);
+        printf("[pre   PSWF21] minmax = %e s (%.6f) | ppoly = %e s (%.6f)\n", t_pre_mm21, pre_pswf21, t_pre_pp21, pre_pp_pswf21);
+
+        /* PSWF43 minmax pre */
+        plan = NUFFT_PSWF_INIT_MODE(M_beta, N_beta, w43, df, freq_factor, "43", TLS_SPREAD_MINMAX);
+        for (int i = 0; i < pre_wups; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        t0 = get_time_sec();
+        for (int i = 0; i < pre_reps; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        double t_pre_mm43 = (get_time_sec() - t0) / (double)pre_reps;
+        NUFFT_PSWF_FREE(plan);
+        double t_dec43 = gamma_pswf43 * (double)N_beta_out43 * unit_pswf43;
+        if (t_pre_mm43 > t_dec43) t_pre_mm43 -= t_dec43;
+        pre_pswf43 = t_pre_mm43 / ((double)M_beta * unit_pswf43);
+
+        /* PSWF43 piecewise pre */
+        plan = NUFFT_PSWF_INIT_MODE(M_beta, N_beta, w43, df, freq_factor, "43", TLS_SPREAD_PIECEWISE);
+        for (int i = 0; i < pre_wups; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        t0 = get_time_sec();
+        for (int i = 0; i < pre_reps; i++) NUFFT_PSWF_PRE(plan, x_beta);
+        double t_pre_pp43 = (get_time_sec() - t0) / (double)pre_reps;
+        NUFFT_PSWF_FREE(plan);
+        if (t_pre_pp43 > t_dec43) t_pre_pp43 -= t_dec43;
+        pre_pp_pswf43 = t_pre_pp43 / ((double)M_beta * unit_pswf43);
+        printf("[pre   PSWF43] minmax = %e s (%.6f) | ppoly = %e s (%.6f)\n", t_pre_mm43, pre_pswf43, t_pre_pp43, pre_pp_pswf43);
+    }
+
+    /* --- PSWF21 piecewise beta --- */
+    {
+        for (int i = 0; i < M_beta; i++) {
+            FLOAT arg = MUL(MUL(FCAST(x_beta[i]), FCAST(df)), FCAST((double)N_beta));
+            dy_re[i] = M_SIN2PI(arg);
+            dy_im[i] = M_COS2PI(arg);
+        }
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_MODE(M_beta, N_beta, w21, df, freq_factor, "21", TLS_SPREAD_PIECEWISE);
+        NUFFT_PSWF_PRE(plan, x_beta);
+
+        for (int i = 0; i < wups_b; i++) {
+            memcpy(y_re_run, y_re_src, M_beta * sizeof(FLOAT));
+            memcpy(y_im_run, y_im_src, M_beta * sizeof(FLOAT));
+            for (int j = 0; j < M_beta; j++) {
+                FLOAT yr = y_re_run[j];
+                FLOAT yi = y_im_run[j];
+                y_re_run[j] = SUB(MUL(yr, dy_re[j]), MUL(yi, dy_im[j]));
+                y_im_run[j] = ADD(MUL(yr, dy_im[j]), MUL(yi, dy_re[j]));
+            }
+            NUFFT_PSWF_EXEC(plan, y_re_run, y_im_run, out_re, out_im, freq_factor);
+        }
+
+        double t_total = 0.0;
+        for (int i = 0; i < reps_b; i++) {
+            memcpy(y_re_run, y_re_src, M_beta * sizeof(FLOAT));
+            memcpy(y_im_run, y_im_src, M_beta * sizeof(FLOAT));
+            double t0 = get_time_sec();
+            for (int j = 0; j < M_beta; j++) {
+                FLOAT yr = y_re_run[j];
+                FLOAT yi = y_im_run[j];
+                y_re_run[j] = SUB(MUL(yr, dy_re[j]), MUL(yi, dy_im[j]));
+                y_im_run[j] = ADD(MUL(yr, dy_im[j]), MUL(yi, dy_re[j]));
+            }
+            NUFFT_PSWF_EXEC(plan, y_re_run, y_im_run, out_re, out_im, freq_factor);
+            t_total += get_time_sec() - t0;
+        }
+        double t_exec = t_total / reps_b;
+        NUFFT_PSWF_FREE(plan);
+        beta_pp_pswf21 = t_exec / ((double)M_beta * unit_pswf21);
+        printf("[beta  PSWF21 ppoly] exec/run = %e s | beta  = %.6f\n", t_exec, beta_pp_pswf21);
+    }
+
+    /* --- PSWF43 piecewise beta --- */
+    {
+        for (int i = 0; i < M_beta; i++) {
+            FLOAT arg = MUL(MUL(FCAST(x_beta[i]), FCAST(df)), FCAST((double)N_beta_out43));
+            dy_re[i] = M_SIN2PI(arg);
+            dy_im[i] = M_COS2PI(arg);
+        }
+        PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_MODE(M_beta, N_beta, w43, df, freq_factor, "43", TLS_SPREAD_PIECEWISE);
+        NUFFT_PSWF_PRE(plan, x_beta);
+
+        for (int i = 0; i < wups_b; i++) {
+            memcpy(y_re_run, y_re_src, M_beta * sizeof(FLOAT));
+            memcpy(y_im_run, y_im_src, M_beta * sizeof(FLOAT));
+            for (int j = 0; j < M_beta; j++) {
+                FLOAT yr = y_re_run[j];
+                FLOAT yi = y_im_run[j];
+                y_re_run[j] = SUB(MUL(yr, dy_re[j]), MUL(yi, dy_im[j]));
+                y_im_run[j] = ADD(MUL(yr, dy_im[j]), MUL(yi, dy_re[j]));
+            }
+            NUFFT_PSWF_EXEC(plan, y_re_run, y_im_run, out_re, out_im, freq_factor);
+        }
+
+        double t_total = 0.0;
+        for (int i = 0; i < reps_b; i++) {
+            memcpy(y_re_run, y_re_src, M_beta * sizeof(FLOAT));
+            memcpy(y_im_run, y_im_src, M_beta * sizeof(FLOAT));
+            double t0 = get_time_sec();
+            for (int j = 0; j < M_beta; j++) {
+                FLOAT yr = y_re_run[j];
+                FLOAT yi = y_im_run[j];
+                y_re_run[j] = SUB(MUL(yr, dy_re[j]), MUL(yi, dy_im[j]));
+                y_im_run[j] = ADD(MUL(yr, dy_im[j]), MUL(yi, dy_re[j]));
+            }
+            NUFFT_PSWF_EXEC(plan, y_re_run, y_im_run, out_re, out_im, freq_factor);
+            t_total += get_time_sec() - t0;
+        }
+        double t_exec = t_total / reps_b;
+        NUFFT_PSWF_FREE(plan);
+        beta_pp_pswf43 = t_exec / ((double)M_beta * unit_pswf43);
+        printf("[beta  PSWF43 ppoly] exec/run = %e s | beta  = %.6f\n", t_exec, beta_pp_pswf43);
+    }
+#endif
+
     free(x_beta);
 #if defined(DOUBLE_DOUBLE)
     free(x_beta_dd);
@@ -578,8 +752,28 @@ int main(int argc, char **argv) {
                 "_PSWF21_GAMMA %.10g\n"
                 "#define " PFX
                 "_PSWF43_BETA %.10g\n"
-                "#define " PFX "_PSWF43_GAMMA %.10g\n\n",
+                "#define " PFX "_PSWF43_GAMMA %.10g\n",
                 alpha, beta_lra, gamma_lra, beta_pswf21, gamma_pswf21, beta_pswf43, gamma_pswf43);
+#    if !defined(DOUBLE_DOUBLE)
+        fprintf(f,
+                "#define " PFX
+                "_PSWF21_PRE %.10g\n"
+                "#define " PFX
+                "_PSWF21_PPOLY_BETA %.10g\n"
+                "#define " PFX
+                "_PSWF21_PPOLY_PRE %.10g\n"
+                "#define " PFX
+                "_PSWF21_PPOLY_CONST %.10g\n"
+                "#define " PFX
+                "_PSWF43_PRE %.10g\n"
+                "#define " PFX
+                "_PSWF43_PPOLY_BETA %.10g\n"
+                "#define " PFX
+                "_PSWF43_PPOLY_PRE %.10g\n"
+                "#define " PFX "_PSWF43_PPOLY_CONST %.10g\n",
+                pre_pswf21, beta_pp_pswf21, pre_pp_pswf21, ppoly_const_pswf21, pre_pswf43, beta_pp_pswf43, pre_pp_pswf43, ppoly_const_pswf43);
+#    endif
+        fprintf(f, "\n");
         fclose(f);
 
 #    undef PFX

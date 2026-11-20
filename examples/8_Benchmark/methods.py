@@ -109,7 +109,7 @@ def make_frequency_grid(
         fmin = _finite_float("fmin", fmin)
         if fmin < 0.0:
             raise ValueError("fmin must be non-negative")
-        first_multiple = math.ceil((fmin / delta_t) / df)
+        first_multiple = math.ceil(fmin / df)
 
     f0 = first_multiple * df
     Nf = math.floor((fmax - f0) / df) + 1

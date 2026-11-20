@@ -18,38 +18,69 @@ from toeplitz_ls import Peak, Peaks, get_peaks  # noqa: E402
 
 def _reference_get_peaks(freq, power, cond=None, threshold=0):
     peaks = []
-    for idx in range(1, len(power) - 1):
-        power_window = power[idx - 1 : idx + 2]
-        if not all(_reference_is_finite(value) for value in power_window):
+    n = len(power)
+    idx = 1
+    while idx < n - 1:
+        p0, p1, p2 = power[idx - 1], power[idx], power[idx + 1]
+        if not (_reference_is_finite(p0) and _reference_is_finite(p1) and _reference_is_finite(p2)):
+            idx += 1
             continue
-        if not (power[idx] > power[idx - 1] and power[idx] > power[idx + 1] and power[idx] > threshold):
+        if not (p1 > p0 and p1 > threshold):
+            idx += 1
             continue
 
-        vertex_freq, vertex_power = _reference_quadratic_vertex(
-            freq[idx - 1],
-            power[idx - 1],
-            freq[idx],
-            power[idx],
-            freq[idx + 1],
-            power[idx + 1],
-        )
-        if cond is None:
-            peaks.append(Peak(vertex_freq, vertex_power))
-        else:
-            cond_window = cond[idx - 1 : idx + 2]
-            if all(_reference_is_finite(value) for value in cond_window):
-                vertex_cond = _reference_quadratic_value(
-                    vertex_freq,
-                    freq[idx - 1],
-                    cond[idx - 1],
-                    freq[idx],
-                    cond[idx],
-                    freq[idx + 1],
-                    cond[idx + 1],
-                )
+        if p1 > p2:
+            vertex_freq, vertex_power = _reference_quadratic_vertex(
+                freq[idx - 1],
+                p0,
+                freq[idx],
+                p1,
+                freq[idx + 1],
+                p2,
+            )
+            if cond is None:
+                peaks.append(Peak(vertex_freq, vertex_power))
             else:
-                vertex_cond = math.nan if mp is None else mp.nan
-            peaks.append(Peak(vertex_freq, vertex_power, vertex_cond))
+                cond_window = cond[idx - 1 : idx + 2]
+                if all(_reference_is_finite(value) for value in cond_window):
+                    vertex_cond = _reference_quadratic_value(
+                        vertex_freq,
+                        freq[idx - 1],
+                        cond[idx - 1],
+                        freq[idx],
+                        cond[idx],
+                        freq[idx + 1],
+                        cond[idx + 1],
+                    )
+                else:
+                    vertex_cond = math.nan if mp is None else mp.nan
+                peaks.append(Peak(vertex_freq, vertex_power, vertex_cond))
+            idx += 1
+        elif p1 == p2:
+            end = idx + 1
+            while end + 1 < n and _reference_is_finite(power[end + 1]) and power[end + 1] == p1:
+                end += 1
+            if end + 1 < n and _reference_is_finite(power[end + 1]) and p1 > power[end + 1]:
+                mid_freq = (freq[idx] + freq[end]) / 2
+                if cond is None:
+                    peaks.append(Peak(mid_freq, p1))
+                else:
+                    cond_window = cond[idx : end + 1]
+                    if all(_reference_is_finite(value) for value in cond_window):
+                        lo = idx
+                        while lo + 1 < end and freq[lo + 1] < mid_freq:
+                            lo += 1
+                        if freq[lo + 1] == mid_freq:
+                            mid_cond = cond[lo + 1]
+                        else:
+                            t_frac = (mid_freq - freq[lo]) / (freq[lo + 1] - freq[lo])
+                            mid_cond = cond[lo] + t_frac * (cond[lo + 1] - cond[lo])
+                    else:
+                        mid_cond = math.nan if mp is None else mp.nan
+                    peaks.append(Peak(mid_freq, p1, mid_cond))
+            idx = end + 1
+        else:
+            idx += 1
 
     peaks.sort(key=lambda peak: peak.power, reverse=True)
     return peaks
@@ -128,9 +159,50 @@ class PeakUtilityTests(unittest.TestCase):
 
         self.assertEqual(len(peaks), 0)
 
-    def test_endpoints_and_plateaus_are_ignored(self):
+    def test_endpoints_steps_and_nan_adjacent_plateaus_are_ignored(self):
         self.assertEqual(len(get_peaks([0.0, 1.0, 2.0], [2.0, 1.0, 3.0])), 0)
-        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 1.0, 0.0])), 0)
+        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0], [1.0, 1.0, 0.0])), 0)
+        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0], [0.0, 1.0, 1.0])), 0)
+        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 1.0, 2.0])), 0)
+        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0, 3.0], [math.nan, 1.0, 1.0, 0.0])), 0)
+        self.assertEqual(len(get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 1.0, math.nan])), 0)
+
+    def test_plateau_peaks_report_midpoint_frequency(self):
+        # Two-sample tie (common in single precision) -> midpoint between tied bins.
+        even_peaks = get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 5.0, 5.0, 0.0], cond=[1.0, 10.0, 20.0, 2.0])
+        self.assertEqual(len(even_peaks), 1)
+        self.assertAlmostEqual(even_peaks[0].freq, 1.5)
+        self.assertAlmostEqual(even_peaks[0].power, 5.0)
+        self.assertAlmostEqual(even_peaks[0].cond, 15.0)
+
+        # Odd-width plateau -> center frequency and center condition value.
+        odd_peaks = get_peaks([0.0, 1.0, 2.0, 3.0, 4.0], [0.0, 4.0, 4.0, 4.0, 0.0], cond=[1.0, 10.0, 14.0, 20.0, 2.0])
+        self.assertEqual(len(odd_peaks), 1)
+        self.assertAlmostEqual(odd_peaks[0].freq, 2.0)
+        self.assertAlmostEqual(odd_peaks[0].power, 4.0)
+        self.assertAlmostEqual(odd_peaks[0].cond, 14.0)
+
+        # Non-uniform spacing, NaN cond on plateau, and float32 input.
+        nonuniform = get_peaks([0.0, 1.0, 1.2, 3.0, 4.0], [0.0, 3.0, 3.0, 3.0, 0.0], cond=[1.0, 10.0, 12.0, 30.0, 2.0])
+        self.assertEqual(len(nonuniform), 1)
+        self.assertAlmostEqual(nonuniform[0].freq, 2.0)
+        self.assertAlmostEqual(nonuniform[0].cond, 20.0)
+
+        nan_cond = get_peaks([0.0, 1.0, 2.0, 3.0], [0.0, 5.0, 5.0, 0.0], cond=[1.0, math.nan, 20.0, 2.0])
+        self.assertEqual(len(nan_cond), 1)
+        self.assertTrue(math.isnan(nan_cond[0].cond))
+
+        f32_freq = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float32)
+        f32_power = np.array([0.0, 0.9999999, 0.9999999, 0.0], dtype=np.float32)
+        f32_peaks = get_peaks(f32_freq, f32_power)
+        self.assertEqual(len(f32_peaks), 1)
+        self.assertAlmostEqual(float(f32_peaks[0].freq), 1.5, places=6)
+        self.assertAlmostEqual(float(f32_peaks[0].power), float(f32_power[1]), places=6)
+
+        # Step followed by a real peak still detects the real peak.
+        step_then_peak = get_peaks([0.0, 1.0, 2.0, 3.0, 4.0], [0.0, 1.0, 1.0, 5.0, 0.0])
+        self.assertEqual(len(step_then_peak), 1)
+        self.assertAlmostEqual(step_then_peak[0].freq, 53.0 / 18.0)
 
     def test_nan_power_samples_are_accepted_and_skip_windows(self):
         freq = list(range(9))
@@ -367,6 +439,17 @@ class MpmathPeakUtilityTests(unittest.TestCase):
                     self.assertTrue(mp.isnan(native_peak.cond))
                 else:
                     self.assertLess(abs(native_peak.cond - ref_peak.cond), mp.mpf("1e-25"))
+
+    def test_mpmath_plateau_reports_midpoint(self):
+        with mp.workprec(106):
+            freq = [mp.mpf(0), mp.mpf(1), mp.mpf(2), mp.mpf(3)]
+            power = [mp.mpf(0), mp.mpf(5), mp.mpf(5), mp.mpf(0)]
+            cond = [mp.mpf(1), mp.mpf(10), mp.mpf(20), mp.mpf(2)]
+            peaks = get_peaks(freq, power, cond=cond)
+            self.assertEqual(len(peaks), 1)
+            self.assertEqual(peaks[0].freq, mp.mpf("1.5"))
+            self.assertEqual(peaks[0].power, mp.mpf(5))
+            self.assertEqual(peaks[0].cond, mp.mpf(15))
 
 
 if __name__ == "__main__":
