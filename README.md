@@ -3,6 +3,9 @@
 Reference implementation of the multiharmonic least-squares periodogram
 (AoVMH(W) / FastChi²) algorithm described in [Rutkowski & Poleski (2026)](https://arxiv.org/abs/2611.20300) using a blocked NuFFT and a fast Toeplitz solver.
 
+[![PyPI version](https://img.shields.io/pypi/v/toeplitz-ls.svg)](https://pypi.org/project/toeplitz-ls/)
+[![arXiv](https://img.shields.io/badge/arXiv-2611.20300-b31b1b.svg)](https://arxiv.org/abs/2611.20300)
+
 ## Installation
 
 The package requires Python >= 3.8 and NumPy >= 1.17.3; the optional `tlsdd`
