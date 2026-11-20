@@ -253,7 +253,7 @@ If you use this code in your research, please cite:
   doi           = {10.48550/arXiv.2611.20300},
   url           = {[https://arxiv.org/abs/2611.20300](https://arxiv.org/abs/2611.20300)}
 }
-
+```
 ## Performance
 
 The algorithm relies on blocked NuFFT sweep with vectorized transforms, deferred
