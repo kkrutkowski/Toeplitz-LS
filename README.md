@@ -1,7 +1,7 @@
 # Toeplitz-LS
 
 Reference implementation of the multiharmonic least-squares periodogram
-(AoVMH(W) / FastChi²) using a blocked NuFFT and a fast Toeplitz solver.
+(AoVMH(W) / FastChi²) algorithm described in [Rutkowski & Poleski (2026)](https://arxiv.org/abs/2611.20300) using a blocked NuFFT and a fast Toeplitz solver.
 
 ## Installation
 
@@ -235,10 +235,24 @@ make -C tests check
 Build artifacts (objects, staged wheel payloads, `.toolchains/`) live under
 `.build/`. Nothing is committed to it.
 
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@misc{rutkowski2026faster,
+  author        = {Rutkowski, Kacper and Poleski, Rados{\l}aw},
+  title         = {Faster $\chi^2$ periodogram: Accelerating linear algebra with fast Toeplitz solvers},
+  year          = {2026},
+  eprint        = {2611.20300},
+  archivePrefix = {arXiv},
+  primaryClass  = {astro-ph.IM},
+  doi           = {10.48550/arXiv.2611.20300},
+  url           = {[https://arxiv.org/abs/2611.20300](https://arxiv.org/abs/2611.20300)}
+}
+
 ## Performance
 
-The hot path is a blocked NuFFT sweep with vectorized transforms, deferred
-permutations, and block-sized work arrays. On a modern
-x86-64 CPU, a periodogram over roughly 10^4 frequencies takes on the order of
-milliseconds; the IHS path is at least 3x cheaper. The benchmark harness lives
+The algorithm relies on blocked NuFFT sweep with vectorized transforms, deferred
+permutations, and block-sized work arrays. The IHS path is an experimental approximation, expected to derive at least 3x cheaper, but appropriate only, when the 4th power of degree *does not* exceed the effective number of measurements. The benchmark harness is present in
 in `tests/`.
