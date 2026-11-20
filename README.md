@@ -64,7 +64,7 @@ accept `normalization=`:
 | value | output | notes |
 |---|---|---|
 | `"standard"` (default) | coefficient of determination `R^2` | |
-| `"anova"` | ANOVA / `F` statistic | Schwarzenberg-Czerny's ANOVA convention |
+| `"anova"` | ANOVA / `F` statistic | A. Schwarzenberg-Czerny's ANOVA convention |
 | `"nll"` | natural negative log false-alarm probability | `-ln(FAP)` |
 
 For `nterms = d` harmonics:
@@ -72,7 +72,7 @@ For `nterms = d` harmonics:
 - `"standard"` is the coefficient of determination `R^2` of the full model.
   Values at or above 1 are numerical artefacts of an ill-conditioned solve and
   are reported as 0.
-- `"anova"` is the ANOVA `F` statistic in Schwarzenberg-Czerny's convention.
+- `"anova"` is the ANOVA `F` statistic in A. Schwarzenberg-Czerny's convention.
 - `"nll"` is the natural-log negative false-alarm probability, `-ln(FAP)`,
   computed from the direct Pochhammer/incomplete-beta statistic with its
   finite-sample correction. `Neff = (sum w)^2 / sum(w^2)` with `w = 1/dy^2`.
