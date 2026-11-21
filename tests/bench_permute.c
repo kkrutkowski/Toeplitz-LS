@@ -93,19 +93,45 @@ static double double_max_rel_error(const void *ar, const void *ai, const void *b
     return worst;
 }
 
+static double bfloat_max_rel_error(const void *ar, const void *ai, const void *br, const void *bi, uint32_t n) {
+    return (memcmp(ar, br, (size_t)n * sizeof(VECF)) == 0 && memcmp(ai, bi, (size_t)n * sizeof(VECF)) == 0) ? 0.0 : 1.0;
+}
+
+static double bdouble_max_rel_error(const void *ar, const void *ai, const void *br, const void *bi, uint32_t n) {
+    return (memcmp(ar, br, (size_t)n * sizeof(VEC)) == 0 && memcmp(ai, bi, (size_t)n * sizeof(VEC)) == 0) ? 0.0 : 1.0;
+}
+
+static double bdd_max_rel_error(const void *ar, const void *ai, const void *br, const void *bi, uint32_t n) {
+    return (memcmp(ar, br, (size_t)n * sizeof(VECDD)) == 0 && memcmp(ai, bi, (size_t)n * sizeof(VECDD)) == 0) ? 0.0 : 1.0;
+}
+
 static void fill_templates(uint32_t n, void *tmpl_r, void *tmpl_i, size_t elem) {
     uint32_t rng = 2463534242u;
+    const size_t total_words = ((size_t)n * elem) / sizeof(uint32_t);
     for (int part = 0; part < 2; ++part) {
         void *dst = part ? tmpl_i : tmpl_r;
-        for (uint32_t k = 0; k < n; ++k) {
-            rng ^= rng << 13;
-            rng ^= rng >> 17;
-            rng ^= rng << 5;
-            const double value = (double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0;
-            if (elem == sizeof(float))
-                ((float *)dst)[k] = (float)value;
-            else
-                ((double *)dst)[k] = value;
+        if (elem == sizeof(float)) {
+            for (uint32_t k = 0; k < n; ++k) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                ((float *)dst)[k] = (float)((double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0);
+            }
+        } else if (elem == sizeof(double)) {
+            for (uint32_t k = 0; k < n; ++k) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                ((double *)dst)[k] = (double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0;
+            }
+        } else {
+            uint32_t *w = (uint32_t *)dst;
+            for (size_t k = 0; k < total_words; ++k) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                w[k] = rng;
+            }
         }
     }
 }
@@ -195,10 +221,47 @@ static void run_precision(const precision *api, int rounds, int reps, int min_lo
 }
 
 int main(int argc, char **argv) {
-    const int rounds = (argc > 1) ? atoi(argv[1]) : 7;
-    const int reps = (argc > 2) ? atoi(argv[2]) : 9;
-    const int min_log = (argc > 3) ? atoi(argv[3]) : 4;
-    const int max_log = (argc > 4) ? atoi(argv[4]) : 16;
+    int breadth = 0;
+    int arg_off = 1;
+    if (argc > 1 && strcmp(argv[1], "--breadth") == 0) {
+        breadth = 1;
+        arg_off = 2;
+    }
+    const int rounds = (argc > arg_off) ? atoi(argv[arg_off]) : 7;
+    const int reps = (argc > arg_off + 1) ? atoi(argv[arg_off + 1]) : 9;
+    const int min_log = (argc > arg_off + 2) ? atoi(argv[arg_off + 2]) : (breadth ? 5 : 4);
+    const int max_log = (argc > arg_off + 3) ? atoi(argv[arg_off + 3]) : 16;
+
+    if (breadth) {
+        const precision bfloat_api = {
+            "breadth-float (VECF)",
+            sizeof(VECF),
+            (void *(*)(uint32_t))nanofftf_make_plan_breadth,
+            (void (*)(void *))nanofftf_destroy_plan,
+            (void (*)(void *, void *, void *))nanofftf_permute_breadth,
+            bfloat_max_rel_error,
+        };
+        const precision bdouble_api = {
+            "breadth-double (VEC)",
+            sizeof(VEC),
+            (void *(*)(uint32_t))nanofft_make_plan_breadth,
+            (void (*)(void *))nanofft_destroy_plan,
+            (void (*)(void *, void *, void *))nanofft_permute_breadth,
+            bdouble_max_rel_error,
+        };
+        const precision bdd_api = {
+            "breadth-dd (VECDD)",
+            sizeof(VECDD),
+            (void *(*)(uint32_t))nanofftdd_make_plan_breadth,
+            (void (*)(void *))nanofftdd_destroy_plan,
+            (void (*)(void *, void *, void *))nanofftdd_permute_breadth,
+            bdd_max_rel_error,
+        };
+        run_precision(&bfloat_api, rounds, reps, min_log, max_log);
+        run_precision(&bdouble_api, rounds, reps, min_log, max_log);
+        run_precision(&bdd_api, rounds, reps, min_log, max_log);
+        return 0;
+    }
 
     const precision float_api = {
         "float",

@@ -26,6 +26,14 @@
 #    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_FLOAT
 #endif
 
+#if defined(DOUBLE_DOUBLE)
+#    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_DD
+#elif defined(DOUBLE)
+#    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_DOUBLE
+#else
+#    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_FLOAT
+#endif
+
 /* Per-grid fusion-depth table measured by tests/bench_fuse --tune.  Each
  * precision build selects its own array; a missing table simply means the
  * per-precision default is used for every grid. */
@@ -38,9 +46,19 @@
 #    else
 #        define NANOFFT_TUNED_DEPTH nanofft_depth_float
 #    endif
+#    ifdef NANOFFT_BDEPTH_TABLE
+#        if defined(DOUBLE_DOUBLE)
+#            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_dd
+#        elif defined(DOUBLE)
+#            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_double
+#        else
+#            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_float
+#        endif
+#    endif
 #endif
 
 #define NANOFFT_EFFECTIVE_FUSE(fuse) ((fuse) < 1 ? 1 : ((fuse) > NANOFFT_FFT_FUSE_BUILD ? NANOFFT_FFT_FUSE_BUILD : (fuse)))
+#define NANOFFT_EFFECTIVE_BFUSE(fuse) ((fuse) < 1 ? 1 : ((fuse) > NANOFFT_FFT_BFUSE_BUILD ? NANOFFT_FFT_BFUSE_BUILD : (fuse)))
 
 typedef struct {
     uint32_t i;
@@ -49,6 +67,7 @@ typedef struct {
 
 struct PLAN_T {
     uint32_t N;
+    int is_breadth; /* 0 = depth-wise scalar/SIMD plan, 1 = breadth-wise vector-wide plan */
     int fuse;       /* radix-2 DIF stages fused per pass (1 = classically staged) */
     int fuse_order; /* which end of the stage sequence gets the leftover pass */
     int cobravo;    /* 1 = vectorized tile bit reversal, 0 = scalar in-tile swap */
@@ -56,6 +75,8 @@ struct PLAN_T {
     FLOAT *twiddle_imag;
     FLOAT *cobra_buffer_real; /* two tiles: A at offset 0, B at BLOCK_ELEMS */
     FLOAT *cobra_buffer_imag;
+    BREADTH_VEC *bcobra_real; /* two breadth tiles: A at 0, B at BCOBRA_BLOCK_ELEMS */
+    BREADTH_VEC *bcobra_imag;
     int permute;     /* effective bit-reversal strategy for this plan */
     rev_pair *pairs; /* lazily built swap-pair list, NULL until first use */
     uint32_t npairs;
@@ -106,6 +127,29 @@ NANOFFT_UNUSED static inline uint32_t intmax(int32_t a, int32_t b) { return (a >
 #    include <immintrin.h>
 #else
 #    define COBRAVO_GATHER 0
+#endif
+
+/* Breadth-wise COBRAVO sizing: keep 4 staging tiles (A/B x real/imag) in L1.
+ * Elements are BREADTH_VEC (VEC_BYTES, or 2*VEC_BYTES for VECDD). */
+#if VEC_BYTES >= 64 || (VEC_BYTES >= 32 && defined(DOUBLE_DOUBLE))
+#    define BCOBRA_MAX_W 3u
+#else
+#    define BCOBRA_MAX_W 4u
+#endif
+#define BCOBRA_BLOCK_WIDTH (1u << BCOBRA_MAX_W)
+#define BCOBRA_BLOCK_ELEMS (BCOBRA_BLOCK_WIDTH * BCOBRA_BLOCK_WIDTH)
+#define BCOBRA_MIN_LOG 6u
+#define BCOBRA_W3_LEN (1u << 6)
+#define BCOBRA_W4_LEN (1u << 8)
+#define BCOBRA_IDX_LEN (BCOBRA_W3_LEN + BCOBRA_W4_LEN)
+
+#define BPAIRS_MIN_LOG 6u
+#if defined(DOUBLE_DOUBLE)
+#    define BPAIRS_MAX_LOG 13u
+#elif VEC_BYTES >= 64
+#    define BPAIRS_MAX_LOG 10u
+#else
+#    define BPAIRS_MAX_LOG 11u
 #endif
 
 static inline uint32_t intlog2(uint32_t input) {
@@ -420,6 +464,196 @@ inline static void bit_reverse_permutation_1d(FLOAT *values, uint32_t N, PLAN_T 
         return;
     }
     cobravo_shuffle_1d(values, order, plan->cobra_buffer_real, plan->cobra_buffer_real + BLOCK_ELEMS, plan->cobravo);
+}
+
+/* =========================================================================
+ * Breadth-wise bit-reverse permutation (with adapted COBRAVO)
+ * ========================================================================= */
+
+static uint16_t bcobra_rev_idx[BCOBRA_IDX_LEN] __attribute__((aligned(64)));
+
+static inline const uint16_t *bcobra_idx_table(uint32_t w) {
+    if (w >= 4u) return bcobra_rev_idx + BCOBRA_W3_LEN;
+    return bcobra_rev_idx;
+}
+
+__attribute__((constructor)) static void bcobra_build_idx_table(void) {
+    for (uint32_t i = 0; i < BCOBRA_W3_LEN; ++i) bcobra_rev_idx[i] = (uint16_t)reverse_bits(i, 6u);
+    for (uint32_t i = 0; i < BCOBRA_W4_LEN; ++i) bcobra_rev_idx[BCOBRA_W3_LEN + i] = (uint16_t)reverse_bits(i, 8u);
+}
+
+static inline void table_shuffle_breadth(BREADTH_VEC *real, BREADTH_VEC *imag, uint32_t log_n) {
+    const uint32_t n = 1u << log_n;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t j = reverse_bits(i, log_n);
+        if (j > i) {
+            const BREADTH_VEC tr = LOAD_BVEC(&real[i]);
+            const BREADTH_VEC ti = LOAD_BVEC(&imag[i]);
+            STORE_BVEC(&real[i], LOAD_BVEC(&real[j]));
+            STORE_BVEC(&imag[i], LOAD_BVEC(&imag[j]));
+            STORE_BVEC(&real[j], tr);
+            STORE_BVEC(&imag[j], ti);
+        }
+    }
+}
+
+static inline void table_shuffle_1d_breadth(BREADTH_VEC *values, uint32_t log_n) {
+    const uint32_t n = 1u << log_n;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t j = reverse_bits(i, log_n);
+        if (j > i) {
+            const BREADTH_VEC t = LOAD_BVEC(&values[i]);
+            STORE_BVEC(&values[i], LOAD_BVEC(&values[j]));
+            STORE_BVEC(&values[j], t);
+        }
+    }
+}
+
+static inline void pair_shuffle_breadth(BREADTH_VEC *real, BREADTH_VEC *imag, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const BREADTH_VEC tr = LOAD_BVEC(&real[i]);
+        const BREADTH_VEC ti = LOAD_BVEC(&imag[i]);
+        STORE_BVEC(&real[i], LOAD_BVEC(&real[j]));
+        STORE_BVEC(&imag[i], LOAD_BVEC(&imag[j]));
+        STORE_BVEC(&real[j], tr);
+        STORE_BVEC(&imag[j], ti);
+    }
+}
+
+static inline void pair_shuffle_1d_breadth(BREADTH_VEC *values, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const BREADTH_VEC t = LOAD_BVEC(&values[i]);
+        STORE_BVEC(&values[i], LOAD_BVEC(&values[j]));
+        STORE_BVEC(&values[j], t);
+    }
+}
+
+static inline void cobravo_load_tile_breadth(const BREADTH_VEC *src, uint32_t b_shifted, uint32_t shift_top, uint32_t w, BREADTH_VEC *dst) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + (size_t)a * width, src + ((size_t)a << shift_top) + b_shifted, (size_t)width * sizeof(BREADTH_VEC));
+}
+
+static inline void cobravo_store_tile_breadth(const BREADTH_VEC *src, BREADTH_VEC *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + ((size_t)a << shift_top) + b_shifted, src + (size_t)a * width, (size_t)width * sizeof(BREADTH_VEC));
+}
+
+static inline void cobravo_reverse_tile_breadth(BREADTH_VEC *tile_values, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    for (uint32_t i = 0; i < tile; ++i) {
+        const uint32_t j = reverse_bits(i, 2u * w);
+        if (j > i) {
+            const BREADTH_VEC t = LOAD_BVEC(&tile_values[i]);
+            STORE_BVEC(&tile_values[i], LOAD_BVEC(&tile_values[j]));
+            STORE_BVEC(&tile_values[j], t);
+        }
+    }
+}
+
+/* Direct vector-wide tile emit: each element is already one aligned BREADTH_VEC,
+ * so sequential destination stores read reversed staging slots directly without
+ * needing i32gather (portable across SSE2, AVX2, AVX-512, ARM64, and VECDD). */
+static inline void cobravo_emit_tile_breadth(BREADTH_VEC *src, BREADTH_VEC *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w, int vectorized) {
+    if (vectorized) {
+        const uint32_t width = 1u << w;
+        const uint16_t *idx = bcobra_idx_table(w);
+        for (uint32_t a = 0; a < width; ++a) {
+            BREADTH_VEC *row = dst + ((size_t)a << shift_top) + b_shifted;
+            const uint16_t *idx_row = idx + (size_t)a * width;
+            for (uint32_t c = 0; c < width; ++c) STORE_BVEC(&row[c], LOAD_BVEC(&src[idx_row[c]]));
+        }
+        return;
+    }
+    cobravo_reverse_tile_breadth(src, w);
+    cobravo_store_tile_breadth(src, dst, b_shifted, shift_top, w);
+}
+
+static inline void cobravo_shuffle_breadth(BREADTH_VEC *real, BREADTH_VEC *imag, uint32_t log_n, BREADTH_VEC *bufA_real, BREADTH_VEC *bufA_imag,
+                                           BREADTH_VEC *bufB_real, BREADTH_VEC *bufB_imag, int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > BCOBRA_MAX_W) w = BCOBRA_MAX_W;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile_breadth(real, b_shifted, shift_top, w, bufA_real);
+        cobravo_load_tile_breadth(imag, b_shifted, shift_top, w, bufA_imag);
+        if (b != b_rev) {
+            cobravo_load_tile_breadth(real, b_rev_shifted, shift_top, w, bufB_real);
+            cobravo_load_tile_breadth(imag, b_rev_shifted, shift_top, w, bufB_imag);
+        }
+
+        cobravo_emit_tile_breadth(bufA_real, real, b_rev_shifted, shift_top, w, vectorized);
+        cobravo_emit_tile_breadth(bufA_imag, imag, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) {
+            cobravo_emit_tile_breadth(bufB_real, real, b_shifted, shift_top, w, vectorized);
+            cobravo_emit_tile_breadth(bufB_imag, imag, b_shifted, shift_top, w, vectorized);
+        }
+    }
+}
+
+static inline void cobravo_shuffle_1d_breadth(BREADTH_VEC *values, uint32_t log_n, BREADTH_VEC *bufA, BREADTH_VEC *bufB, int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > BCOBRA_MAX_W) w = BCOBRA_MAX_W;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile_breadth(values, b_shifted, shift_top, w, bufA);
+        if (b != b_rev) cobravo_load_tile_breadth(values, b_rev_shifted, shift_top, w, bufB);
+
+        cobravo_emit_tile_breadth(bufA, values, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) cobravo_emit_tile_breadth(bufB, values, b_shifted, shift_top, w, vectorized);
+    }
+}
+
+static inline void bit_reverse_permutation_breadth(BREADTH_VEC *real, BREADTH_VEC *imag, uint32_t N, PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle_breadth(real, imag, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute != TLS_PERMUTE_COBRAVO || plan->bcobra_real == NULL || plan->bcobra_imag == NULL) {
+        table_shuffle_breadth(real, imag, order);
+        return;
+    }
+    cobravo_shuffle_breadth(real, imag, order, plan->bcobra_real, plan->bcobra_imag, plan->bcobra_real + BCOBRA_BLOCK_ELEMS,
+                            plan->bcobra_imag + BCOBRA_BLOCK_ELEMS, plan->cobravo);
+}
+
+static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint32_t N, PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle_1d_breadth(values, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute != TLS_PERMUTE_COBRAVO || plan->bcobra_real == NULL) {
+        table_shuffle_1d_breadth(values, order);
+        return;
+    }
+    cobravo_shuffle_1d_breadth(values, order, plan->bcobra_real, plan->bcobra_real + BCOBRA_BLOCK_ELEMS, plan->cobravo);
 }
 
 /* =========================================================================
@@ -750,6 +984,19 @@ int PREFIX(depth_for)(uint32_t N) {
     return NANOFFT_FFT_FUSE_BUILD;
 }
 
+int PREFIX(breadth_depth_for)(uint32_t N) {
+#if defined(NANOFFT_DEPTH_TABLE) && defined(NANOFFT_BDEPTH_TABLE)
+    const uint32_t order = intlog2(N);
+    if (order < 32u) {
+        const int tuned = (int)NANOFFT_TUNED_BDEPTH[order];
+        if (tuned >= 1 && tuned <= NANOFFT_FFT_BFUSE_BUILD) return tuned;
+    }
+#else
+    (void)N;
+#endif
+    return NANOFFT_FFT_BFUSE_BUILD;
+}
+
 static uint32_t fused_stages(uint32_t N) {
     const uint32_t log_n = intlog2(N);
     const uint32_t log_v = (INTERNAL_VEC_LEN > 1) ? intlog2((uint32_t)INTERNAL_VEC_LEN) : 0;
@@ -871,6 +1118,131 @@ static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, 
 }
 
 /* =========================================================================
+ * Breadth-wise DIF FFT kernels (all log2(N) stages, no intra-vector tail)
+ * ========================================================================= */
+
+#define NANOFFT_BFUSED_PASS_BODY(L)                                                                  \
+    {                                                                                                \
+        const uint32_t q = step >> (L);                                                              \
+        uint32_t base[1 << (L)];                                                                     \
+        {                                                                                            \
+            uint32_t acc = shift;                                                                    \
+            for (uint32_t t = 0; t < (L); ++t) {                                                     \
+                base[t] = acc;                                                                       \
+                acc += step >> (t + 1);                                                              \
+            }                                                                                        \
+        }                                                                                            \
+        for (uint32_t i = 0; i < n; i += step) {                                                     \
+            for (uint32_t j = 0; j < q; ++j) {                                                       \
+                BREADTH_VEC vr[1 << (L)], vi[1 << (L)];                                              \
+                _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                \
+                    vr[m] = LOAD_BVEC(&real[i + j + m * q]);                                         \
+                    vi[m] = LOAD_BVEC(&imag[i + j + m * q]);                                         \
+                }                                                                                    \
+                _Pragma("GCC unroll 4") for (uint32_t t = 0; t < (L); ++t) {                         \
+                    const uint32_t h = 1u << ((L) - 1u - t);                                         \
+                    _Pragma("GCC unroll 16") for (uint32_t lo = 0; lo < (1u << (L)); lo += 2u * h) { \
+                        _Pragma("GCC unroll 8") for (uint32_t m = 0; m < h; ++m) {                   \
+                            const uint32_t a = lo + m, b = a + h;                                    \
+                            const BREADTH_VEC wr = BREADTH_SPLAT(tw_r[base[t] + m * q + j]);         \
+                            const BREADTH_VEC wi = BREADTH_SPLAT(tw_i[base[t] + m * q + j]);         \
+                            const BREADTH_VEC sr = BREADTH_ADD(vr[a], vr[b]);                        \
+                            const BREADTH_VEC si = BREADTH_ADD(vi[a], vi[b]);                        \
+                            const BREADTH_VEC dr = BREADTH_SUB(vr[a], vr[b]);                        \
+                            const BREADTH_VEC di = BREADTH_SUB(vi[a], vi[b]);                        \
+                            vr[a] = sr;                                                              \
+                            vi[a] = si;                                                              \
+                            vr[b] = BREADTH_SUB(BREADTH_MUL(dr, wr), BREADTH_MUL(di, wi));           \
+                            vi[b] = BREADTH_ADD(BREADTH_MUL(dr, wi), BREADTH_MUL(di, wr));           \
+                        }                                                                            \
+                    }                                                                                \
+                }                                                                                    \
+                _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                \
+                    STORE_BVEC(&real[i + j + m * q], vr[m]);                                         \
+                    STORE_BVEC(&imag[i + j + m * q], vi[m]);                                         \
+                }                                                                                    \
+            }                                                                                        \
+        }                                                                                            \
+    }
+
+static inline void sande_tukey_bfused_pass(BREADTH_VEC *real, BREADTH_VEC *imag, const FLOAT *tw_r, const FLOAT *tw_i, uint32_t n, uint32_t step,
+                                           uint32_t shift, int layers) {
+    switch (layers) {
+        case 1:
+            NANOFFT_BFUSED_PASS_BODY(1)
+            break;
+#if NANOFFT_FFT_BFUSE_BUILD >= 2
+        case 2:
+            NANOFFT_BFUSED_PASS_BODY(2)
+            break;
+#endif
+#if NANOFFT_FFT_BFUSE_BUILD >= 3
+        case 3:
+            NANOFFT_BFUSED_PASS_BODY(3)
+            break;
+#endif
+#if NANOFFT_FFT_BFUSE_BUILD >= 4
+        case 4:
+            NANOFFT_BFUSED_PASS_BODY(4)
+            break;
+#endif
+        default:
+            break;
+    }
+}
+
+static void sande_tukey_bstages(BREADTH_VEC *real_signal, BREADTH_VEC *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N) {
+    uint32_t shift = 0;
+    for (uint32_t step = N; step > 1u; step >>= 1) {
+        const uint32_t half_step = step >> 1;
+        for (uint32_t i = 0; i < N; i += step) {
+            for (uint32_t j = 0; j < half_step; ++j) {
+                const BREADTH_VEC r_even = LOAD_BVEC(&real_signal[i + j]);
+                const BREADTH_VEC i_even = LOAD_BVEC(&imag_signal[i + j]);
+                const BREADTH_VEC r_odd = LOAD_BVEC(&real_signal[i + j + half_step]);
+                const BREADTH_VEC i_odd = LOAD_BVEC(&imag_signal[i + j + half_step]);
+
+                STORE_BVEC(&real_signal[i + j], BREADTH_ADD(r_even, r_odd));
+                STORE_BVEC(&imag_signal[i + j], BREADTH_ADD(i_even, i_odd));
+
+                const BREADTH_VEC r_tmp = BREADTH_SUB(r_even, r_odd);
+                const BREADTH_VEC i_tmp = BREADTH_SUB(i_even, i_odd);
+                const BREADTH_VEC b_real = BREADTH_SPLAT(real_buffer[shift + j]);
+                const BREADTH_VEC b_imag = BREADTH_SPLAT(imag_buffer[shift + j]);
+
+                STORE_BVEC(&real_signal[i + j + half_step], BREADTH_SUB(BREADTH_MUL(r_tmp, b_real), BREADTH_MUL(i_tmp, b_imag)));
+                STORE_BVEC(&imag_signal[i + j + half_step], BREADTH_ADD(BREADTH_MUL(r_tmp, b_imag), BREADTH_MUL(i_tmp, b_real)));
+            }
+        }
+        shift += half_step;
+    }
+}
+
+static void sande_tukey_in_place_breadth(BREADTH_VEC *real_signal, BREADTH_VEC *imag_signal, const FLOAT *real_buffer, const FLOAT *imag_buffer, uint32_t N,
+                                         int fuse, int fuse_order) {
+    const uint32_t stages = intlog2(N);
+    const uint32_t layers = (uint32_t)fuse;
+
+    if (layers == 1u) {
+        sande_tukey_bstages(real_signal, imag_signal, real_buffer, imag_buffer, N);
+        return;
+    }
+
+    fuse_pass passes[NANOFFT_MAX_PASSES];
+    const uint32_t npass = fuse_schedule(N, stages, layers, fuse_order, passes);
+    for (uint32_t p = 0; p < npass; ++p)
+        sande_tukey_bfused_pass(real_signal, imag_signal, real_buffer, imag_buffer, N, passes[p].step, passes[p].shift, (int)passes[p].layers);
+}
+
+static void generate_buffer_breadth(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, int fuse, int fuse_order) {
+    const uint32_t stages = intlog2(N);
+    const uint32_t layers = (uint32_t)fuse;
+    fuse_pass passes[NANOFFT_MAX_PASSES];
+    const uint32_t npass = fuse_schedule(N, stages, layers, fuse_order, passes);
+    for (uint32_t p = 0; p < npass; ++p) generate_fused_pass(passes[p].step, passes[p].shift, passes[p].layers, real_buffer, imag_buffer);
+}
+
+/* =========================================================================
  * Public API Implementation
  * ========================================================================= */
 
@@ -889,6 +1261,7 @@ PLAN_T *PREFIX(make_plan)(uint32_t N) {
 
     PLAN_T *plan = (PLAN_T *)nanofft_malloc(sizeof(PLAN_T));
     plan->N = N;
+    plan->is_breadth = 0;
     {
         /* 0 selects the build-time default: floor(log2(VEC_LEN)) stages, one
          * less for the float pass, 2 for double-double. */
@@ -920,6 +1293,54 @@ PLAN_T *PREFIX(make_plan)(uint32_t N) {
     size_t cobra_size = 2u * BLOCK_ELEMS * sizeof(FLOAT);
     plan->cobra_buffer_real = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(cobra_size));
     plan->cobra_buffer_imag = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(cobra_size));
+    plan->bcobra_real = NULL;
+    plan->bcobra_imag = NULL;
+
+    return plan;
+}
+
+PLAN_T *PREFIX(make_plan_breadth)(uint32_t N) {
+    if (!is_power_of_two((int)N) || N < 2u) {
+        fprintf(stderr, "Breadth signal length must be a power of 2 >= 2\n");
+        exit(EXIT_FAILURE);
+    }
+
+    PLAN_T *plan = (PLAN_T *)nanofft_malloc(sizeof(PLAN_T));
+    plan->N = N;
+    plan->is_breadth = 1;
+    {
+        const int requested = tls_tuning_fft_bfuse();
+        plan->fuse = (requested == TLS_TUNING_FFT_FUSE_AUTO) ? PREFIX(breadth_depth_for)(N) : NANOFFT_EFFECTIVE_BFUSE(requested);
+    }
+    plan->fuse_order = tls_tuning_fft_order();
+    plan->cobravo = tls_tuning_cobravo();
+    plan->pairs = NULL;
+    plan->npairs = 0;
+    {
+        const uint32_t order = intlog2(N);
+        int mode = tls_tuning_permute();
+        if (mode == TLS_PERMUTE_AUTO) {
+            mode = (order < BPAIRS_MIN_LOG) ? TLS_PERMUTE_TABLE : ((order <= BPAIRS_MAX_LOG) ? TLS_PERMUTE_PAIRS : TLS_PERMUTE_COBRAVO);
+        }
+        if (mode == TLS_PERMUTE_PAIRS && order > BPAIRS_MAX_LOG + 6u) mode = TLS_PERMUTE_COBRAVO;
+        if (mode == TLS_PERMUTE_COBRAVO && order < BCOBRA_MIN_LOG) mode = TLS_PERMUTE_TABLE;
+        plan->permute = mode;
+    }
+
+    plan->twiddle_real = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+    plan->twiddle_imag = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(FLOAT)));
+    generate_buffer_breadth(N, plan->twiddle_real, plan->twiddle_imag, plan->fuse, plan->fuse_order);
+
+    plan->cobra_buffer_real = NULL;
+    plan->cobra_buffer_imag = NULL;
+    if (plan->permute == TLS_PERMUTE_COBRAVO) {
+        const size_t bcobra_size = 2u * BCOBRA_BLOCK_ELEMS * sizeof(BREADTH_VEC);
+        plan->bcobra_real = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(bcobra_size));
+        plan->bcobra_imag = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(bcobra_size));
+    } else {
+        plan->bcobra_real = NULL;
+        plan->bcobra_imag = NULL;
+    }
 
     return plan;
 }
@@ -930,6 +1351,8 @@ void PREFIX(destroy_plan)(PLAN_T *plan) {
         nanofft_aligned_free(plan->twiddle_imag);
         nanofft_aligned_free(plan->cobra_buffer_real);
         nanofft_aligned_free(plan->cobra_buffer_imag);
+        nanofft_aligned_free(plan->bcobra_real);
+        nanofft_aligned_free(plan->bcobra_imag);
         nanofft_aligned_free(plan->pairs);
         nanofft_aligned_free(plan);
     }
@@ -946,6 +1369,21 @@ void PREFIX(permute_1d)(PLAN_T *plan, FLOAT *values) { bit_reverse_permutation_1
 void PREFIX(execute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
     PREFIX(execute_raw)(plan, real_signal, imag_signal);
     PREFIX(permute)(plan, real_signal, imag_signal);
+}
+
+void PREFIX(execute_raw_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC *imag_signal) {
+    sande_tukey_in_place_breadth(real_signal, imag_signal, plan->twiddle_real, plan->twiddle_imag, plan->N, plan->fuse, plan->fuse_order);
+}
+
+void PREFIX(permute_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC *imag_signal) {
+    bit_reverse_permutation_breadth(real_signal, imag_signal, plan->N, plan);
+}
+
+void PREFIX(permute_1d_breadth)(PLAN_T *plan, BREADTH_VEC *values) { bit_reverse_permutation_1d_breadth(values, plan->N, plan); }
+
+void PREFIX(execute_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC *imag_signal) {
+    PREFIX(execute_raw_breadth)(plan, real_signal, imag_signal);
+    PREFIX(permute_breadth)(plan, real_signal, imag_signal);
 }
 
 /* =========================================================================
@@ -1033,4 +1471,107 @@ __attribute__((weak)) void FALLBACK_PREFIX(permute_1d)(FALLBACK_PLAN_T *plan, FA
     for (uint32_t i = 0; i < N; ++i) values[i] = TO_FALLBACK(temp[i]);
 
     nanofft_aligned_free(temp);
+}
+
+#if defined(DOUBLE_DOUBLE)
+#    define FALLBACK_BREADTH_VEC VEC
+#    define FALLBACK_BREADTH_VEC_LEN VEC_LEN
+#    define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
+#    define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
+#elif defined(DOUBLE)
+#    define FALLBACK_BREADTH_VEC VECF
+#    define FALLBACK_BREADTH_VEC_LEN VECF_LEN
+#    define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
+#    define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
+#else
+#    define FALLBACK_BREADTH_VEC VEC
+#    define FALLBACK_BREADTH_VEC_LEN VEC_LEN
+#    define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
+#    define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
+#endif
+
+__attribute__((weak)) FALLBACK_PLAN_T *FALLBACK_PREFIX(make_plan_breadth)(uint32_t N) {
+    static bool warned = false;
+    if (!warned) {
+        fprintf(stderr, "[nanofft warning] %s is missing. Falling back to %s.\n", STR(FALLBACK_PREFIX(make_plan_breadth)), STR(PREFIX(make_plan_breadth)));
+        warned = true;
+    }
+    return (FALLBACK_PLAN_T *)PREFIX(make_plan_breadth)(N);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(execute_raw_breadth)(FALLBACK_PLAN_T *plan, FALLBACK_BREADTH_VEC *real, FALLBACK_BREADTH_VEC *imag) {
+    const uint32_t N = ((PLAN_T *)plan)->N;
+    BREADTH_VEC *temp_r = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(BREADTH_VEC)));
+    BREADTH_VEC *temp_i = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(BREADTH_VEC)));
+    for (int base = 0; base < FALLBACK_BREADTH_VEC_LEN; base += BREADTH_VEC_LEN) {
+        const int count = (FALLBACK_BREADTH_VEC_LEN - base < BREADTH_VEC_LEN) ? (FALLBACK_BREADTH_VEC_LEN - base) : BREADTH_VEC_LEN;
+        for (uint32_t i = 0; i < N; ++i) {
+            BREADTH_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
+            for (int l = 0; l < count; ++l) {
+                BREADTH_SET_LANE(vr, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(real[i], base + l)));
+                BREADTH_SET_LANE(vi, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(imag[i], base + l)));
+            }
+            temp_r[i] = vr;
+            temp_i[i] = vi;
+        }
+        PREFIX(execute_raw_breadth)((PLAN_T *)plan, temp_r, temp_i);
+        for (uint32_t i = 0; i < N; ++i) {
+            for (int l = 0; l < count; ++l) {
+                FALLBACK_BREADTH_SET(real[i], base + l, TO_FALLBACK(BREADTH_GET_LANE(temp_r[i], l)));
+                FALLBACK_BREADTH_SET(imag[i], base + l, TO_FALLBACK(BREADTH_GET_LANE(temp_i[i], l)));
+            }
+        }
+    }
+    nanofft_aligned_free(temp_r);
+    nanofft_aligned_free(temp_i);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(permute_breadth)(FALLBACK_PLAN_T *plan, FALLBACK_BREADTH_VEC *real, FALLBACK_BREADTH_VEC *imag) {
+    const uint32_t N = ((PLAN_T *)plan)->N;
+    BREADTH_VEC *temp_r = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(BREADTH_VEC)));
+    BREADTH_VEC *temp_i = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(BREADTH_VEC)));
+    for (int base = 0; base < FALLBACK_BREADTH_VEC_LEN; base += BREADTH_VEC_LEN) {
+        const int count = (FALLBACK_BREADTH_VEC_LEN - base < BREADTH_VEC_LEN) ? (FALLBACK_BREADTH_VEC_LEN - base) : BREADTH_VEC_LEN;
+        for (uint32_t i = 0; i < N; ++i) {
+            BREADTH_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
+            for (int l = 0; l < count; ++l) {
+                BREADTH_SET_LANE(vr, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(real[i], base + l)));
+                BREADTH_SET_LANE(vi, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(imag[i], base + l)));
+            }
+            temp_r[i] = vr;
+            temp_i[i] = vi;
+        }
+        PREFIX(permute_breadth)((PLAN_T *)plan, temp_r, temp_i);
+        for (uint32_t i = 0; i < N; ++i) {
+            for (int l = 0; l < count; ++l) {
+                FALLBACK_BREADTH_SET(real[i], base + l, TO_FALLBACK(BREADTH_GET_LANE(temp_r[i], l)));
+                FALLBACK_BREADTH_SET(imag[i], base + l, TO_FALLBACK(BREADTH_GET_LANE(temp_i[i], l)));
+            }
+        }
+    }
+    nanofft_aligned_free(temp_r);
+    nanofft_aligned_free(temp_i);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(permute_1d_breadth)(FALLBACK_PLAN_T *plan, FALLBACK_BREADTH_VEC *values) {
+    const uint32_t N = ((PLAN_T *)plan)->N;
+    BREADTH_VEC *temp = (BREADTH_VEC *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(N * sizeof(BREADTH_VEC)));
+    for (int base = 0; base < FALLBACK_BREADTH_VEC_LEN; base += BREADTH_VEC_LEN) {
+        const int count = (FALLBACK_BREADTH_VEC_LEN - base < BREADTH_VEC_LEN) ? (FALLBACK_BREADTH_VEC_LEN - base) : BREADTH_VEC_LEN;
+        for (uint32_t i = 0; i < N; ++i) {
+            BREADTH_VEC v = BREADTH_ZERO;
+            for (int l = 0; l < count; ++l) BREADTH_SET_LANE(v, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(values[i], base + l)));
+            temp[i] = v;
+        }
+        PREFIX(permute_1d_breadth)((PLAN_T *)plan, temp);
+        for (uint32_t i = 0; i < N; ++i) {
+            for (int l = 0; l < count; ++l) FALLBACK_BREADTH_SET(values[i], base + l, TO_FALLBACK(BREADTH_GET_LANE(temp[i], l)));
+        }
+    }
+    nanofft_aligned_free(temp);
+}
+
+__attribute__((weak)) void FALLBACK_PREFIX(execute_breadth)(FALLBACK_PLAN_T *plan, FALLBACK_BREADTH_VEC *real, FALLBACK_BREADTH_VEC *imag) {
+    FALLBACK_PREFIX(execute_raw_breadth)(plan, real, imag);
+    FALLBACK_PREFIX(permute_breadth)(plan, real, imag);
 }

@@ -131,6 +131,114 @@ tls_pswf_plan_choice tls_optimize_pswf_plan(int N, int M, int degree, int is_ihs
     return (pp.cost < mm.cost) ? pp : mm;
 }
 
+double tls_approximate_breadth_cost(int N, int M, int block, int degree, int is_ihs, int backend, int vec_len, double alpha, double b_alpha, double b_fft_ratio,
+                                    double b_beta, double gamma, double b_pre_m, double const_cost) {
+    int block_eff = block;
+    if (backend == TLS_BACKEND_PSWF43) block_eff += block_eff >> 1;
+    if (block_eff <= 0) block_eff = 1;
+    if (vec_len < 1) vec_len = 1;
+
+    int d = (degree > 0) ? degree : 1;
+    double batch_eff = (double)vec_len * (double)block_eff;
+    double n_batches = ceil((double)N / batch_eff);
+    if (n_batches < 1.0) n_batches = 1.0;
+    double n_factors = is_ihs ? (double)d : (double)(2 * d);
+    double n_execs = is_ihs ? (double)d : (double)(3 * d);
+
+    /* PSWF FFTs have Nfft = 2*block while unit_pswf is normalized by 2^(1+alpha),
+     * so converting unit_bfft*(2*block)^(1+b_alpha) into unit_pswf units carries
+     * the factor 2^(b_alpha - alpha).  LRA has Nfft = block (no factor of 2). */
+    double b_fft_scale = b_fft_ratio;
+    if (backend == TLS_BACKEND_PSWF43 || backend == TLS_BACKEND_PSWF21) b_fft_scale *= pow(2.0, b_alpha - alpha);
+
+    double fft_cost = n_execs * n_batches * b_fft_scale * (double)block_eff * pow((double)block, b_alpha);
+    double deconv_cost = gamma * (double)block_eff;
+    double pre_cost = b_pre_m * n_factors * (double)M;
+    double exec_cost = b_beta * n_execs * n_batches * (double)M;
+    return fft_cost + deconv_cost + const_cost + pre_cost + exec_cost;
+}
+
+static tls_plan_choice tls_sweep_breadth_mode(int N, int M, int degree, int is_ihs, int backend, int vec_len, int min_block_breadth, double alpha,
+                                              double b_alpha, double b_fft_ratio, double b_beta, double gamma, double b_pre_m, double const_cost,
+                                              int spread_mode) {
+    int min_b = (min_block_breadth >= 4) ? min_block_breadth : 4;
+    double target = ceil((double)N / (double)((vec_len > 0) ? vec_len : 1));
+    int n_cap = bitceil(target);
+    if (n_cap < min_b) n_cap = min_b;
+    if (n_cap > (1 << 29)) n_cap = (1 << 29);
+
+    tls_plan_choice best;
+    best.block = min_b;
+    best.spread_mode = spread_mode;
+    best.vec_mode = TLS_VEC_BREADTH;
+    best.cost = tls_approximate_breadth_cost(N, M, min_b, degree, is_ihs, backend, vec_len, alpha, b_alpha, b_fft_ratio, b_beta, gamma, b_pre_m, const_cost);
+
+    for (int block = min_b << 1; block <= n_cap; block <<= 1) {
+        double c = tls_approximate_breadth_cost(N, M, block, degree, is_ihs, backend, vec_len, alpha, b_alpha, b_fft_ratio, b_beta, gamma, b_pre_m, const_cost);
+        if (c < best.cost) {
+            best.block = block;
+            best.cost = c;
+        }
+        if (block == (1 << 29)) break;
+    }
+    return best;
+}
+
+static void tls_consider_choice(tls_plan_choice *best, int *have_best, tls_plan_choice cand) {
+    if (!(*have_best) || cand.cost < best->cost) {
+        *best = cand;
+        *have_best = 1;
+    }
+}
+
+tls_plan_choice tls_optimize_plan(int N, int M, int degree, int is_ihs, int backend, int vec_len, int min_block_breadth, int is_dd, double alpha, double gamma,
+                                  double beta_mm, double pre_mm, double beta_pp, double pre_pp, double ppoly_const, double b_alpha, double b_fft_ratio,
+                                  double b_beta_mm, double b_pre_mm, double b_beta_pp, double b_pre_pp, int forced_spread_mode, int forced_vec_mode) {
+    const int is_lra = (backend == TLS_BACKEND_LRA);
+    tls_plan_choice best = {128, TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, 0.0};
+    int have_best = 0;
+
+    if (!is_dd && forced_vec_mode != TLS_VEC_BREADTH) {
+        if (is_lra) {
+            tls_pswf_plan_choice d = tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_mm, gamma, 0.0, 0.0, TLS_SPREAD_MINMAX);
+            tls_consider_choice(&best, &have_best, (tls_plan_choice){d.block, TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, d.cost});
+        } else {
+            if (forced_spread_mode != TLS_SPREAD_PIECEWISE) {
+                tls_pswf_plan_choice d = tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_mm, gamma, pre_mm, 0.0, TLS_SPREAD_MINMAX);
+                tls_consider_choice(&best, &have_best, (tls_plan_choice){d.block, TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, d.cost});
+            }
+            if (forced_spread_mode != TLS_SPREAD_MINMAX) {
+                tls_pswf_plan_choice d =
+                    tls_optimize_pswf_single_mode(N, M, degree, is_ihs, backend, alpha, beta_pp, gamma, pre_pp, ppoly_const, TLS_SPREAD_PIECEWISE);
+                tls_consider_choice(&best, &have_best, (tls_plan_choice){d.block, TLS_SPREAD_PIECEWISE, TLS_VEC_DEPTH, d.cost});
+            }
+        }
+    }
+
+    if (forced_vec_mode != TLS_VEC_DEPTH) {
+        int min_b = min_block_breadth;
+        if (is_dd && N < min_b * vec_len) min_b = 16;
+        if (is_lra) {
+            tls_plan_choice b = tls_sweep_breadth_mode(N, M, degree, is_ihs, backend, vec_len, min_b, alpha, b_alpha, b_fft_ratio, b_beta_mm, gamma, 0.0, 0.0,
+                                                       TLS_SPREAD_MINMAX);
+            tls_consider_choice(&best, &have_best, b);
+        } else {
+            if (is_dd || forced_spread_mode != TLS_SPREAD_PIECEWISE) {
+                tls_plan_choice b = tls_sweep_breadth_mode(N, M, degree, is_ihs, backend, vec_len, min_b, alpha, b_alpha, b_fft_ratio, b_beta_mm, gamma,
+                                                           b_pre_mm, 0.0, TLS_SPREAD_MINMAX);
+                tls_consider_choice(&best, &have_best, b);
+            }
+            if (!is_dd && forced_spread_mode != TLS_SPREAD_MINMAX) {
+                tls_plan_choice b = tls_sweep_breadth_mode(N, M, degree, is_ihs, backend, vec_len, min_b, alpha, b_alpha, b_fft_ratio, b_beta_pp, gamma,
+                                                           b_pre_pp, ppoly_const, TLS_SPREAD_PIECEWISE);
+                tls_consider_choice(&best, &have_best, b);
+            }
+        }
+    }
+
+    return best;
+}
+
 int tls_pswf43_plan_len_from_base(int base_len) {
     int plan_len = base_len;
     if (plan_len < 4) plan_len = 4;

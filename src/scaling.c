@@ -45,6 +45,10 @@ static double get_time_sec(void) {
 #    define NUFFT_PSWF_PRE tlsdd_nufft_pswf_precompute
 #    define NUFFT_PSWF_EXEC tlsdd_nufft_pswf_execute
 #    define NUFFT_PSWF_FREE tlsdd_nufft_free_pswf_plan
+#    define NUFFT_LRA_INIT_OPTS tlsdd_nufft_lra_initialize_opts
+#    define NUFFT_LRA_EXEC_BREADTH tlsdd_nufft_lra_execute_breadth
+#    define NUFFT_PSWF_INIT_OPTS tlsdd_nufft_pswf_initialize_opts
+#    define NUFFT_PSWF_EXEC_BREADTH tlsdd_nufft_pswf_execute_breadth
 #    define LRA_PLAN_T tlsdd_nufft_lra_plan
 #    define PSWF_PLAN_T tlsdd_nufft_pswf_plan
 #    define NUFFT_RANK 27
@@ -61,6 +65,10 @@ static double get_time_sec(void) {
 #    define NUFFT_PSWF_PRE tls_nufft_pswf_precompute
 #    define NUFFT_PSWF_EXEC tls_nufft_pswf_execute
 #    define NUFFT_PSWF_FREE tls_nufft_free_pswf_plan
+#    define NUFFT_LRA_INIT_OPTS tls_nufft_lra_initialize_opts
+#    define NUFFT_LRA_EXEC_BREADTH tls_nufft_lra_execute_breadth
+#    define NUFFT_PSWF_INIT_OPTS tls_nufft_pswf_initialize_opts
+#    define NUFFT_PSWF_EXEC_BREADTH tls_nufft_pswf_execute_breadth
 #    define LRA_PLAN_T tls_nufft_lra_plan
 #    define PSWF_PLAN_T tls_nufft_pswf_plan
 #    define NUFFT_RANK 16
@@ -77,6 +85,10 @@ static double get_time_sec(void) {
 #    define NUFFT_PSWF_PRE tlsf_nufft_pswf_precompute
 #    define NUFFT_PSWF_EXEC tlsf_nufft_pswf_execute
 #    define NUFFT_PSWF_FREE tlsf_nufft_free_pswf_plan
+#    define NUFFT_LRA_INIT_OPTS tlsf_nufft_lra_initialize_opts
+#    define NUFFT_LRA_EXEC_BREADTH tlsf_nufft_lra_execute_breadth
+#    define NUFFT_PSWF_INIT_OPTS tlsf_nufft_pswf_initialize_opts
+#    define NUFFT_PSWF_EXEC_BREADTH tlsf_nufft_pswf_execute_breadth
 #    define LRA_PLAN_T tlsf_nufft_lra_plan
 #    define PSWF_PLAN_T tlsf_nufft_pswf_plan
 #    define NUFFT_RANK 9
@@ -689,6 +701,208 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* =========================================================================
+     * Phase 6: Breadth-wise SIMD calibration
+     *
+     * Measures:
+     *   - b_alpha, b_fft_ratio = unit_bfft / unit_fft from execute_breadth
+     *   - b_beta for LRA, PSWF21 (minmax [+ ppoly]), PSWF43 (minmax [+ ppoly])
+     *   - b_pre for PSWF21/PSWF43 (minmax [+ ppoly])
+     * ======================================================================= */
+    double b_alpha = alpha;
+    double b_fft_ratio = (double)BREADTH_VEC_LEN;
+    double b_beta_lra = 0.0, b_beta_pswf21 = 0.0, b_beta_pswf43 = 0.0;
+    double b_pre_pswf21 = 0.0, b_pre_pswf43 = 0.0;
+#if !defined(DOUBLE_DOUBLE)
+    double b_beta_pp_pswf21 = 0.0, b_beta_pp_pswf43 = 0.0;
+    double b_pre_pp_pswf21 = 0.0, b_pre_pp_pswf43 = 0.0;
+#endif
+
+    /* --- Breadth FFT sweep --- */
+    {
+#if defined(DOUBLE_DOUBLE)
+        const int bk_start = 5, bk_end = 13;
+        int bwups = 64, bruns = 1024;
+#else
+        const int bk_start = 5, bk_end = 15;
+        int bwups = 256, bruns = 8192;
+#endif
+        double blog2_N[30], blog2_T_per_N[30];
+        int bpt = 0;
+        for (int k = bk_start; k <= bk_end; ++k) {
+            uint32_t N = 1u << k;
+            BREADTH_VEC *bre = (BREADTH_VEC *)aligned_alloc(64, (size_t)N * sizeof(BREADTH_VEC));
+            BREADTH_VEC *bim = (BREADTH_VEC *)aligned_alloc(64, (size_t)N * sizeof(BREADTH_VEC));
+            for (uint32_t i = 0; i < N; ++i) {
+                BREADTH_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
+                for (int l = 0; l < BREADTH_VEC_LEN; ++l) {
+                    BREADTH_SET_LANE(vr, l, FCAST((double)rand() / RAND_MAX));
+                    BREADTH_SET_LANE(vi, l, FCAST((double)rand() / RAND_MAX));
+                }
+                bre[i] = vr;
+                bim[i] = vi;
+            }
+            PREFIX(plan) *bplan = PREFIX(make_plan_breadth)(N);
+            for (int i = 0; i < bwups; ++i) PREFIX(execute_breadth)(bplan, bre, bim);
+            double t0 = get_time_sec();
+            for (int i = 0; i < bruns; ++i) PREFIX(execute_breadth)(bplan, bre, bim);
+            double total = get_time_sec() - t0;
+            double per_run = total / (double)bruns;
+            blog2_N[bpt] = (double)k;
+            blog2_T_per_N[bpt] = log2(per_run / (double)N);
+            bpt++;
+            printf("[bfft] k=%2d | N=%6u | runs=%5d | time/batch: %6.2e s\n", k, N, bruns, per_run);
+            if (total > 0.3) {
+                bruns /= 4;
+                bwups /= 4;
+            } else if (total > 0.08) {
+                bruns /= 2;
+                bwups /= 2;
+            }
+            if (bruns < 4) bruns = 4;
+            if (bwups < 1) bwups = 1;
+            PREFIX(destroy_plan)(bplan);
+            free(bre);
+            free(bim);
+        }
+        double bsx = 0.0, bsy = 0.0;
+        for (int i = 0; i < bpt; ++i) {
+            bsx += blog2_N[i];
+            bsy += blog2_T_per_N[i];
+        }
+        double bmx = bsx / bpt, bmy = bsy / bpt;
+        double bnum = 0.0, bden = 0.0;
+        for (int i = 0; i < bpt; ++i) {
+            bnum += (blog2_N[i] - bmx) * (blog2_T_per_N[i] - bmy);
+            bden += (blog2_N[i] - bmx) * (blog2_N[i] - bmx);
+        }
+        b_alpha = bnum / bden;
+        double unit_bfft = pow(2.0, bmy - b_alpha * bmx);
+        b_fft_ratio = unit_bfft / unit_fft;
+        printf("[bfft  fit] b_alpha = %.6f | unit_bfft = %e s | b_fft_ratio = %.6f\n", b_alpha, unit_bfft, b_fft_ratio);
+    }
+
+    /* --- Breadth beta & precompute --- */
+    {
+        BREADTH_VEC *bout_re = (BREADTH_VEC *)aligned_alloc(64, (size_t)N_beta_out43 * sizeof(BREADTH_VEC));
+        BREADTH_VEC *bout_im = (BREADTH_VEC *)aligned_alloc(64, (size_t)N_beta_out43 * sizeof(BREADTH_VEC));
+#if defined(DOUBLE_DOUBLE)
+        const int bwups_b = 2, breps_b = 8;
+        const int bpre_wups = 2, bpre_reps = 6;
+        const dd_t *xb_in = x_beta_dd;
+#else
+        const int bwups_b = 4, breps_b = 32;
+        const int bpre_wups = 4, bpre_reps = 16;
+        const double *xb_in = x_beta;
+#endif
+        const double f0_b = 0.125;
+
+        /* LRA breadth beta */
+        {
+            LRA_PLAN_T *plan = NUFFT_LRA_INIT_OPTS(M_beta, N_beta, rank, df, freq_factor, TLS_VEC_BREADTH);
+            NUFFT_LRA_PRE(plan, xb_in, M_beta, N_beta, rank);
+            for (int i = 0; i < bwups_b; ++i) NUFFT_LRA_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta, 0, freq_factor, bout_re, bout_im);
+            double t0 = get_time_sec();
+            for (int i = 0; i < breps_b; ++i) NUFFT_LRA_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta, 0, freq_factor, bout_re, bout_im);
+            double t_exec = (get_time_sec() - t0) / (double)breps_b;
+            NUFFT_LRA_FREE(plan);
+            b_beta_lra = t_exec / ((double)M_beta * unit_lra);
+            printf("[bbeta LRA   ] exec/batch = %e s | b_beta = %.6f\n", t_exec, b_beta_lra);
+        }
+
+        /* PSWF21 breadth minmax pre + beta */
+        {
+            PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_OPTS(M_beta, N_beta, w21, df, freq_factor, "21", TLS_SPREAD_MINMAX, TLS_VEC_BREADTH);
+            for (int i = 0; i < bpre_wups; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t0 = get_time_sec();
+            for (int i = 0; i < bpre_reps; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t_pre = (get_time_sec() - t0) / (double)bpre_reps;
+            double t_dec21 = gamma_pswf21 * (double)N_beta * unit_pswf21;
+            if (t_pre > t_dec21) t_pre -= t_dec21;
+            b_pre_pswf21 = t_pre / ((double)M_beta * unit_pswf21);
+
+            for (int i = 0; i < bwups_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            t0 = get_time_sec();
+            for (int i = 0; i < breps_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            double t_exec = (get_time_sec() - t0) / (double)breps_b;
+            NUFFT_PSWF_FREE(plan);
+            b_beta_pswf21 = t_exec / ((double)M_beta * unit_pswf21);
+            printf("[bbeta PSWF21] exec/batch = %e s (%.6f) | b_pre = %.6f\n", t_exec, b_beta_pswf21, b_pre_pswf21);
+        }
+
+        /* PSWF43 breadth minmax pre + beta */
+        {
+            PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_OPTS(M_beta, N_beta, w43, df, freq_factor, "43", TLS_SPREAD_MINMAX, TLS_VEC_BREADTH);
+            for (int i = 0; i < bpre_wups; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t0 = get_time_sec();
+            for (int i = 0; i < bpre_reps; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t_pre = (get_time_sec() - t0) / (double)bpre_reps;
+            double t_dec43 = gamma_pswf43 * (double)N_beta_out43 * unit_pswf43;
+            if (t_pre > t_dec43) t_pre -= t_dec43;
+            b_pre_pswf43 = t_pre / ((double)M_beta * unit_pswf43);
+
+            for (int i = 0; i < bwups_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta_out43, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            t0 = get_time_sec();
+            for (int i = 0; i < breps_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta_out43, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            double t_exec = (get_time_sec() - t0) / (double)breps_b;
+            NUFFT_PSWF_FREE(plan);
+            b_beta_pswf43 = t_exec / ((double)M_beta * unit_pswf43);
+            printf("[bbeta PSWF43] exec/batch = %e s (%.6f) | b_pre = %.6f\n", t_exec, b_beta_pswf43, b_pre_pswf43);
+        }
+
+#if !defined(DOUBLE_DOUBLE)
+        /* PSWF21 breadth ppoly pre + beta */
+        {
+            PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_OPTS(M_beta, N_beta, w21, df, freq_factor, "21", TLS_SPREAD_PIECEWISE, TLS_VEC_BREADTH);
+            for (int i = 0; i < bpre_wups; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t0 = get_time_sec();
+            for (int i = 0; i < bpre_reps; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t_pre = (get_time_sec() - t0) / (double)bpre_reps;
+            double t_dec21 = gamma_pswf21 * (double)N_beta * unit_pswf21;
+            if (t_pre > t_dec21) t_pre -= t_dec21;
+            b_pre_pp_pswf21 = t_pre / ((double)M_beta * unit_pswf21);
+
+            for (int i = 0; i < bwups_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            t0 = get_time_sec();
+            for (int i = 0; i < breps_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            double t_exec = (get_time_sec() - t0) / (double)breps_b;
+            NUFFT_PSWF_FREE(plan);
+            b_beta_pp_pswf21 = t_exec / ((double)M_beta * unit_pswf21);
+            printf("[bbeta PSWF21 ppoly] exec/batch = %e s (%.6f) | b_pre = %.6f\n", t_exec, b_beta_pp_pswf21, b_pre_pp_pswf21);
+        }
+
+        /* PSWF43 breadth ppoly pre + beta */
+        {
+            PSWF_PLAN_T *plan = NUFFT_PSWF_INIT_OPTS(M_beta, N_beta, w43, df, freq_factor, "43", TLS_SPREAD_PIECEWISE, TLS_VEC_BREADTH);
+            for (int i = 0; i < bpre_wups; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t0 = get_time_sec();
+            for (int i = 0; i < bpre_reps; ++i) NUFFT_PSWF_PRE(plan, xb_in);
+            double t_pre = (get_time_sec() - t0) / (double)bpre_reps;
+            double t_dec43 = gamma_pswf43 * (double)N_beta_out43 * unit_pswf43;
+            if (t_pre > t_dec43) t_pre -= t_dec43;
+            b_pre_pp_pswf43 = t_pre / ((double)M_beta * unit_pswf43);
+
+            for (int i = 0; i < bwups_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta_out43, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            t0 = get_time_sec();
+            for (int i = 0; i < breps_b; ++i)
+                NUFFT_PSWF_EXEC_BREADTH(plan, xb_in, y_re_src, f0_b, N_beta_out43, 0, freq_factor, TLS_NUFFT_OUT_NATURAL, bout_re, bout_im);
+            double t_exec = (get_time_sec() - t0) / (double)breps_b;
+            NUFFT_PSWF_FREE(plan);
+            b_beta_pp_pswf43 = t_exec / ((double)M_beta * unit_pswf43);
+            printf("[bbeta PSWF43 ppoly] exec/batch = %e s (%.6f) | b_pre = %.6f\n", t_exec, b_beta_pp_pswf43, b_pre_pp_pswf43);
+        }
+#endif
+        free(bout_re);
+        free(bout_im);
+    }
+
     free(x_beta);
 #if defined(DOUBLE_DOUBLE)
     free(x_beta_dd);
@@ -772,6 +986,32 @@ int main(int argc, char **argv) {
                 "_PSWF43_PPOLY_PRE %.10g\n"
                 "#define " PFX "_PSWF43_PPOLY_CONST %.10g\n",
                 pre_pswf21, beta_pp_pswf21, pre_pp_pswf21, ppoly_const_pswf21, pre_pswf43, beta_pp_pswf43, pre_pp_pswf43, ppoly_const_pswf43);
+#    endif
+        fprintf(f,
+                "#define " PFX
+                "_B_ALPHA %.10g\n"
+                "#define " PFX
+                "_B_FFT_RATIO %.10g\n"
+                "#define " PFX
+                "_LRA_B_BETA %.10g\n"
+                "#define " PFX
+                "_PSWF21_B_BETA %.10g\n"
+                "#define " PFX
+                "_PSWF21_B_PRE %.10g\n"
+                "#define " PFX
+                "_PSWF43_B_BETA %.10g\n"
+                "#define " PFX "_PSWF43_B_PRE %.10g\n",
+                b_alpha, b_fft_ratio, b_beta_lra, b_beta_pswf21, b_pre_pswf21, b_beta_pswf43, b_pre_pswf43);
+#    if !defined(DOUBLE_DOUBLE)
+        fprintf(f,
+                "#define " PFX
+                "_PSWF21_B_PPOLY_BETA %.10g\n"
+                "#define " PFX
+                "_PSWF21_B_PPOLY_PRE %.10g\n"
+                "#define " PFX
+                "_PSWF43_B_PPOLY_BETA %.10g\n"
+                "#define " PFX "_PSWF43_B_PPOLY_PRE %.10g\n",
+                b_beta_pp_pswf21, b_pre_pp_pswf21, b_beta_pp_pswf43, b_pre_pp_pswf43);
 #    endif
         fprintf(f, "\n");
         fclose(f);

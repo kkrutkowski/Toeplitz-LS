@@ -15,11 +15,13 @@
 #endif
 
 static int tuning_fft_fuse = TLS_TUNING_FFT_FUSE_DEFAULT;
+static int tuning_fft_bfuse = TLS_TUNING_FFT_FUSE_DEFAULT;
 static int tuning_fft_order = TLS_FFT_ORDER_END;
 static int tuning_cobravo = TLS_TUNING_COBRAVO_DEFAULT;
 static int tuning_defer = TLS_TUNING_DEFER_DEFAULT;
 static int tuning_permute = TLS_PERMUTE_AUTO;
 static int tuning_spread = TLS_SPREAD_AUTO;
+static int tuning_vectorize = TLS_VEC_AUTO;
 static unsigned long long tuning_work_bytes = 0;
 
 int tls_tuning_fft_fuse(void) { return tuning_fft_fuse; }
@@ -28,6 +30,14 @@ void tls_tuning_set_fft_fuse(int fuse) {
     if (fuse < 0) fuse = TLS_TUNING_FFT_FUSE_AUTO;
     if (fuse > NANOFFT_FFT_FUSE_MAX) fuse = NANOFFT_FFT_FUSE_MAX;
     tuning_fft_fuse = fuse;
+}
+
+int tls_tuning_fft_bfuse(void) { return tuning_fft_bfuse; }
+
+void tls_tuning_set_fft_bfuse(int fuse) {
+    if (fuse < 0) fuse = TLS_TUNING_FFT_FUSE_AUTO;
+    if (fuse > NANOFFT_FFT_FUSE_MAX) fuse = NANOFFT_FFT_FUSE_MAX;
+    tuning_fft_bfuse = fuse;
 }
 
 int tls_tuning_fft_order(void) { return tuning_fft_order; }
@@ -56,6 +66,14 @@ void tls_tuning_set_spread(int mode) {
     if (mode < TLS_SPREAD_AUTO) mode = TLS_SPREAD_AUTO;
     if (mode > TLS_SPREAD_PIECEWISE) mode = TLS_SPREAD_PIECEWISE;
     tuning_spread = mode;
+}
+
+int tls_tuning_vectorize(void) { return tuning_vectorize; }
+
+void tls_tuning_set_vectorize(int mode) {
+    if (mode < TLS_VEC_AUTO) mode = TLS_VEC_AUTO;
+    if (mode > TLS_VEC_BREADTH) mode = TLS_VEC_BREADTH;
+    tuning_vectorize = mode;
 }
 
 unsigned long long tls_tuning_work_bytes(void) { return tuning_work_bytes; }

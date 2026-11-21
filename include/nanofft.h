@@ -1,6 +1,11 @@
 #ifndef NANOFFT_H
 #define NANOFFT_H
 
+#if defined(__FMA__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+#    include <immintrin.h>
+#elif defined(__aarch64__) || defined(__ARM_FEATURE_FMA)
+#    include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdint.h>
 #include <tls_export.h>
@@ -83,6 +88,31 @@
 #    define NANOFFT_FFT_FUSE_DD NANOFFT_FFT_FUSE_DD_DEFAULT
 #endif
 
+/* Breadth-wise fused-twiddle FFT depth defaults (stages fused per pass). */
+#if VEC_BYTES >= 64
+#    define NANOFFT_FFT_BFUSE_FLOAT_DEFAULT 2
+#    define NANOFFT_FFT_BFUSE_DOUBLE_DEFAULT 2
+#    define NANOFFT_FFT_BFUSE_DD_DEFAULT 2
+#elif VEC_BYTES >= 32
+#    define NANOFFT_FFT_BFUSE_FLOAT_DEFAULT 2
+#    define NANOFFT_FFT_BFUSE_DOUBLE_DEFAULT 2
+#    define NANOFFT_FFT_BFUSE_DD_DEFAULT 1
+#else
+#    define NANOFFT_FFT_BFUSE_FLOAT_DEFAULT 2
+#    define NANOFFT_FFT_BFUSE_DOUBLE_DEFAULT 2
+#    define NANOFFT_FFT_BFUSE_DD_DEFAULT 1
+#endif
+
+#ifndef NANOFFT_FFT_BFUSE_FLOAT
+#    define NANOFFT_FFT_BFUSE_FLOAT NANOFFT_FFT_BFUSE_FLOAT_DEFAULT
+#endif
+#ifndef NANOFFT_FFT_BFUSE_DOUBLE
+#    define NANOFFT_FFT_BFUSE_DOUBLE NANOFFT_FFT_BFUSE_DOUBLE_DEFAULT
+#endif
+#ifndef NANOFFT_FFT_BFUSE_DD
+#    define NANOFFT_FFT_BFUSE_DD NANOFFT_FFT_BFUSE_DD_DEFAULT
+#endif
+
 /*
  * Fusion depth a plan would use for a grid of `N` points when the caller asks
  * for the automatic choice (TLS_TUNING_FFT_FUSE_AUTO): the per-grid value from
@@ -94,6 +124,9 @@
 TLS_API int nanofftf_depth_for(uint32_t N);
 TLS_API int nanofft_depth_for(uint32_t N);
 TLS_API int nanofftdd_depth_for(uint32_t N);
+TLS_API int nanofftf_breadth_depth_for(uint32_t N);
+TLS_API int nanofft_breadth_depth_for(uint32_t N);
+TLS_API int nanofftdd_breadth_depth_for(uint32_t N);
 
 /* Largest depth any precision may be built with. */
 #ifndef NANOFFT_FFT_FUSE_MAX
@@ -108,6 +141,15 @@ TLS_API int nanofftdd_depth_for(uint32_t N);
 #endif
 #if NANOFFT_FFT_FUSE_DD < 1 || NANOFFT_FFT_FUSE_DD > NANOFFT_FFT_FUSE_MAX
 #    error "NANOFFT_FFT_FUSE_DD must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_BFUSE_FLOAT < 1 || NANOFFT_FFT_BFUSE_FLOAT > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_BFUSE_FLOAT must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_BFUSE_DOUBLE < 1 || NANOFFT_FFT_BFUSE_DOUBLE > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_BFUSE_DOUBLE must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_BFUSE_DD < 1 || NANOFFT_FFT_BFUSE_DD > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_BFUSE_DD must be between 1 and NANOFFT_FFT_FUSE_MAX"
 #endif
 
 /* -------------------------------------------------------------------------
@@ -441,6 +483,12 @@ TLS_API void nanofftf_execute_raw(nanofftf_plan *plan, float *real_signal, float
 /* In-place bit reversal of a slot-ordered pair / single array. */
 TLS_API void nanofftf_permute(nanofftf_plan *plan, float *real_signal, float *imag_signal);
 TLS_API void nanofftf_permute_1d(nanofftf_plan *plan, float *values);
+/* Breadth-wise transform: each VECF holds VECF_LEN independent blocks at the same bin. */
+TLS_API nanofftf_plan *nanofftf_make_plan_breadth(uint32_t N);
+TLS_API void nanofftf_execute_breadth(nanofftf_plan *plan, VECF *real_signal, VECF *imag_signal);
+TLS_API void nanofftf_execute_raw_breadth(nanofftf_plan *plan, VECF *real_signal, VECF *imag_signal);
+TLS_API void nanofftf_permute_breadth(nanofftf_plan *plan, VECF *real_signal, VECF *imag_signal);
+TLS_API void nanofftf_permute_1d_breadth(nanofftf_plan *plan, VECF *values);
 
 /* -------------------------------------------------------------------------
  * Double Precision API (nanofft)
@@ -448,6 +496,109 @@ TLS_API void nanofftf_permute_1d(nanofftf_plan *plan, float *values);
 #define VEC_LEN (VEC_BYTES / 8)
 typedef double VEC __attribute__((vector_size(VEC_BYTES)));
 typedef uint64_t VEC_INT __attribute__((vector_size(VEC_BYTES)));
+
+/* -------------------------------------------------------------------------
+ * Double-Double SIMD Vector Type (VECDD)
+ *
+ * Shares double's lane count (VECDD_LEN == VEC_LEN).  Every lane holds one
+ * compensated hi/lo pair; arithmetic uses hardware FMA when available and
+ * portable Veltkamp splitting otherwise (never scalar libm fma()).
+ * ------------------------------------------------------------------------- */
+#define VECDD_LEN VEC_LEN
+typedef struct {
+    VEC hi;
+    VEC lo;
+} VECDD;
+
+static inline VECDD vecdd_make(VEC hi, VEC lo) {
+    VECDD res = {hi, lo};
+    return res;
+}
+
+static inline VECDD vecdd_splat(dd_t a) {
+    VECDD res;
+    res.hi = (VEC){} + a.hi;
+    res.lo = (VEC){} + a.lo;
+    return res;
+}
+
+static inline VECDD vecdd_splat_d(double a) {
+    VECDD res;
+    res.hi = (VEC){} + a;
+    res.lo = (VEC){};
+    return res;
+}
+
+static inline VECDD vecdd_neg(VECDD a) { return vecdd_make(-a.hi, -a.lo); }
+
+static inline void vecdd_two_sum(VEC a, VEC b, VEC *r, VEC *e) {
+    *r = a + b;
+    VEC v = *r - a;
+    *e = (a - (*r - v)) + (b - v);
+}
+
+static inline void vecdd_two_sum_quick(VEC x, VEC y, VEC *r, VEC *e) {
+    *r = x + y;
+    *e = y - (*r - x);
+}
+
+static inline void vecdd_two_difference(VEC x, VEC y, VEC *r, VEC *e) {
+    *r = x - y;
+    VEC t = *r - x;
+    *e = (x - (*r - t)) - (y + t);
+}
+
+static inline void vecdd_two_product(VEC x, VEC y, VEC *r, VEC *e) {
+    *r = x * y;
+#if defined(__FMA__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__)) && \
+    ((VEC_BYTES == 64 && defined(__AVX512F__)) || (VEC_BYTES == 32 && defined(__AVX__)) || (VEC_BYTES == 16 && defined(__SSE2__)))
+#    if VEC_BYTES == 64
+    *e = (VEC)_mm512_fmsub_pd((__m512d)x, (__m512d)y, (__m512d)(*r));
+#    elif VEC_BYTES == 32
+    *e = (VEC)_mm256_fmsub_pd((__m256d)x, (__m256d)y, (__m256d)(*r));
+#    else
+    *e = (VEC)_mm_fmsub_pd((__m128d)x, (__m128d)y, (__m128d)(*r));
+#    endif
+#elif (defined(__aarch64__) || defined(__ARM_FEATURE_FMA)) && VEC_BYTES == 16
+    *e = (VEC)vfmaq_f64((float64x2_t)(-(*r)), (float64x2_t)x, (float64x2_t)y);
+#else
+    /* Portable IEEE-754 Veltkamp splitting (exact under -fno-fast-math). */
+    const VEC split = (VEC){} + 134217729.0; /* 2^27 + 1 */
+    VEC cx = split * x;
+    VEC x_hi = cx - (cx - x);
+    VEC x_lo = x - x_hi;
+    VEC cy = split * y;
+    VEC y_hi = cy - (cy - y);
+    VEC y_lo = y - y_hi;
+    *e = ((x_hi * y_hi - *r) + x_hi * y_lo + x_lo * y_hi) + x_lo * y_lo;
+#endif
+}
+
+static inline VECDD vecdd_add(VECDD a, VECDD b) {
+    VEC r, e, r_f, e_f;
+    vecdd_two_sum(a.hi, b.hi, &r, &e);
+    e = e + a.lo + b.lo;
+    vecdd_two_sum_quick(r, e, &r_f, &e_f);
+    return vecdd_make(r_f, e_f);
+}
+
+static inline VECDD vecdd_sub(VECDD a, VECDD b) {
+    VEC r, e, r_f, e_f;
+    vecdd_two_difference(a.hi, b.hi, &r, &e);
+    e = e + a.lo - b.lo;
+    vecdd_two_sum_quick(r, e, &r_f, &e_f);
+    return vecdd_make(r_f, e_f);
+}
+
+static inline VECDD vecdd_mul(VECDD a, VECDD b) {
+    VEC r, e, r_f, e_f;
+    vecdd_two_product(a.hi, b.hi, &r, &e);
+    e = e + a.hi * b.lo + a.lo * b.hi;
+    vecdd_two_sum_quick(r, e, &r_f, &e_f);
+    return vecdd_make(r_f, e_f);
+}
+
+static inline VECDD vecdd_mul_scalar(VECDD a, dd_t s) { return vecdd_mul(a, vecdd_splat(s)); }
 
 /* -------------------------------------------------------------------------
  * Vectorized sqrt / exp helpers  (float and double only, not dd_t)
@@ -468,6 +619,11 @@ TLS_API void nanofft_execute(nanofft_plan *plan, double *real_signal, double *im
 TLS_API void nanofft_execute_raw(nanofft_plan *plan, double *real_signal, double *imag_signal);
 TLS_API void nanofft_permute(nanofft_plan *plan, double *real_signal, double *imag_signal);
 TLS_API void nanofft_permute_1d(nanofft_plan *plan, double *values);
+TLS_API nanofft_plan *nanofft_make_plan_breadth(uint32_t N);
+TLS_API void nanofft_execute_breadth(nanofft_plan *plan, VEC *real_signal, VEC *imag_signal);
+TLS_API void nanofft_execute_raw_breadth(nanofft_plan *plan, VEC *real_signal, VEC *imag_signal);
+TLS_API void nanofft_permute_breadth(nanofft_plan *plan, VEC *real_signal, VEC *imag_signal);
+TLS_API void nanofft_permute_1d_breadth(nanofft_plan *plan, VEC *values);
 
 /* -------------------------------------------------------------------------
  * Double-Double Precision API (nanofftdd)
@@ -479,5 +635,10 @@ TLS_API void nanofftdd_execute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *im
 TLS_API void nanofftdd_execute_raw(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
 TLS_API void nanofftdd_permute(nanofftdd_plan *plan, dd_t *real_signal, dd_t *imag_signal);
 TLS_API void nanofftdd_permute_1d(nanofftdd_plan *plan, dd_t *values);
+TLS_API nanofftdd_plan *nanofftdd_make_plan_breadth(uint32_t N);
+TLS_API void nanofftdd_execute_breadth(nanofftdd_plan *plan, VECDD *real_signal, VECDD *imag_signal);
+TLS_API void nanofftdd_execute_raw_breadth(nanofftdd_plan *plan, VECDD *real_signal, VECDD *imag_signal);
+TLS_API void nanofftdd_permute_breadth(nanofftdd_plan *plan, VECDD *real_signal, VECDD *imag_signal);
+TLS_API void nanofftdd_permute_1d_breadth(nanofftdd_plan *plan, VECDD *values);
 
 #endif /* NANOFFT_H */

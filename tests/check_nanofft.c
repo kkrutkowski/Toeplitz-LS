@@ -531,6 +531,314 @@ static void check_min_grid(void) {
     printf("  smallest grid n=%u accepted, rejected below\n", n);
 }
 
+static void check_breadth_float(void) {
+    const uint32_t sizes[] = {2, 4, 8, 16, 64, 256, 1024};
+    const int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+    for (int si = 0; si < nsizes; ++si) {
+        const uint32_t n = sizes[si];
+        const uint32_t log_n = (uint32_t)(log2((double)n) + 0.5);
+        VECF *in_r = (VECF *)test_alloc(n * sizeof(VECF));
+        VECF *in_i = (VECF *)test_alloc(n * sizeof(VECF));
+        VECF *out_r = (VECF *)test_alloc(n * sizeof(VECF));
+        VECF *out_i = (VECF *)test_alloc(n * sizeof(VECF));
+        float *lane_r = (float *)test_alloc(n * sizeof(float));
+        float *lane_i = (float *)test_alloc(n * sizeof(float));
+        double *ref_r = (double *)test_alloc((size_t)n * VECF_LEN * sizeof(double));
+        double *ref_i = (double *)test_alloc((size_t)n * VECF_LEN * sizeof(double));
+
+        for (uint32_t k = 0; k < n; ++k) {
+            VECF vr, vi;
+            for (int l = 0; l < VECF_LEN; ++l) {
+                vr[l] = frand();
+                vi[l] = frand();
+            }
+            in_r[k] = vr;
+            in_i[k] = vi;
+        }
+        for (int l = 0; l < VECF_LEN; ++l) {
+            for (uint32_t k = 0; k < n; ++k) {
+                lane_r[k] = in_r[k][l];
+                lane_i[k] = in_i[k][l];
+            }
+            naive_dft(lane_r, lane_i, ref_r + (size_t)l * n, ref_i + (size_t)l * n, (int)n);
+        }
+
+        for (int fuse = 1; fuse <= NANOFFT_FFT_FUSE_MAX; ++fuse) {
+            for (int ord = 0; ord < 2; ++ord) {
+                tls_tuning_set_fft_bfuse(fuse);
+                tls_tuning_set_fft_order(ord ? TLS_FFT_ORDER_FRONT : TLS_FFT_ORDER_END);
+                nanofftf_plan *plan = nanofftf_make_plan_breadth(n);
+                memcpy(out_r, in_r, n * sizeof(VECF));
+                memcpy(out_i, in_i, n * sizeof(VECF));
+                nanofftf_execute_breadth(plan, out_r, out_i);
+
+                for (int l = 0; l < VECF_LEN; ++l) {
+                    double err = 0.0, scale = 0.0;
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const double dr = ref_r[(size_t)l * n + k];
+                        const double di = ref_i[(size_t)l * n + k];
+                        const double mag = sqrt(dr * dr + di * di);
+                        if (mag > scale) scale = mag;
+                        const double er = (double)out_r[k][l] - dr;
+                        const double ei = (double)out_i[k][l] - di;
+                        const double e = sqrt(er * er + ei * ei);
+                        if (e > err) err = e;
+                    }
+                    const double rel = scale > 0.0 ? err / scale : err;
+                    CHECK(rel < 5e-5, "breadth float n=%u fuse=%d ord=%d lane=%d rel=%.3g", n, fuse, ord, l, rel);
+                }
+                nanofftf_destroy_plan(plan);
+            }
+        }
+
+        /* Check all 4 permute strategies (2D and 1D) and raw+permute == execute. */
+        const int pmodes[4] = {TLS_PERMUTE_TABLE, TLS_PERMUTE_PAIRS, TLS_PERMUTE_COBRAVO, TLS_PERMUTE_COBRAVO};
+        const int pcob[4] = {1, 1, 1, 0};
+        tls_tuning_set_fft_bfuse(TLS_TUNING_FFT_FUSE_DEFAULT);
+        tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
+        for (int p = 0; p < 4; ++p) {
+            tls_tuning_set_permute(pmodes[p]);
+            tls_tuning_set_cobravo(pcob[p]);
+            nanofftf_plan *plan = nanofftf_make_plan_breadth(n);
+            VECF *r0 = (VECF *)test_alloc(n * sizeof(VECF));
+            VECF *i0 = (VECF *)test_alloc(n * sizeof(VECF));
+            VECF *r1 = (VECF *)test_alloc(n * sizeof(VECF));
+            VECF *i1 = (VECF *)test_alloc(n * sizeof(VECF));
+            VECF *v1d = (VECF *)test_alloc(n * sizeof(VECF));
+            for (uint32_t k = 0; k < n; ++k) {
+                VECF v;
+                for (int l = 0; l < VECF_LEN; ++l) v[l] = (float)(k * (uint32_t)VECF_LEN + (uint32_t)l);
+                v1d[k] = v;
+            }
+            nanofftf_permute_1d_breadth(plan, v1d);
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t want_k = reverse_bits_ref(k, log_n);
+                for (int l = 0; l < VECF_LEN; ++l) {
+                    CHECK(v1d[k][l] == (float)(want_k * (uint32_t)VECF_LEN + (uint32_t)l), "breadth float permute_1d n=%u p=%d k=%u l=%d", n, p, k, l);
+                }
+            }
+            memcpy(r0, in_r, n * sizeof(VECF));
+            memcpy(i0, in_i, n * sizeof(VECF));
+            memcpy(r1, in_r, n * sizeof(VECF));
+            memcpy(i1, in_i, n * sizeof(VECF));
+            nanofftf_execute_breadth(plan, r0, i0);
+            nanofftf_execute_raw_breadth(plan, r1, i1);
+            nanofftf_permute_breadth(plan, r1, i1);
+            CHECK(memcmp(r0, r1, n * sizeof(VECF)) == 0 && memcmp(i0, i1, n * sizeof(VECF)) == 0, "breadth float raw+permute != execute n=%u p=%d", n, p);
+            free(r0);
+            free(i0);
+            free(r1);
+            free(i1);
+            free(v1d);
+            nanofftf_destroy_plan(plan);
+        }
+        tls_tuning_set_permute(TLS_PERMUTE_AUTO);
+        tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);
+
+        free(in_r);
+        free(in_i);
+        free(out_r);
+        free(out_i);
+        free(lane_r);
+        free(lane_i);
+        free(ref_r);
+        free(ref_i);
+    }
+}
+
+static void check_breadth_double(void) {
+    const uint32_t sizes[] = {2, 8, 64, 256, 1024};
+    const int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+    for (int si = 0; si < nsizes; ++si) {
+        const uint32_t n = sizes[si];
+        const uint32_t log_n = (uint32_t)(log2((double)n) + 0.5);
+        VEC *in_r = (VEC *)test_alloc(n * sizeof(VEC));
+        VEC *in_i = (VEC *)test_alloc(n * sizeof(VEC));
+        VEC *out_r = (VEC *)test_alloc(n * sizeof(VEC));
+        VEC *out_i = (VEC *)test_alloc(n * sizeof(VEC));
+        double *ref_r = (double *)test_alloc((size_t)n * VEC_LEN * sizeof(double));
+        double *ref_i = (double *)test_alloc((size_t)n * VEC_LEN * sizeof(double));
+        const double two_pi = 6.283185307179586476925286766559;
+
+        for (uint32_t k = 0; k < n; ++k) {
+            VEC vr, vi;
+            for (int l = 0; l < VEC_LEN; ++l) {
+                vr[l] = (double)frand();
+                vi[l] = (double)frand();
+            }
+            in_r[k] = vr;
+            in_i[k] = vi;
+        }
+        for (int l = 0; l < VEC_LEN; ++l) {
+            for (uint32_t k = 0; k < n; ++k) {
+                double ar = 0.0, ai = 0.0;
+                for (uint32_t m = 0; m < n; ++m) {
+                    const double th = two_pi * (double)k * (double)m / (double)n;
+                    const double c = cos(th), s = sin(th);
+                    ar += in_r[m][l] * c - in_i[m][l] * s;
+                    ai += in_i[m][l] * c + in_r[m][l] * s;
+                }
+                ref_r[(size_t)l * n + k] = ar;
+                ref_i[(size_t)l * n + k] = ai;
+            }
+        }
+
+        for (int fuse = 1; fuse <= NANOFFT_FFT_FUSE_MAX; ++fuse) {
+            tls_tuning_set_fft_bfuse(fuse);
+            nanofft_plan *plan = nanofft_make_plan_breadth(n);
+            memcpy(out_r, in_r, n * sizeof(VEC));
+            memcpy(out_i, in_i, n * sizeof(VEC));
+            nanofft_execute_breadth(plan, out_r, out_i);
+            for (int l = 0; l < VEC_LEN; ++l) {
+                double err = 0.0, scale = 0.0;
+                for (uint32_t k = 0; k < n; ++k) {
+                    const double dr = ref_r[(size_t)l * n + k], di = ref_i[(size_t)l * n + k];
+                    const double mag = sqrt(dr * dr + di * di);
+                    if (mag > scale) scale = mag;
+                    const double er = out_r[k][l] - dr, ei = out_i[k][l] - di;
+                    const double e = sqrt(er * er + ei * ei);
+                    if (e > err) err = e;
+                }
+                const double rel = scale > 0.0 ? err / scale : err;
+                CHECK(rel < 1e-12, "breadth double n=%u fuse=%d lane=%d rel=%.3g", n, fuse, l, rel);
+            }
+            nanofft_destroy_plan(plan);
+        }
+        tls_tuning_set_fft_bfuse(TLS_TUNING_FFT_FUSE_DEFAULT);
+
+        const int pmodes[4] = {TLS_PERMUTE_TABLE, TLS_PERMUTE_PAIRS, TLS_PERMUTE_COBRAVO, TLS_PERMUTE_COBRAVO};
+        const int pcob[4] = {1, 1, 1, 0};
+        for (int p = 0; p < 4; ++p) {
+            tls_tuning_set_permute(pmodes[p]);
+            tls_tuning_set_cobravo(pcob[p]);
+            nanofft_plan *plan = nanofft_make_plan_breadth(n);
+            VEC *v1d = (VEC *)test_alloc(n * sizeof(VEC));
+            for (uint32_t k = 0; k < n; ++k) {
+                VEC v;
+                for (int l = 0; l < VEC_LEN; ++l) v[l] = (double)(k * (uint32_t)VEC_LEN + (uint32_t)l);
+                v1d[k] = v;
+            }
+            nanofft_permute_1d_breadth(plan, v1d);
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t want_k = reverse_bits_ref(k, log_n);
+                for (int l = 0; l < VEC_LEN; ++l)
+                    CHECK(v1d[k][l] == (double)(want_k * (uint32_t)VEC_LEN + (uint32_t)l), "breadth double permute_1d n=%u p=%d k=%u l=%d", n, p, k, l);
+            }
+            free(v1d);
+            nanofft_destroy_plan(plan);
+        }
+        tls_tuning_set_permute(TLS_PERMUTE_AUTO);
+        tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);
+
+        free(in_r);
+        free(in_i);
+        free(out_r);
+        free(out_i);
+        free(ref_r);
+        free(ref_i);
+    }
+}
+
+static void check_breadth_dd(void) {
+    const uint32_t sizes[] = {2, 8, 64, 256, 1024};
+    const int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+    for (int si = 0; si < nsizes; ++si) {
+        const uint32_t n = sizes[si];
+        const uint32_t log_n = (uint32_t)(log2((double)n) + 0.5);
+        VECDD *in_r = (VECDD *)test_alloc(n * sizeof(VECDD));
+        VECDD *in_i = (VECDD *)test_alloc(n * sizeof(VECDD));
+        VECDD *out_r = (VECDD *)test_alloc(n * sizeof(VECDD));
+        VECDD *out_i = (VECDD *)test_alloc(n * sizeof(VECDD));
+        dd_t *ref_r = (dd_t *)test_alloc((size_t)n * VECDD_LEN * sizeof(dd_t));
+        dd_t *ref_i = (dd_t *)test_alloc((size_t)n * VECDD_LEN * sizeof(dd_t));
+
+        for (uint32_t k = 0; k < n; ++k) {
+            VEC rhi, rlo, ihi, ilo;
+            for (int l = 0; l < VECDD_LEN; ++l) {
+                rhi[l] = (double)frand();
+                rlo[l] = (double)frand() * 1e-17;
+                ihi[l] = (double)frand();
+                ilo[l] = (double)frand() * 1e-17;
+            }
+            in_r[k] = vecdd_make(rhi, rlo);
+            in_i[k] = vecdd_make(ihi, ilo);
+        }
+        /* Compare against scalar nanofftdd_execute per lane (full 106-bit accuracy). */
+        nanofftdd_plan *ref_plan = nanofftdd_make_plan(n);
+        for (int l = 0; l < VECDD_LEN; ++l) {
+            dd_t *rr = ref_r + (size_t)l * n;
+            dd_t *ri = ref_i + (size_t)l * n;
+            for (uint32_t k = 0; k < n; ++k) {
+                rr[k] = dd_make(in_r[k].hi[l], in_r[k].lo[l]);
+                ri[k] = dd_make(in_i[k].hi[l], in_i[k].lo[l]);
+            }
+            nanofftdd_execute(ref_plan, rr, ri);
+        }
+        nanofftdd_destroy_plan(ref_plan);
+
+        for (int fuse = 1; fuse <= NANOFFT_FFT_FUSE_MAX; ++fuse) {
+            tls_tuning_set_fft_bfuse(fuse);
+            nanofftdd_plan *plan = nanofftdd_make_plan_breadth(n);
+            memcpy(out_r, in_r, n * sizeof(VECDD));
+            memcpy(out_i, in_i, n * sizeof(VECDD));
+            nanofftdd_execute_breadth(plan, out_r, out_i);
+            for (int l = 0; l < VECDD_LEN; ++l) {
+                double err = 0.0, scale = 0.0;
+                for (uint32_t k = 0; k < n; ++k) {
+                    const dd_t want_r = ref_r[(size_t)l * n + k];
+                    const dd_t want_i = ref_i[(size_t)l * n + k];
+                    const double mag = hypot(want_r.hi, want_i.hi);
+                    if (mag > scale) scale = mag;
+                    const double er = (out_r[k].hi[l] - want_r.hi) + (out_r[k].lo[l] - want_r.lo);
+                    const double ei = (out_i[k].hi[l] - want_i.hi) + (out_i[k].lo[l] - want_i.lo);
+                    const double e = hypot(er, ei);
+                    if (e > err) err = e;
+                }
+                const double rel = scale > 0.0 ? err / scale : err;
+                CHECK(rel < 1e-26, "breadth dd n=%u fuse=%d lane=%d rel=%.3g", n, fuse, l, rel);
+            }
+            nanofftdd_destroy_plan(plan);
+        }
+        tls_tuning_set_fft_bfuse(TLS_TUNING_FFT_FUSE_DEFAULT);
+
+        const int pmodes[4] = {TLS_PERMUTE_TABLE, TLS_PERMUTE_PAIRS, TLS_PERMUTE_COBRAVO, TLS_PERMUTE_COBRAVO};
+        const int pcob[4] = {1, 1, 1, 0};
+        for (int p = 0; p < 4; ++p) {
+            tls_tuning_set_permute(pmodes[p]);
+            tls_tuning_set_cobravo(pcob[p]);
+            nanofftdd_plan *plan = nanofftdd_make_plan_breadth(n);
+            VECDD *v1d = (VECDD *)test_alloc(n * sizeof(VECDD));
+            for (uint32_t k = 0; k < n; ++k) {
+                VEC hi, lo;
+                for (int l = 0; l < VECDD_LEN; ++l) {
+                    hi[l] = (double)(k * (uint32_t)VECDD_LEN + (uint32_t)l);
+                    lo[l] = (double)l * 1e-20;
+                }
+                v1d[k] = vecdd_make(hi, lo);
+            }
+            nanofftdd_permute_1d_breadth(plan, v1d);
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint32_t want_k = reverse_bits_ref(k, log_n);
+                for (int l = 0; l < VECDD_LEN; ++l) {
+                    CHECK(v1d[k].hi[l] == (double)(want_k * (uint32_t)VECDD_LEN + (uint32_t)l) && v1d[k].lo[l] == (double)l * 1e-20,
+                          "breadth dd permute_1d n=%u p=%d k=%u l=%d", n, p, k, l);
+                }
+            }
+            free(v1d);
+            nanofftdd_destroy_plan(plan);
+        }
+        tls_tuning_set_permute(TLS_PERMUTE_AUTO);
+        tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);
+
+        free(in_r);
+        free(in_i);
+        free(out_r);
+        free(out_i);
+        free(ref_r);
+        free(ref_i);
+    }
+}
+
 int main(void) {
     printf("check_nanofft: permutation\n");
     check_permutation();
@@ -547,6 +855,12 @@ int main(void) {
     check_dd_permutation();
     printf("check_nanofft: double-double FFT\n");
     check_fft_dd();
+    printf("check_nanofft: breadth float FFT & permute\n");
+    check_breadth_float();
+    printf("check_nanofft: breadth double FFT & permute\n");
+    check_breadth_double();
+    printf("check_nanofft: breadth double-double FFT & permute\n");
+    check_breadth_dd();
 
     if (failures) {
         printf("check_nanofft: %d failure(s)\n", failures);

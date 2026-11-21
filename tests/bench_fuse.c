@@ -322,7 +322,105 @@ DEFINE_BENCH(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nano
 DEFINE_TUNE(float, nanofftf_plan, nanofftf_make_plan, nanofftf_destroy_plan, nanofftf_execute_raw, float, NANOFFT_FFT_FUSE_FLOAT)
 DEFINE_TUNE(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nanofft_execute_raw, double, NANOFFT_FFT_FUSE_DOUBLE)
 
-static void emit_depth_header(const char *path, const unsigned char *tf, const unsigned char *td, const char *note) {
+#define DEFINE_BTUNE(TAG, PLAN_T_, MAKE, DESTROY, EXEC, VTYPE, LANES, MAXDEPTH, INIT_LANE)                         \
+    static void btune_##TAG(unsigned char *table, const uint32_t *sizes, int nsizes, int layouts, int reps) {      \
+        printf("  %-6s %-6s", "grid", "ns/b");                                                                     \
+        for (int d = 1; d <= (MAXDEPTH); ++d) printf(" %9s", "depth");                                             \
+        printf("   chosen\n");                                                                                     \
+        const size_t shift = (64 >= sizeof(VTYPE)) ? (64 / sizeof(VTYPE)) : 1u;                                    \
+        for (int si = 0; si < nsizes; ++si) {                                                                      \
+            const uint32_t n = sizes[si];                                                                          \
+            const int logn = exact_log2(n);                                                                        \
+            const size_t padded = (size_t)n + (size_t)NLAYOUTS * shift;                                            \
+            VTYPE *buf_r = (VTYPE *)aligned_bytes(padded * sizeof(VTYPE));                                         \
+            VTYPE *buf_i = (VTYPE *)aligned_bytes(padded * sizeof(VTYPE));                                         \
+            VTYPE *tmpl_r = (VTYPE *)aligned_bytes(n * sizeof(VTYPE));                                             \
+            VTYPE *tmpl_i = (VTYPE *)aligned_bytes(n * sizeof(VTYPE));                                             \
+            uint32_t rng = 2463534242u;                                                                            \
+            for (uint32_t k = 0; k < n; ++k) {                                                                     \
+                for (int l = 0; l < (int)(LANES); ++l) {                                                           \
+                    rng ^= rng << 13;                                                                              \
+                    rng ^= rng >> 17;                                                                              \
+                    rng ^= rng << 5;                                                                               \
+                    const double vr = (double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0;                                 \
+                    rng ^= rng << 13;                                                                              \
+                    rng ^= rng >> 17;                                                                              \
+                    rng ^= rng << 5;                                                                               \
+                    const double vi = (double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0;                                 \
+                    INIT_LANE(tmpl_r[k], l, vr);                                                                   \
+                    INIT_LANE(tmpl_i[k], l, vi);                                                                   \
+                }                                                                                                  \
+            }                                                                                                      \
+            double best[NANOFFT_FFT_FUSE_MAX + 1];                                                                 \
+            for (int d = 1; d <= (MAXDEPTH); ++d) {                                                                \
+                double per[NLAYOUTS] = {0};                                                                        \
+                for (int r = 0; r < layouts; ++r) per[r] = 1e30;                                                   \
+                for (int r = 0; r < layouts; ++r) {                                                                \
+                    VTYPE *rp = buf_r + (size_t)r * shift;                                                         \
+                    VTYPE *ip = buf_i + (size_t)r * shift;                                                         \
+                    const size_t pad_bytes = (size_t)(((r * 17) % NLAYOUTS) * 64);                                 \
+                    void *pad = pad_bytes ? aligned_bytes(pad_bytes) : NULL;                                       \
+                    tls_tuning_set_fft_bfuse(d);                                                                   \
+                    tls_tuning_set_fft_order(TLS_FFT_ORDER_END);                                                   \
+                    PLAN_T_ *plan = MAKE(n);                                                                       \
+                    for (int rep = 0; rep < reps; ++rep) {                                                         \
+                        memcpy(rp, tmpl_r, n * sizeof(VTYPE));                                                     \
+                        memcpy(ip, tmpl_i, n * sizeof(VTYPE));                                                     \
+                        const double t0 = now_seconds();                                                           \
+                        EXEC(plan, rp, ip);                                                                        \
+                        const double dt = now_seconds() - t0;                                                      \
+                        if (dt < per[r]) per[r] = dt;                                                              \
+                    }                                                                                              \
+                    DESTROY(plan);                                                                                 \
+                    free(pad);                                                                                     \
+                }                                                                                                  \
+                for (int a = 1; a < layouts; ++a) {                                                                \
+                    const double key = per[a];                                                                     \
+                    int b = a - 1;                                                                                 \
+                    while (b >= 0 && per[b] > key) {                                                               \
+                        per[b + 1] = per[b];                                                                       \
+                        --b;                                                                                       \
+                    }                                                                                              \
+                    per[b + 1] = key;                                                                              \
+                }                                                                                                  \
+                best[d] = per[layouts / 2];                                                                        \
+            }                                                                                                      \
+            int winner = 1;                                                                                        \
+            for (int d = 2; d <= (MAXDEPTH); ++d)                                                                  \
+                if (best[d] < best[winner]) winner = d;                                                            \
+            for (int d = 1; d < winner; ++d)                                                                       \
+                if (best[d] <= best[winner] * 1.02) {                                                              \
+                    winner = d;                                                                                    \
+                    break;                                                                                         \
+                }                                                                                                  \
+            table[logn] = (unsigned char)winner;                                                                   \
+            printf("  2^%-3d %6.3f", logn, best[1] * 1e9 / ((double)n * (double)(LANES)));                         \
+            for (int d = 1; d <= (MAXDEPTH); ++d) printf(" %9.3f", best[d] * 1e9 / ((double)n * (double)(LANES))); \
+            printf("   d%d\n", winner);                                                                            \
+            free(buf_r);                                                                                           \
+            free(buf_i);                                                                                           \
+            free(tmpl_r);                                                                                          \
+            free(tmpl_i);                                                                                          \
+        }                                                                                                          \
+    }
+
+#define INIT_LANE_F(v, l, x) ((v)[(l)] = (float)(x))
+#define INIT_LANE_D(v, l, x) ((v)[(l)] = (double)(x))
+#define INIT_LANE_DD(v, l, x)      \
+    do {                           \
+        (v).hi[(l)] = (double)(x); \
+        (v).lo[(l)] = 0.0;         \
+    } while (0)
+
+DEFINE_BTUNE(float, nanofftf_plan, nanofftf_make_plan_breadth, nanofftf_destroy_plan, nanofftf_execute_raw_breadth, VECF, VECF_LEN, NANOFFT_FFT_BFUSE_FLOAT,
+             INIT_LANE_F)
+DEFINE_BTUNE(double, nanofft_plan, nanofft_make_plan_breadth, nanofft_destroy_plan, nanofft_execute_raw_breadth, VEC, VEC_LEN, NANOFFT_FFT_BFUSE_DOUBLE,
+             INIT_LANE_D)
+DEFINE_BTUNE(dd, nanofftdd_plan, nanofftdd_make_plan_breadth, nanofftdd_destroy_plan, nanofftdd_execute_raw_breadth, VECDD, VECDD_LEN, NANOFFT_FFT_BFUSE_DD,
+             INIT_LANE_DD)
+
+static void emit_depth_header(const char *path, const unsigned char *tf, const unsigned char *td, const unsigned char *btf, const unsigned char *btd,
+                              const unsigned char *btdd, const char *note) {
     FILE *f = fopen(path, "w");
     if (!f) {
         fprintf(stderr, "cannot open %s\n", path);
@@ -341,7 +439,8 @@ static void emit_depth_header(const char *path, const unsigned char *tf, const u
             " * Regenerate with `make tune` (native) or as part of `make wheels`.\n"
             " */\n"
             "#ifndef NANOFFT_DEPTH_TABLE_H\n"
-            "#define NANOFFT_DEPTH_TABLE_H\n\n",
+            "#define NANOFFT_DEPTH_TABLE_H\n\n"
+            "#define NANOFFT_BDEPTH_TABLE 1\n\n",
             note);
     const char *names[3] = {"nanofft_depth_float", "nanofft_depth_double", "nanofft_depth_dd"};
     const unsigned char *tabs[3] = {tf, td, NULL};
@@ -353,7 +452,15 @@ static void emit_depth_header(const char *path, const unsigned char *tf, const u
     fprintf(f, "/* Double-double is scalar (one lane) and keeps its 2-stage default. */\n");
     fprintf(f, "static const unsigned char %s[32] = {", names[2]);
     for (int i = 0; i < 32; ++i) fprintf(f, "%s0", (i % 16) ? ", " : (i ? ",\n    " : ""));
-    fprintf(f, "};\n\n#endif /* NANOFFT_DEPTH_TABLE_H */\n");
+    fprintf(f, "};\n\n");
+    const char *bnames[3] = {"nanofft_bdepth_float", "nanofft_bdepth_double", "nanofft_bdepth_dd"};
+    const unsigned char *btabs[3] = {btf, btd, btdd};
+    for (int t = 0; t < 3; ++t) {
+        fprintf(f, "static const unsigned char %s[32] = {", bnames[t]);
+        for (int i = 0; i < 32; ++i) fprintf(f, "%s%d", (i % 16) ? ", " : (i ? ",\n    " : ""), (int)btabs[t][i]);
+        fprintf(f, "};\n");
+    }
+    fprintf(f, "\n#endif /* NANOFFT_DEPTH_TABLE_H */\n");
     fclose(f);
     printf("[emit] wrote %s\n", path);
 }
@@ -396,14 +503,54 @@ int main(int argc, char **argv) {
 
         static unsigned char table_float[32];
         static unsigned char table_double[32];
-        printf("tune: grids 2^%d..2^%d, %d layouts, %d reps, depths 1..%d/%d\n", min_log, max_log, layouts, reps, NANOFFT_FFT_FUSE_FLOAT,
-               NANOFFT_FFT_FUSE_DOUBLE);
+        static unsigned char btable_float[32];
+        static unsigned char btable_double[32];
+        static unsigned char btable_dd[32];
+        printf("tune: grids 2^%d..2^%d, %d layouts, %d reps, depths 1..%d/%d (breadth 1..%d/%d/%d)\n", min_log, max_log, layouts, reps, NANOFFT_FFT_FUSE_FLOAT,
+               NANOFFT_FFT_FUSE_DOUBLE, NANOFFT_FFT_BFUSE_FLOAT, NANOFFT_FFT_BFUSE_DOUBLE, NANOFFT_FFT_BFUSE_DD);
         printf("== double ==\n");
         tune_double(table_double, sizes, nsizes, layouts, reps);
         printf("== float ==\n");
         tune_float(table_float, sizes, nsizes, layouts, reps);
-        if (emit) emit_depth_header(emit, table_float, table_double, note);
+        uint32_t bsizes[MAX_SIZES];
+        int nbsizes = 0;
+        const int bmax = (max_log > 16) ? 16 : max_log;
+        for (int k = 4; k <= bmax && nbsizes < MAX_SIZES; ++k) bsizes[nbsizes++] = 1u << k;
+        printf("== breadth double (VEC_LEN=%d) ==\n", VEC_LEN);
+        btune_double(btable_double, bsizes, nbsizes, layouts, reps);
+        printf("== breadth float (VECF_LEN=%d) ==\n", VECF_LEN);
+        btune_float(btable_float, bsizes, nbsizes, layouts, reps);
+        printf("== breadth dd (VECDD_LEN=%d) ==\n", VECDD_LEN);
+        btune_dd(btable_dd, bsizes, nbsizes, layouts, reps);
+        if (emit) emit_depth_header(emit, table_float, table_double, btable_float, btable_double, btable_dd, note);
         tls_tuning_set_fft_fuse(TLS_TUNING_FFT_FUSE_DEFAULT);
+        tls_tuning_set_fft_bfuse(TLS_TUNING_FFT_FUSE_DEFAULT);
+        tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--breadth") == 0) {
+        int layouts = (argc > 2) ? atoi(argv[2]) : 16;
+        int reps = (argc > 3) ? atoi(argv[3]) : 8;
+        int min_log = (argc > 4) ? atoi(argv[4]) : 4;
+        int max_log = (argc > 5) ? atoi(argv[5]) : 15;
+        if (layouts < 1) layouts = 1;
+        if (layouts > NLAYOUTS) layouts = NLAYOUTS;
+        if (reps < 1) reps = 1;
+        if (min_log < 1) min_log = 1;
+        if (max_log > 18) max_log = 18;
+        uint32_t bsizes[MAX_SIZES];
+        int nbsizes = 0;
+        for (int k = min_log; k <= max_log && nbsizes < MAX_SIZES; ++k) bsizes[nbsizes++] = 1u << k;
+        static unsigned char btf[32], btd[32], btdd[32];
+        printf("bench_fuse --breadth: %d layouts, %d reps, grids 2^%d..2^%d, bfuse defaults %d/%d/%d\n", layouts, reps, min_log, max_log,
+               NANOFFT_FFT_BFUSE_FLOAT, NANOFFT_FFT_BFUSE_DOUBLE, NANOFFT_FFT_BFUSE_DD);
+        printf("== breadth double (VEC_LEN=%d) ==\n", VEC_LEN);
+        btune_double(btd, bsizes, nbsizes, layouts, reps);
+        printf("== breadth float (VECF_LEN=%d) ==\n", VECF_LEN);
+        btune_float(btf, bsizes, nbsizes, layouts, reps);
+        printf("== breadth dd (VECDD_LEN=%d) ==\n", VECDD_LEN);
+        btune_dd(btdd, bsizes, nbsizes, layouts, reps);
+        tls_tuning_set_fft_bfuse(TLS_TUNING_FFT_FUSE_DEFAULT);
         tls_tuning_set_fft_order(TLS_FFT_ORDER_END);
         return 0;
     }

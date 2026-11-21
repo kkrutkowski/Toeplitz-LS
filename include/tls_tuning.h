@@ -32,6 +32,10 @@ enum {
 TLS_API int tls_tuning_fft_fuse(void);
 TLS_API void tls_tuning_set_fft_fuse(int fuse);
 
+/* Breadth-wise FFT fusion depth: 0 = per-precision breadth default, or 1..NANOFFT_FFT_FUSE_MAX. */
+TLS_API int tls_tuning_fft_bfuse(void);
+TLS_API void tls_tuning_set_fft_bfuse(int fuse);
+
 /* Fusion order: where the leftover stages of an odd stage count go.
  *   TLS_FFT_ORDER_END   = leftover pass first, then every full-depth pass
  *   TLS_FFT_ORDER_FRONT = every full-depth pass first, leftover pass last */
@@ -70,6 +74,12 @@ enum {
  * piecewise polynomial evaluation. */
 TLS_API int tls_tuning_spread(void);
 TLS_API void tls_tuning_set_spread(int mode);
+
+/* Vectorization default when using the non-_opts C entry points:
+ * TLS_VEC_AUTO (0) = cost-model choice, TLS_VEC_DEPTH (1) = depth-wise SIMD
+ * within one block, TLS_VEC_BREADTH (2) = breadth-wise SIMD across V blocks. */
+TLS_API int tls_tuning_vectorize(void);
+TLS_API void tls_tuning_set_vectorize(int mode);
 
 /* Bytes of periodogram work arrays allocated by the most recent fastchi2 call. */
 TLS_API unsigned long long tls_tuning_work_bytes(void);

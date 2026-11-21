@@ -13,6 +13,8 @@ enum { TLS_BACKEND_PSWF43 = 1, TLS_BACKEND_PSWF21 = 2, TLS_BACKEND_LRA = 3 };
 
 enum { TLS_SPREAD_AUTO = 0, TLS_SPREAD_MINMAX = 1, TLS_SPREAD_PIECEWISE = 2 };
 
+enum { TLS_VEC_AUTO = 0, TLS_VEC_DEPTH = 1, TLS_VEC_BREADTH = 2 };
+
 enum { TLS_SOLVER_LEVINSON = 1, TLS_SOLVER_ZOHAR = 2, TLS_SOLVER_BAREISS = 3, TLS_SOLVER_LDLT = 4, TLS_SOLVER_SVD = 5 };
 
 /*
@@ -62,6 +64,15 @@ TLS_API int tls_fastchi2_spread(const double *t, const double *y, const double *
 TLS_API int tlsdd_fastchi2_spread(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
                                   int normalization, int spreading, dd_t *power, dd_t *cond);
 
+TLS_API int tlsf_fastchi2_opts(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                               int normalization, int spreading, int vectorize, float *power, float *cond);
+
+TLS_API int tls_fastchi2_opts(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                              int normalization, int spreading, int vectorize, double *power, double *cond);
+
+TLS_API int tlsdd_fastchi2_opts(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                                int normalization, int spreading, int vectorize, dd_t *power, dd_t *cond);
+
 /*
  * Incoherent harmonic sum (IHS) periodogram.
  *
@@ -97,6 +108,15 @@ TLS_API int tls_ihs_spread(const double *t, const double *y, const double *dy, i
 
 TLS_API int tlsdd_ihs_spread(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
                              int spreading, dd_t *power);
+
+TLS_API int tlsf_ihs_opts(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                          int spreading, int vectorize, float *power);
+
+TLS_API int tls_ihs_opts(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                         int spreading, int vectorize, double *power);
+
+TLS_API int tlsdd_ihs_opts(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                           int spreading, int vectorize, dd_t *power);
 
 #ifdef __cplusplus
 }

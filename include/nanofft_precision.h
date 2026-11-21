@@ -29,6 +29,19 @@
 #undef TO_DOUBLE
 #undef FROM_FALLBACK
 #undef TO_FALLBACK
+#undef BREADTH_VEC
+#undef BREADTH_VEC_LEN
+#undef BREADTH_ADD
+#undef BREADTH_SUB
+#undef BREADTH_MUL
+#undef BREADTH_MUL_S
+#undef BREADTH_NEG
+#undef BREADTH_SPLAT
+#undef BREADTH_ZERO
+#undef BREADTH_GET_LANE
+#undef BREADTH_SET_LANE
+#undef LOAD_BVEC
+#undef STORE_BVEC
 
 #if defined(DOUBLE_DOUBLE)
 
@@ -62,6 +75,22 @@ typedef uint32_t INTERNAL_VEC_INT;
 #    define TO_DOUBLE(a) dd_to_double(a)
 #    define FROM_FALLBACK(a) dd_make((double)(a), 0.0)
 #    define TO_FALLBACK(a) ((a).hi)
+#    define BREADTH_VEC VECDD
+#    define BREADTH_VEC_LEN VECDD_LEN
+#    define BREADTH_ADD(a, b) vecdd_add((a), (b))
+#    define BREADTH_SUB(a, b) vecdd_sub((a), (b))
+#    define BREADTH_MUL(a, b) vecdd_mul((a), (b))
+#    define BREADTH_MUL_S(v, s) vecdd_mul_scalar((v), (s))
+#    define BREADTH_NEG(a) vecdd_neg((a))
+#    define BREADTH_SPLAT(s) vecdd_splat((s))
+#    define BREADTH_ZERO ((VECDD){(VEC){}, (VEC){}})
+#    define BREADTH_GET_LANE(v, lane) dd_make((v).hi[(lane)], (v).lo[(lane)])
+#    define BREADTH_SET_LANE(v, lane, val) \
+        do {                               \
+            dd_t _bl_ = (val);             \
+            (v).hi[(lane)] = _bl_.hi;      \
+            (v).lo[(lane)] = _bl_.lo;      \
+        } while (0)
 
 #elif defined(DOUBLE)
 
@@ -99,6 +128,20 @@ typedef VEC_INT INTERNAL_VEC_INT;
 #    define TO_DOUBLE(a) ((double)(a))
 #    define FROM_FALLBACK(a) ((double)(a))
 #    define TO_FALLBACK(a) ((float)(a))
+#    define BREADTH_VEC VEC
+#    define BREADTH_VEC_LEN VEC_LEN
+#    define BREADTH_ADD(a, b) ((a) + (b))
+#    define BREADTH_SUB(a, b) ((a) - (b))
+#    define BREADTH_MUL(a, b) ((a) * (b))
+#    define BREADTH_MUL_S(v, s) ((v) * ((VEC){} + (double)(s)))
+#    define BREADTH_NEG(a) (-(a))
+#    define BREADTH_SPLAT(s) ((VEC){} + (double)(s))
+#    define BREADTH_ZERO ((VEC){})
+#    define BREADTH_GET_LANE(v, lane) ((v)[(lane)])
+#    define BREADTH_SET_LANE(v, lane, val) \
+        do {                               \
+            (v)[(lane)] = (val);           \
+        } while (0)
 
 #else
 
@@ -136,6 +179,20 @@ typedef VECF_INT INTERNAL_VEC_INT;
 #    define TO_DOUBLE(a) ((double)(a))
 #    define FROM_FALLBACK(a) ((float)(a))
 #    define TO_FALLBACK(a) ((double)(a))
+#    define BREADTH_VEC VECF
+#    define BREADTH_VEC_LEN VECF_LEN
+#    define BREADTH_ADD(a, b) ((a) + (b))
+#    define BREADTH_SUB(a, b) ((a) - (b))
+#    define BREADTH_MUL(a, b) ((a) * (b))
+#    define BREADTH_MUL_S(v, s) ((v) * ((VECF){} + (float)(s)))
+#    define BREADTH_NEG(a) (-(a))
+#    define BREADTH_SPLAT(s) ((VECF){} + (float)(s))
+#    define BREADTH_ZERO ((VECF){})
+#    define BREADTH_GET_LANE(v, lane) ((v)[(lane)])
+#    define BREADTH_SET_LANE(v, lane, val) \
+        do {                               \
+            (v)[(lane)] = (val);           \
+        } while (0)
 
 #endif
 
@@ -145,3 +202,5 @@ typedef VECF_INT INTERNAL_VEC_INT;
 
 #define LOAD_VEC(ptr) (*(const INTERNAL_VEC *)(ptr))
 #define STORE_VEC(ptr, val) (*(INTERNAL_VEC *)(ptr) = (val))
+#define LOAD_BVEC(ptr) (*(const BREADTH_VEC *)(ptr))
+#define STORE_BVEC(ptr, val) (*(BREADTH_VEC *)(ptr) = (val))

@@ -29,16 +29,25 @@ enum {
  * the plan found the periodic kept-bin pattern, which
  * TLS_*_nufft_pswf_slots_available() reports.
  */
-#define TLS_INTERNAL_PSWF_DECL(prefix, type, plan_type)                                                                                                     \
+#define TLS_INTERNAL_PSWF_DECL(prefix, type, input_type, bvec_type, plan_type, lra_plan_type)                                                               \
     TLS_API plan_type *prefix##_nufft_pswf_initialize_mode(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode);   \
+    TLS_API plan_type *prefix##_nufft_pswf_initialize_opts(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode,    \
+                                                           int vec_mode);                                                                                   \
     TLS_API void prefix##_nufft_pswf_execute_mode(plan_type *plan, const type *y_real, const type *y_imag, type *out_real, type *out_imag, int freq_factor, \
                                                   int mode);                                                                                                \
+    TLS_API void prefix##_nufft_pswf_execute_breadth(plan_type *plan, const input_type *x, const type *val, double f0, int block, int block_base,           \
+                                                     int freq_factor, int mode, bvec_type *out_real, bvec_type *out_imag);                                  \
     TLS_API int prefix##_nufft_pswf_slots_available(plan_type *plan);                                                                                       \
-    TLS_API void prefix##_nufft_pswf_finish_slots(plan_type *plan, const type *compact, type *out, int count);
+    TLS_API void prefix##_nufft_pswf_finish_slots(plan_type *plan, const type *compact, type *out, int count);                                              \
+    TLS_API void prefix##_nufft_pswf_finish_slots_breadth(plan_type *plan, const bvec_type *compact, type *out, int block, int active_lanes,                \
+                                                          int total_remaining);                                                                             \
+    TLS_API lra_plan_type *prefix##_nufft_lra_initialize_opts(int max_Mpoints, int max_N, int max_rank, double df, int freq_factor, int vec_mode);          \
+    TLS_API void prefix##_nufft_lra_execute_breadth(const lra_plan_type *plan, const input_type *x, const type *val, double f0, int block, int block_base,  \
+                                                    int freq_factor, bvec_type *out_real, bvec_type *out_imag);
 
-TLS_INTERNAL_PSWF_DECL(tlsf, float, tlsf_nufft_pswf_plan)
-TLS_INTERNAL_PSWF_DECL(tls, double, tls_nufft_pswf_plan)
-TLS_INTERNAL_PSWF_DECL(tlsdd, dd_t, tlsdd_nufft_pswf_plan)
+TLS_INTERNAL_PSWF_DECL(tlsf, float, double, VECF, tlsf_nufft_pswf_plan, tlsf_nufft_lra_plan)
+TLS_INTERNAL_PSWF_DECL(tls, double, double, VEC, tls_nufft_pswf_plan, tls_nufft_lra_plan)
+TLS_INTERNAL_PSWF_DECL(tlsdd, dd_t, dd_t, VECDD, tlsdd_nufft_pswf_plan, tlsdd_nufft_lra_plan)
 
 #undef TLS_INTERNAL_PSWF_DECL
 

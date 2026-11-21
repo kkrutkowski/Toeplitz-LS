@@ -40,6 +40,7 @@ HERE = Path(__file__).resolve().parent
 
 _BACKENDS = {"pswf43": 1, "pswf21": 2, "lra": 3}
 _SPREADINGS = {"auto": 0, "minmax": 1, "piecewise": 2}
+_VECTORIZATIONS = {"auto": 0, "depth": 1, "breadth": 2}
 _SOLVERS = {"levinson": 1, "zohar": 2, "bareiss": 3, "ldlt": 4, "svd": 5}
 _NORMALIZATIONS = {
     "standard": 0,
@@ -284,6 +285,114 @@ def _load_library():
         ctypes.POINTER(DD),
     ]
     lib.tlsdd_ihs_spread.restype = ctypes.c_int
+
+    lib.tlsf_fastchi2_opts.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsf_fastchi2_opts.restype = ctypes.c_int
+
+    lib.tls_fastchi2_opts.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.tls_fastchi2_opts.restype = ctypes.c_int
+
+    lib.tlsdd_fastchi2_opts.argtypes = [
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+    ]
+    lib.tlsdd_fastchi2_opts.restype = ctypes.c_int
+
+    lib.tlsf_ihs_opts.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsf_ihs_opts.restype = ctypes.c_int
+
+    lib.tls_ihs_opts.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_double),
+    ]
+    lib.tls_ihs_opts.restype = ctypes.c_int
+
+    lib.tlsdd_ihs_opts.argtypes = [
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.POINTER(DD),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(DD),
+    ]
+    lib.tlsdd_ihs_opts.restype = ctypes.c_int
     _LIB = lib
     return lib
 
@@ -304,6 +413,21 @@ def _spreading_id(spreading, *, allow_piecewise=True):
                 raise ValueError("spreading='piecewise' is not supported in double-double precision; use 'auto' or 'minmax'")
             return _SPREADINGS[key]
     raise ValueError("spreading must be 'auto', 'minmax', or 'piecewise'")
+
+
+def _vectorize_id(vectorize, *, allow_depth=True):
+    if isinstance(vectorize, str):
+        key = vectorize.strip().lower()
+        if key in _VECTORIZATIONS:
+            if key == "depth" and not allow_depth:
+                raise ValueError("vectorize='depth' is not supported in double-double precision; use 'auto' or 'breadth'")
+            return _VECTORIZATIONS[key]
+    elif isinstance(vectorize, int) and not isinstance(vectorize, bool):
+        if vectorize in _VECTORIZATIONS.values():
+            if vectorize == _VECTORIZATIONS["depth"] and not allow_depth:
+                raise ValueError("vectorize='depth' is not supported in double-double precision; use 'auto' or 'breadth'")
+            return vectorize
+    raise ValueError("vectorize must be 'auto', 'depth', or 'breadth'")
 
 
 def _solver_id(solver):
@@ -487,6 +611,7 @@ class tlsf:
         nterms=3,
         normalization="standard",
         spreading="auto",
+        vectorize="auto",
         *,
         autonan=True,
     ):
@@ -494,11 +619,13 @@ class tlsf:
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
         ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
-        or ``'piecewise'``.
+        or ``'piecewise'``. ``vectorize`` accepts ``'auto'`` (default),
+        ``'depth'``, or ``'breadth'``.
         """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
         spreading = _spreading_id(spreading)
+        vectorize = _vectorize_id(vectorize)
         min_Nf = 32 if backend == _BACKENDS["lra"] else 16
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
         solver = _solver_id_for_nterms(solver, nterms)
@@ -508,7 +635,7 @@ class tlsf:
         cond = None if autonan else np.empty(Nf, dtype=np.float32)
         cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        status = _load_library().tlsf_fastchi2_spread(
+        status = _load_library().tlsf_fastchi2_opts(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -521,10 +648,11 @@ class tlsf:
             solver,
             normalization,
             spreading,
+            vectorize,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             cond_ptr,
         )
-        _raise_status("tlsf_fastchi2_spread", status)
+        _raise_status("tlsf_fastchi2_opts", status)
         power = out
         if autonan:
             return power
@@ -543,6 +671,7 @@ class tlsf:
         backend="pswf43",
         solver=None,
         spreading="auto",
+        vectorize="auto",
         *,
         autonan=True,
     ):
@@ -550,11 +679,13 @@ class tlsf:
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
         ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
-        or ``'piecewise'``.
+        or ``'piecewise'``. ``vectorize`` accepts ``'auto'`` (default),
+        ``'depth'``, or ``'breadth'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
         _spreading_id(spreading)
+        _vectorize_id(vectorize)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float32)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -571,6 +702,7 @@ class tlsf:
             solver=solver,
             normalization=normalization,
             spreading=spreading,
+            vectorize=vectorize,
             nterms=nterms,
             autonan=autonan,
         )
@@ -596,6 +728,7 @@ class tls:
         nterms=3,
         normalization="standard",
         spreading="auto",
+        vectorize="auto",
         *,
         autonan=True,
     ):
@@ -603,11 +736,13 @@ class tls:
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
         ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
-        or ``'piecewise'``.
+        or ``'piecewise'``. ``vectorize`` accepts ``'auto'`` (default),
+        ``'depth'``, or ``'breadth'``.
         """
         normalization = _check_normalization(normalization)
         backend = _backend_id(backend)
         spreading = _spreading_id(spreading)
+        vectorize = _vectorize_id(vectorize)
         Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=8)
         solver = _solver_id_for_nterms(solver, nterms)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, np.float64)
@@ -616,7 +751,7 @@ class tls:
         cond = None if autonan else np.empty(Nf, dtype=np.float64)
         cond_ptr = ctypes.POINTER(ctypes.c_double)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
 
-        status = _load_library().tls_fastchi2_spread(
+        status = _load_library().tls_fastchi2_opts(
             t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
@@ -629,10 +764,11 @@ class tls:
             solver,
             normalization,
             spreading,
+            vectorize,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
             cond_ptr,
         )
-        _raise_status("tls_fastchi2_spread", status)
+        _raise_status("tls_fastchi2_opts", status)
         power = out
         if autonan:
             return power
@@ -651,6 +787,7 @@ class tls:
         backend="pswf43",
         solver=None,
         spreading="auto",
+        vectorize="auto",
         *,
         autonan=True,
     ):
@@ -658,11 +795,13 @@ class tls:
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
         ``'nll'``. ``spreading`` accepts ``'auto'`` (default), ``'minmax'``,
-        or ``'piecewise'``.
+        or ``'piecewise'``. ``vectorize`` accepts ``'auto'`` (default),
+        ``'depth'``, or ``'breadth'``.
         """
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
         _spreading_id(spreading)
+        _vectorize_id(vectorize)
         t_arr, y_arr, dy_arr = _prepare_numpy_inputs(x, y, dy, np.float64)
         _check_observation_count(t_arr.size, nterms)
         delta_t = np.max(t_arr) - np.min(t_arr)
@@ -679,6 +818,7 @@ class tls:
             solver=solver,
             normalization=normalization,
             spreading=spreading,
+            vectorize=vectorize,
             nterms=nterms,
             autonan=autonan,
         )
@@ -704,6 +844,7 @@ class tlsdd:
         nterms=3,
         normalization="standard",
         spreading="auto",
+        vectorize="auto",
         *,
         autonan=True,
     ):
@@ -711,10 +852,12 @@ class tlsdd:
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
         ``'nll'``. ``spreading`` accepts ``'auto'`` (default) or ``'minmax'``.
+        ``vectorize`` accepts ``'auto'`` (default) or ``'breadth'``.
         """
         mp = _require_mpmath()
         normalization = _check_normalization(normalization)
         spreading = _spreading_id(spreading, allow_piecewise=False)
+        vectorize = _vectorize_id(vectorize, allow_depth=False)
         Nf = _check_int("Nf", Nf, 1)
         nterms = _check_int("nterms", nterms, 1)
         df_mpf = mp.mpf(df)
@@ -750,7 +893,7 @@ class tlsdd:
         cond = None if autonan else (DD * Nf)()
         cond_ptr = ctypes.POINTER(DD)() if cond is None else cond
 
-        status = _load_library().tlsdd_fastchi2_spread(
+        status = _load_library().tlsdd_fastchi2_opts(
             t_dd,
             y_dd,
             dy_dd,
@@ -763,10 +906,11 @@ class tlsdd:
             solver,
             normalization,
             spreading,
+            vectorize,
             out,
             cond_ptr,
         )
-        _raise_status("tlsdd_fastchi2_spread", status)
+        _raise_status("tlsdd_fastchi2_opts", status)
         power = [_dd_to_mpf(out[i]) for i in range(Nf)]
         if autonan:
             return power
@@ -786,6 +930,7 @@ class tlsdd:
         backend="pswf43",
         solver=None,
         spreading="auto",
+        vectorize="auto",
         *,
         autonan=True,
     ):
@@ -793,11 +938,13 @@ class tlsdd:
 
         ``normalization`` accepts ``'standard'`` (default), ``'anova'``,
         ``'nll'``. ``spreading`` accepts ``'auto'`` (default) or ``'minmax'``.
+        ``vectorize`` accepts ``'auto'`` (default) or ``'breadth'``.
         """
         mp = _require_mpmath()
         nterms = _check_int("nterms", nterms, 1)
         _solver_id_for_nterms(solver, nterms)
         _spreading_id(spreading, allow_piecewise=False)
+        _vectorize_id(vectorize, allow_depth=False)
         t_mpf = _as_mpf_list(x, "x")
         y_mpf = _as_mpf_list(y, "y")
         if dy is None:
@@ -827,6 +974,7 @@ class tlsdd:
             solver=solver,
             normalization=normalization,
             spreading=spreading,
+            vectorize=vectorize,
             nterms=nterms,
             autonan=autonan,
         )

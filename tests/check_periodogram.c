@@ -470,6 +470,167 @@ static void run_spread_policy_and_errors(void) {
           "tlsdd_ihs_spread should reject PIECEWISE");
 }
 
+static void run_vectorize_fastchi2_case(const char *name, int M, int N, int degree, int backend, int solver, int norm, int spread) {
+    double *t = (double *)test_alloc((size_t)M * sizeof(double));
+    double *y = (double *)test_alloc((size_t)M * sizeof(double));
+    double *dy = (double *)test_alloc((size_t)M * sizeof(double));
+    float *fy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *fdy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *fpd = (float *)test_alloc((size_t)N * sizeof(float));
+    float *fpb = (float *)test_alloc((size_t)N * sizeof(float));
+    float *fpa = (float *)test_alloc((size_t)N * sizeof(float));
+    float *fcd = (float *)test_alloc((size_t)N * sizeof(float));
+    float *fcb = (float *)test_alloc((size_t)N * sizeof(float));
+    double *dpd = (double *)test_alloc((size_t)N * sizeof(double));
+    double *dpb = (double *)test_alloc((size_t)N * sizeof(double));
+    double *dpa = (double *)test_alloc((size_t)N * sizeof(double));
+    double *dcd = (double *)test_alloc((size_t)N * sizeof(double));
+    double *dcb = (double *)test_alloc((size_t)N * sizeof(double));
+
+    make_curve(M, t, y);
+    for (int m = 0; m < M; ++m) {
+        dy[m] = 0.1 + 0.02 * urand();
+        fy[m] = (float)y[m];
+        fdy[m] = (float)dy[m];
+    }
+
+    for (int defer = 0; defer <= 1; ++defer) {
+        tls_tuning_set_defer(defer);
+        int sfd = tlsf_fastchi2_opts(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, solver, norm, spread, TLS_VEC_DEPTH, fpd, fcd);
+        int sfb = tlsf_fastchi2_opts(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, solver, norm, spread, TLS_VEC_BREADTH, fpb, fcb);
+        int sfa = tlsf_fastchi2_opts(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, solver, norm, spread, TLS_VEC_AUTO, fpa, NULL);
+        CHECK(sfd == 0 && sfb == 0 && sfa >= 0, "%s float (defer=%d): status d=%d b=%d a=%d", name, defer, sfd, sfb, sfa);
+        CHECK(same_values(fpd, fpb, N, 3e-4, 3e-5), "%s float (defer=%d): depth vs breadth power mismatch", name, defer);
+        CHECK(same_values(fcd, fcb, N, 3e-3, 3e-4), "%s float (defer=%d): depth vs breadth cond mismatch", name, defer);
+        CHECK(same_values(fpd, fpa, N, 3e-4, 3e-5), "%s float (defer=%d): depth vs auto power mismatch", name, defer);
+
+        int sdd = tls_fastchi2_opts(t, y, dy, M, 0.001, 0.0005, N, degree, backend, solver, norm, spread, TLS_VEC_DEPTH, dpd, dcd);
+        int sdb = tls_fastchi2_opts(t, y, dy, M, 0.001, 0.0005, N, degree, backend, solver, norm, spread, TLS_VEC_BREADTH, dpb, dcb);
+        int sda = tls_fastchi2_opts(t, y, dy, M, 0.001, 0.0005, N, degree, backend, solver, norm, spread, TLS_VEC_AUTO, dpa, NULL);
+        CHECK(sdd == 0 && sdb == 0 && sda >= 0, "%s double (defer=%d): status d=%d b=%d a=%d", name, defer, sdd, sdb, sda);
+        CHECK(same_values_d(dpd, dpb, N, 1e-10, 1e-11), "%s double (defer=%d): depth vs breadth power mismatch", name, defer);
+        CHECK(same_values_d(dcd, dcb, N, 1e-8, 1e-9), "%s double (defer=%d): depth vs breadth cond mismatch", name, defer);
+        CHECK(same_values_d(dpd, dpa, N, 1e-10, 1e-11), "%s double (defer=%d): depth vs auto power mismatch", name, defer);
+    }
+
+    free(t);
+    free(y);
+    free(dy);
+    free(fy);
+    free(fdy);
+    free(fpd);
+    free(fpb);
+    free(fpa);
+    free(fcd);
+    free(fcb);
+    free(dpd);
+    free(dpb);
+    free(dpa);
+    free(dcd);
+    free(dcb);
+}
+
+static void run_vectorize_ihs_case(const char *name, int M, int N, int degree, int backend, int norm, int spread) {
+    double *t = (double *)test_alloc((size_t)M * sizeof(double));
+    double *y = (double *)test_alloc((size_t)M * sizeof(double));
+    double *dy = (double *)test_alloc((size_t)M * sizeof(double));
+    float *fy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *fdy = (float *)test_alloc((size_t)M * sizeof(float));
+    float *fpd = (float *)test_alloc((size_t)N * sizeof(float));
+    float *fpb = (float *)test_alloc((size_t)N * sizeof(float));
+    double *dpd = (double *)test_alloc((size_t)N * sizeof(double));
+    double *dpb = (double *)test_alloc((size_t)N * sizeof(double));
+
+    make_curve(M, t, y);
+    for (int m = 0; m < M; ++m) {
+        dy[m] = 0.1 + 0.02 * urand();
+        fy[m] = (float)y[m];
+        fdy[m] = (float)dy[m];
+    }
+
+    for (int defer = 0; defer <= 1; ++defer) {
+        tls_tuning_set_defer(defer);
+        int sf0 = tlsf_ihs_opts(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, norm, spread, TLS_VEC_DEPTH, fpd);
+        int sf1 = tlsf_ihs_opts(t, fy, fdy, M, 0.001, 0.0005, N, degree, backend, norm, spread, TLS_VEC_BREADTH, fpb);
+        int sd0 = tls_ihs_opts(t, y, dy, M, 0.001, 0.0005, N, degree, backend, norm, spread, TLS_VEC_DEPTH, dpd);
+        int sd1 = tls_ihs_opts(t, y, dy, M, 0.001, 0.0005, N, degree, backend, norm, spread, TLS_VEC_BREADTH, dpb);
+        CHECK(sf0 == 0 && sf1 == 0 && sd0 == 0 && sd1 == 0, "%s (defer=%d): ihs status", name, defer);
+        CHECK(same_values(fpd, fpb, N, 3e-4, 3e-5), "%s (defer=%d): float IHS depth vs breadth mismatch", name, defer);
+        CHECK(same_values_d(dpd, dpb, N, 1e-10, 1e-11), "%s (defer=%d): double IHS depth vs breadth mismatch", name, defer);
+    }
+
+    free(t);
+    free(y);
+    free(dy);
+    free(fy);
+    free(fdy);
+    free(fpd);
+    free(fpb);
+    free(dpd);
+    free(dpb);
+}
+
+static void run_vectorize_dd_and_errors(void) {
+    const int M = 180;
+    const int N = 333;
+    double *td = (double *)test_alloc((size_t)M * sizeof(double));
+    double *yd = (double *)test_alloc((size_t)M * sizeof(double));
+    double *dyd = (double *)test_alloc((size_t)M * sizeof(double));
+    dd_t *t = (dd_t *)test_alloc((size_t)M * sizeof(dd_t));
+    dd_t *y = (dd_t *)test_alloc((size_t)M * sizeof(dd_t));
+    dd_t *dy = (dd_t *)test_alloc((size_t)M * sizeof(dd_t));
+    dd_t *pdd = (dd_t *)test_alloc((size_t)N * sizeof(dd_t));
+    double *pref = (double *)test_alloc((size_t)N * sizeof(double));
+    double *pdd_as_d = (double *)test_alloc((size_t)N * sizeof(double));
+
+    make_curve(M, td, yd);
+    for (int m = 0; m < M; ++m) {
+        dyd[m] = 0.1 + 0.02 * urand();
+        t[m] = dd_make(td[m], 0.0);
+        y[m] = dd_make(yd[m], 0.0);
+        dy[m] = dd_make(dyd[m], 0.0);
+    }
+
+    const int backends[3] = {TLS_BACKEND_PSWF43, TLS_BACKEND_PSWF21, TLS_BACKEND_LRA};
+    for (int bi = 0; bi < 3; ++bi) {
+        int s_dd = tlsdd_fastchi2_opts(t, y, dy, M, 0.001, 0.0005, N, 2, backends[bi], TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX,
+                                       TLS_VEC_BREADTH, pdd, NULL);
+        int s_ref = tls_fastchi2_opts(td, yd, dyd, M, 0.001, 0.0005, N, 2, backends[bi], TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX,
+                                      TLS_VEC_DEPTH, pref, NULL);
+        CHECK(s_dd >= 0 && s_ref >= 0, "dd breadth fastchi2 be=%d status dd=%d ref=%d", backends[bi], s_dd, s_ref);
+        for (int i = 0; i < N; ++i) pdd_as_d[i] = dd_to_double(pdd[i]);
+        CHECK(same_values_d(pref, pdd_as_d, N, 1e-10, 1e-11), "dd breadth vs double depth fastchi2 mismatch be=%d", backends[bi]);
+
+        int si_dd = tlsdd_ihs_opts(t, y, dy, M, 0.001, 0.0005, N, 2, backends[bi], TLS_NORM_IHS_DEFAULT, TLS_SPREAD_MINMAX, TLS_VEC_BREADTH, pdd);
+        int si_ref = tls_ihs_opts(td, yd, dyd, M, 0.001, 0.0005, N, 2, backends[bi], TLS_NORM_IHS_DEFAULT, TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, pref);
+        CHECK(si_dd == 0 && si_ref == 0, "dd breadth ihs be=%d status dd=%d ref=%d", backends[bi], si_dd, si_ref);
+        for (int i = 0; i < N; ++i) pdd_as_d[i] = dd_to_double(pdd[i]);
+        CHECK(same_values_d(pref, pdd_as_d, N, 1e-10, 1e-11), "dd breadth vs double depth ihs mismatch be=%d", backends[bi]);
+    }
+
+    /* Validation: invalid vectorize & DD rejection of TLS_VEC_DEPTH. */
+    CHECK(tlsdd_fastchi2_opts(t, y, dy, M, 0.001, 0.0005, 32, 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX, TLS_VEC_DEPTH,
+                              pdd, NULL) == TLS_ERR_ARGUMENT,
+          "tlsdd_fastchi2_opts must reject TLS_VEC_DEPTH");
+    CHECK(tlsdd_ihs_opts(t, y, dy, M, 0.001, 0.0005, 32, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, pdd) == TLS_ERR_ARGUMENT,
+          "tlsdd_ihs_opts must reject TLS_VEC_DEPTH");
+    CHECK(tls_fastchi2_opts(td, yd, dyd, M, 0.001, 0.0005, 32, 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_AUTO, 99, pref,
+                            NULL) == TLS_ERR_ARGUMENT,
+          "tls_fastchi2_opts must reject invalid vectorize");
+    CHECK(tls_ihs_opts(td, yd, dyd, M, 0.001, 0.0005, 32, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD, TLS_SPREAD_AUTO, -1, pref) == TLS_ERR_ARGUMENT,
+          "tls_ihs_opts must reject invalid vectorize");
+
+    free(td);
+    free(yd);
+    free(dyd);
+    free(t);
+    free(y);
+    free(dy);
+    free(pdd);
+    free(pref);
+    free(pdd_as_d);
+}
+
 int main(int argc, char **argv) {
     dump_mode = (argc > 1 && strcmp(argv[1], "--dump") == 0);
 
@@ -519,6 +680,23 @@ int main(int argc, char **argv) {
     run_spread_ihs("ihs_pswf43_d3", 600, 1024, 3, TLS_BACKEND_PSWF43, TLS_NORM_IHS_DEFAULT);
     run_spread_policy_and_errors();
     tls_tuning_set_spread(TLS_SPREAD_AUTO);
+
+    printf("check_periodogram: breadth vs depth vs auto vectorization\n");
+    run_vectorize_fastchi2_case("v_gls_pswf43_mm", 500, 777, 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX);
+    run_vectorize_fastchi2_case("v_gls_pswf43_pp", 500, 777, 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_PIECEWISE);
+    run_vectorize_fastchi2_case("v_d3_pswf43_mm", 600, 1237, 3, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_NLL, TLS_SPREAD_MINMAX);
+    run_vectorize_fastchi2_case("v_d3_pswf43_pp", 600, 1237, 3, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_NLL, TLS_SPREAD_PIECEWISE);
+    run_vectorize_fastchi2_case("v_d2_pswf21_pp", 500, 777, 2, TLS_BACKEND_PSWF21, TLS_SOLVER_ZOHAR, TLS_NORM_ANOVA, TLS_SPREAD_PIECEWISE);
+    run_vectorize_fastchi2_case("v_d2_bareiss_reg", 500, 513, 2, TLS_BACKEND_PSWF43, TLS_SOLVER_BAREISS, TLS_NORM_REGULARIZED, TLS_SPREAD_MINMAX);
+    run_vectorize_fastchi2_case("v_d2_ldlt", 400, 513, 2, TLS_BACKEND_PSWF43, TLS_SOLVER_LDLT, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX);
+    run_vectorize_fastchi2_case("v_d2_svd", 400, 513, 2, TLS_BACKEND_PSWF43, TLS_SOLVER_SVD, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX);
+    run_vectorize_fastchi2_case("v_d3_lra", 500, 777, 3, TLS_BACKEND_LRA, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX);
+    run_vectorize_ihs_case("v_ihs_d1_pswf43", 500, 777, 1, TLS_BACKEND_PSWF43, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX);
+    run_vectorize_ihs_case("v_ihs_d3_pswf43_pp", 600, 1237, 3, TLS_BACKEND_PSWF43, TLS_NORM_NLL, TLS_SPREAD_PIECEWISE);
+    run_vectorize_ihs_case("v_ihs_d3_pswf21_mm", 600, 777, 3, TLS_BACKEND_PSWF21, TLS_NORM_IHS_DEFAULT, TLS_SPREAD_MINMAX);
+    run_vectorize_ihs_case("v_ihs_d3_lra", 500, 777, 3, TLS_BACKEND_LRA, TLS_NORM_NLL, TLS_SPREAD_MINMAX);
+    run_vectorize_dd_and_errors();
+    tls_tuning_set_vectorize(TLS_VEC_AUTO);
 
     tls_tuning_set_defer(TLS_TUNING_DEFER_DEFAULT);
     tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);

@@ -31,7 +31,7 @@ OBJS := \
 	$(BUILD)/tlsdd_utils.o \
 	$(BUILD)/tuning.o
 
-TARGETS := $(BUILD)/check_nanofft $(BUILD)/check_vecmath $(BUILD)/check_periodogram $(BUILD)/dump_periodogram $(BUILD)/bench_fft $(BUILD)/bench_permute $(BUILD)/bench_fuse $(BUILD)/bench_periodogram $(BUILD)/bench_public $(BUILD)/bench_spread
+TARGETS := $(BUILD)/check_nanofft $(BUILD)/check_vecmath $(BUILD)/check_periodogram $(BUILD)/dump_periodogram $(BUILD)/bench_fft $(BUILD)/bench_permute $(BUILD)/bench_fuse $(BUILD)/bench_periodogram $(BUILD)/bench_public $(BUILD)/bench_spread $(BUILD)/bench_vectorize
 
 .PHONY: all check bench bench_permute permute bench_fuse fuse tune clean
 .DELETE_ON_ERROR:
@@ -114,6 +114,9 @@ $(BUILD)/bench_public: bench_public.c $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
 
 $(BUILD)/bench_spread: bench_spread.c $(BUILD)/scaling.h $(OBJS)
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
+
+$(BUILD)/bench_vectorize: bench_vectorize.c $(BUILD)/scaling.h $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
 
 bench_fuse: $(BUILD)/bench_fuse

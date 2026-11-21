@@ -23,6 +23,20 @@ TLS_API double tls_approximate_pswf_cost(int N, int M, int block, int degree, in
                                          double const_cost);
 TLS_API tls_pswf_plan_choice tls_optimize_pswf_plan(int N, int M, int degree, int is_ihs, int backend, double alpha, double gamma, double beta_mm,
                                                     double pre_mm, double beta_pp, double pre_pp, double ppoly_const, int forced_spread_mode);
+
+typedef struct {
+    int block;
+    int spread_mode;
+    int vec_mode;
+    double cost;
+} tls_plan_choice;
+
+TLS_API double tls_approximate_breadth_cost(int N, int M, int block, int degree, int is_ihs, int backend, int vec_len, double alpha, double b_alpha,
+                                            double b_fft_ratio, double b_beta, double gamma, double b_pre_m, double const_cost);
+TLS_API tls_plan_choice tls_optimize_plan(int N, int M, int degree, int is_ihs, int backend, int vec_len, int min_block_breadth, int is_dd, double alpha,
+                                          double gamma, double beta_mm, double pre_mm, double beta_pp, double pre_pp, double ppoly_const, double b_alpha,
+                                          double b_fft_ratio, double b_beta_mm, double b_pre_mm, double b_beta_pp, double b_pre_pp, int forced_spread_mode,
+                                          int forced_vec_mode);
 TLS_API int tls_pswf43_plan_len_from_base(int base_len);
 TLS_API int tls_pswf43_output_len_for_plan(int plan_len);
 TLS_API int tls_twiddle_ladder_levels(int N, int block);
