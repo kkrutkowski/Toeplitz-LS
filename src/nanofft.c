@@ -1388,12 +1388,17 @@ void PREFIX(execute_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC
 
 /* =========================================================================
  * Weak Fallback Mechanisms
+ *
+ * COFF/PE has no true weak symbols: LLVM lowers __attribute__((weak)) to a
+ * non-weak .weak.<sym>.default.<first_sym> alias, which collides across
+ * nanofft-f.o and nanofft-dd.o whenever they share a COMDAT constant pool
+ * symbol.  Windows builds always link all three precisions together.
  * ========================================================================= */
+#if !defined(_WIN32)
 
 // Macro stringification helpers
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
-
+#    define STR_HELPER(x) #x
+#    define STR(x) STR_HELPER(x)
 __attribute__((weak)) FALLBACK_PLAN_T *FALLBACK_PREFIX(make_plan)(uint32_t N) {
     static bool warned = false;
     if (!warned) {
@@ -1473,22 +1478,22 @@ __attribute__((weak)) void FALLBACK_PREFIX(permute_1d)(FALLBACK_PLAN_T *plan, FA
     nanofft_aligned_free(temp);
 }
 
-#if defined(DOUBLE_DOUBLE)
-#    define FALLBACK_BREADTH_VEC VEC
-#    define FALLBACK_BREADTH_VEC_LEN VEC_LEN
-#    define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
-#    define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
-#elif defined(DOUBLE)
-#    define FALLBACK_BREADTH_VEC VECF
-#    define FALLBACK_BREADTH_VEC_LEN VECF_LEN
-#    define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
-#    define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
-#else
-#    define FALLBACK_BREADTH_VEC VEC
-#    define FALLBACK_BREADTH_VEC_LEN VEC_LEN
-#    define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
-#    define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
-#endif
+#    if defined(DOUBLE_DOUBLE)
+#        define FALLBACK_BREADTH_VEC VEC
+#        define FALLBACK_BREADTH_VEC_LEN VEC_LEN
+#        define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
+#        define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
+#    elif defined(DOUBLE)
+#        define FALLBACK_BREADTH_VEC VECF
+#        define FALLBACK_BREADTH_VEC_LEN VECF_LEN
+#        define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
+#        define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
+#    else
+#        define FALLBACK_BREADTH_VEC VEC
+#        define FALLBACK_BREADTH_VEC_LEN VEC_LEN
+#        define FALLBACK_BREADTH_GET(v, lane) ((v)[(lane)])
+#        define FALLBACK_BREADTH_SET(v, lane, val) ((v)[(lane)] = (val))
+#    endif
 
 __attribute__((weak)) FALLBACK_PLAN_T *FALLBACK_PREFIX(make_plan_breadth)(uint32_t N) {
     static bool warned = false;
@@ -1506,13 +1511,12 @@ __attribute__((weak)) void FALLBACK_PREFIX(execute_raw_breadth)(FALLBACK_PLAN_T 
     for (int base = 0; base < FALLBACK_BREADTH_VEC_LEN; base += BREADTH_VEC_LEN) {
         const int count = (FALLBACK_BREADTH_VEC_LEN - base < BREADTH_VEC_LEN) ? (FALLBACK_BREADTH_VEC_LEN - base) : BREADTH_VEC_LEN;
         for (uint32_t i = 0; i < N; ++i) {
-            BREADTH_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
+            temp_r[i] = BREADTH_ZERO;
+            temp_i[i] = BREADTH_ZERO;
             for (int l = 0; l < count; ++l) {
-                BREADTH_SET_LANE(vr, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(real[i], base + l)));
-                BREADTH_SET_LANE(vi, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(imag[i], base + l)));
+                BREADTH_SET_LANE(temp_r[i], l, FROM_FALLBACK(FALLBACK_BREADTH_GET(real[i], base + l)));
+                BREADTH_SET_LANE(temp_i[i], l, FROM_FALLBACK(FALLBACK_BREADTH_GET(imag[i], base + l)));
             }
-            temp_r[i] = vr;
-            temp_i[i] = vi;
         }
         PREFIX(execute_raw_breadth)((PLAN_T *)plan, temp_r, temp_i);
         for (uint32_t i = 0; i < N; ++i) {
@@ -1533,13 +1537,12 @@ __attribute__((weak)) void FALLBACK_PREFIX(permute_breadth)(FALLBACK_PLAN_T *pla
     for (int base = 0; base < FALLBACK_BREADTH_VEC_LEN; base += BREADTH_VEC_LEN) {
         const int count = (FALLBACK_BREADTH_VEC_LEN - base < BREADTH_VEC_LEN) ? (FALLBACK_BREADTH_VEC_LEN - base) : BREADTH_VEC_LEN;
         for (uint32_t i = 0; i < N; ++i) {
-            BREADTH_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
+            temp_r[i] = BREADTH_ZERO;
+            temp_i[i] = BREADTH_ZERO;
             for (int l = 0; l < count; ++l) {
-                BREADTH_SET_LANE(vr, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(real[i], base + l)));
-                BREADTH_SET_LANE(vi, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(imag[i], base + l)));
+                BREADTH_SET_LANE(temp_r[i], l, FROM_FALLBACK(FALLBACK_BREADTH_GET(real[i], base + l)));
+                BREADTH_SET_LANE(temp_i[i], l, FROM_FALLBACK(FALLBACK_BREADTH_GET(imag[i], base + l)));
             }
-            temp_r[i] = vr;
-            temp_i[i] = vi;
         }
         PREFIX(permute_breadth)((PLAN_T *)plan, temp_r, temp_i);
         for (uint32_t i = 0; i < N; ++i) {
@@ -1559,9 +1562,8 @@ __attribute__((weak)) void FALLBACK_PREFIX(permute_1d_breadth)(FALLBACK_PLAN_T *
     for (int base = 0; base < FALLBACK_BREADTH_VEC_LEN; base += BREADTH_VEC_LEN) {
         const int count = (FALLBACK_BREADTH_VEC_LEN - base < BREADTH_VEC_LEN) ? (FALLBACK_BREADTH_VEC_LEN - base) : BREADTH_VEC_LEN;
         for (uint32_t i = 0; i < N; ++i) {
-            BREADTH_VEC v = BREADTH_ZERO;
-            for (int l = 0; l < count; ++l) BREADTH_SET_LANE(v, l, FROM_FALLBACK(FALLBACK_BREADTH_GET(values[i], base + l)));
-            temp[i] = v;
+            temp[i] = BREADTH_ZERO;
+            for (int l = 0; l < count; ++l) BREADTH_SET_LANE(temp[i], l, FROM_FALLBACK(FALLBACK_BREADTH_GET(values[i], base + l)));
         }
         PREFIX(permute_1d_breadth)((PLAN_T *)plan, temp);
         for (uint32_t i = 0; i < N; ++i) {
@@ -1575,3 +1577,4 @@ __attribute__((weak)) void FALLBACK_PREFIX(execute_breadth)(FALLBACK_PLAN_T *pla
     FALLBACK_PREFIX(execute_raw_breadth)(plan, real, imag);
     FALLBACK_PREFIX(permute_breadth)(plan, real, imag);
 }
+#endif /* !defined(_WIN32) */

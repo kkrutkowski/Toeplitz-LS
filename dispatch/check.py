@@ -352,7 +352,12 @@ def _compare(a: str, b: str, rel=1e-6) -> bool:
         right = [float(x) for x in b.split()[1:]]
     except ValueError:
         return False
-    return all(abs(x - y) <= rel * max(1.0, abs(x)) for x, y in zip(left, right))
+    # CHECKSUM prints (double max, double sum, float32 max).  Different vector
+    # widths can legitimately choose different optimal block sizes in breadth
+    # mode, shifting a bin toward the PSWF43 band edge where float32 varies by
+    # a few 1e-6 while double still agrees well within 1e-6.
+    tols = (rel, rel, max(rel, 1e-5)) if len(left) == 3 else (rel,) * len(left)
+    return len(left) == len(right) and all(abs(x - y) <= tol * max(1.0, abs(x)) for x, y, tol in zip(left, right, tols))
 
 
 if __name__ == "__main__":
