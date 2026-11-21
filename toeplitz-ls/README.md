@@ -64,6 +64,12 @@ also accept `spreading=`: `"auto"` (default, selects from the calibrated cost
 model), `"minmax"` (precomputed minmax-polynomial weights), or `"piecewise"`
 (vectorized on-the-fly piecewise polynomials; single and double precision only).
 
+All modules also accept `vectorize=`: `"auto"` (default, selects from the
+calibrated cost model), `"depth"` (vectorizes within each block; single and
+double precision only — raises `ValueError` on `tlsdd`/`ihsdd`), or `"breadth"`
+(vectorizes across consecutive blocks across all backends, including
+double-double via `VECDD`).
+
 The IHS modules (`ihsf`, `ihs`, `ihsdd`) are a simplified formulation of a
 similar periodogram. They assume that the harmonic frequencies are independent
 (a regression from the standard least-squares periodogram) but not orthogonal,

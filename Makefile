@@ -183,14 +183,14 @@ $(NATIVE_SCALING_HEADER): | $(NATIVE_DIR) $(NATIVE_SCALING_DIR)
 	rm -f $@
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofftf.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofft.o
-	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofftdd.o
+	$(CC) $(NATIVE_FLAGS) $(DD_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofftdd.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tls_nufft1.o
-	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o
+	$(CC) $(NATIVE_FLAGS) $(DD_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/tuning.c -o $(NATIVE_SCALING_DIR)/tuning.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftf.o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsf_nufft_scaling $(LDLIBS)
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofft.o $(NATIVE_SCALING_DIR)/tls_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tls_nufft_scaling $(LDLIBS)
-	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftdd.o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsdd_nufft_scaling $(LDLIBS)
+	$(CC) $(NATIVE_FLAGS) $(DD_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftdd.o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsdd_nufft_scaling $(LDLIBS)
 	cd $(NATIVE_DIR) && ../native-scaling/tlsf_nufft_scaling
 	cd $(NATIVE_DIR) && ../native-scaling/tls_nufft_scaling
 	cd $(NATIVE_DIR) && ../native-scaling/tlsdd_nufft_scaling

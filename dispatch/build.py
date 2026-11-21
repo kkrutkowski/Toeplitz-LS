@@ -162,6 +162,9 @@ def _empty_depth_table(path: Path, note: str) -> Path:
         "static const unsigned char nanofft_depth_float[32] = {0};\n"
         "static const unsigned char nanofft_depth_double[32] = {0};\n"
         "static const unsigned char nanofft_depth_dd[32] = {0};\n"
+        "static const unsigned char nanofft_bdepth_float[32] = {0};\n"
+        "static const unsigned char nanofft_bdepth_double[32] = {0};\n"
+        "static const unsigned char nanofft_bdepth_dd[32] = {0};\n"
         "#endif\n" % note
     )
     return path
@@ -207,6 +210,7 @@ def _measure_inputs(tc, variant, workdir: Path, *, note: str) -> tuple[Path, Pat
             *variant.cflags,
             "-O3",
             "-ffast-math",
+            *(GNU_DD_CFLAGS if define == "DOUBLE_DOUBLE" else ()),
             "-DSAVE",
             f"-D{define}" if define else "-D_NONE",
             "-I" + str(INCLUDE),
@@ -244,7 +248,8 @@ def _cached(vl_arch: str, vl: int) -> tuple[Path, Path] | None:
     base = CACHE / f"{vl_arch}-vl{vl}"
     scaling, table = base / "scaling.h", base / "nanofft_depth_table.h"
     if scaling.exists() and table.exists():
-        return scaling, table
+        if "D_B_ALPHA" in scaling.read_text(encoding="utf-8") and "nanofft_bdepth_double" in table.read_text(encoding="utf-8"):
+            return scaling, table
     return None
 
 

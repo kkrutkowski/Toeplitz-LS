@@ -95,6 +95,17 @@ accept `spreading=`:
 | `"minmax"` | precomputes per-point minmax-polynomial PSWF0 weights once before block execution |
 | `"piecewise"` | evaluates vectorized piecewise polynomials on the fly during spreading, avoiding weight-table precomputation and memory traffic (single and double precision only) |
 
+## Vectorization modes
+
+Both the FastChi2 (`tlsf`, `tls`, `tlsdd`) and IHS (`ihsf`, `ihs`, `ihsdd`)
+modules accept `vectorize=` on `power()` and `autopower()`:
+
+| value | behavior |
+|---|---|
+| `"auto"` (default) | selects `"depth"` or `"breadth"` (and spreading mode) from the calibrated cost model |
+| `"depth"` | vectorizes across FFT bins within each frequency block (single and double precision only; raises `ValueError` on `tlsdd`/`ihsdd`) |
+| `"breadth"` | vectorizes across consecutive frequency blocks in parallel across all backends (`"pswf43"`, `"pswf21"`, `"lra"`), including double-double via `VECDD` |
+
 ## IHS periodogram
 
 The `ihsf`, `ihs`, and `ihsdd` modules expose the same `power()` and
@@ -180,6 +191,7 @@ freq, r2 = tls.autopower(
     oversampling=5,  # frequency density, relative to a dense, uniform FFT
     backend="pswf43",  # or "pswf21", "lra"
     spreading="auto",  # or "minmax", "piecewise"
+    vectorize="auto",  # or "depth", "breadth"
     normalization="standard",  # or "anova", "nll"
 )
 
@@ -263,11 +275,13 @@ If you use this code in your research, please cite:
   archivePrefix = {arXiv},
   primaryClass  = {astro-ph.IM},
   doi           = {10.48550/arXiv.2611.20300},
-  url           = {[https://arxiv.org/abs/2611.20300](https://arxiv.org/abs/2611.20300)}
+  url           = {https://arxiv.org/abs/2611.20300}
 }
 ```
 ## Performance
 
-The algorithm relies on blocked NuFFT sweep with vectorized transforms, deferred
-permutations, and block-sized work arrays. The IHS path is an experimental approximation, expected to derive at least 3x cheaper, but appropriate only, when the 4th power of degree *does not* exceed the effective number of measurements. The benchmark harness is present in
-in `tests/`.
+The algorithm relies on blocked NuFFT sweeps with depth- and breadth-wise
+vectorized transforms, deferred permutations, and block-sized work arrays. The
+IHS path is an experimental approximation, expected to be at least 3x cheaper,
+but appropriate only when the 4th power of degree *does not* exceed the
+effective number of measurements. The benchmark harness is present in `tests/`.
