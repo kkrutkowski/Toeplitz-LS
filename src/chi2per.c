@@ -1528,509 +1528,14 @@ static int gls_impl_breadth(const BREADTH_VEC *Sw, const BREADTH_VEC *Cw, const 
     return CHI2PER_OK;
 }
 
-#if defined(DOUBLE_DOUBLE)
-static int solve_periodogram_ldlt_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, int normalization,
-                                     int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (normalization == TLS_NORM_REGULARIZED) return CHI2PER_ERR_SOLVER;
-    const int norder = 2 * degree + 1;
-    size_t norder_sq = (size_t)norder * (size_t)norder;
-
-    FLOAT *XTX = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-    FLOAT *XTy = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *X = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *L = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-    FLOAT *D = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Y = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Z = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-
-    if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
-        nanofft_aligned_free(XTX);
-        nanofft_aligned_free(XTy);
-        nanofft_aligned_free(X);
-        nanofft_aligned_free(L);
-        nanofft_aligned_free(D);
-        nanofft_aligned_free(Y);
-        nanofft_aligned_free(Z);
-        return CHI2PER_ERR_ALLOC;
-    }
-
-    int nan_count = 0;
-
-    for (int idx = 0; idx < N; ++idx) {
-        for (int row = 0; row < norder; ++row) {
-            XTy[row] = real_rhs_value(Syw, Cyw, N, idx, row);
-            for (int col = 0; col < norder; ++col) {
-                XTX[(size_t)row * norder + col] = real_gram_value(Sw, Cw, N, idx, row, col);
-            }
-        }
-
-        FLOAT condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
-        if (cond) cond[idx] = condition_bound;
-        if (!cond && condition_bound_is_singular(condition_bound, CHI2PER_SOLVER_LDLT)) {
-            power[idx] = chi2_nan();
-            ++nan_count;
-            continue;
-        }
-
-        FLOAT dot = FCAST(0.0);
-        for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
-        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
-        if (!cond && power_is_nan(power[idx])) ++nan_count;
-    }
-
-    nanofft_aligned_free(XTX);
-    nanofft_aligned_free(XTy);
-    nanofft_aligned_free(X);
-    nanofft_aligned_free(L);
-    nanofft_aligned_free(D);
-    nanofft_aligned_free(Y);
-    nanofft_aligned_free(Z);
-    return cond ? CHI2PER_OK : nan_count;
-}
-
-static int solve_periodogram_svd_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, FLOAT chi2_ref, int normalization,
-                                    int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (normalization == TLS_NORM_REGULARIZED) return CHI2PER_ERR_SOLVER;
-    const int norder = 2 * degree + 1;
-    size_t norder_sq = (size_t)norder * (size_t)norder;
-
-    FLOAT *XTX = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-    FLOAT *XTy = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *X = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Q = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-    FLOAT *S = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-    FLOAT *D = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Y = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-
-    if (!XTX || !XTy || !X || !Q || !S || !D || !Y) {
-        nanofft_aligned_free(XTX);
-        nanofft_aligned_free(XTy);
-        nanofft_aligned_free(X);
-        nanofft_aligned_free(Q);
-        nanofft_aligned_free(S);
-        nanofft_aligned_free(D);
-        nanofft_aligned_free(Y);
-        return CHI2PER_ERR_ALLOC;
-    }
-
-    FLOAT max_cond = cond ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD);
-    int nan_count = 0;
-
-    for (int idx = 0; idx < N; ++idx) {
-        for (int row = 0; row < norder; ++row) {
-            XTy[row] = real_rhs_value(Syw, Cyw, N, idx, row);
-            for (int col = 0; col < norder; ++col) {
-                XTX[(size_t)row * norder + col] = real_gram_value(Sw, Cw, N, idx, row, col);
-            }
-        }
-
-        FLOAT condition_bound = SOLVE_SVD((size_t)norder, XTX, XTy, X, Q, S, D, Y, max_cond);
-        if (cond) cond[idx] = condition_bound;
-        if (!cond && condition_bound_is_invalid(condition_bound)) {
-            power[idx] = chi2_nan();
-            ++nan_count;
-            continue;
-        }
-
-        FLOAT dot = FCAST(0.0);
-        for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k], X[k]));
-        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
-        if (!cond && power_is_nan(power[idx])) ++nan_count;
-    }
-
-    nanofft_aligned_free(XTX);
-    nanofft_aligned_free(XTy);
-    nanofft_aligned_free(X);
-    nanofft_aligned_free(Q);
-    nanofft_aligned_free(S);
-    nanofft_aligned_free(D);
-    nanofft_aligned_free(Y);
-    return cond ? CHI2PER_OK : nan_count;
-}
-
-static int solve_periodogram_dd(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
-                                int normalization, int M, const cybenko_model_t *cyb, FLOAT b, FLOAT *power, FLOAT *cond) {
-    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, power, cond);
-    if (solver == CHI2PER_SOLVER_SVD) return solve_periodogram_svd_dd(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, power, cond);
-
-    const int norder = 2 * degree + 1;
-
-    FLOAT *Rr = (FLOAT *)checked_malloc((size_t)norder + 1, sizeof(FLOAT));
-    FLOAT *Ri = (FLOAT *)checked_malloc((size_t)norder + 1, sizeof(FLOAT));
-    FLOAT *Yr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Yi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Xr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Xi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Ar = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Ai = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Apr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *Api = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    FLOAT *BUr = NULL;
-    FLOAT *BUi = NULL;
-    FLOAT *BD = NULL;
-    FLOAT *Bur = NULL;
-    FLOAT *Bui = NULL;
-    FLOAT *Bvr = NULL;
-    FLOAT *Bvi = NULL;
-    FLOAT *Bwr = NULL;
-    FLOAT *Bwi = NULL;
-
-    if (!Rr || !Ri || !Yr || !Yi || !Xr || !Xi || !Ar || !Ai || !Apr || !Api) {
-        nanofft_aligned_free(Rr);
-        nanofft_aligned_free(Ri);
-        nanofft_aligned_free(Yr);
-        nanofft_aligned_free(Yi);
-        nanofft_aligned_free(Xr);
-        nanofft_aligned_free(Xi);
-        nanofft_aligned_free(Ar);
-        nanofft_aligned_free(Ai);
-        nanofft_aligned_free(Apr);
-        nanofft_aligned_free(Api);
-        return CHI2PER_ERR_ALLOC;
-    }
-
-    if (solver == CHI2PER_SOLVER_BAREISS) {
-        size_t norder_sq = (size_t)norder * (size_t)norder;
-        BUr = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        BUi = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        BD = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        Bur = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        Bui = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        Bvr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        Bvi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        Bwr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        Bwi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-
-        if (!BUr || !BUi || !BD || !Bur || !Bui || !Bvr || !Bvi || !Bwr || !Bwi) {
-            nanofft_aligned_free(Rr);
-            nanofft_aligned_free(Ri);
-            nanofft_aligned_free(Yr);
-            nanofft_aligned_free(Yi);
-            nanofft_aligned_free(Xr);
-            nanofft_aligned_free(Xi);
-            nanofft_aligned_free(Ar);
-            nanofft_aligned_free(Ai);
-            nanofft_aligned_free(Apr);
-            nanofft_aligned_free(Api);
-            nanofft_aligned_free(BUr);
-            nanofft_aligned_free(BUi);
-            nanofft_aligned_free(BD);
-            nanofft_aligned_free(Bur);
-            nanofft_aligned_free(Bui);
-            nanofft_aligned_free(Bvr);
-            nanofft_aligned_free(Bvi);
-            nanofft_aligned_free(Bwr);
-            nanofft_aligned_free(Bwi);
-            return CHI2PER_ERR_ALLOC;
-        }
-    }
-
-    int nan_count = 0;
-
-    for (int idx = 0; idx < N; ++idx) {
-        for (int k = 0; k < norder; ++k) {
-            Rr[k] = Cw[(size_t)k * N + idx];
-            Ri[k] = NEG(Sw[(size_t)k * N + idx]);
-
-            int h = k - degree;
-            if (h == 0) {
-                Yr[k] = Cyw[idx];
-                Yi[k] = FCAST(0.0);
-            } else if (h > 0) {
-                Yr[k] = Cyw[(size_t)h * N + idx];
-                Yi[k] = NEG(Syw[(size_t)h * N + idx]);
-            } else {
-                int ah = -h;
-                Yr[k] = Cyw[(size_t)ah * N + idx];
-                Yi[k] = Syw[(size_t)ah * N + idx];
-            }
-        }
-        Rr[norder] = FCAST(0.0);
-        Ri[norder] = FCAST(0.0);
-
-        FLOAT condition_bound;
-        if (solver == CHI2PER_SOLVER_LEVINSON) {
-            condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
-        } else if (solver == CHI2PER_SOLVER_ZOHAR) {
-            condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ar, Ai, Apr, Api);
-        } else if (solver == CHI2PER_SOLVER_BAREISS) {
-            condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
-        } else {
-            nanofft_aligned_free(Rr);
-            nanofft_aligned_free(Ri);
-            nanofft_aligned_free(Yr);
-            nanofft_aligned_free(Yi);
-            nanofft_aligned_free(Xr);
-            nanofft_aligned_free(Xi);
-            nanofft_aligned_free(Ar);
-            nanofft_aligned_free(Ai);
-            nanofft_aligned_free(Apr);
-            nanofft_aligned_free(Api);
-            nanofft_aligned_free(BUr);
-            nanofft_aligned_free(BUi);
-            nanofft_aligned_free(BD);
-            nanofft_aligned_free(Bur);
-            nanofft_aligned_free(Bui);
-            nanofft_aligned_free(Bvr);
-            nanofft_aligned_free(Bvi);
-            nanofft_aligned_free(Bwr);
-            nanofft_aligned_free(Bwi);
-            return CHI2PER_ERR_SOLVER;
-        }
-
-        if (cond) cond[idx] = condition_bound;
-        if (!cond && condition_bound_is_singular(condition_bound, solver)) {
-            power[idx] = chi2_nan();
-            ++nan_count;
-            continue;
-        }
-
-        FLOAT dot = Xr[0];
-        power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b);
-        if (!cond && power_is_nan(power[idx])) ++nan_count;
-    }
-
-    nanofft_aligned_free(Rr);
-    nanofft_aligned_free(Ri);
-    nanofft_aligned_free(Yr);
-    nanofft_aligned_free(Yi);
-    nanofft_aligned_free(Xr);
-    nanofft_aligned_free(Xi);
-    nanofft_aligned_free(Ar);
-    nanofft_aligned_free(Ai);
-    nanofft_aligned_free(Apr);
-    nanofft_aligned_free(Api);
-    nanofft_aligned_free(BUr);
-    nanofft_aligned_free(BUi);
-    nanofft_aligned_free(BD);
-    nanofft_aligned_free(Bur);
-    nanofft_aligned_free(Bui);
-    nanofft_aligned_free(Bvr);
-    nanofft_aligned_free(Bvi);
-    nanofft_aligned_free(Bwr);
-    nanofft_aligned_free(Bwi);
-    return cond ? CHI2PER_OK : nan_count;
-}
-
-/* Reusable scalar workspace for breadth DOUBLE_DOUBLE solves (avoids per-batch malloc). */
+/* Reusable scratch for the Levinson/Zohar/Bareiss batch solvers across all
+ * three precisions (VECF, VEC, VECDD via BREADTH_VEC).  The plan's block loop
+ * solves one block at a time, so re-allocating this per block would put an
+ * allocator call on the hot path; it is sized by the model order only. */
 typedef struct {
     int norder;
-    int solver;
-    FLOAT *Rr, *Ri, *Yr, *Yi, *Xr, *Xi, *Ar, *Ai, *Apr, *Api;
-    FLOAT *BUr, *BUi, *BD, *Bur, *Bui, *Bvr, *Bvi, *Bwr, *Bwi;
-    FLOAT *XTX, *XTy, *X, *L, *D, *Y, *Z, *Q, *S;
-} dd_solver_workspace;
-
-static void dd_solver_workspace_free(dd_solver_workspace *ws) {
-    if (!ws) return;
-    nanofft_aligned_free(ws->Rr);
-    nanofft_aligned_free(ws->Ri);
-    nanofft_aligned_free(ws->Yr);
-    nanofft_aligned_free(ws->Yi);
-    nanofft_aligned_free(ws->Xr);
-    nanofft_aligned_free(ws->Xi);
-    nanofft_aligned_free(ws->Ar);
-    nanofft_aligned_free(ws->Ai);
-    nanofft_aligned_free(ws->Apr);
-    nanofft_aligned_free(ws->Api);
-    nanofft_aligned_free(ws->BUr);
-    nanofft_aligned_free(ws->BUi);
-    nanofft_aligned_free(ws->BD);
-    nanofft_aligned_free(ws->Bur);
-    nanofft_aligned_free(ws->Bui);
-    nanofft_aligned_free(ws->Bvr);
-    nanofft_aligned_free(ws->Bvi);
-    nanofft_aligned_free(ws->Bwr);
-    nanofft_aligned_free(ws->Bwi);
-    nanofft_aligned_free(ws->XTX);
-    nanofft_aligned_free(ws->XTy);
-    nanofft_aligned_free(ws->X);
-    nanofft_aligned_free(ws->L);
-    nanofft_aligned_free(ws->D);
-    nanofft_aligned_free(ws->Y);
-    nanofft_aligned_free(ws->Z);
-    nanofft_aligned_free(ws->Q);
-    nanofft_aligned_free(ws->S);
-    memset(ws, 0, sizeof(*ws));
-}
-
-static int dd_solver_workspace_init(dd_solver_workspace *ws, int norder, int solver) {
-    memset(ws, 0, sizeof(*ws));
-    ws->norder = norder;
-    ws->solver = solver;
-    const size_t norder_sq = (size_t)norder * (size_t)norder;
-    if (solver == CHI2PER_SOLVER_LDLT) {
-        ws->XTX = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->XTy = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->X = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->L = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->D = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Y = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Z = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        if (!ws->XTX || !ws->XTy || !ws->X || !ws->L || !ws->D || !ws->Y || !ws->Z) {
-            dd_solver_workspace_free(ws);
-            return CHI2PER_ERR_ALLOC;
-        }
-        return CHI2PER_OK;
-    }
-    if (solver == CHI2PER_SOLVER_SVD) {
-        ws->XTX = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->XTy = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->X = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Q = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->S = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->D = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Y = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        if (!ws->XTX || !ws->XTy || !ws->X || !ws->Q || !ws->S || !ws->D || !ws->Y) {
-            dd_solver_workspace_free(ws);
-            return CHI2PER_ERR_ALLOC;
-        }
-        return CHI2PER_OK;
-    }
-    ws->Rr = (FLOAT *)checked_malloc((size_t)norder + 1, sizeof(FLOAT));
-    ws->Ri = (FLOAT *)checked_malloc((size_t)norder + 1, sizeof(FLOAT));
-    ws->Yr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Yi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Xr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Xi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Ar = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Ai = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Apr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    ws->Api = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-    if (!ws->Rr || !ws->Ri || !ws->Yr || !ws->Yi || !ws->Xr || !ws->Xi || !ws->Ar || !ws->Ai || !ws->Apr || !ws->Api) {
-        dd_solver_workspace_free(ws);
-        return CHI2PER_ERR_ALLOC;
-    }
-    if (solver == CHI2PER_SOLVER_BAREISS) {
-        ws->BUr = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->BUi = (FLOAT *)checked_malloc(norder_sq, sizeof(FLOAT));
-        ws->BD = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Bur = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Bui = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Bvr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Bvi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Bwr = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        ws->Bwi = (FLOAT *)checked_malloc((size_t)norder, sizeof(FLOAT));
-        if (!ws->BUr || !ws->BUi || !ws->BD || !ws->Bur || !ws->Bui || !ws->Bvr || !ws->Bvi || !ws->Bwr || !ws->Bwi) {
-            dd_solver_workspace_free(ws);
-            return CHI2PER_ERR_ALLOC;
-        }
-    }
-    return CHI2PER_OK;
-}
-
-static inline FLOAT real_gram_value_dd_lane(const BREADTH_VEC *Sw, const BREADTH_VEC *Cw, int block, int idx, int lane, int row, int col) {
-    const int m = real_term_harmonic(col);
-    const int n = real_term_harmonic(row);
-    const int col_sin = real_term_is_sin(col);
-    const int row_sin = real_term_is_sin(row);
-    const int diff = abs(m - n);
-    const int sum = m + n;
-    const FLOAT half = FCAST(0.5);
-
-    if (col_sin && row_sin) {
-        return MUL(half, SUB(BREADTH_GET_LANE(Cw[(size_t)diff * (size_t)block + (size_t)idx], lane),
-                             BREADTH_GET_LANE(Cw[(size_t)sum * (size_t)block + (size_t)idx], lane)));
-    }
-    if (!col_sin && !row_sin) {
-        return MUL(half, ADD(BREADTH_GET_LANE(Cw[(size_t)diff * (size_t)block + (size_t)idx], lane),
-                             BREADTH_GET_LANE(Cw[(size_t)sum * (size_t)block + (size_t)idx], lane)));
-    }
-    if (col_sin) {
-        return MUL(half, ADD(signed_float_value(BREADTH_GET_LANE(Sw[(size_t)diff * (size_t)block + (size_t)idx], lane), m - n),
-                             BREADTH_GET_LANE(Sw[(size_t)sum * (size_t)block + (size_t)idx], lane)));
-    }
-    return MUL(half, ADD(signed_float_value(BREADTH_GET_LANE(Sw[(size_t)diff * (size_t)block + (size_t)idx], lane), n - m),
-                         BREADTH_GET_LANE(Sw[(size_t)sum * (size_t)block + (size_t)idx], lane)));
-}
-
-static inline FLOAT real_rhs_value_dd_lane(const BREADTH_VEC *Syw, const BREADTH_VEC *Cyw, int block, int idx, int lane, int term) {
-    const int h = real_term_harmonic(term);
-    if (real_term_is_sin(term)) return BREADTH_GET_LANE(Syw[(size_t)h * (size_t)block + (size_t)idx], lane);
-    return BREADTH_GET_LANE(Cyw[(size_t)h * (size_t)block + (size_t)idx], lane);
-}
-
-static int solve_periodogram_breadth_dd(const BREADTH_VEC *Sw, const BREADTH_VEC *Cw, const BREADTH_VEC *Syw, const BREADTH_VEC *Cyw, int block,
-                                        int active_lanes, int degree, int solver, FLOAT chi2_ref, int normalization, int M, const cybenko_model_t *cyb, FLOAT b,
-                                        BREADTH_VEC *power_b, BREADTH_VEC *cond_b, dd_solver_workspace *ws) {
-    const int norder = 2 * degree + 1;
-    if (!ws || ws->norder != norder) return CHI2PER_ERR_ALLOC;
-    const FLOAT max_cond = cond_b ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD);
-
-    for (int idx = 0; idx < block; ++idx) {
-        BREADTH_VEC p_out = BREADTH_ZERO;
-        BREADTH_VEC c_out = BREADTH_ZERO;
-        for (int lane = 0; lane < active_lanes; ++lane) {
-            if (solver == CHI2PER_SOLVER_LDLT || solver == CHI2PER_SOLVER_SVD) {
-                for (int row = 0; row < norder; ++row) {
-                    ws->XTy[row] = real_rhs_value_dd_lane(Syw, Cyw, block, idx, lane, row);
-                    for (int col = 0; col < norder; ++col)
-                        ws->XTX[(size_t)row * (size_t)norder + (size_t)col] = real_gram_value_dd_lane(Sw, Cw, block, idx, lane, row, col);
-                }
-                FLOAT condition_bound = (solver == CHI2PER_SOLVER_LDLT)
-                                            ? SOLVE_LDLT((size_t)norder, ws->XTX, ws->XTy, ws->X, ws->L, ws->D, ws->Y, ws->Z)
-                                            : SOLVE_SVD((size_t)norder, ws->XTX, ws->XTy, ws->X, ws->Q, ws->S, ws->D, ws->Y, max_cond);
-                if (cond_b) BREADTH_SET_LANE(c_out, lane, condition_bound);
-                const int bad = (solver == CHI2PER_SOLVER_LDLT) ? condition_bound_is_singular(condition_bound, CHI2PER_SOLVER_LDLT)
-                                                                : condition_bound_is_invalid(condition_bound);
-                if (!cond_b && bad) {
-                    BREADTH_SET_LANE(p_out, lane, chi2_nan());
-                    continue;
-                }
-                FLOAT dot = FCAST(0.0);
-                for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(ws->XTy[k], ws->X[k]));
-                BREADTH_SET_LANE(p_out, lane, normalize_power_entry(dot, chi2_ref, condition_bound, normalization, degree, M, cyb, b));
-            } else {
-                for (int k = 0; k < norder; ++k) {
-                    ws->Rr[k] = BREADTH_GET_LANE(Cw[(size_t)k * (size_t)block + (size_t)idx], lane);
-                    ws->Ri[k] = NEG(BREADTH_GET_LANE(Sw[(size_t)k * (size_t)block + (size_t)idx], lane));
-                    const int h = k - degree;
-                    if (h == 0) {
-                        ws->Yr[k] = BREADTH_GET_LANE(Cyw[idx], lane);
-                        ws->Yi[k] = FCAST(0.0);
-                    } else if (h > 0) {
-                        ws->Yr[k] = BREADTH_GET_LANE(Cyw[(size_t)h * (size_t)block + (size_t)idx], lane);
-                        ws->Yi[k] = NEG(BREADTH_GET_LANE(Syw[(size_t)h * (size_t)block + (size_t)idx], lane));
-                    } else {
-                        const int ah = -h;
-                        ws->Yr[k] = BREADTH_GET_LANE(Cyw[(size_t)ah * (size_t)block + (size_t)idx], lane);
-                        ws->Yi[k] = BREADTH_GET_LANE(Syw[(size_t)ah * (size_t)block + (size_t)idx], lane);
-                    }
-                }
-                ws->Rr[norder] = FCAST(0.0);
-                ws->Ri[norder] = FCAST(0.0);
-                FLOAT condition_bound;
-                if (solver == CHI2PER_SOLVER_LEVINSON) {
-                    condition_bound = SOLVE_LEVINSON((size_t)norder, ws->Rr, ws->Ri, ws->Yr, ws->Yi, ws->Xr, ws->Xi, ws->Ar, ws->Ai, ws->Apr, ws->Api);
-                } else if (solver == CHI2PER_SOLVER_ZOHAR) {
-                    condition_bound = SOLVE_ZOHAR((size_t)norder, ws->Rr, ws->Ri, ws->Yr, ws->Yi, ws->Xr, ws->Xi, ws->Ar, ws->Ai, ws->Apr, ws->Api);
-                } else if (solver == CHI2PER_SOLVER_BAREISS) {
-                    condition_bound = SOLVE_BAREISS((size_t)norder, ws->Rr, ws->Ri, ws->Yr, ws->Yi, ws->Xr, ws->Xi, ws->BUr, ws->BUi, ws->BD, ws->Bur, ws->Bui,
-                                                    ws->Bvr, ws->Bvi, ws->Bwr, ws->Bwi);
-                } else {
-                    return CHI2PER_ERR_SOLVER;
-                }
-                if (cond_b) BREADTH_SET_LANE(c_out, lane, condition_bound);
-                if (!cond_b && condition_bound_is_singular(condition_bound, solver)) {
-                    BREADTH_SET_LANE(p_out, lane, chi2_nan());
-                    continue;
-                }
-                BREADTH_SET_LANE(p_out, lane, normalize_power_entry(ws->Xr[0], chi2_ref, condition_bound, normalization, degree, M, cyb, b));
-            }
-        }
-        STORE_BVEC(&power_b[idx], p_out);
-        if (cond_b) STORE_BVEC(&cond_b[idx], c_out);
-    }
-    return CHI2PER_OK;
-}
-#else
-/* Reusable scratch for the Levinson/Zohar/Bareiss batch solvers.  The plan's
- * block loop solves one block at a time, so re-allocating this per block would
- * put an allocator call on the hot path; it is sized by the model order only. */
-typedef struct {
-    int norder;
-    INTERNAL_VEC *Rr, *Ri, *Yr, *Yi, *Xr, *Xi, *Ehr, *Ehi, *Ehpr, *Ehpi;
-    INTERNAL_VEC *BUr, *BUi, *BD, *Bur, *Bui, *Bvr, *Bvi, *Bwr, *Bwi;
+    BREADTH_VEC *Rr, *Ri, *Yr, *Yi, *Xr, *Xi, *Ehr, *Ehi, *Ehpr, *Ehpi;
+    BREADTH_VEC *BUr, *BUi, *BD, *Bur, *Bui, *Bvr, *Bvi, *Bwr, *Bwi;
 } toep_workspace;
 
 static void toep_workspace_free(toep_workspace *ws) {
@@ -2060,31 +1565,31 @@ static void toep_workspace_free(toep_workspace *ws) {
 static int toep_workspace_init(toep_workspace *ws, int norder, int solver) {
     memset(ws, 0, sizeof(*ws));
     ws->norder = norder;
-    ws->Rr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder + 1, sizeof(INTERNAL_VEC));
-    ws->Ri = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder + 1, sizeof(INTERNAL_VEC));
-    ws->Yr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Yi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Xr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Xi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Ehr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Ehi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Ehpr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    ws->Ehpi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    ws->Rr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder + 1, sizeof(BREADTH_VEC));
+    ws->Ri = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder + 1, sizeof(BREADTH_VEC));
+    ws->Yr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Yi = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Xr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Xi = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Ehr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Ehi = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Ehpr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    ws->Ehpi = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
     if (!ws->Rr || !ws->Ri || !ws->Yr || !ws->Yi || !ws->Xr || !ws->Xi || !ws->Ehr || !ws->Ehi || !ws->Ehpr || !ws->Ehpi) {
         toep_workspace_free(ws);
         return CHI2PER_ERR_ALLOC;
     }
     if (solver == CHI2PER_SOLVER_BAREISS) {
         const size_t norder_sq = (size_t)norder * (size_t)norder;
-        ws->BUr = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-        ws->BUi = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-        ws->BD = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-        ws->Bur = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-        ws->Bui = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-        ws->Bvr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-        ws->Bvi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-        ws->Bwr = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-        ws->Bwi = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+        ws->BUr = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+        ws->BUi = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+        ws->BD = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+        ws->Bur = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+        ws->Bui = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+        ws->Bvr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+        ws->Bvi = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+        ws->Bwr = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+        ws->Bwi = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
         if (!ws->BUr || !ws->BUi || !ws->BD || !ws->Bur || !ws->Bui || !ws->Bvr || !ws->Bvi || !ws->Bwr || !ws->Bwi) {
             toep_workspace_free(ws);
             return CHI2PER_ERR_ALLOC;
@@ -2099,13 +1604,13 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
-    INTERNAL_VEC *XTX = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *XTy = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *X = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *L = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *D = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Y = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Z = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    BREADTH_VEC *XTX = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *XTy = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *X = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *L = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *D = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Y = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Z = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
 
     if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
         nanofft_aligned_free(XTX);
@@ -2120,30 +1625,31 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
 
     int nan_count = 0;
 
-    for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
+    for (int base = 0; base < N; base += BREADTH_VEC_LEN) {
         for (int row = 0; row < norder; ++row) {
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+            for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
                 int idx = base + lane;
                 if (idx >= N) idx = N - 1;
-                XTy[row][lane] = real_rhs_value(Syw, Cyw, N, idx, row);
+                BREADTH_SET_LANE(XTy[row], lane, real_rhs_value(Syw, Cyw, N, idx, row));
             }
 
             for (int col = 0; col < norder; ++col) {
-                for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
                     int idx = base + lane;
                     if (idx >= N) idx = N - 1;
-                    XTX[(size_t)row * norder + col][lane] = real_gram_value(Sw, Cw, N, idx, row, col);
+                    BREADTH_SET_LANE(XTX[(size_t)row * norder + col], lane, real_gram_value(Sw, Cw, N, idx, row, col));
                 }
             }
         }
 
-        INTERNAL_VEC condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
+        BREADTH_VEC condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
 
-        for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+        for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
             int idx = base + lane;
             if (idx >= N) continue;
-            if (cond) cond[idx] = condition_bound[lane];
-            if (!cond && condition_bound_is_singular(condition_bound[lane], CHI2PER_SOLVER_LDLT)) {
+            FLOAT cb = BREADTH_GET_LANE(condition_bound, lane);
+            if (cond) cond[idx] = cb;
+            if (!cond && condition_bound_is_singular(cb, CHI2PER_SOLVER_LDLT)) {
                 power[idx] = chi2_nan();
                 ++nan_count;
                 continue;
@@ -2151,9 +1657,9 @@ static int solve_periodogram_ldlt_vec(const FLOAT *Sw, const FLOAT *Cw, const FL
 
             FLOAT dot = FCAST(0.0);
             for (int k = 0; k < norder; ++k) {
-                dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
+                dot = ADD(dot, MUL(BREADTH_GET_LANE(XTy[k], lane), BREADTH_GET_LANE(X[k], lane)));
             }
-            power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            power[idx] = normalize_power_entry(dot, chi2_ref, cb, normalization, degree, M, cyb, b);
             if (!cond && power_is_nan(power[idx])) ++nan_count;
         }
     }
@@ -2174,13 +1680,13 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
     const int norder = 2 * degree + 1;
     size_t norder_sq = (size_t)norder * (size_t)norder;
 
-    INTERNAL_VEC *XTX = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *XTy = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *X = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Q = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *S = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *D = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Y = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    BREADTH_VEC *XTX = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *XTy = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *X = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Q = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *S = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *D = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Y = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
 
     if (!XTX || !XTy || !X || !Q || !S || !D || !Y) {
         nanofft_aligned_free(XTX);
@@ -2193,34 +1699,34 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
         return CHI2PER_ERR_ALLOC;
     }
 
-    INTERNAL_VEC max_cond;
-    for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) max_cond[lane] = cond ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD);
+    BREADTH_VEC max_cond = BREADTH_SPLAT(cond ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD));
     int nan_count = 0;
 
-    for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
+    for (int base = 0; base < N; base += BREADTH_VEC_LEN) {
         for (int row = 0; row < norder; ++row) {
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+            for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
                 int idx = base + lane;
                 if (idx >= N) idx = N - 1;
-                XTy[row][lane] = real_rhs_value(Syw, Cyw, N, idx, row);
+                BREADTH_SET_LANE(XTy[row], lane, real_rhs_value(Syw, Cyw, N, idx, row));
             }
 
             for (int col = 0; col < norder; ++col) {
-                for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
                     int idx = base + lane;
                     if (idx >= N) idx = N - 1;
-                    XTX[(size_t)row * norder + col][lane] = real_gram_value(Sw, Cw, N, idx, row, col);
+                    BREADTH_SET_LANE(XTX[(size_t)row * norder + col], lane, real_gram_value(Sw, Cw, N, idx, row, col));
                 }
             }
         }
 
-        INTERNAL_VEC condition_bound = SOLVE_SVD((size_t)norder, XTX, XTy, X, Q, S, D, Y, max_cond);
+        BREADTH_VEC condition_bound = SOLVE_SVD((size_t)norder, XTX, XTy, X, Q, S, D, Y, max_cond);
 
-        for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+        for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
             int idx = base + lane;
             if (idx >= N) continue;
-            if (cond) cond[idx] = condition_bound[lane];
-            if (!cond && condition_bound_is_invalid(condition_bound[lane])) {
+            FLOAT cb = BREADTH_GET_LANE(condition_bound, lane);
+            if (cond) cond[idx] = cb;
+            if (!cond && condition_bound_is_invalid(cb)) {
                 power[idx] = chi2_nan();
                 ++nan_count;
                 continue;
@@ -2228,9 +1734,9 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
 
             FLOAT dot = FCAST(0.0);
             for (int k = 0; k < norder; ++k) {
-                dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
+                dot = ADD(dot, MUL(BREADTH_GET_LANE(XTy[k], lane), BREADTH_GET_LANE(X[k], lane)));
             }
-            power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            power[idx] = normalize_power_entry(dot, chi2_ref, cb, normalization, degree, M, cyb, b);
             if (!cond && power_is_nan(power[idx])) ++nan_count;
         }
     }
@@ -2253,113 +1759,80 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
     const int norder = 2 * degree + 1;
     if (!ws || ws->norder != norder || !ws->Rr) return CHI2PER_ERR_ALLOC;
 
-    INTERNAL_VEC *Rr = ws->Rr;
-    INTERNAL_VEC *Ri = ws->Ri;
-    INTERNAL_VEC *Yr = ws->Yr;
-    INTERNAL_VEC *Yi = ws->Yi;
-    INTERNAL_VEC *Xr = ws->Xr;
-    INTERNAL_VEC *Xi = ws->Xi;
-    INTERNAL_VEC *Ehr = ws->Ehr;
-    INTERNAL_VEC *Ehi = ws->Ehi;
-    INTERNAL_VEC *Ehpr = ws->Ehpr;
-    INTERNAL_VEC *Ehpi = ws->Ehpi;
-    INTERNAL_VEC *BUr = ws->BUr;
-    INTERNAL_VEC *BUi = ws->BUi;
-    INTERNAL_VEC *BD = ws->BD;
-    INTERNAL_VEC *Bur = ws->Bur;
-    INTERNAL_VEC *Bui = ws->Bui;
-    INTERNAL_VEC *Bvr = ws->Bvr;
-    INTERNAL_VEC *Bvi = ws->Bvi;
-    INTERNAL_VEC *Bwr = ws->Bwr;
-    INTERNAL_VEC *Bwi = ws->Bwi;
+    BREADTH_VEC *Rr = ws->Rr;
+    BREADTH_VEC *Ri = ws->Ri;
+    BREADTH_VEC *Yr = ws->Yr;
+    BREADTH_VEC *Yi = ws->Yi;
+    BREADTH_VEC *Xr = ws->Xr;
+    BREADTH_VEC *Xi = ws->Xi;
+    BREADTH_VEC *Ehr = ws->Ehr;
+    BREADTH_VEC *Ehi = ws->Ehi;
+    BREADTH_VEC *Ehpr = ws->Ehpr;
+    BREADTH_VEC *Ehpi = ws->Ehpi;
+    BREADTH_VEC *BUr = ws->BUr;
+    BREADTH_VEC *BUi = ws->BUi;
+    BREADTH_VEC *BD = ws->BD;
+    BREADTH_VEC *Bur = ws->Bur;
+    BREADTH_VEC *Bui = ws->Bui;
+    BREADTH_VEC *Bvr = ws->Bvr;
+    BREADTH_VEC *Bvi = ws->Bvi;
+    BREADTH_VEC *Bwr = ws->Bwr;
+    BREADTH_VEC *Bwi = ws->Bwi;
     if (solver == CHI2PER_SOLVER_BAREISS && (!BUr || !BUi || !BD || !Bur || !Bui || !Bvr || !Bvi || !Bwr || !Bwi)) return CHI2PER_ERR_ALLOC;
 
     int nan_count = 0;
 
-    for (int base = 0; base < N; base += INTERNAL_VEC_LEN) {
+    for (int base = 0; base < N; base += BREADTH_VEC_LEN) {
         for (int k = 0; k < norder; ++k) {
             int h = k - degree;
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+            for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
                 int idx = base + lane;
                 if (idx >= N) idx = N - 1;
 
-                Rr[k][lane] = Cw[(size_t)k * N + idx];
-                Ri[k][lane] = NEG(Sw[(size_t)k * N + idx]);
+                BREADTH_SET_LANE(Rr[k], lane, Cw[(size_t)k * N + idx]);
+                BREADTH_SET_LANE(Ri[k], lane, NEG(Sw[(size_t)k * N + idx]));
 
                 if (h == 0) {
-                    Yr[k][lane] = Cyw[idx];
-                    Yi[k][lane] = FCAST(0.0);
+                    BREADTH_SET_LANE(Yr[k], lane, Cyw[idx]);
+                    BREADTH_SET_LANE(Yi[k], lane, FCAST(0.0));
                 } else if (h > 0) {
-                    Yr[k][lane] = Cyw[(size_t)h * N + idx];
-                    Yi[k][lane] = NEG(Syw[(size_t)h * N + idx]);
+                    BREADTH_SET_LANE(Yr[k], lane, Cyw[(size_t)h * N + idx]);
+                    BREADTH_SET_LANE(Yi[k], lane, NEG(Syw[(size_t)h * N + idx]));
                 } else {
                     int ah = -h;
-                    Yr[k][lane] = Cyw[(size_t)ah * N + idx];
-                    Yi[k][lane] = Syw[(size_t)ah * N + idx];
+                    BREADTH_SET_LANE(Yr[k], lane, Cyw[(size_t)ah * N + idx]);
+                    BREADTH_SET_LANE(Yi[k], lane, Syw[(size_t)ah * N + idx]);
                 }
             }
         }
 
-        for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
-            Rr[norder][lane] = FCAST(0.0);
-            Ri[norder][lane] = FCAST(0.0);
-        }
+        Rr[norder] = BREADTH_ZERO;
+        Ri[norder] = BREADTH_ZERO;
 
-        int singular_lane[INTERNAL_VEC_LEN];
-        for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) singular_lane[lane] = 0;
-        INTERNAL_VEC condition_bound;
-
+        BREADTH_VEC condition_bound;
         if (solver == CHI2PER_SOLVER_LEVINSON) {
             condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
-                int idx = base + lane;
-                if (idx >= N) continue;
-                if (cond) cond[idx] = condition_bound[lane];
-                if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
-                    singular_lane[lane] = 1;
-                    power[idx] = chi2_nan();
-                    ++nan_count;
-                }
-            }
         } else if (solver == CHI2PER_SOLVER_ZOHAR) {
             condition_bound = SOLVE_ZOHAR((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
-                int idx = base + lane;
-                if (idx >= N) continue;
-                if (cond) cond[idx] = condition_bound[lane];
-                if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
-                    singular_lane[lane] = 1;
-                    power[idx] = chi2_nan();
-                    ++nan_count;
-                }
-            }
         } else if (solver == CHI2PER_SOLVER_BAREISS) {
             condition_bound = SOLVE_BAREISS((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, BUr, BUi, BD, Bur, Bui, Bvr, Bvi, Bwr, Bwi);
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
-                int idx = base + lane;
-                if (idx >= N) continue;
-                if (cond) cond[idx] = condition_bound[lane];
-                if (!cond && condition_bound_is_singular(condition_bound[lane], solver)) {
-                    singular_lane[lane] = 1;
-                    power[idx] = chi2_nan();
-                    ++nan_count;
-                }
-            }
         } else {
             return CHI2PER_ERR_SOLVER;
         }
 
-        for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+        for (int lane = 0; lane < BREADTH_VEC_LEN; ++lane) {
             int idx = base + lane;
             if (idx >= N) continue;
-            if (singular_lane[lane]) continue;
+            FLOAT cb = BREADTH_GET_LANE(condition_bound, lane);
+            if (cond) cond[idx] = cb;
+            if (!cond && condition_bound_is_singular(cb, solver)) {
+                power[idx] = chi2_nan();
+                ++nan_count;
+                continue;
+            }
 
-#    if defined(DOUBLE_DOUBLE)
-            FLOAT dot = Xr[0];
-#    else
-            FLOAT dot = Xr[0][lane];
-#    endif
-            power[idx] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            FLOAT dot = BREADTH_GET_LANE(Xr[0], lane);
+            power[idx] = normalize_power_entry(dot, chi2_ref, cb, normalization, degree, M, cyb, b);
             if (!cond && power_is_nan(power[idx])) ++nan_count;
         }
     }
@@ -2367,28 +1840,33 @@ static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *
     return cond ? CHI2PER_OK : nan_count;
 }
 
-static inline INTERNAL_VEC signed_vec_value(INTERNAL_VEC value, int sign) {
-    if (sign < 0) return NEG(value);
+static inline BREADTH_VEC signed_vec_value(BREADTH_VEC value, int sign) {
+    if (sign < 0) return BREADTH_NEG(value);
     if (sign > 0) return value;
-    return (INTERNAL_VEC){};
+    return BREADTH_ZERO;
 }
 
-static inline INTERNAL_VEC real_gram_value_vec(const BREADTH_VEC *Sw, const BREADTH_VEC *Cw, int block, int idx, int row, int col) {
+static inline BREADTH_VEC real_gram_value_vec(const BREADTH_VEC *Sw, const BREADTH_VEC *Cw, int block, int idx, int row, int col) {
     const int m = real_term_harmonic(col);
     const int n = real_term_harmonic(row);
     const int col_sin = real_term_is_sin(col);
     const int row_sin = real_term_is_sin(row);
     const int diff = abs(m - n);
     const int sum = m + n;
-    const INTERNAL_VEC half = (INTERNAL_VEC){} + FCAST(0.5);
+    const BREADTH_VEC half = BREADTH_SPLAT(FCAST(0.5));
 
-    if (col_sin && row_sin) return MUL(half, SUB(Cw[(size_t)diff * (size_t)block + (size_t)idx], Cw[(size_t)sum * (size_t)block + (size_t)idx]));
-    if (!col_sin && !row_sin) return MUL(half, ADD(Cw[(size_t)diff * (size_t)block + (size_t)idx], Cw[(size_t)sum * (size_t)block + (size_t)idx]));
-    if (col_sin) return MUL(half, ADD(signed_vec_value(Sw[(size_t)diff * (size_t)block + (size_t)idx], m - n), Sw[(size_t)sum * (size_t)block + (size_t)idx]));
-    return MUL(half, ADD(signed_vec_value(Sw[(size_t)diff * (size_t)block + (size_t)idx], n - m), Sw[(size_t)sum * (size_t)block + (size_t)idx]));
+    if (col_sin && row_sin)
+        return BREADTH_MUL(half, BREADTH_SUB(Cw[(size_t)diff * (size_t)block + (size_t)idx], Cw[(size_t)sum * (size_t)block + (size_t)idx]));
+    if (!col_sin && !row_sin)
+        return BREADTH_MUL(half, BREADTH_ADD(Cw[(size_t)diff * (size_t)block + (size_t)idx], Cw[(size_t)sum * (size_t)block + (size_t)idx]));
+    if (col_sin)
+        return BREADTH_MUL(half,
+                           BREADTH_ADD(signed_vec_value(Sw[(size_t)diff * (size_t)block + (size_t)idx], m - n), Sw[(size_t)sum * (size_t)block + (size_t)idx]));
+    return BREADTH_MUL(half,
+                       BREADTH_ADD(signed_vec_value(Sw[(size_t)diff * (size_t)block + (size_t)idx], n - m), Sw[(size_t)sum * (size_t)block + (size_t)idx]));
 }
 
-static inline INTERNAL_VEC real_rhs_value_vec(const BREADTH_VEC *Syw, const BREADTH_VEC *Cyw, int block, int idx, int term) {
+static inline BREADTH_VEC real_rhs_value_vec(const BREADTH_VEC *Syw, const BREADTH_VEC *Cyw, int block, int idx, int term) {
     const int h = real_term_harmonic(term);
     if (real_term_is_sin(term)) return Syw[(size_t)h * (size_t)block + (size_t)idx];
     return Cyw[(size_t)h * (size_t)block + (size_t)idx];
@@ -2401,13 +1879,13 @@ static int solve_periodogram_ldlt_breadth(const BREADTH_VEC *Sw, const BREADTH_V
     const int norder = 2 * degree + 1;
     const size_t norder_sq = (size_t)norder * (size_t)norder;
 
-    INTERNAL_VEC *XTX = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *XTy = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *X = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *L = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *D = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Y = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Z = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    BREADTH_VEC *XTX = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *XTy = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *X = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *L = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *D = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Y = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Z = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
 
     if (!XTX || !XTy || !X || !L || !D || !Y || !Z) {
         nanofft_aligned_free(XTX);
@@ -2426,19 +1904,20 @@ static int solve_periodogram_ldlt_breadth(const BREADTH_VEC *Sw, const BREADTH_V
             for (int col = 0; col < norder; ++col) XTX[(size_t)row * (size_t)norder + (size_t)col] = real_gram_value_vec(Sw, Cw, block, idx, row, col);
         }
 
-        const INTERNAL_VEC condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
-        INTERNAL_VEC p_out = (INTERNAL_VEC){};
-        if (cond_b) cond_b[idx] = condition_bound;
+        const BREADTH_VEC condition_bound = SOLVE_LDLT((size_t)norder, XTX, XTy, X, L, D, Y, Z);
+        BREADTH_VEC p_out = BREADTH_ZERO;
+        if (cond_b) STORE_BVEC(&cond_b[idx], condition_bound);
         for (int lane = 0; lane < active_lanes; ++lane) {
-            if (!cond_b && condition_bound_is_singular(condition_bound[lane], CHI2PER_SOLVER_LDLT)) {
-                p_out[lane] = chi2_nan();
+            FLOAT cb = BREADTH_GET_LANE(condition_bound, lane);
+            if (!cond_b && condition_bound_is_singular(cb, CHI2PER_SOLVER_LDLT)) {
+                BREADTH_SET_LANE(p_out, lane, chi2_nan());
                 continue;
             }
             FLOAT dot = FCAST(0.0);
-            for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
-            p_out[lane] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(BREADTH_GET_LANE(XTy[k], lane), BREADTH_GET_LANE(X[k], lane)));
+            BREADTH_SET_LANE(p_out, lane, normalize_power_entry(dot, chi2_ref, cb, normalization, degree, M, cyb, b));
         }
-        power_b[idx] = p_out;
+        STORE_BVEC(&power_b[idx], p_out);
     }
 
     nanofft_aligned_free(XTX);
@@ -2458,13 +1937,13 @@ static int solve_periodogram_svd_breadth(const BREADTH_VEC *Sw, const BREADTH_VE
     const int norder = 2 * degree + 1;
     const size_t norder_sq = (size_t)norder * (size_t)norder;
 
-    INTERNAL_VEC *XTX = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *XTy = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *X = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Q = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *S = (INTERNAL_VEC *)checked_aligned_malloc(norder_sq, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *D = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
-    INTERNAL_VEC *Y = (INTERNAL_VEC *)checked_aligned_malloc((size_t)norder, sizeof(INTERNAL_VEC));
+    BREADTH_VEC *XTX = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *XTy = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *X = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Q = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *S = (BREADTH_VEC *)checked_aligned_malloc(norder_sq, sizeof(BREADTH_VEC));
+    BREADTH_VEC *D = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
+    BREADTH_VEC *Y = (BREADTH_VEC *)checked_aligned_malloc((size_t)norder, sizeof(BREADTH_VEC));
 
     if (!XTX || !XTy || !X || !Q || !S || !D || !Y) {
         nanofft_aligned_free(XTX);
@@ -2477,26 +1956,27 @@ static int solve_periodogram_svd_breadth(const BREADTH_VEC *Sw, const BREADTH_VE
         return CHI2PER_ERR_ALLOC;
     }
 
-    INTERNAL_VEC max_cond = (INTERNAL_VEC){} + (cond_b ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD));
+    BREADTH_VEC max_cond = BREADTH_SPLAT(cond_b ? FCAST(0.0) : FCAST(COND_SINGULARITY_THRESHOLD_SVD));
     for (int idx = 0; idx < block; ++idx) {
         for (int row = 0; row < norder; ++row) {
             XTy[row] = real_rhs_value_vec(Syw, Cyw, block, idx, row);
             for (int col = 0; col < norder; ++col) XTX[(size_t)row * (size_t)norder + (size_t)col] = real_gram_value_vec(Sw, Cw, block, idx, row, col);
         }
 
-        const INTERNAL_VEC condition_bound = SOLVE_SVD((size_t)norder, XTX, XTy, X, Q, S, D, Y, max_cond);
-        INTERNAL_VEC p_out = (INTERNAL_VEC){};
-        if (cond_b) cond_b[idx] = condition_bound;
+        const BREADTH_VEC condition_bound = SOLVE_SVD((size_t)norder, XTX, XTy, X, Q, S, D, Y, max_cond);
+        BREADTH_VEC p_out = BREADTH_ZERO;
+        if (cond_b) STORE_BVEC(&cond_b[idx], condition_bound);
         for (int lane = 0; lane < active_lanes; ++lane) {
-            if (!cond_b && condition_bound_is_invalid(condition_bound[lane])) {
-                p_out[lane] = chi2_nan();
+            FLOAT cb = BREADTH_GET_LANE(condition_bound, lane);
+            if (!cond_b && condition_bound_is_invalid(cb)) {
+                BREADTH_SET_LANE(p_out, lane, chi2_nan());
                 continue;
             }
             FLOAT dot = FCAST(0.0);
-            for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(XTy[k][lane], X[k][lane]));
-            p_out[lane] = normalize_power_entry(dot, chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            for (int k = 0; k < norder; ++k) dot = ADD(dot, MUL(BREADTH_GET_LANE(XTy[k], lane), BREADTH_GET_LANE(X[k], lane)));
+            BREADTH_SET_LANE(p_out, lane, normalize_power_entry(dot, chi2_ref, cb, normalization, degree, M, cyb, b));
         }
-        power_b[idx] = p_out;
+        STORE_BVEC(&power_b[idx], p_out);
     }
 
     nanofft_aligned_free(XTX);
@@ -2509,9 +1989,9 @@ static int solve_periodogram_svd_breadth(const BREADTH_VEC *Sw, const BREADTH_VE
     return CHI2PER_OK;
 }
 
-/* Zero-transpose breadth Toeplitz solver: BREADTH_VEC == INTERNAL_VEC, so
- * every frequency bin feeds straight into the vector-batch solver without
- * lane gathering or transposing. */
+/* Zero-transpose breadth Toeplitz solver across all three precisions (VECF,
+ * VEC, VECDD): every frequency bin feeds straight into the SIMD-batched solver
+ * without lane gathering or transposing. */
 static int solve_periodogram_breadth_vec(const BREADTH_VEC *Sw, const BREADTH_VEC *Cw, const BREADTH_VEC *Syw, const BREADTH_VEC *Cyw, int block,
                                          int active_lanes, int degree, int solver, FLOAT chi2_ref, int normalization, int M, const cybenko_model_t *cyb,
                                          FLOAT b, BREADTH_VEC *power_b, BREADTH_VEC *cond_b, toep_workspace *ws) {
@@ -2523,39 +2003,39 @@ static int solve_periodogram_breadth_vec(const BREADTH_VEC *Sw, const BREADTH_VE
     const int norder = 2 * degree + 1;
     if (!ws || ws->norder != norder || !ws->Rr) return CHI2PER_ERR_ALLOC;
 
-    INTERNAL_VEC *Rr = ws->Rr;
-    INTERNAL_VEC *Ri = ws->Ri;
-    INTERNAL_VEC *Yr = ws->Yr;
-    INTERNAL_VEC *Yi = ws->Yi;
-    INTERNAL_VEC *Xr = ws->Xr;
-    INTERNAL_VEC *Xi = ws->Xi;
-    INTERNAL_VEC *Ehr = ws->Ehr;
-    INTERNAL_VEC *Ehi = ws->Ehi;
-    INTERNAL_VEC *Ehpr = ws->Ehpr;
-    INTERNAL_VEC *Ehpi = ws->Ehpi;
-    INTERNAL_VEC *BUr = ws->BUr;
-    INTERNAL_VEC *BUi = ws->BUi;
-    INTERNAL_VEC *BD = ws->BD;
-    INTERNAL_VEC *Bur = ws->Bur;
-    INTERNAL_VEC *Bui = ws->Bui;
-    INTERNAL_VEC *Bvr = ws->Bvr;
-    INTERNAL_VEC *Bvi = ws->Bvi;
-    INTERNAL_VEC *Bwr = ws->Bwr;
-    INTERNAL_VEC *Bwi = ws->Bwi;
+    BREADTH_VEC *Rr = ws->Rr;
+    BREADTH_VEC *Ri = ws->Ri;
+    BREADTH_VEC *Yr = ws->Yr;
+    BREADTH_VEC *Yi = ws->Yi;
+    BREADTH_VEC *Xr = ws->Xr;
+    BREADTH_VEC *Xi = ws->Xi;
+    BREADTH_VEC *Ehr = ws->Ehr;
+    BREADTH_VEC *Ehi = ws->Ehi;
+    BREADTH_VEC *Ehpr = ws->Ehpr;
+    BREADTH_VEC *Ehpi = ws->Ehpi;
+    BREADTH_VEC *BUr = ws->BUr;
+    BREADTH_VEC *BUi = ws->BUi;
+    BREADTH_VEC *BD = ws->BD;
+    BREADTH_VEC *Bur = ws->Bur;
+    BREADTH_VEC *Bui = ws->Bui;
+    BREADTH_VEC *Bvr = ws->Bvr;
+    BREADTH_VEC *Bvi = ws->Bvi;
+    BREADTH_VEC *Bwr = ws->Bwr;
+    BREADTH_VEC *Bwi = ws->Bwi;
     if (solver == CHI2PER_SOLVER_BAREISS && (!BUr || !BUi || !BD || !Bur || !Bui || !Bvr || !Bvi || !Bwr || !Bwi)) return CHI2PER_ERR_ALLOC;
 
-    const INTERNAL_VEC vzero = (INTERNAL_VEC){};
+    const BREADTH_VEC vzero = BREADTH_ZERO;
     for (int idx = 0; idx < block; ++idx) {
         for (int k = 0; k < norder; ++k) {
             Rr[k] = Cw[(size_t)k * (size_t)block + (size_t)idx];
-            Ri[k] = NEG(Sw[(size_t)k * (size_t)block + (size_t)idx]);
+            Ri[k] = BREADTH_NEG(Sw[(size_t)k * (size_t)block + (size_t)idx]);
             const int h = k - degree;
             if (h == 0) {
                 Yr[k] = Cyw[idx];
                 Yi[k] = vzero;
             } else if (h > 0) {
                 Yr[k] = Cyw[(size_t)h * (size_t)block + (size_t)idx];
-                Yi[k] = NEG(Syw[(size_t)h * (size_t)block + (size_t)idx]);
+                Yi[k] = BREADTH_NEG(Syw[(size_t)h * (size_t)block + (size_t)idx]);
             } else {
                 const int ah = -h;
                 Yr[k] = Cyw[(size_t)ah * (size_t)block + (size_t)idx];
@@ -2565,7 +2045,7 @@ static int solve_periodogram_breadth_vec(const BREADTH_VEC *Sw, const BREADTH_VE
         Rr[norder] = vzero;
         Ri[norder] = vzero;
 
-        INTERNAL_VEC condition_bound;
+        BREADTH_VEC condition_bound;
         if (solver == CHI2PER_SOLVER_LEVINSON) {
             condition_bound = SOLVE_LEVINSON((size_t)norder, Rr, Ri, Yr, Yi, Xr, Xi, Ehr, Ehi, Ehpr, Ehpi);
         } else if (solver == CHI2PER_SOLVER_ZOHAR) {
@@ -2576,20 +2056,20 @@ static int solve_periodogram_breadth_vec(const BREADTH_VEC *Sw, const BREADTH_VE
             return CHI2PER_ERR_SOLVER;
         }
 
-        INTERNAL_VEC p_out = vzero;
-        if (cond_b) cond_b[idx] = condition_bound;
+        BREADTH_VEC p_out = vzero;
+        if (cond_b) STORE_BVEC(&cond_b[idx], condition_bound);
         for (int lane = 0; lane < active_lanes; ++lane) {
-            if (!cond_b && condition_bound_is_singular(condition_bound[lane], solver)) {
-                p_out[lane] = chi2_nan();
+            FLOAT cb = BREADTH_GET_LANE(condition_bound, lane);
+            if (!cond_b && condition_bound_is_singular(cb, solver)) {
+                BREADTH_SET_LANE(p_out, lane, chi2_nan());
                 continue;
             }
-            p_out[lane] = normalize_power_entry(Xr[0][lane], chi2_ref, condition_bound[lane], normalization, degree, M, cyb, b);
+            BREADTH_SET_LANE(p_out, lane, normalize_power_entry(BREADTH_GET_LANE(Xr[0], lane), chi2_ref, cb, normalization, degree, M, cyb, b));
         }
-        power_b[idx] = p_out;
+        STORE_BVEC(&power_b[idx], p_out);
     }
     return CHI2PER_OK;
 }
-#endif
 
 int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
                                int normalization, int spreading, int vectorize, FLOAT *power, FLOAT *cond) {
@@ -2629,13 +2109,8 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
     memset(&ladder, 0, sizeof(ladder));
     memset(&rows, 0, sizeof(rows));
     memset(&rows_b, 0, sizeof(rows_b));
-#if !defined(DOUBLE_DOUBLE)
     toep_workspace workspace;
     memset(&workspace, 0, sizeof(workspace));
-#else
-    dd_solver_workspace dd_ws;
-    memset(&dd_ws, 0, sizeof(dd_ws));
-#endif
     FLOAT *out_r = use_breadth ? NULL : (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
     FLOAT *out_i = use_breadth ? NULL : (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
     FLOAT *power_block = use_breadth ? NULL : (FLOAT *)checked_aligned_malloc((size_t)block, sizeof(FLOAT));
@@ -2730,17 +2205,10 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
     if (use_breadth) {
         status = trig_rows_breadth_init(&rows_b, block, max_factor, degree);
         if (status != CHI2PER_OK) goto cleanup;
-#if !defined(DOUBLE_DOUBLE)
         if (degree > 1 && (solver == CHI2PER_SOLVER_LEVINSON || solver == CHI2PER_SOLVER_ZOHAR || solver == CHI2PER_SOLVER_BAREISS)) {
             status = toep_workspace_init(&workspace, 2 * degree + 1, solver);
             if (status != CHI2PER_OK) goto cleanup;
         }
-#else
-        if (degree > 1) {
-            status = dd_solver_workspace_init(&dd_ws, 2 * degree + 1, solver);
-            if (status != CHI2PER_OK) goto cleanup;
-        }
-#endif
         const int slot_block = (defer && use_pswf) ? 1 : 0;
         const int mode = slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL;
         const BREADTH_VEC v_ws = BREADTH_SPLAT(ws);
@@ -2778,13 +2246,8 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
                 block_status = gls_impl_breadth(rows_b.Sw, rows_b.Cw, rows_b.Syw, rows_b.Cyw, block, active_lanes, ws, yws, chi2_ref, normalization, M, &cyb, b,
                                                 power_b, cond_b);
             } else {
-#if defined(DOUBLE_DOUBLE)
-                block_status = solve_periodogram_breadth_dd(rows_b.Sw, rows_b.Cw, rows_b.Syw, rows_b.Cyw, block, active_lanes, degree, solver, chi2_ref,
-                                                            normalization, M, &cyb, b, power_b, cond_b, &dd_ws);
-#else
                 block_status = solve_periodogram_breadth_vec(rows_b.Sw, rows_b.Cw, rows_b.Syw, rows_b.Cyw, block, active_lanes, degree, solver, chi2_ref,
                                                              normalization, M, &cyb, b, power_b, cond_b, &workspace);
-#endif
             }
             if (block_status < 0) {
                 status = block_status;
@@ -2824,12 +2287,10 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
     if (status == CHI2PER_OK) status = block_ladder_init(&ladder, x, w, yw, M, max_factor, degree, block, ladder_levels, backend, f0, df);
     if (status != CHI2PER_OK) goto cleanup;
 
-#if !defined(DOUBLE_DOUBLE)
     if (degree > 1 && (solver == CHI2PER_SOLVER_LEVINSON || solver == CHI2PER_SOLVER_ZOHAR || solver == CHI2PER_SOLVER_BAREISS)) {
         status = toep_workspace_init(&workspace, 2 * degree + 1, solver);
         if (status != CHI2PER_OK) goto cleanup;
     }
-#endif
 
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         const int base = (int)(block_idx * (size_t)block);
@@ -2866,13 +2327,8 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
         if (degree == 1) {
             block_status = gls_impl(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, ws, yws, chi2_ref, normalization, M, &cyb, b, power_block, cond_block);
         } else {
-#if defined(DOUBLE_DOUBLE)
-            block_status =
-                solve_periodogram_dd(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, power_block, cond_block);
-#else
             block_status = solve_periodogram_vec(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, power_block,
                                                  cond_block, &workspace);
-#endif
         }
         if (block_status < 0) {
             status = block_status;
@@ -2912,11 +2368,7 @@ cleanup:
     block_ladder_free(&ladder);
     trig_rows_free(&rows);
     trig_rows_breadth_free(&rows_b);
-#if !defined(DOUBLE_DOUBLE)
     toep_workspace_free(&workspace);
-#else
-    dd_solver_workspace_free(&dd_ws);
-#endif
     return status;
 }
 

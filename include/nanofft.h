@@ -1,7 +1,7 @@
 #ifndef NANOFFT_H
 #define NANOFFT_H
 
-#if defined(__FMA__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+#if (defined(__FMA__) || defined(__SSE2__)) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
 #    include <immintrin.h>
 #elif defined(__aarch64__) || defined(__ARM_FEATURE_FMA)
 #    include <arm_neon.h>
@@ -600,6 +600,14 @@ static inline VECDD vecdd_mul(VECDD a, VECDD b) {
 
 static inline VECDD vecdd_mul_scalar(VECDD a, dd_t s) { return vecdd_mul(a, vecdd_splat(s)); }
 
+static inline VECDD vecdd_div(VECDD a, VECDD b) {
+    VEC q1 = a.hi / b.hi;
+    VECDD q1_dd = vecdd_make(q1, (VEC){});
+    VECDD r = vecdd_sub(a, vecdd_mul(b, q1_dd));
+    VEC q2 = r.hi / b.hi;
+    return vecdd_add(q1_dd, vecdd_make(q2, (VEC){}));
+}
+
 /* -------------------------------------------------------------------------
  * Vectorized sqrt / exp helpers  (float and double only, not dd_t)
  *
@@ -611,6 +619,23 @@ static inline VECDD vecdd_mul_scalar(VECDD a, dd_t s) { return vecdd_mul(a, vecd
  * finite range, denormals and saturation included.
  * ------------------------------------------------------------------------- */
 #include <nanofft_vecmath.h>
+
+static inline VECDD vecdd_sqrt(VECDD a) {
+    VEC c = vec_sqrt(a.hi);
+    VEC u, uu;
+    vecdd_two_product(c, c, &u, &uu);
+    VEC half = (VEC){} + 0.5;
+    VEC cc = (a.hi - u - uu + a.lo) * half / c;
+    VEC y = c + cc;
+    VEC yy = c - y + cc;
+    for (int lane = 0; lane < VECDD_LEN; lane++) {
+        if (!(a.hi[lane] > 0.0)) {
+            y[lane] = 0.0;
+            yy[lane] = 0.0;
+        }
+    }
+    return vecdd_make(y, yy);
+}
 
 typedef struct nanofft_plan nanofft_plan;
 TLS_API nanofft_plan *nanofft_make_plan(uint32_t N);

@@ -349,19 +349,42 @@ static void benchmark_double(int n, const std::vector<ToeplitzSystem> &systems,
 
 static void benchmark_dd(int n, const std::vector<ToeplitzSystem> &systems,
                          const std::vector<QuadSolution> &refs) {
-  const int calls = (int)systems.size();
-  std::vector<dd_t> Rr(calls * (n + 1)), Ri(calls * (n + 1));
-  std::vector<dd_t> Yr(calls * n), Yi(calls * n), Xr(calls * n), Xi(calls * n),
+  const int lanes = VECDD_LEN;
+  const int calls = ((int)systems.size() + lanes - 1) / lanes;
+  std::vector<VECDD> Rr(calls * (n + 1)), Ri(calls * (n + 1));
+  std::vector<VECDD> Yr(calls * n), Yi(calls * n), Xr(calls * n), Xi(calls * n),
       EhR(calls * n), EhI(calls * n), EhPrevR(calls * n), EhPrevI(calls * n);
 
   for (int call = 0; call < calls; call++) {
     for (int k = 0; k <= n; k++) {
-      Rr[call * (n + 1) + k] = dd_from_double_local(systems[call].Rr[k]);
-      Ri[call * (n + 1) + k] = dd_from_double_local(systems[call].Ri[k]);
+      VECDD vr = vecdd_splat_d(0.0), vi = vecdd_splat_d(0.0);
+      for (int lane = 0; lane < lanes; lane++) {
+        int s = call * lanes + lane;
+        if (s >= (int)systems.size()) s = (int)systems.size() - 1;
+        dd_t rr = dd_from_double_local(systems[s].Rr[k]);
+        dd_t ri = dd_from_double_local(systems[s].Ri[k]);
+        vr.hi[lane] = rr.hi;
+        vr.lo[lane] = rr.lo;
+        vi.hi[lane] = ri.hi;
+        vi.lo[lane] = ri.lo;
+      }
+      Rr[call * (n + 1) + k] = vr;
+      Ri[call * (n + 1) + k] = vi;
     }
     for (int k = 0; k < n; k++) {
-      Yr[call * n + k] = dd_from_double_local(systems[call].Yr[k]);
-      Yi[call * n + k] = dd_from_double_local(systems[call].Yi[k]);
+      VECDD yr = vecdd_splat_d(0.0), yi = vecdd_splat_d(0.0);
+      for (int lane = 0; lane < lanes; lane++) {
+        int s = call * lanes + lane;
+        if (s >= (int)systems.size()) s = (int)systems.size() - 1;
+        dd_t yrv = dd_from_double_local(systems[s].Yr[k]);
+        dd_t yiv = dd_from_double_local(systems[s].Yi[k]);
+        yr.hi[lane] = yrv.hi;
+        yr.lo[lane] = yrv.lo;
+        yi.hi[lane] = yiv.hi;
+        yi.lo[lane] = yiv.lo;
+      }
+      Yr[call * n + k] = yr;
+      Yi[call * n + k] = yi;
     }
   }
 
@@ -382,8 +405,11 @@ static void benchmark_dd(int n, const std::vector<ToeplitzSystem> &systems,
 
   mp_quad z_num = 0, z_den = 0, ldlt_num = 0, ldlt_den = 0;
   double t_qr = 0.0, t_ldlt = 0.0;
-  for (int s = 0; s < calls; s++) {
-    const mp_quad r2_z = dd_to_mp_quad(Xr[s * n + 0]);
+  for (int s = 0; s < (int)systems.size(); s++) {
+    int call = s / lanes;
+    int lane = s % lanes;
+    dd_t r2_dd = dd_make(Xr[call * n + 0].hi[lane], Xr[call * n + 0].lo[lane]);
+    const mp_quad r2_z = dd_to_mp_quad(r2_dd);
     const mp_quad dr = r2_z - refs[s].r2;
     z_num += dr * dr;
     z_den += refs[s].r2 * refs[s].r2;
@@ -400,7 +426,7 @@ static void benchmark_dd(int n, const std::vector<ToeplitzSystem> &systems,
     ldlt_den += 1;
   }
 
-  print_result("double-double", n, 1, calls, t_zohar, t_qr, t_ldlt,
+  print_result("double-double", n, lanes, calls, t_zohar, t_qr, t_ldlt,
                std::sqrt((double)(z_num / (z_den + mp_quad("1e-300")))), 0.0,
                std::sqrt((double)(ldlt_num / ldlt_den)));
 }

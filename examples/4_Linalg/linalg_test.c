@@ -50,12 +50,6 @@ static VEC vec_splat(double value) {
   return v;
 }
 
-static dd_t dd_from_double(double value) {
-  return (dd_t){value, 0.0};
-}
-
-static dd_t dd_neg_local(dd_t value) { return dd_make(-value.hi, -value.lo); }
-
 static void print_result(const char *label, size_t n, size_t lanes,
                          size_t calls, double t_lev, double t_zoh,
                          double rel_diff) {
@@ -313,55 +307,65 @@ static benchmark_result benchmark_solvers(size_t d, size_t num_systems) {
   }
 
   {
-    size_t calls = solver_calls_for(num_systems, 1);
+    size_t calls = solver_calls_for(num_systems, VECDD_LEN);
 
-    dd_t *R_r = tls_alloc(n + 1, sizeof(*R_r), __alignof__(dd_t));
-    dd_t *R_i = tls_alloc(n + 1, sizeof(*R_i), __alignof__(dd_t));
-    dd_t *y_r = tls_alloc(n, sizeof(*y_r), __alignof__(dd_t));
-    dd_t *y_i = tls_alloc(n, sizeof(*y_i), __alignof__(dd_t));
-    dd_t *x_exact_r = tls_alloc(n, sizeof(*x_exact_r), __alignof__(dd_t));
-    dd_t *x_exact_i = tls_alloc(n, sizeof(*x_exact_i), __alignof__(dd_t));
-    dd_t *x_lev_r = tls_alloc(n, sizeof(*x_lev_r), __alignof__(dd_t));
-    dd_t *x_lev_i = tls_alloc(n, sizeof(*x_lev_i), __alignof__(dd_t));
-    dd_t *x_zoh_r = tls_alloc(n, sizeof(*x_zoh_r), __alignof__(dd_t));
-    dd_t *x_zoh_i = tls_alloc(n, sizeof(*x_zoh_i), __alignof__(dd_t));
-    dd_t *a_r = tls_alloc(n, sizeof(*a_r), __alignof__(dd_t));
-    dd_t *a_i = tls_alloc(n, sizeof(*a_i), __alignof__(dd_t));
-    dd_t *a_prev_r = tls_alloc(n, sizeof(*a_prev_r), __alignof__(dd_t));
-    dd_t *a_prev_i = tls_alloc(n, sizeof(*a_prev_i), __alignof__(dd_t));
-    dd_t *e_hat_r = tls_alloc(n, sizeof(*e_hat_r), __alignof__(dd_t));
-    dd_t *e_hat_i = tls_alloc(n, sizeof(*e_hat_i), __alignof__(dd_t));
-    dd_t *e_hat_prev_r = tls_alloc(n, sizeof(*e_hat_prev_r), __alignof__(dd_t));
-    dd_t *e_hat_prev_i = tls_alloc(n, sizeof(*e_hat_prev_i), __alignof__(dd_t));
+    VECDD *R_r = tls_alloc(n + 1, sizeof(*R_r), __alignof__(VECDD));
+    VECDD *R_i = tls_alloc(n + 1, sizeof(*R_i), __alignof__(VECDD));
+    VECDD *y_r = tls_alloc(n, sizeof(*y_r), __alignof__(VECDD));
+    VECDD *y_i = tls_alloc(n, sizeof(*y_i), __alignof__(VECDD));
+    VECDD *x_exact_r = tls_alloc(n, sizeof(*x_exact_r), __alignof__(VECDD));
+    VECDD *x_exact_i = tls_alloc(n, sizeof(*x_exact_i), __alignof__(VECDD));
+    VECDD *x_lev_r = tls_alloc(n, sizeof(*x_lev_r), __alignof__(VECDD));
+    VECDD *x_lev_i = tls_alloc(n, sizeof(*x_lev_i), __alignof__(VECDD));
+    VECDD *x_zoh_r = tls_alloc(n, sizeof(*x_zoh_r), __alignof__(VECDD));
+    VECDD *x_zoh_i = tls_alloc(n, sizeof(*x_zoh_i), __alignof__(VECDD));
+    VECDD *a_r = tls_alloc(n, sizeof(*a_r), __alignof__(VECDD));
+    VECDD *a_i = tls_alloc(n, sizeof(*a_i), __alignof__(VECDD));
+    VECDD *a_prev_r = tls_alloc(n, sizeof(*a_prev_r), __alignof__(VECDD));
+    VECDD *a_prev_i = tls_alloc(n, sizeof(*a_prev_i), __alignof__(VECDD));
+    VECDD *e_hat_r = tls_alloc(n, sizeof(*e_hat_r), __alignof__(VECDD));
+    VECDD *e_hat_i = tls_alloc(n, sizeof(*e_hat_i), __alignof__(VECDD));
+    VECDD *e_hat_prev_r = tls_alloc(n, sizeof(*e_hat_prev_r), __alignof__(VECDD));
+    VECDD *e_hat_prev_i = tls_alloc(n, sizeof(*e_hat_prev_i), __alignof__(VECDD));
 
-    R_r[0] = dd_from_double((double)n);
-    R_i[0] = dd_from_double(0.0);
+    R_r[0] = vecdd_splat_d((double)n);
+    R_i[0] = vecdd_splat_d(0.0);
     for (size_t k = 1; k <= n; k++) {
-      R_r[k] = dd_from_double(rand_signed_unit() * scale);
-      R_i[k] = dd_from_double(rand_signed_unit() * scale);
+      VECDD rr = vecdd_splat_d(0.0), ri = vecdd_splat_d(0.0);
+      for (int lane = 0; lane < VECDD_LEN; lane++) {
+        rr.hi[lane] = rand_signed_unit() * scale;
+        ri.hi[lane] = rand_signed_unit() * scale;
+      }
+      R_r[k] = rr;
+      R_i[k] = ri;
     }
 
     for (size_t i = 0; i < n; i++) {
-      x_exact_r[i] = dd_from_double(rand_signed_unit());
-      x_exact_i[i] = dd_from_double(rand_signed_unit());
+      VECDD xr = vecdd_splat_d(0.0), xi = vecdd_splat_d(0.0);
+      for (int lane = 0; lane < VECDD_LEN; lane++) {
+        xr.hi[lane] = rand_signed_unit();
+        xi.hi[lane] = rand_signed_unit();
+      }
+      x_exact_r[i] = xr;
+      x_exact_i[i] = xi;
     }
 
     for (size_t i = 0; i < n; i++) {
-      dd_t sr = dd_from_double(0.0);
-      dd_t si = dd_from_double(0.0);
+      VECDD sr = vecdd_splat_d(0.0);
+      VECDD si = vecdd_splat_d(0.0);
       for (size_t j = 0; j < n; j++) {
-        dd_t Hr, Hi;
+        VECDD Hr, Hi;
         if (i >= j) {
           Hr = R_r[i - j];
           Hi = R_i[i - j];
         } else {
           Hr = R_r[j - i];
-          Hi = dd_neg_local(R_i[j - i]);
+          Hi = vecdd_neg(R_i[j - i]);
         }
-        sr = dd_add(sr,
-                    dd_sub(dd_mul(Hr, x_exact_r[j]), dd_mul(Hi, x_exact_i[j])));
-        si = dd_add(si,
-                    dd_add(dd_mul(Hr, x_exact_i[j]), dd_mul(Hi, x_exact_r[j])));
+        sr = vecdd_add(
+            sr, vecdd_sub(vecdd_mul(Hr, x_exact_r[j]), vecdd_mul(Hi, x_exact_i[j])));
+        si = vecdd_add(
+            si, vecdd_add(vecdd_mul(Hr, x_exact_i[j]), vecdd_mul(Hi, x_exact_r[j])));
       }
       y_r[i] = sr;
       y_i[i] = si;
@@ -392,11 +396,14 @@ static benchmark_result benchmark_solvers(size_t d, size_t num_systems) {
     result.dd_levinson_faster = t_lev < t_zoh;
 
     double num = 0.0, den = 0.0;
-    double dr = dd_to_double(x_lev_r[0]) - dd_to_double(x_zoh_r[0]);
-    double lr = dd_to_double(x_lev_r[0]);
-    num += dr * dr;
-    den += lr * lr;
-    print_result("double-double", n, 1, calls, t_lev, t_zoh,
+    for (int lane = 0; lane < VECDD_LEN; lane++) {
+      double lev_v = x_lev_r[0].hi[lane] + x_lev_r[0].lo[lane];
+      double zoh_v = x_zoh_r[0].hi[lane] + x_zoh_r[0].lo[lane];
+      double dr = lev_v - zoh_v;
+      num += dr * dr;
+      den += lev_v * lev_v;
+    }
+    print_result("double-double", n, VECDD_LEN, calls, t_lev, t_zoh,
                  sqrt(num / (den + 1e-300)));
 
     free(R_r);

@@ -1,10 +1,9 @@
 /* =============================================================================
  * linalg.h  —  Public API for the precision-generic Toeplitz solvers.
  *
- * Declarations for all three precision variants produced by linalg.c. The
- * float and double variants take GCC vector-extension batches, solving one
- * independent system per SIMD lane. The double-double variant is scalar
- * because its INTERNAL_VEC_LEN is 1.
+ * Declarations for all three precision variants produced by linalg.c. All
+ * three variants take SIMD vector batches (VECF, VEC, VECDD), solving one
+ * independent system per SIMD lane.
  * =============================================================================
  */
 
@@ -31,7 +30,8 @@ TLS_API VECF tlsf_solve_ldlt(size_t n, const VECF *A, const VECF *b, VECF *x, VE
 /** Levinson-Durbin recursion, single precision vector batch.
  *  Solves the Hermitian Toeplitz system T x = y.
  *  Returns a lane-wise upper condition bound from the reflection coefficients.
- *  Workspace: a_r, a_i, a_prev_r, a_prev_i — caller-owned, each length n. */
+ *  Workspace: a_r, a_i — caller-owned, each length n; a_prev_r, a_prev_i are
+ *  unused (retained for API compatibility; may be NULL). */
 TLS_API VECF tlsf_solve_levinson(size_t n, const VECF *R_r, const VECF *R_i, const VECF *y_r, const VECF *y_i, VECF *x_r, VECF *x_i, VECF *a_r, VECF *a_i,
                                  VECF *a_prev_r, VECF *a_prev_i);
 
@@ -73,22 +73,21 @@ TLS_API VEC tls_solve_zohar(size_t n, const VEC *R_r, const VEC *R_i, const VEC 
 TLS_API VEC tls_solve_svd(size_t n, const VEC *A, const VEC *b, VEC *x, VEC *Q, VEC *S, VEC *D, VEC *y, VEC max_cond);
 
 /* =========================================================================
- * double-double  (tlsdd_)
+ * double-double  (tlsdd_, SIMD VECDD batches)
  * ========================================================================= */
 
-TLS_API dd_t tlsdd_solve_ldlt(size_t n, const dd_t *A, const dd_t *b, dd_t *x, dd_t *L, dd_t *D, dd_t *y, dd_t *z);
+TLS_API VECDD tlsdd_solve_ldlt(size_t n, const VECDD *A, const VECDD *b, VECDD *x, VECDD *L, VECDD *D, VECDD *y, VECDD *z);
 
-TLS_API dd_t tlsdd_solve_levinson(size_t n, const dd_t *R_r, const dd_t *R_i, const dd_t *y_r, const dd_t *y_i, dd_t *x_r, dd_t *x_i, dd_t *a_r, dd_t *a_i,
-                                  dd_t *a_prev_r, dd_t *a_prev_i);
+TLS_API VECDD tlsdd_solve_levinson(size_t n, const VECDD *R_r, const VECDD *R_i, const VECDD *y_r, const VECDD *y_i, VECDD *x_r, VECDD *x_i, VECDD *a_r,
+                                   VECDD *a_i, VECDD *a_prev_r, VECDD *a_prev_i);
 
-TLS_API dd_t tlsdd_solve_bareiss(size_t n, const dd_t *R_r, const dd_t *R_i, const dd_t *y_r, const dd_t *y_i, dd_t *x_r, dd_t *x_i, dd_t *U_r, dd_t *U_i,
-                                 dd_t *D, dd_t *u_r, dd_t *u_i, dd_t *v_r, dd_t *v_i, dd_t *w_r, dd_t *w_i);
+TLS_API VECDD tlsdd_solve_bareiss(size_t n, const VECDD *R_r, const VECDD *R_i, const VECDD *y_r, const VECDD *y_i, VECDD *x_r, VECDD *x_i, VECDD *U_r,
+                                  VECDD *U_i, VECDD *D, VECDD *u_r, VECDD *u_i, VECDD *v_r, VECDD *v_i, VECDD *w_r, VECDD *w_i);
 
-TLS_API dd_t tlsdd_solve_zohar(size_t n, const dd_t *R_r, const dd_t *R_i, const dd_t *y_r, const dd_t *y_i, dd_t *s_r, dd_t *s_i, dd_t *e_hat_r, dd_t *e_hat_i,
-                               dd_t *e_hat_prev_r, dd_t *e_hat_prev_i);
+TLS_API VECDD tlsdd_solve_zohar(size_t n, const VECDD *R_r, const VECDD *R_i, const VECDD *y_r, const VECDD *y_i, VECDD *s_r, VECDD *s_i, VECDD *e_hat_r,
+                                VECDD *e_hat_i, VECDD *e_hat_prev_r, VECDD *e_hat_prev_i);
 
-TLS_API dd_t tlsdd_solve_svd(size_t n, const dd_t *A, const dd_t *b, dd_t *x, dd_t *Q, dd_t *S, dd_t *D, dd_t *y, dd_t max_cond);
-
+TLS_API VECDD tlsdd_solve_svd(size_t n, const VECDD *A, const VECDD *b, VECDD *x, VECDD *Q, VECDD *S, VECDD *D, VECDD *y, VECDD max_cond);
 #ifdef __cplusplus
 }
 #endif

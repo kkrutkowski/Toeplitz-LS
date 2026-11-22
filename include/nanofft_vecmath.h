@@ -39,15 +39,41 @@
 #include <tls_platform.h>
 
 static inline VECF vecf_sqrt(VECF v) {
-    VECF r;
+#if defined(__SSE2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__)) && \
+    ((VEC_BYTES == 64 && defined(__AVX512F__)) || (VEC_BYTES == 32 && defined(__AVX__)) || VEC_BYTES == 16)
+#    if VEC_BYTES == 64
+    return (VECF)_mm512_sqrt_ps((__m512)v);
+#    elif VEC_BYTES == 32
+    return (VECF)_mm256_sqrt_ps((__m256)v);
+#    else
+    return (VECF)_mm_sqrt_ps((__m128)v);
+#    endif
+#elif defined(__aarch64__) && VEC_BYTES == 16
+    return (VECF)vsqrtq_f32((float32x4_t)v);
+#else
+    VECF r = {};
     for (int i = 0; i < VECF_LEN; i++) r[i] = sqrtf(v[i]);
     return r;
+#endif
 }
 
 static inline VEC vec_sqrt(VEC v) {
-    VEC r;
+#if defined(__SSE2__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__)) && \
+    ((VEC_BYTES == 64 && defined(__AVX512F__)) || (VEC_BYTES == 32 && defined(__AVX__)) || VEC_BYTES == 16)
+#    if VEC_BYTES == 64
+    return (VEC)_mm512_sqrt_pd((__m512d)v);
+#    elif VEC_BYTES == 32
+    return (VEC)_mm256_sqrt_pd((__m256d)v);
+#    else
+    return (VEC)_mm_sqrt_pd((__m128d)v);
+#    endif
+#elif defined(__aarch64__) && VEC_BYTES == 16
+    return (VEC)vsqrtq_f64((float64x2_t)v);
+#else
+    VEC r = {};
     for (int i = 0; i < VEC_LEN; i++) r[i] = sqrt(v[i]);
     return r;
+#endif
 }
 
 static inline VECF vecf_exp(VECF v) {

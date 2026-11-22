@@ -29,68 +29,57 @@
 #endif
 
 #if defined(DOUBLE_DOUBLE)
-#    define VCONST(x) FCONST(x)
-#    define VCAST(x) FCAST(x)
-static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return FCAST(sqrt(TO_DOUBLE(abs2))); }
+typedef VECDD LINALG_VEC;
+#    define LINALG_VEC_LEN VECDD_LEN
+#    define LADD(a, b) vecdd_add((a), (b))
+#    define LSUB(a, b) vecdd_sub((a), (b))
+#    define LMUL(a, b) vecdd_mul((a), (b))
+#    define LDIV(a, b) vecdd_div((a), (b))
+#    define LNEG(a) vecdd_neg((a))
+#    define LSQRT(a) vecdd_sqrt((a))
+#    define VCONST(x) vecdd_splat_d((double)(x))
+#    define VCAST(x) vecdd_splat_d((double)(x))
+static inline FLOAT TLS(lane_get)(LINALG_VEC value, int lane) { return dd_make(value.hi[lane], value.lo[lane]); }
+static inline void TLS(lane_set)(LINALG_VEC *value, int lane, FLOAT lane_value) {
+    value->hi[lane] = lane_value.hi;
+    value->lo[lane] = lane_value.lo;
+}
 #else
-static inline INTERNAL_VEC TLS(vec_splat)(FLOAT value) {
-    INTERNAL_VEC v;
-    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) v[lane] = value;
+typedef INTERNAL_VEC LINALG_VEC;
+#    define LINALG_VEC_LEN INTERNAL_VEC_LEN
+#    define LADD(a, b) ADD((a), (b))
+#    define LSUB(a, b) SUB((a), (b))
+#    define LMUL(a, b) MUL((a), (b))
+#    define LDIV(a, b) DIV((a), (b))
+#    define LNEG(a) NEG((a))
+#    define LSQRT(a) M_SQRT((a))
+static inline LINALG_VEC TLS(vec_splat)(FLOAT value) {
+    LINALG_VEC v;
+    for (int lane = 0; lane < LINALG_VEC_LEN; lane++) v[lane] = value;
     return v;
 }
 #    define VCONST(x) TLS(vec_splat)(FCONST(x))
 #    define VCAST(x) TLS(vec_splat)(FCAST(x))
-static inline INTERNAL_VEC TLS(reflection_abs)(INTERNAL_VEC abs2) { return M_SQRT(abs2); }
+static inline FLOAT TLS(lane_get)(LINALG_VEC value, int lane) { return value[lane]; }
+static inline void TLS(lane_set)(LINALG_VEC *value, int lane, FLOAT lane_value) { (*value)[lane] = lane_value; }
 #endif
 
-static inline INTERNAL_VEC TLS(reflection_condition_step)(INTERNAL_VEC abs2) {
-    INTERNAL_VEC abs_reflection = TLS(reflection_abs)(abs2);
-    return DIV(ADD(VCONST(1.0), abs_reflection), SUB(VCONST(1.0), abs_reflection));
-}
-
-static inline INTERNAL_VEC TLS(ldlt_diag_condition)(size_t n, const INTERNAL_VEC *restrict D) {
-#if defined(DOUBLE_DOUBLE)
-    INTERNAL_VEC dmin = D[0];
-    INTERNAL_VEC dmax = D[0];
-    for (size_t i = 1; i < n; i++) {
-        if (TO_DOUBLE(D[i]) < TO_DOUBLE(dmin)) dmin = D[i];
-        if (TO_DOUBLE(D[i]) > TO_DOUBLE(dmax)) dmax = D[i];
-    }
-    return DIV(dmax, dmin);
-#else
-    INTERNAL_VEC ratio;
-    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
-        FLOAT dmin = D[0][lane];
-        FLOAT dmax = D[0][lane];
+static inline LINALG_VEC TLS(ldlt_diag_condition)(size_t n, const LINALG_VEC *restrict D) {
+    LINALG_VEC ratio = VCONST(0.0);
+    for (int lane = 0; lane < LINALG_VEC_LEN; lane++) {
+        FLOAT dmin = TLS(lane_get)(D[0], lane);
+        FLOAT dmax = dmin;
         for (size_t i = 1; i < n; i++) {
-            FLOAT d = D[i][lane];
-            if (d < dmin) dmin = d;
-            if (d > dmax) dmax = d;
+            FLOAT d = TLS(lane_get)(D[i], lane);
+            if (TO_DOUBLE(d) < TO_DOUBLE(dmin)) dmin = d;
+            if (TO_DOUBLE(d) > TO_DOUBLE(dmax)) dmax = d;
         }
-        ratio[lane] = dmax / dmin;
+        TLS(lane_set)(&ratio, lane, DIV(dmax, dmin));
     }
     return ratio;
-#endif
 }
 
 static inline FLOAT TLS(scalar_abs)(FLOAT value) { return TO_DOUBLE(value) < 0.0 ? NEG(value) : value; }
-
-#if defined(DOUBLE_DOUBLE)
-static inline FLOAT TLS(lane_get)(INTERNAL_VEC value, int lane) {
-    (void)lane;
-    return value;
-}
-
-static inline void TLS(lane_set)(INTERNAL_VEC *value, int lane, FLOAT lane_value) {
-    (void)lane;
-    *value = lane_value;
-}
-#else
-static inline FLOAT TLS(lane_get)(INTERNAL_VEC value, int lane) { return value[lane]; }
-
-static inline void TLS(lane_set)(INTERNAL_VEC *value, int lane, FLOAT lane_value) { (*value)[lane] = lane_value; }
-#endif
-
 static inline double TLS(svd_tolerance)(void) {
 #if defined(DOUBLE_DOUBLE)
     return 1e-24;
@@ -124,48 +113,48 @@ static inline int TLS(svd_max_sweeps)(void) {
  *
  * Returns lane-wise Dmax/Dmin from the LDLT diagonal.
  * ========================================================================= */
-INTERNAL_VEC TLS(solve_ldlt)(size_t n, const INTERNAL_VEC *restrict A, const INTERNAL_VEC *restrict b, INTERNAL_VEC *restrict x, INTERNAL_VEC *restrict L,
-                             INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict y, INTERNAL_VEC *restrict z) {
+LINALG_VEC TLS(solve_ldlt)(size_t n, const LINALG_VEC *restrict A, const LINALG_VEC *restrict b, LINALG_VEC *restrict x, LINALG_VEC *restrict L,
+                           LINALG_VEC *restrict D, LINALG_VEC *restrict y, LINALG_VEC *restrict z) {
     for (size_t i = 0; i < n; i++) {
         size_t i_row_offset = i * n;
         for (size_t j = 0; j < i; j++) {
             size_t j_row_offset = j * n;
-            INTERNAL_VEC sum = VCONST(0.0);
+            LINALG_VEC sum = VCONST(0.0);
             for (size_t k = 0; k < j; k++) {
-                sum = ADD(sum, MUL(MUL(L[i_row_offset + k], L[j_row_offset + k]), D[k]));
+                sum = LADD(sum, LMUL(LMUL(L[i_row_offset + k], L[j_row_offset + k]), D[k]));
             }
-            L[i_row_offset + j] = DIV(SUB(A[i_row_offset + j], sum), D[j]);
+            L[i_row_offset + j] = LDIV(LSUB(A[i_row_offset + j], sum), D[j]);
         }
 
-        INTERNAL_VEC sum2 = VCONST(0.0);
+        LINALG_VEC sum2 = VCONST(0.0);
         for (size_t k = 0; k < i; k++) {
-            sum2 = ADD(sum2, MUL(MUL(L[i_row_offset + k], L[i_row_offset + k]), D[k]));
+            sum2 = LADD(sum2, LMUL(LMUL(L[i_row_offset + k], L[i_row_offset + k]), D[k]));
         }
-        D[i] = SUB(A[i_row_offset + i], sum2);
+        D[i] = LSUB(A[i_row_offset + i], sum2);
         L[i_row_offset + i] = VCONST(1.0);
     }
 
-    INTERNAL_VEC condition = TLS(ldlt_diag_condition)(n, D);
+    LINALG_VEC condition = TLS(ldlt_diag_condition)(n, D);
 
     for (size_t i = 0; i < n; i++) {
         size_t row_offset = i * n;
-        INTERNAL_VEC sum = VCONST(0.0);
+        LINALG_VEC sum = VCONST(0.0);
         for (size_t j = 0; j < i; j++) {
-            sum = ADD(sum, MUL(L[row_offset + j], y[j]));
+            sum = LADD(sum, LMUL(L[row_offset + j], y[j]));
         }
-        y[i] = SUB(b[i], sum);
+        y[i] = LSUB(b[i], sum);
     }
 
     for (size_t i = 0; i < n; i++) {
-        z[i] = DIV(y[i], D[i]);
+        z[i] = LDIV(y[i], D[i]);
     }
 
     for (size_t i = n; i-- > 0;) {
-        INTERNAL_VEC sum = VCONST(0.0);
+        LINALG_VEC sum = VCONST(0.0);
         for (size_t j = i + 1; j < n; j++) {
-            sum = ADD(sum, MUL(L[j * n + i], x[j]));
+            sum = LADD(sum, LMUL(L[j * n + i], x[j]));
         }
-        x[i] = SUB(z[i], sum);
+        x[i] = LSUB(z[i], sum);
     }
 
     return condition;
@@ -191,8 +180,8 @@ INTERNAL_VEC TLS(solve_ldlt)(size_t n, const INTERNAL_VEC *restrict A, const INT
  * condition indicates that the Jacobi sweeps did not fully converge for that
  * lane within the precision-specific sweep limit.
  * ========================================================================= */
-INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTERNAL_VEC *restrict b, INTERNAL_VEC *restrict x, INTERNAL_VEC *restrict Q,
-                            INTERNAL_VEC *restrict S, INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict y, INTERNAL_VEC max_cond) {
+LINALG_VEC TLS(solve_svd)(size_t n, const LINALG_VEC *restrict A, const LINALG_VEC *restrict b, LINALG_VEC *restrict x, LINALG_VEC *restrict Q,
+                          LINALG_VEC *restrict S, LINALG_VEC *restrict D, LINALG_VEC *restrict y, LINALG_VEC max_cond) {
     for (size_t i = 0; i < n * n; i++) {
         S[i] = A[i];
         Q[i] = VCONST(0.0);
@@ -212,7 +201,7 @@ INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTE
                 size_t qq = q * n + q;
                 size_t pq = p * n + q;
 
-                for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+                for (int lane = 0; lane < LINALG_VEC_LEN; lane++) {
                     FLOAT app = TLS(lane_get)(S[pp], lane);
                     FLOAT aqq = TLS(lane_get)(S[qq], lane);
                     FLOAT apq = TLS(lane_get)(S[pq], lane);
@@ -276,15 +265,15 @@ INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTE
         if (all_converged) break;
     }
 
-    int lane_converged[INTERNAL_VEC_LEN];
-    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) lane_converged[lane] = 1;
+    int lane_converged[LINALG_VEC_LEN];
+    for (int lane = 0; lane < LINALG_VEC_LEN; lane++) lane_converged[lane] = 1;
 
     for (size_t p = 0; p < n; p++) {
         for (size_t q = p + 1; q < n; q++) {
             size_t pp = p * n + p;
             size_t qq = q * n + q;
             size_t pq = p * n + q;
-            for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+            for (int lane = 0; lane < LINALG_VEC_LEN; lane++) {
                 FLOAT app = TLS(lane_get)(S[pp], lane);
                 FLOAT aqq = TLS(lane_get)(S[qq], lane);
                 FLOAT apq = TLS(lane_get)(S[pq], lane);
@@ -295,9 +284,9 @@ INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTE
         }
     }
 
-    INTERNAL_VEC condition = VCONST(0.0);
+    LINALG_VEC condition = VCONST(0.0);
 
-    for (int lane = 0; lane < INTERNAL_VEC_LEN; lane++) {
+    for (int lane = 0; lane < LINALG_VEC_LEN; lane++) {
         FLOAT max_abs = FCAST(0.0);
         FLOAT min_abs = FCAST(0.0);
         FLOAT max_positive = FCAST(0.0);
@@ -358,93 +347,133 @@ INTERNAL_VEC TLS(solve_svd)(size_t n, const INTERNAL_VEC *restrict A, const INTE
 /* =========================================================================
  * tlsf/tls/tlsdd_solve_levinson
  *
- * Levinson-Durbin recursion for INTERNAL_VEC_LEN independent complex
- * Hermitian Toeplitz systems T x = y. Each array element is one vector of
- * lane-wise systems:
+ * Fused in-place Levinson-Durbin recursion for LINALG_VEC_LEN independent
+ * complex Hermitian Toeplitz systems T x = y (quadratic form r2 = y^H T^-1 y):
  *   T_{ij} = R[|i-j|], R[0] real and positive, R[-k] = conj(R[k]).
  *
  * In / out
  *   R_r, R_i    Toeplitz row, length n
  *   y_r, y_i    right-hand side, length n
- *   x_r, x_i    solution, length n  (written on exit)
- *   return      lane-wise product Π (1 + |gamma_j|) / (1 - |gamma_j|)
+ *   x_r, x_i    x_r[0] = y^H T^-1 y, x_i[0] = 0
+ *   return      lane-wise product n * Π (1 + |gamma_j|) / (1 - |gamma_j|)
  *
- * Workspace (caller-allocated, length n each)
- *   a_r, a_i          predictor polynomial
- *   a_prev_r, a_prev_i  copy from the previous order
+ * Workspace (caller-allocated)
+ *   a_r, a_i            predictor polynomial, length n each
+ *   a_prev_r, a_prev_i  unused (retained for API compatibility; may be NULL)
  * ========================================================================= */
-INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, const INTERNAL_VEC *restrict R_i, const INTERNAL_VEC *restrict y_r,
-                                 const INTERNAL_VEC *restrict y_i, INTERNAL_VEC *restrict x_r, INTERNAL_VEC *restrict x_i, INTERNAL_VEC *restrict a_r,
-                                 INTERNAL_VEC *restrict a_i, INTERNAL_VEC *restrict a_prev_r, INTERNAL_VEC *restrict a_prev_i) {
-    INTERNAL_VEC E = R_r[0];
-    INTERNAL_VEC cond_bound = VCAST((double)n);
+LINALG_VEC TLS(solve_levinson)(size_t n, const LINALG_VEC *restrict R_r, const LINALG_VEC *restrict R_i, const LINALG_VEC *restrict y_r,
+                               const LINALG_VEC *restrict y_i, LINALG_VEC *restrict x_r, LINALG_VEC *restrict x_i, LINALG_VEC *restrict a_r,
+                               LINALG_VEC *restrict a_i, LINALG_VEC *restrict a_prev_r, LINALG_VEC *restrict a_prev_i) {
+    (void)a_prev_r;
+    (void)a_prev_i;
 
-    INTERNAL_VEC inv_E = DIV(VCONST(1.0), E);
-    INTERNAL_VEC r2 = MUL(ADD(MUL(y_r[0], y_r[0]), MUL(y_i[0], y_i[0])), inv_E);
+    const LINALG_VEC one = VCONST(1.0);
+    const LINALG_VEC zero = VCONST(0.0);
+    LINALG_VEC E = R_r[0];
+    LINALG_VEC inv_E = LDIV(one, E);
+    LINALG_VEC r2 = LMUL(LADD(LMUL(y_r[0], y_r[0]), LMUL(y_i[0], y_i[0])), inv_E);
+    LINALG_VEC cond_num = VCAST((double)n);
+    LINALG_VEC cond_den = one;
 
-    /* a[0] is the leading (unit) coefficient, never modified. */
-    a_r[0] = VCONST(1.0);
-    a_i[0] = VCONST(0.0);
+    a_r[0] = one;
+    a_i[0] = zero;
 
     for (size_t k = 1; k < n; k++) {
-        /* ----- reflection coefficient: lambda = sum_{i=0}^{k-1} R[k-i] a[i] */
-        INTERNAL_VEC lambda_r = VCONST(0.0);
-        INTERNAL_VEC lambda_i = VCONST(0.0);
+        /* 4-way unrolled reflection inner product: lambda = sum_{i=0}^{k-1} R[k-i] a[i] */
+        LINALG_VEC lr0 = R_r[k], li0 = R_i[k]; /* i = 0: a[0] == 1 + 0i */
+        LINALG_VEC lr1 = zero, li1 = zero;
+        LINALG_VEC lr2 = zero, li2 = zero;
+        LINALG_VEC lr3 = zero, li3 = zero;
+        size_t i = 1;
+        for (; i + 3 < k; i += 4) {
+            LINALG_VEC r0r = R_r[k - i], r0i = R_i[k - i], a0r = a_r[i], a0i = a_i[i];
+            lr0 = LADD(lr0, LSUB(LMUL(r0r, a0r), LMUL(r0i, a0i)));
+            li0 = LADD(li0, LADD(LMUL(r0r, a0i), LMUL(r0i, a0r)));
 
-        for (size_t i = 0; i < k; i++) {
-            INTERNAL_VEC rr = R_r[k - i], ri = R_i[k - i];
-            INTERNAL_VEC ar = a_r[i], ai = a_i[i];
-            lambda_r = ADD(lambda_r, SUB(MUL(rr, ar), MUL(ri, ai)));
-            lambda_i = ADD(lambda_i, ADD(MUL(rr, ai), MUL(ri, ar)));
+            LINALG_VEC r1r = R_r[k - i - 1], r1i = R_i[k - i - 1], a1r = a_r[i + 1], a1i = a_i[i + 1];
+            lr1 = LADD(lr1, LSUB(LMUL(r1r, a1r), LMUL(r1i, a1i)));
+            li1 = LADD(li1, LADD(LMUL(r1r, a1i), LMUL(r1i, a1r)));
+
+            LINALG_VEC r2r = R_r[k - i - 2], r2i = R_i[k - i - 2], a2r = a_r[i + 2], a2i = a_i[i + 2];
+            lr2 = LADD(lr2, LSUB(LMUL(r2r, a2r), LMUL(r2i, a2i)));
+            li2 = LADD(li2, LADD(LMUL(r2r, a2i), LMUL(r2i, a2r)));
+
+            LINALG_VEC r3r = R_r[k - i - 3], r3i = R_i[k - i - 3], a3r = a_r[i + 3], a3i = a_i[i + 3];
+            lr3 = LADD(lr3, LSUB(LMUL(r3r, a3r), LMUL(r3i, a3i)));
+            li3 = LADD(li3, LADD(LMUL(r3r, a3i), LMUL(r3i, a3r)));
+        }
+        for (; i < k; i++) {
+            LINALG_VEC rr = R_r[k - i], ri = R_i[k - i], ar = a_r[i], ai = a_i[i];
+            lr0 = LADD(lr0, LSUB(LMUL(rr, ar), LMUL(ri, ai)));
+            li0 = LADD(li0, LADD(LMUL(rr, ai), LMUL(ri, ar)));
+        }
+        LINALG_VEC lambda_r = LADD(LADD(lr0, lr1), LADD(lr2, lr3));
+        LINALG_VEC lambda_i = LADD(LADD(li0, li1), LADD(li2, li3));
+
+        LINALG_VEC gamma_r = LNEG(LMUL(lambda_r, inv_E));
+        LINALG_VEC gamma_i = LNEG(LMUL(lambda_i, inv_E));
+
+        /* Start inv_E = 1 / E and sqrt(|gamma|^2) before the fused update + xi loop
+         * so both overlap with the O(k) FMA work; defer cond division to the end. */
+        LINALG_VEC abs2_gamma = LADD(LMUL(gamma_r, gamma_r), LMUL(gamma_i, gamma_i));
+        LINALG_VEC abs_gamma = LSQRT(abs2_gamma);
+        E = LMUL(E, LSUB(one, abs2_gamma));
+        inv_E = LDIV(one, E);
+
+        /* a[k] = gamma (since a[0] == 1 + 0i); initialize xi with i=0 and i=k terms. */
+        a_r[k] = gamma_r;
+        a_i[k] = gamma_i;
+        LINALG_VEC xr0 = LADD(y_r[k], LSUB(LMUL(gamma_r, y_r[0]), LMUL(gamma_i, y_i[0])));
+        LINALG_VEC xi0 = LADD(y_i[k], LADD(LMUL(gamma_r, y_i[0]), LMUL(gamma_i, y_r[0])));
+        LINALG_VEC xr1 = zero, xi1 = zero;
+
+        /* Paired in-place symmetric update of (a[lo], a[hi]) fused with xi accumulation. */
+        size_t lo = 1, hi = k - 1;
+        for (; lo < hi; ++lo, --hi) {
+            LINALG_VEC alr = a_r[lo], ali = a_i[lo];
+            LINALG_VEC ahr = a_r[hi], ahi = a_i[hi];
+
+            LINALG_VEC nlr = LADD(alr, LADD(LMUL(gamma_r, ahr), LMUL(gamma_i, ahi)));
+            LINALG_VEC nli = LADD(ali, LSUB(LMUL(gamma_i, ahr), LMUL(gamma_r, ahi)));
+            LINALG_VEC nhr = LADD(ahr, LADD(LMUL(gamma_r, alr), LMUL(gamma_i, ali)));
+            LINALG_VEC nhi = LADD(ahi, LSUB(LMUL(gamma_i, alr), LMUL(gamma_r, ali)));
+
+            a_r[lo] = nlr;
+            a_i[lo] = nli;
+            a_r[hi] = nhr;
+            a_i[hi] = nhi;
+
+            LINALG_VEC yhr = y_r[hi], yhi = y_i[hi];
+            LINALG_VEC ylr = y_r[lo], yli = y_i[lo];
+            xr0 = LADD(xr0, LSUB(LMUL(nlr, yhr), LMUL(nli, yhi)));
+            xi0 = LADD(xi0, LADD(LMUL(nlr, yhi), LMUL(nli, yhr)));
+            xr1 = LADD(xr1, LSUB(LMUL(nhr, ylr), LMUL(nhi, yli)));
+            xi1 = LADD(xi1, LADD(LMUL(nhr, yli), LMUL(nhi, ylr)));
+        }
+        if (lo == hi) {
+            LINALG_VEC alr = a_r[lo], ali = a_i[lo];
+            LINALG_VEC nlr = LADD(alr, LADD(LMUL(gamma_r, alr), LMUL(gamma_i, ali)));
+            LINALG_VEC nli = LADD(ali, LSUB(LMUL(gamma_i, alr), LMUL(gamma_r, ali)));
+            a_r[lo] = nlr;
+            a_i[lo] = nli;
+
+            LINALG_VEC ylr = y_r[lo], yli = y_i[lo];
+            xr0 = LADD(xr0, LSUB(LMUL(nlr, ylr), LMUL(nli, yli)));
+            xi0 = LADD(xi0, LADD(LMUL(nlr, yli), LMUL(nli, ylr)));
         }
 
-        INTERNAL_VEC gamma_r = NEG(MUL(lambda_r, inv_E));
-        INTERNAL_VEC gamma_i = NEG(MUL(lambda_i, inv_E));
+        cond_num = LMUL(cond_num, LADD(one, abs_gamma));
+        cond_den = LMUL(cond_den, LSUB(one, abs_gamma));
 
-        /* ----- snapshot current predictor before order-update */
-        for (size_t i = 0; i < k; i++) {
-            a_prev_r[i] = a_r[i];
-            a_prev_i[i] = a_i[i];
-        }
-
-        /* ----- a[k] = gamma * conj(a_prev[0]) */
-        INTERNAL_VEC ap0_r = a_prev_r[0];
-        INTERNAL_VEC ap0_i = NEG(a_prev_i[0]);
-        a_r[k] = SUB(MUL(gamma_r, ap0_r), MUL(gamma_i, ap0_i));
-        a_i[k] = ADD(MUL(gamma_r, ap0_i), MUL(gamma_i, ap0_r));
-
-        /* ----- a[i] += gamma * conj(a_prev[k-i]),  i = 1 … k-1 */
-        for (size_t i = 1; i < k; i++) {
-            INTERNAL_VEC ap_r = a_prev_r[k - i];
-            INTERNAL_VEC ap_i = NEG(a_prev_i[k - i]);
-            INTERNAL_VEC tr = SUB(MUL(gamma_r, ap_r), MUL(gamma_i, ap_i));
-            INTERNAL_VEC ti = ADD(MUL(gamma_r, ap_i), MUL(gamma_i, ap_r));
-            a_r[i] = ADD(a_prev_r[i], tr);
-            a_i[i] = ADD(a_prev_i[i], ti);
-        }
-
-        /* ----- error energy: E *= (1 - |gamma|^2) */
-        INTERNAL_VEC abs2_gamma = ADD(MUL(gamma_r, gamma_r), MUL(gamma_i, gamma_i));
-        cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_gamma));
-        E = MUL(E, SUB(VCONST(1.0), abs2_gamma));
-        inv_E = DIV(VCONST(1.0), E);
-
-        /* ----- Forward R^2 inner product: xi_k = sum_{i=0}^k a[i] * y[k-i] */
-        INTERNAL_VEC xi_r = y_r[k];
-        INTERNAL_VEC xi_i = y_i[k];
-        for (size_t i = 1; i <= k; i++) {
-            INTERNAL_VEC ar = a_r[i], ai = a_i[i];
-            INTERNAL_VEC yr = y_r[k - i], yi = y_i[k - i];
-            xi_r = ADD(xi_r, SUB(MUL(ar, yr), MUL(ai, yi)));
-            xi_i = ADD(xi_i, ADD(MUL(ar, yi), MUL(ai, yr)));
-        }
-        INTERNAL_VEC abs2_xi = ADD(MUL(xi_r, xi_r), MUL(xi_i, xi_i));
-        r2 = ADD(r2, MUL(abs2_xi, inv_E));
+        LINALG_VEC xr = LADD(xr0, xr1);
+        LINALG_VEC xi = LADD(xi0, xi1);
+        LINALG_VEC abs2_xi = LADD(LMUL(xr, xr), LMUL(xi, xi));
+        r2 = LADD(r2, LMUL(abs2_xi, inv_E));
     }
 
     x_r[0] = r2;
-    x_i[0] = VCONST(0.0);
-    return cond_bound;
+    x_i[0] = zero;
+    return LDIV(cond_num, cond_den);
 }
 
 /* =========================================================================
@@ -455,18 +484,21 @@ INTERNAL_VEC TLS(solve_levinson)(size_t n, const INTERNAL_VEC *restrict R_r, con
  *
  * Workspace (caller-allocated)
  *   U_r, U_i            upper triangular factor, length n*n each
- *   D                   real diagonal, length n
+ *   D                   real inverse diagonal scratch, length n
  *   u_r, u_i, v_r, v_i  Bareiss generators, length n each
  *   w_r, w_i            substitution workspace, length n each
  *
  * Returns the same lane-wise reflection-coefficient condition bound used by
  * solve_levinson.
  * ========================================================================= */
-INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, const INTERNAL_VEC *restrict R_i, const INTERNAL_VEC *restrict y_r,
-                                const INTERNAL_VEC *restrict y_i, INTERNAL_VEC *restrict x_r, INTERNAL_VEC *restrict x_i, INTERNAL_VEC *restrict U_r,
-                                INTERNAL_VEC *restrict U_i, INTERNAL_VEC *restrict D, INTERNAL_VEC *restrict u_r, INTERNAL_VEC *restrict u_i,
-                                INTERNAL_VEC *restrict v_r, INTERNAL_VEC *restrict v_i, INTERNAL_VEC *restrict w_r, INTERNAL_VEC *restrict w_i) {
-    INTERNAL_VEC cond_bound = VCAST((double)n);
+LINALG_VEC TLS(solve_bareiss)(size_t n, const LINALG_VEC *restrict R_r, const LINALG_VEC *restrict R_i, const LINALG_VEC *restrict y_r,
+                              const LINALG_VEC *restrict y_i, LINALG_VEC *restrict x_r, LINALG_VEC *restrict x_i, LINALG_VEC *restrict U_r,
+                              LINALG_VEC *restrict U_i, LINALG_VEC *restrict D, LINALG_VEC *restrict u_r, LINALG_VEC *restrict u_i, LINALG_VEC *restrict v_r,
+                              LINALG_VEC *restrict v_i, LINALG_VEC *restrict w_r, LINALG_VEC *restrict w_i) {
+    const LINALG_VEC one = VCONST(1.0);
+    const LINALG_VEC zero = VCONST(0.0);
+    LINALG_VEC cond_num = VCAST((double)n);
+    LINALG_VEC cond_den = one;
 
     for (size_t j = 0; j < n; j++) {
         u_r[j] = R_r[j];
@@ -475,13 +507,16 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
             v_r[j] = R_r[j + 1];
             v_i[j] = R_i[j + 1];
         } else {
-            v_r[j] = VCONST(0.0);
-            v_i[j] = VCONST(0.0);
+            v_r[j] = zero;
+            v_i[j] = zero;
         }
     }
 
     for (size_t k = 0; k < n; k++) {
-        D[k] = u_r[0];
+        /* Save 1 / D[k] directly in D[k] so forward substitution avoids a second
+         * pass of n divisions. */
+        LINALG_VEC inv_D = LDIV(one, u_r[0]);
+        D[k] = inv_D;
 
         size_t row_offset = k * n + k;
         for (size_t j = 0; j < n - k; j++) {
@@ -491,33 +526,31 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
 
         if (k == n - 1) break;
 
-        INTERNAL_VEC inv_D = DIV(VCONST(1.0), D[k]);
-        INTERNAL_VEC rho_r = MUL(v_r[0], inv_D);
-        INTERNAL_VEC rho_i = MUL(v_i[0], inv_D);
-        INTERNAL_VEC abs2_rho = ADD(MUL(rho_r, rho_r), MUL(rho_i, rho_i));
-        cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_rho));
+        LINALG_VEC rho_r = LMUL(v_r[0], inv_D);
+        LINALG_VEC rho_i = LMUL(v_i[0], inv_D);
+        LINALG_VEC abs2_rho = LADD(LMUL(rho_r, rho_r), LMUL(rho_i, rho_i));
+        LINALG_VEC abs_rho = LSQRT(abs2_rho);
 
         for (size_t j = 0; j < n - k - 1; j++) {
-            INTERNAL_VEC uj_r = u_r[j];
-            INTERNAL_VEC uj_i = u_i[j];
-            INTERNAL_VEC vj_r = v_r[j];
-            INTERNAL_VEC vj_i = v_i[j];
+            LINALG_VEC uj_r = u_r[j];
+            LINALG_VEC uj_i = u_i[j];
+            LINALG_VEC vj_r = v_r[j];
+            LINALG_VEC vj_i = v_i[j];
 
-            INTERNAL_VEC up1_r = u_r[j + 1];
-            INTERNAL_VEC up1_i = u_i[j + 1];
-            INTERNAL_VEC vp1_r = v_r[j + 1];
-            INTERNAL_VEC vp1_i = v_i[j + 1];
+            LINALG_VEC up1_r = u_r[j + 1];
+            LINALG_VEC up1_i = u_i[j + 1];
+            LINALG_VEC vp1_r = v_r[j + 1];
+            LINALG_VEC vp1_i = v_i[j + 1];
 
-            u_r[j] = SUB(uj_r, ADD(MUL(rho_r, vj_r), MUL(rho_i, vj_i)));
-            u_i[j] = SUB(uj_i, SUB(MUL(rho_r, vj_i), MUL(rho_i, vj_r)));
+            u_r[j] = LSUB(uj_r, LADD(LMUL(rho_r, vj_r), LMUL(rho_i, vj_i)));
+            u_i[j] = LSUB(uj_i, LSUB(LMUL(rho_r, vj_i), LMUL(rho_i, vj_r)));
 
-            v_r[j] = SUB(vp1_r, SUB(MUL(rho_r, up1_r), MUL(rho_i, up1_i)));
-            v_i[j] = SUB(vp1_i, ADD(MUL(rho_r, up1_i), MUL(rho_i, up1_r)));
+            v_r[j] = LSUB(vp1_r, LSUB(LMUL(rho_r, up1_r), LMUL(rho_i, up1_i)));
+            v_i[j] = LSUB(vp1_i, LADD(LMUL(rho_r, up1_i), LMUL(rho_i, up1_r)));
         }
-    }
 
-    for (size_t k = 0; k < n; k++) {
-        v_r[k] = DIV(VCONST(1.0), D[k]);
+        cond_num = LMUL(cond_num, LADD(one, abs_rho));
+        cond_den = LMUL(cond_den, LSUB(one, abs_rho));
     }
 
     for (size_t i = 0; i < n; i++) {
@@ -525,33 +558,29 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
         w_i[i] = y_i[i];
     }
 
+    /* Forward substitution fused with quadratic-form accumulation:
+     *   |w_raw|^2 / D_j = Re(w_raw * conj(w_raw / D_j)). */
+    LINALG_VEC r2 = zero;
     for (size_t j = 0; j < n; j++) {
-        w_r[j] = MUL(w_r[j], v_r[j]);
-        w_i[j] = MUL(w_i[j], v_r[j]);
+        LINALG_VEC wraw_r = w_r[j];
+        LINALG_VEC wraw_i = w_i[j];
+        LINALG_VEC wj_r = LMUL(wraw_r, D[j]);
+        LINALG_VEC wj_i = LMUL(wraw_i, D[j]);
+        r2 = LADD(r2, LADD(LMUL(wraw_r, wj_r), LMUL(wraw_i, wj_i)));
 
-        INTERNAL_VEC wj_r = w_r[j];
-        INTERNAL_VEC wj_i = w_i[j];
         size_t row_offset = j * n;
-
         for (size_t i = j + 1; i < n; i++) {
-            INTERNAL_VEC Uji_r = U_r[row_offset + i];
-            INTERNAL_VEC Uji_i = U_i[row_offset + i];
+            LINALG_VEC Uji_r = U_r[row_offset + i];
+            LINALG_VEC Uji_i = U_i[row_offset + i];
 
-            w_r[i] = SUB(w_r[i], SUB(MUL(Uji_r, wj_r), MUL(Uji_i, wj_i)));
-            w_i[i] = SUB(w_i[i], ADD(MUL(Uji_r, wj_i), MUL(Uji_i, wj_r)));
+            w_r[i] = LSUB(w_r[i], LSUB(LMUL(Uji_r, wj_r), LMUL(Uji_i, wj_i)));
+            w_i[i] = LSUB(w_i[i], LADD(LMUL(Uji_r, wj_i), LMUL(Uji_i, wj_r)));
         }
     }
 
-    /* Backwards substitution omitted: compute quadratic form R^2 forward-only */
-    INTERNAL_VEC r2 = VCONST(0.0);
-    for (size_t k = 0; k < n; k++) {
-        INTERNAL_VEC w2 = ADD(MUL(w_r[k], w_r[k]), MUL(w_i[k], w_i[k]));
-        r2 = ADD(r2, MUL(w2, D[k]));
-    }
     x_r[0] = r2;
-    x_i[0] = VCONST(0.0);
-
-    return cond_bound;
+    x_i[0] = zero;
+    return LDIV(cond_num, cond_den);
 }
 
 /* =========================================================================
@@ -561,125 +590,137 @@ INTERNAL_VEC TLS(solve_bareiss)(size_t n, const INTERNAL_VEC *restrict R_r, cons
  * Same system definition as solve_levinson above.
  *
  * Workspace (caller-allocated, length n each)
- *   e_hat_r, e_hat_i          backwards predictor
- *   e_hat_prev_r, e_hat_prev_i  snapshot from the previous order
+ *   e_hat_r, e_hat_i            backwards predictor (ping-ponged with prev)
+ *   e_hat_prev_r, e_hat_prev_i  alternate buffer (no per-step copy)
  *
  * Returns the same lane-wise reflection-coefficient condition bound used by
  * solve_levinson, deriving |rho| from Zohar's lambda recurrence.
- *
- * Note: the loop accesses R[i+1] for i up to n-1, so the caller must ensure
- * R is allocated with at least n+1 slots (or accept the final iteration reads
- * one past the last defined element, as in the original code).
  * ========================================================================= */
-INTERNAL_VEC TLS(solve_zohar)(size_t n, const INTERNAL_VEC *restrict R_r, const INTERNAL_VEC *restrict R_i, const INTERNAL_VEC *restrict y_r,
-                              const INTERNAL_VEC *restrict y_i, INTERNAL_VEC *restrict s_r, INTERNAL_VEC *restrict s_i, INTERNAL_VEC *restrict e_hat_r,
-                              INTERNAL_VEC *restrict e_hat_i, INTERNAL_VEC *restrict e_hat_prev_r, INTERNAL_VEC *restrict e_hat_prev_i) {
-    INTERNAL_VEC inv_R0 = DIV(VCONST(1.0), R_r[0]);
+LINALG_VEC TLS(solve_zohar)(size_t n, const LINALG_VEC *restrict R_r, const LINALG_VEC *restrict R_i, const LINALG_VEC *restrict y_r,
+                            const LINALG_VEC *restrict y_i, LINALG_VEC *restrict s_r, LINALG_VEC *restrict s_i, LINALG_VEC *restrict e_hat_r,
+                            LINALG_VEC *restrict e_hat_i, LINALG_VEC *restrict e_hat_prev_r, LINALG_VEC *restrict e_hat_prev_i) {
+    const LINALG_VEC one = VCONST(1.0);
+    const LINALG_VEC zero = VCONST(0.0);
+    LINALG_VEC inv_R0 = LDIV(one, R_r[0]);
 
-    s_r[0] = MUL(y_r[0], inv_R0);
-    s_i[0] = MUL(y_i[0], inv_R0);
+    s_r[0] = LMUL(y_r[0], inv_R0);
+    s_i[0] = LMUL(y_i[0], inv_R0);
+
+    LINALG_VEC cond_num = VCAST((double)n);
+    LINALG_VEC cond_den = one;
+
+    if (n <= 1) {
+        s_r[0] = LADD(LMUL(y_r[0], s_r[0]), LMUL(y_i[0], s_i[0]));
+        s_i[0] = zero;
+        return cond_num;
+    }
 
     /* rho_{-1} = conj(R[1]) / R[0] */
-    INTERNAL_VEC rho_m1_r = MUL(R_r[1], inv_R0);
-    INTERNAL_VEC rho_m1_i = NEG(MUL(R_i[1], inv_R0));
+    LINALG_VEC rho_m1_r = LMUL(R_r[1], inv_R0);
+    LINALG_VEC rho_m1_i = LNEG(LMUL(R_i[1], inv_R0));
 
-    e_hat_r[0] = NEG(rho_m1_r);
-    e_hat_i[0] = NEG(rho_m1_i);
+    LINALG_VEC *cur_r = e_hat_r;
+    LINALG_VEC *cur_i = e_hat_i;
+    LINALG_VEC *prev_r = e_hat_prev_r;
+    LINALG_VEC *prev_i = e_hat_prev_i;
+
+    cur_r[0] = LNEG(rho_m1_r);
+    cur_i[0] = LNEG(rho_m1_i);
 
     /* lambda = 1 - |rho_{-1}|^2 */
-    INTERNAL_VEC abs2_rho_m1 = ADD(MUL(rho_m1_r, rho_m1_r), MUL(rho_m1_i, rho_m1_i));
-    INTERNAL_VEC lambda = SUB(VCONST(1.0), abs2_rho_m1);
-    INTERNAL_VEC cond_bound = VCAST((double)n);
-    if (n > 1) cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_rho_m1));
+    LINALG_VEC abs2_rho_m1 = LADD(LMUL(rho_m1_r, rho_m1_r), LMUL(rho_m1_i, rho_m1_i));
+    LINALG_VEC abs_rho_m1 = LSQRT(abs2_rho_m1);
+    cond_num = LMUL(cond_num, LADD(one, abs_rho_m1));
+    cond_den = LMUL(cond_den, LSUB(one, abs_rho_m1));
+    LINALG_VEC lambda = LSUB(one, abs2_rho_m1);
 
     for (size_t i = 1; i < n; i++) {
-        /* ----- snapshot backwards predictor */
-        for (size_t k = 0; k < i; k++) {
-            e_hat_prev_r[k] = e_hat_r[k];
-            e_hat_prev_i[k] = e_hat_i[k];
-        }
+        /* Ping-pong predictor buffers: previous order is now in prev_r/prev_i. */
+        LINALG_VEC *tmp_r = prev_r;
+        LINALG_VEC *tmp_i = prev_i;
+        prev_r = cur_r;
+        prev_i = cur_i;
+        cur_r = tmp_r;
+        cur_i = tmp_i;
 
-        /* ----- theta = (y[i] - sum_{k<i} rho_{i-k} s[k]) / R[0]
-         *        where rho_{j} = R[j] / R[0]  (un-conjugated)             */
-        INTERNAL_VEC theta_r = MUL(y_r[i], inv_R0);
-        INTERNAL_VEC theta_i = MUL(y_i[i], inv_R0);
+        /* Overlap inv_lambda = 1 / lambda with the O(i) inner dot products, and
+         * factor inv_R0 outside the sums to avoid 2*n^2 redundant multiplies. */
+        LINALG_VEC inv_lambda = LDIV(one, lambda);
+        LINALG_VEC inv_R0_lam = LMUL(inv_R0, inv_lambda);
 
-        /* ----- eta is only needed if i + 1 < n to prepare the next order */
-        INTERNAL_VEC eta_r = VCONST(0.0);
-        INTERNAL_VEC eta_i = VCONST(0.0);
+        LINALG_VEC theta_raw_r = y_r[i];
+        LINALG_VEC theta_raw_i = y_i[i];
+        LINALG_VEC eta_raw_r = zero;
+        LINALG_VEC eta_raw_i = zero;
 
         if (i + 1 < n) {
-            eta_r = NEG(MUL(R_r[i + 1], inv_R0)); /* -Re(R[i+1])/R[0] */
-            eta_i = MUL(R_i[i + 1], inv_R0);      /* +Im(R[i+1])/R[0] → -conj */
+            eta_raw_r = LNEG(R_r[i + 1]);
+            eta_raw_i = R_i[i + 1]; /* -conj(R[i+1]) */
 
             for (size_t k = 0; k < i; k++) {
-                INTERNAL_VEC rho_ik_r = MUL(R_r[i - k], inv_R0);
-                INTERNAL_VEC rho_ik_i = MUL(R_i[i - k], inv_R0);
+                LINALG_VEC rik_r = R_r[i - k], rik_i = R_i[i - k];
+                LINALG_VEC rmk_r = R_r[k + 1], rmk_i = LNEG(R_i[k + 1]); /* conj(R[k+1]) */
+                LINALG_VEC sk_r = s_r[k], sk_i = s_i[k];
+                LINALG_VEC pk_r = prev_r[k], pk_i = prev_i[k];
 
-                /* conj(rho_{k+1}) = (R_r[k+1] - j R_i[k+1]) / R[0] */
-                INTERNAL_VEC rho_mk1_r = MUL(R_r[k + 1], inv_R0);
-                INTERNAL_VEC rho_mk1_i = NEG(MUL(R_i[k + 1], inv_R0));
+                theta_raw_r = LSUB(theta_raw_r, LSUB(LMUL(sk_r, rik_r), LMUL(sk_i, rik_i)));
+                theta_raw_i = LSUB(theta_raw_i, LADD(LMUL(sk_r, rik_i), LMUL(sk_i, rik_r)));
 
-                theta_r = SUB(theta_r, SUB(MUL(s_r[k], rho_ik_r), MUL(s_i[k], rho_ik_i)));
-                theta_i = SUB(theta_i, ADD(MUL(s_r[k], rho_ik_i), MUL(s_i[k], rho_ik_r)));
-
-                eta_r = SUB(eta_r, SUB(MUL(rho_mk1_r, e_hat_prev_r[k]), MUL(rho_mk1_i, e_hat_prev_i[k])));
-                eta_i = SUB(eta_i, ADD(MUL(rho_mk1_r, e_hat_prev_i[k]), MUL(rho_mk1_i, e_hat_prev_r[k])));
+                eta_raw_r = LSUB(eta_raw_r, LSUB(LMUL(rmk_r, pk_r), LMUL(rmk_i, pk_i)));
+                eta_raw_i = LSUB(eta_raw_i, LADD(LMUL(rmk_r, pk_i), LMUL(rmk_i, pk_r)));
             }
         } else {
             for (size_t k = 0; k < i; k++) {
-                INTERNAL_VEC rho_ik_r = MUL(R_r[i - k], inv_R0);
-                INTERNAL_VEC rho_ik_i = MUL(R_i[i - k], inv_R0);
+                LINALG_VEC rik_r = R_r[i - k], rik_i = R_i[i - k];
+                LINALG_VEC sk_r = s_r[k], sk_i = s_i[k];
 
-                theta_r = SUB(theta_r, SUB(MUL(s_r[k], rho_ik_r), MUL(s_i[k], rho_ik_i)));
-                theta_i = SUB(theta_i, ADD(MUL(s_r[k], rho_ik_i), MUL(s_i[k], rho_ik_r)));
+                theta_raw_r = LSUB(theta_raw_r, LSUB(LMUL(sk_r, rik_r), LMUL(sk_i, rik_i)));
+                theta_raw_i = LSUB(theta_raw_i, LADD(LMUL(sk_r, rik_i), LMUL(sk_i, rik_r)));
             }
         }
 
-        INTERNAL_VEC inv_lambda = DIV(VCONST(1.0), lambda);
-        INTERNAL_VEC t_lam_r = MUL(theta_r, inv_lambda);
-        INTERNAL_VEC t_lam_i = MUL(theta_i, inv_lambda);
+        LINALG_VEC t_lam_r = LMUL(theta_raw_r, inv_R0_lam);
+        LINALG_VEC t_lam_i = LMUL(theta_raw_i, inv_R0_lam);
 
-        /* ----- simultaneous update of s */
+        /* Simultaneous update of s */
         for (size_t k = 0; k < i; k++) {
-            s_r[k] = ADD(s_r[k], SUB(MUL(t_lam_r, e_hat_prev_r[k]), MUL(t_lam_i, e_hat_prev_i[k])));
-            s_i[k] = ADD(s_i[k], ADD(MUL(t_lam_r, e_hat_prev_i[k]), MUL(t_lam_i, e_hat_prev_r[k])));
+            LINALG_VEC pk_r = prev_r[k], pk_i = prev_i[k];
+            s_r[k] = LADD(s_r[k], LSUB(LMUL(t_lam_r, pk_r), LMUL(t_lam_i, pk_i)));
+            s_i[k] = LADD(s_i[k], LADD(LMUL(t_lam_r, pk_i), LMUL(t_lam_i, pk_r)));
         }
-
         s_r[i] = t_lam_r;
         s_i[i] = t_lam_i;
 
         if (i + 1 < n) {
-            INTERNAL_VEC e_lam_r = MUL(eta_r, inv_lambda);
-            INTERNAL_VEC e_lam_i = MUL(eta_i, inv_lambda);
+            LINALG_VEC e_lam_r = LMUL(eta_raw_r, inv_R0_lam);
+            LINALG_VEC e_lam_i = LMUL(eta_raw_i, inv_R0_lam);
+            LINALG_VEC abs2_refl = LADD(LMUL(e_lam_r, e_lam_r), LMUL(e_lam_i, e_lam_i));
+            LINALG_VEC abs_refl = LSQRT(abs2_refl);
 
             for (size_t k = 0; k < i; k++) {
                 size_t g_idx = i - 1 - k;
-                INTERNAL_VEC g_r = e_hat_prev_r[g_idx];
-                INTERNAL_VEC g_i = NEG(e_hat_prev_i[g_idx]);
+                LINALG_VEC g_r = prev_r[g_idx];
+                LINALG_VEC g_i = LNEG(prev_i[g_idx]);
 
-                e_hat_r[k + 1] = ADD(e_hat_prev_r[k], SUB(MUL(e_lam_r, g_r), MUL(e_lam_i, g_i)));
-                e_hat_i[k + 1] = ADD(e_hat_prev_i[k], ADD(MUL(e_lam_r, g_i), MUL(e_lam_i, g_r)));
+                cur_r[k + 1] = LADD(prev_r[k], LSUB(LMUL(e_lam_r, g_r), LMUL(e_lam_i, g_i)));
+                cur_i[k + 1] = LADD(prev_i[k], LADD(LMUL(e_lam_r, g_i), LMUL(e_lam_i, g_r)));
             }
+            cur_r[0] = e_lam_r;
+            cur_i[0] = e_lam_i;
 
-            e_hat_r[0] = e_lam_r;
-            e_hat_i[0] = e_lam_i;
+            cond_num = LMUL(cond_num, LADD(one, abs_refl));
+            cond_den = LMUL(cond_den, LSUB(one, abs_refl));
 
-            /* ----- lambda update */
-            INTERNAL_VEC abs2_reflection = ADD(MUL(e_lam_r, e_lam_r), MUL(e_lam_i, e_lam_i));
-            cond_bound = MUL(cond_bound, TLS(reflection_condition_step)(abs2_reflection));
-
-            INTERNAL_VEC eta_mag_sq = ADD(MUL(eta_r, eta_r), MUL(eta_i, eta_i));
-            lambda = SUB(lambda, MUL(eta_mag_sq, inv_lambda));
+            /* lambda *= (1 - |e_lam|^2)  (identical to lambda - |eta|^2 / lambda) */
+            lambda = LMUL(lambda, LSUB(one, abs2_refl));
         }
     }
 
-    INTERNAL_VEC r2 = VCONST(0.0);
+    LINALG_VEC r2 = zero;
     for (size_t k = 0; k < n; k++) {
-        r2 = ADD(r2, ADD(MUL(y_r[k], s_r[k]), MUL(y_i[k], s_i[k])));
+        r2 = LADD(r2, LADD(LMUL(y_r[k], s_r[k]), LMUL(y_i[k], s_i[k])));
     }
     s_r[0] = r2;
-    s_i[0] = VCONST(0.0);
-
-    return cond_bound;
+    s_i[0] = zero;
+    return LDIV(cond_num, cond_den);
 }
