@@ -73,7 +73,6 @@ struct FloatTraits {
     template <int Sign> using PlanT = sycl_fft::DifFftPlanf<Sign>;
     static constexpr const char* kName = "FP32";
     static constexpr int kDefaultLogTotal = 25;   // 256 MiB / buffer
-    static constexpr size_t kDefaultChunkMB = 6;
     static constexpr double kTolRel = 2e-5;
 
     static ComplexT from_doubles(double r, double i) {
@@ -90,7 +89,6 @@ struct DoubleTraits {
     template <int Sign> using PlanT = sycl_fft::DifFftPlan<Sign>;
     static constexpr const char* kName = "FP64";
     static constexpr int kDefaultLogTotal = 24;   // 256 MiB / buffer
-    static constexpr size_t kDefaultChunkMB = 16;
     static constexpr double kTolRel = 5e-14;
 
     static ComplexT from_doubles(double r, double i) {
@@ -107,7 +105,6 @@ struct DfTraits {
     template <int Sign> using PlanT = sycl_fft::DifFftPlandf<Sign>;
     static constexpr const char* kName = "DF (2xFP32)";
     static constexpr int kDefaultLogTotal = 24;   // 256 MiB / buffer
-    static constexpr size_t kDefaultChunkMB = 16;
     static constexpr double kTolRel = 5e-12;
 
     static ComplexT from_doubles(double r, double i) {
@@ -227,21 +224,22 @@ void compute_errors_prec(
 }
 
 template <typename Traits, int Sign>
-bool run_verification_prec(sycl::queue& q, int min_logN, int max_logN) {
+bool run_verification_prec(
+    sycl::queue& q, int min_logN, int max_logN, const sycl_fft::FftLaunchConfig& cfg) {
     using ComplexT = typename Traits::ComplexT;
     using PlanT = typename Traits::template PlanT<Sign>;
 
     std::printf("\n=== Correctness Verification (%s DIF Radix-2, Sign=%+d vs 80-bit long double Ref) ===\n",
                 Traits::kName, Sign);
-    std::printf("%-5s %-8s %-4s | %-12s %-12s | %-12s %-12s | %s\n",
-                "logN", "N", "bs", "Raw_MaxRel", "BitRev_MaxRel", "Raw_MaxAbs", "BitRev_MaxAbs", "Status");
+    std::printf("%-5s %-8s %-4s | %-12s %-12s %-12s | %-12s | %s\n",
+                "logN", "N", "bs", "Raw_MaxRel", "InPl_MaxRel", "BitRev_MaxRel", "Raw_MaxAbs", "Status");
 
     bool all_ok = true;
     for (int logN = min_logN; logN <= max_logN; ++logN) {
         const size_t N = size_t{1} << logN;
         const size_t bs = (logN == 10) ? 1 : ((logN <= 14) ? 5 : 3);
         const size_t total = N * bs;
-        std::vector<ComplexT> h_in(total), h_raw(total), h_nat(total);
+        std::vector<ComplexT> h_in(total), h_raw(total), h_inpl(total), h_nat(total);
         SplitMix64 rng(0x12345678ULL + static_cast<uint64_t>(logN) * 997ULL);
         for (size_t i = 0; i < total; ++i) {
             h_in[i] = Traits::from_doubles(rng.next_double(), rng.next_double());
@@ -251,13 +249,18 @@ bool run_verification_prec(sycl::queue& q, int min_logN, int max_logN) {
         auto* d_out = sycl::malloc_device<ComplexT>(total, q);
         q.memcpy(d_in, h_in.data(), total * sizeof(ComplexT)).wait();
 
-        PlanT plan(q, logN, bs, 4 * 1024 * 1024);
+        PlanT plan(q, logN, bs, cfg);
 
-        // 1) Bit-reversal-free (natural-to-reversed)
+        // 1) Bit-reversal-free out-of-place (natural-to-reversed)
         plan.execute_raw(d_in, d_out, bs);
         q.memcpy(h_raw.data(), d_out, total * sizeof(ComplexT)).wait();
 
-        // 2) Full with GPU bit-reversal (natural-to-natural)
+        // 2) Bit-reversal-free in-place (verifies in-place safety incl. 8192 chunk-1 stash)
+        q.memcpy(d_out, h_in.data(), total * sizeof(ComplexT)).wait();
+        plan.execute_raw(d_out, d_out, bs);
+        q.memcpy(h_inpl.data(), d_out, total * sizeof(ComplexT)).wait();
+
+        // 3) Full with GPU bit-reversal (natural-to-natural)
         plan.execute(d_in, d_out, bs);
         q.memcpy(h_nat.data(), d_out, total * sizeof(ComplexT)).wait();
 
@@ -265,7 +268,8 @@ bool run_verification_prec(sycl::queue& q, int min_logN, int max_logN) {
         sycl::free(d_out, q);
 
         double worst_raw_rel = 0.0, worst_raw_abs = 0.0;
-        double worst_nat_rel = 0.0, worst_nat_abs = 0.0;
+        double worst_inpl_rel = 0.0;
+        double worst_nat_rel = 0.0;
         for (size_t b : {size_t{0}, bs - 1}) {
             std::vector<long double> ref_re(N), ref_im(N);
             for (size_t i = 0; i < N; ++i) {
@@ -277,6 +281,9 @@ bool run_verification_prec(sycl::queue& q, int min_logN, int max_logN) {
             worst_raw_abs = std::max(worst_raw_abs, a);
             worst_raw_rel = std::max(worst_raw_rel, r);
 
+            compute_errors_prec<Traits>(h_inpl.data() + b * N, ref_re, ref_im, N, a, r);
+            worst_inpl_rel = std::max(worst_inpl_rel, r);
+
             for (size_t i = 0; i < N; ++i) {
                 const size_t j = sycl_fft::bit_reverse(static_cast<uint32_t>(i), logN);
                 if (j > i) {
@@ -285,14 +292,15 @@ bool run_verification_prec(sycl::queue& q, int min_logN, int max_logN) {
                 }
             }
             compute_errors_prec<Traits>(h_nat.data() + b * N, ref_re, ref_im, N, a, r);
-            worst_nat_abs = std::max(worst_nat_abs, a);
             worst_nat_rel = std::max(worst_nat_rel, r);
         }
 
-        const bool ok = (worst_raw_rel < Traits::kTolRel && worst_nat_rel < Traits::kTolRel);
+        const bool ok = (worst_raw_rel < Traits::kTolRel &&
+                         worst_inpl_rel < Traits::kTolRel &&
+                         worst_nat_rel < Traits::kTolRel);
         if (!ok) all_ok = false;
-        std::printf("%-5d %-8zu %-4zu | %12.3e %12.3e | %12.3e %12.3e | %s\n",
-                    logN, N, bs, worst_raw_rel, worst_nat_rel, worst_raw_abs, worst_nat_abs,
+        std::printf("%-5d %-8zu %-4zu | %12.3e %12.3e %12.3e | %12.3e | %s\n",
+                    logN, N, bs, worst_raw_rel, worst_inpl_rel, worst_nat_rel, worst_raw_abs,
                     ok ? "PASS" : "FAIL");
     }
     return all_ok;
@@ -307,7 +315,13 @@ struct BenchRow {
 
 template <typename Traits>
 std::vector<BenchRow> run_benchmark_prec(
-    sycl::queue& q, int log_total, int min_logN, int max_logN, size_t chunk_bytes, int ntest, bool in_place) {
+    sycl::queue& q,
+    int log_total,
+    int min_logN,
+    int max_logN,
+    const sycl_fft::FftLaunchConfig& cfg,
+    int ntest,
+    bool in_place) {
     using ComplexT = typename Traits::ComplexT;
     using PlanT = typename Traits::template PlanT<-1>;
 
@@ -324,26 +338,25 @@ std::vector<BenchRow> run_benchmark_prec(
 
     // Warm up GPU clocks to P0 before timing
     {
-        PlanT wplan(q, 12, total >> 12, chunk_bytes);
-        const int warm_iters = (sizeof(ComplexT) == 8) ? 80 : 15;
+        PlanT wplan(q, 12, total >> 12, cfg);
+        const int warm_iters = (sizeof(ComplexT) == 8) ? 80 : 40;
         for (int w = 0; w < warm_iters; ++w) wplan.execute_raw(d_in, d_out, total >> 12);
         q.wait();
     }
 
-    std::printf("\n=== Throughput Benchmark [%s]: Bit-Reversal-Free SYCL DIF Radix-2 (logTotal=%d, %.1f MiB/buf, L2Chunk=%.1f MiB, %s) ===\n",
+    std::printf("\n=== Throughput Benchmark [%s]: Bit-Reversal-Free SYCL DIF Radix-2 (logTotal=%d, %.1f MiB/buf, %s) ===\n",
                 Traits::kName,
                 log_total,
                 static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0),
-                static_cast<double>(chunk_bytes) / (1024.0 * 1024.0),
                 in_place ? "in-place" : "out-of-place");
-    std::printf("%-5s %-8s %-7s | %-9s %-10s %-10s | %-8s\n",
-                "logN", "N", "bs", "Time(ms)", "GFLOP/s", "Eff_GB/s", "ChunkBS");
+    std::printf("%-5s %-8s %-7s | %-9s %-10s %-10s | %-11s %-7s %-8s\n",
+                "logN", "N", "bs", "Time(ms)", "GFLOP/s", "Eff_GB/s", "Dispatch", "ChunkBS", "ChunkMiB");
 
     std::vector<BenchRow> rows;
     for (int logN = min_logN; logN <= max_logN; ++logN) {
         const size_t N = size_t{1} << logN;
         const size_t bs = total / N;
-        PlanT plan(q, logN, bs, chunk_bytes);
+        PlanT plan(q, logN, bs, cfg);
 
         for (int w = 0; w < 8; ++w) {
             plan.execute_raw(d_in, d_out, bs);
@@ -363,8 +376,17 @@ std::vector<BenchRow> run_benchmark_prec(
         const double gflops = flops / (elapsed_ms * 1e6);
         const double gbs = bytes / (elapsed_ms * 1e6);
 
-        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %10.1f | %-8zu\n",
-                    logN, N, bs, elapsed_ms, gflops, gbs, plan.chunk_bs());
+        char disp[32];
+        if (plan.is_two_pass()) {
+            std::snprintf(disp, sizeof(disp), "%dx%d/w%zu",
+                          1 << plan.log_n1(), 1 << plan.log_n2(), plan.pass0_wg_size());
+        } else {
+            std::snprintf(disp, sizeof(disp), "1-pass");
+        }
+        const double chunk_mib = static_cast<double>(plan.chunk_bytes()) / (1024.0 * 1024.0);
+
+        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %10.1f | %-11s %-7zu %7.1f\n",
+                    logN, N, bs, elapsed_ms, gflops, gbs, disp, plan.chunk_bs(), chunk_mib);
         rows.push_back(BenchRow{logN, elapsed_ms, gflops, gbs});
     }
 
@@ -381,6 +403,7 @@ int main(int argc, char** argv) {
     int max_logN = 18;
     int ntest = 20;
     int chunk_mb_override = -1;
+    sycl_fft::FftLaunchConfig cfg{};
     bool in_place = false;
     bool do_verify = true;
     bool do_bench = true;
@@ -396,6 +419,20 @@ int main(int argc, char** argv) {
             max_logN = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--chunk-mb") == 0 && i + 1 < argc) {
             chunk_mb_override = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--wg-size") == 0 && i + 1 < argc) {
+            const size_t wg = static_cast<size_t>(std::atoi(argv[++i]));
+            cfg.pass0_wg_size = wg;
+            cfg.bitrev_wg_size = wg;
+        } else if (std::strcmp(argv[i], "--two-pass-min") == 0 && i + 1 < argc) {
+            cfg.two_pass_min_logN = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--two-pass-n1") == 0 && i + 1 < argc) {
+            cfg.two_pass_log_n1 = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--l2-div") == 0 && i + 1 < argc) {
+            cfg.l2_budget_den = static_cast<size_t>(std::max(1, std::atoi(argv[++i])));
+        } else if (std::strcmp(argv[i], "--min-waves") == 0 && i + 1 < argc) {
+            cfg.min_waves_per_cu = static_cast<size_t>(std::max(0, std::atoi(argv[++i])));
+        } else if (std::strcmp(argv[i], "--no-wide") == 0) {
+            cfg.allow_wide_kernels = false;
         } else if (std::strcmp(argv[i], "--ntest") == 0 && i + 1 < argc) {
             ntest = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--prec") == 0 && i + 1 < argc) {
@@ -411,6 +448,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (chunk_mb_override > 0) {
+        cfg.l2_chunk_bytes = static_cast<size_t>(chunk_mb_override) * 1024 * 1024;
+    }
+
     const bool run_f = (prec == "all" || prec == "f" || prec == "fp32");
     const bool run_d = (prec == "all" || prec == "d" || prec == "fp64");
     const bool run_df = (prec == "all" || prec == "df");
@@ -420,7 +461,16 @@ int main(int argc, char** argv) {
     }
 
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order{}};
-    std::cout << "Device: " << q.get_device().get_info<sycl::info::device::name>() << '\n';
+    const auto dev = q.get_device();
+    const auto dev_cfg = sycl_fft::DeviceFftConfig::query(dev);
+    std::printf("Device: %s | CUs=%zu | L2=%.1f MiB | LocalMem=%.0f KiB | MaxWG=%zu | SG=%zu..%zu\n",
+                dev.get_info<sycl::info::device::name>().c_str(),
+                dev_cfg.max_compute_units,
+                static_cast<double>(dev_cfg.l2_cache_size) / (1024.0 * 1024.0),
+                static_cast<double>(dev_cfg.local_mem_size) / 1024.0,
+                dev_cfg.max_work_group_size,
+                dev_cfg.min_sub_group_size,
+                dev_cfg.sub_group_size);
 
     if (do_verify) {
         if (!verify_standalone_trig(q)) {
@@ -428,16 +478,16 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (run_f) {
-            if (!run_verification_prec<FloatTraits, -1>(q, min_logN, max_logN)) return 1;
-            if (verify_pos_sign && !run_verification_prec<FloatTraits, +1>(q, min_logN, max_logN)) return 1;
+            if (!run_verification_prec<FloatTraits, -1>(q, min_logN, max_logN, cfg)) return 1;
+            if (verify_pos_sign && !run_verification_prec<FloatTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
         }
         if (run_d) {
-            if (!run_verification_prec<DoubleTraits, -1>(q, min_logN, max_logN)) return 1;
-            if (verify_pos_sign && !run_verification_prec<DoubleTraits, +1>(q, min_logN, max_logN)) return 1;
+            if (!run_verification_prec<DoubleTraits, -1>(q, min_logN, max_logN, cfg)) return 1;
+            if (verify_pos_sign && !run_verification_prec<DoubleTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
         }
         if (run_df) {
-            if (!run_verification_prec<DfTraits, -1>(q, min_logN, max_logN)) return 1;
-            if (verify_pos_sign && !run_verification_prec<DfTraits, +1>(q, min_logN, max_logN)) return 1;
+            if (!run_verification_prec<DfTraits, -1>(q, min_logN, max_logN, cfg)) return 1;
+            if (verify_pos_sign && !run_verification_prec<DfTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
         }
     }
 
@@ -445,18 +495,15 @@ int main(int argc, char** argv) {
         std::vector<BenchRow> rows_d, rows_df;
         if (run_f) {
             const int lt = (log_total_override > 0) ? log_total_override : FloatTraits::kDefaultLogTotal;
-            const size_t cmb = (chunk_mb_override > 0) ? static_cast<size_t>(chunk_mb_override) : FloatTraits::kDefaultChunkMB;
-            run_benchmark_prec<FloatTraits>(q, lt, min_logN, max_logN, cmb * 1024 * 1024, ntest, in_place);
+            run_benchmark_prec<FloatTraits>(q, lt, min_logN, max_logN, cfg, ntest, in_place);
         }
         if (run_d) {
             const int lt = (log_total_override > 0) ? log_total_override : DoubleTraits::kDefaultLogTotal;
-            const size_t cmb = (chunk_mb_override > 0) ? static_cast<size_t>(chunk_mb_override) : DoubleTraits::kDefaultChunkMB;
-            rows_d = run_benchmark_prec<DoubleTraits>(q, lt, min_logN, max_logN, cmb * 1024 * 1024, ntest, in_place);
+            rows_d = run_benchmark_prec<DoubleTraits>(q, lt, min_logN, max_logN, cfg, ntest, in_place);
         }
         if (run_df) {
             const int lt = (log_total_override > 0) ? log_total_override : DfTraits::kDefaultLogTotal;
-            const size_t cmb = (chunk_mb_override > 0) ? static_cast<size_t>(chunk_mb_override) : DfTraits::kDefaultChunkMB;
-            rows_df = run_benchmark_prec<DfTraits>(q, lt, min_logN, max_logN, cmb * 1024 * 1024, ntest, in_place);
+            rows_df = run_benchmark_prec<DfTraits>(q, lt, min_logN, max_logN, cfg, ntest, in_place);
         }
         if (!rows_d.empty() && rows_d.size() == rows_df.size()) {
             std::printf("\n=== Summary: DF (2xFP32) vs Native FP64 Speedup ===\n");

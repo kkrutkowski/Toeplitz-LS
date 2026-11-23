@@ -12,6 +12,8 @@
 #undef SYCL_FFT_SMEM_T
 #undef SYCL_FFT_ANGLE_T
 #undef SYCL_FFT_WIDE
+#undef SYCL_FFT_STASH_8192
+#undef SYCL_FFT_COMPUTE_HEAVY
 #undef SYCL_FFT_ZERO
 #undef SYCL_FFT_ONE
 #undef SYCL_FFT_SQRT1_2
@@ -43,6 +45,8 @@
 #define SYCL_FFT_SMEM_T sycl::float2
 #define SYCL_FFT_ANGLE_T float
 #define SYCL_FFT_WIDE 1
+#define SYCL_FFT_STASH_8192 1
+#define SYCL_FFT_COMPUTE_HEAVY 0
 
 #define SYCL_FFT_ZERO df_make(0.0f, 0.0f)
 #define SYCL_FFT_ONE df_make(1.0f, 0.0f)
@@ -66,7 +70,8 @@
 
 #define SYCL_FFT_STORE_COMPLEX(ptr, idx, re_in, im_in)                                            \
     do {                                                                                          \
-        (ptr)[(idx)] = Complexdf{(re_in), (im_in)};                                               \
+        reinterpret_cast<sycl::float4*>(ptr)[(idx)] =                                             \
+            sycl::float4{(re_in).hi, (re_in).lo, (im_in).hi, (im_in).lo};                         \
     } while (0)
 
 #define SYCL_FFT_TO_SMEM(r) sycl::float2{(r).hi, (r).lo}
@@ -93,6 +98,8 @@
 #define SYCL_FFT_SMEM_T double
 #define SYCL_FFT_ANGLE_T double
 #define SYCL_FFT_WIDE 1
+#define SYCL_FFT_STASH_8192 0
+#define SYCL_FFT_COMPUTE_HEAVY 1
 
 #define SYCL_FFT_ZERO 0.0
 #define SYCL_FFT_ONE 1.0
@@ -172,6 +179,8 @@
 #define SYCL_FFT_SMEM_T float
 #define SYCL_FFT_ANGLE_T float
 #define SYCL_FFT_WIDE 0
+#define SYCL_FFT_STASH_8192 0
+#define SYCL_FFT_COMPUTE_HEAVY 0
 
 #define SYCL_FFT_ZERO 0.0f
 #define SYCL_FFT_ONE 1.0f
