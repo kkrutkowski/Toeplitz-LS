@@ -177,7 +177,7 @@ static inline VEC vec_exp(VEC v) {
 
 static inline VEC vec_floor_d(VEC x) {
 #if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
-    VEC k;
+    VEC k = (VEC){};
     for (int i = 0; i < VEC_LEN; i++) k[i] = floor(x[i]);
     return k;
 #else
@@ -226,42 +226,52 @@ static inline VECF vecf_select_f(VECF_INT mask, VECF a, VECF b) {
 }
 
 static inline void vec_sincos2pi(VEC x, VEC *c_out, VEC *s_out) {
-    const VEC zero = (VEC){};
-    const VEC half = (VEC){} + 0.5;
-    const VEC qtr = (VEC){} + 0.25;
-    const VEC_INT sign_bit = (VEC_INT){} + UINT64_C(0x8000000000000000);
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
+    VEC k = (VEC){};
+    for (int i = 0; i < VEC_LEN; i++) k[i] = rint(x[i] * 4.0);
+    const VEC r = x - k * ((VEC){} + 0.25);
+    VEC_INT q = (VEC_INT){};
+    for (int i = 0; i < VEC_LEN; i++) q[i] = (uint64_t)(int64_t)k[i];
+#else
+    const VEC f = x - vec_floor_d(x);
+    VEC_INT q = (VEC_INT){};
+    VEC k = (VEC){};
+    for (int i = 0; i < VEC_LEN; i++) {
+        const int64_t qi = (int64_t)(f[i] * 4.0 + 0.5);
+        q[i] = (uint64_t)qi;
+        k[i] = (double)qi;
+    }
+    const VEC r = f - k * ((VEC){} + 0.25);
+#endif
 
-    VEC f = x - vec_floor_d(x);
-    const VEC_INT ge_half = (VEC_INT)(f >= half);
-    f = f - vec_select_d(ge_half, half, zero);
-    const VEC_INT gt_qtr = (VEC_INT)(f > qtr);
-    f = vec_select_d(gt_qtr, half - f, f);
+    const VEC f2 = r * r;
 
-    const VEC f2 = f * f;
+    VEC ps = f2 * ((VEC){} + NANOFFT_SIN2PI_S6) + ((VEC){} + NANOFFT_SIN2PI_S5);
+    ps = ps * f2 + ((VEC){} + NANOFFT_SIN2PI_S4);
+    ps = ps * f2 + ((VEC){} + NANOFFT_SIN2PI_S3);
+    ps = ps * f2 + ((VEC){} + NANOFFT_SIN2PI_S2);
+    ps = ps * f2 + ((VEC){} + NANOFFT_SIN2PI_S1);
+    ps = ps * f2 + ((VEC){} + NANOFFT_SIN2PI_S0);
+    const VEC s_oct = ps * r;
 
-    VEC ps = f2 * ((VEC){} + (-0.69093588239655204752473229179535744712019258849149)) + ((VEC){} + 3.816997428325180431886496831784263511664844308953);
-    ps = ps * f2 + ((VEC){} + (-15.094471616631987517150792141240583632857536104374));
-    ps = ps * f2 + ((VEC){} + 42.058688305389948652978636940879319419236423555816);
-    ps = ps * f2 + ((VEC){} + (-76.705859647469529848428028740175591232140822775877));
-    ps = ps * f2 + ((VEC){} + 81.605249275026290026468387665436788455350446194769);
-    ps = ps * f2 + ((VEC){} + (-41.341702240395082626913754855518082730586045930014));
-    ps = ps * f2 + ((VEC){} + 6.2831853071795803915351819993098437430793561832783);
-    VEC s_res = ps * f;
+    VEC pc = f2 * ((VEC){} + NANOFFT_COS2PI_C6) + ((VEC){} + NANOFFT_COS2PI_C5);
+    pc = pc * f2 + ((VEC){} + NANOFFT_COS2PI_C4);
+    pc = pc * f2 + ((VEC){} + NANOFFT_COS2PI_C3);
+    pc = pc * f2 + ((VEC){} + NANOFFT_COS2PI_C2);
+    pc = pc * f2 + ((VEC){} + NANOFFT_COS2PI_C1);
+    const VEC c_oct = pc * f2 + ((VEC){} + NANOFFT_COS2PI_C0);
 
-    VEC pc = f2 * ((VEC){} + 0.2719476416639800139555005900627203625997526419121) + ((VEC){} + (-1.7132188587562783227021022500030456711383616906867));
-    pc = pc * f2 + ((VEC){} + 7.9034625375924737942470808816341151858745136793854);
-    pc = pc * f2 + ((VEC){} + (-26.426254069097002482358197039994768718882874895547));
-    pc = pc * f2 + ((VEC){} + 60.244641313230924425507669180781096172477629015917);
-    pc = pc * f2 + ((VEC){} + (-85.456817205981735856122645737764931252180966287231));
-    pc = pc * f2 + ((VEC){} + 64.939394022663960757319625985316082107868087096872);
-    pc = pc * f2 + ((VEC){} + (-19.739208802178707095137280041056835739350734071865));
-    pc = pc * f2 + ((VEC){} + 0.99999999999999999608981951072301324039762563006958);
+    const VEC_INT one = (VEC_INT){} + UINT64_C(1);
+    const VEC_INT two = (VEC_INT){} + UINT64_C(2);
+    const VEC_INT swap = (VEC_INT)((q & one) != (VEC_INT){});
+    const VEC cm = vec_select_d(swap, s_oct, c_oct);
+    const VEC sm = vec_select_d(swap, c_oct, s_oct);
 
     VEC_INT sb, cb;
-    memcpy(&sb, &s_res, sizeof sb);
-    memcpy(&cb, &pc, sizeof cb);
-    sb ^= (ge_half & sign_bit);
-    cb ^= ((ge_half ^ gt_qtr) & sign_bit);
+    memcpy(&sb, &sm, sizeof sb);
+    memcpy(&cb, &cm, sizeof cb);
+    sb ^= (q & two) << 62;
+    cb ^= ((q + one) & two) << 62;
     memcpy(s_out, &sb, sizeof sb);
     memcpy(c_out, &cb, sizeof cb);
 }
@@ -269,105 +279,115 @@ static inline void vec_sincos2pi(VEC x, VEC *c_out, VEC *s_out) {
 static inline void vecf_sincos2pi_d(VEC x_lo, VEC x_hi, VECF *c_out, VECF *s_out) {
     const VEC r_lo = x_lo - vec_floor_d(x_lo);
     const VEC r_hi = x_hi - vec_floor_d(x_hi);
-    VECF f;
+    VECF f = (VECF){};
     for (int i = 0; i < VEC_LEN; i++) {
         f[i] = (float)r_lo[i];
         f[VEC_LEN + i] = (float)r_hi[i];
     }
 
-    const VECF zero = (VECF){};
-    const VECF half = (VECF){} + 0.5f;
-    const VECF qtr = (VECF){} + 0.25f;
-    const VECF_INT sign_bit = (VECF_INT){} + 0x80000000u;
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
+    VECF k = (VECF){};
+    for (int i = 0; i < VECF_LEN; i++) k[i] = rintf(f[i] * 4.0f);
+    const VECF r = f - k * ((VECF){} + 0.25f);
+    VECF_INT q = (VECF_INT){};
+    for (int i = 0; i < VECF_LEN; i++) q[i] = (uint32_t)(int32_t)k[i];
+#else
+    VECF_INT q = (VECF_INT){};
+    VECF k = (VECF){};
+    for (int i = 0; i < VECF_LEN; i++) {
+        const int32_t qi = (int32_t)(f[i] * 4.0f + 0.5f);
+        q[i] = (uint32_t)qi;
+        k[i] = (float)qi;
+    }
+    const VECF r = f - k * ((VECF){} + 0.25f);
+#endif
 
-    const VECF_INT ge_half = (VECF_INT)(f >= half);
-    f = f - vecf_select_f(ge_half, half, zero);
-    const VECF_INT gt_qtr = (VECF_INT)(f > qtr);
-    f = vecf_select_f(gt_qtr, half - f, f);
+    const VECF f2 = r * r;
 
-    const VECF f2 = f * f;
+    VECF ps = f2 * ((VECF){} + NANOFFT_SIN2PIF_S3) + ((VECF){} + NANOFFT_SIN2PIF_S2);
+    ps = ps * f2 + ((VECF){} + NANOFFT_SIN2PIF_S1);
+    ps = ps * f2 + ((VECF){} + NANOFFT_SIN2PIF_S0);
+    const VECF s_oct = ps * r;
 
-    VECF ps = f2 * ((VECF){} + 39.536706065730207835108712734262f) + ((VECF){} + (-76.549782293595742666226937116116f));
-    ps = ps * f2 + ((VECF){} + 81.601004073261773523492199897936f);
-    ps = ps * f2 + ((VECF){} + (-41.341655031416278077153126232486f));
-    ps = ps * f2 + ((VECF){} + 6.2831851600894774430188071795666f);
-    VECF s_res = ps * f;
+    VECF pc = f2 * ((VECF){} + NANOFFT_COS2PIF_C3) + ((VECF){} + NANOFFT_COS2PIF_C2);
+    pc = pc * f2 + ((VECF){} + NANOFFT_COS2PIF_C1);
+    const VECF c_oct = pc * f2 + ((VECF){} + NANOFFT_COS2PIF_C0);
 
-    VECF pc = f2 * ((VECF){} + 56.242380464873243259663276802701f) + ((VECF){} + (-85.240330322699427859509454517828f));
-    pc = pc * f2 + ((VECF){} + 64.934590626780991246193352727536f);
-    pc = pc * f2 + ((VECF){} + (-19.739171434702393618770795066531f));
-    pc = pc * f2 + ((VECF){} + 0.99999995346667013630639784578184f);
+    const VECF_INT one = (VECF_INT){} + 1u;
+    const VECF_INT two = (VECF_INT){} + 2u;
+    const VECF_INT swap = (VECF_INT)((q & one) != (VECF_INT){});
+    const VECF cm = vecf_select_f(swap, s_oct, c_oct);
+    const VECF sm = vecf_select_f(swap, c_oct, s_oct);
 
     VECF_INT sb, cb;
-    memcpy(&sb, &s_res, sizeof sb);
-    memcpy(&cb, &pc, sizeof cb);
-    sb ^= (ge_half & sign_bit);
-    cb ^= ((ge_half ^ gt_qtr) & sign_bit);
+    memcpy(&sb, &sm, sizeof sb);
+    memcpy(&cb, &cm, sizeof cb);
+    sb ^= (q & two) << 30;
+    cb ^= ((q + one) & two) << 30;
     memcpy(s_out, &sb, sizeof sb);
     memcpy(c_out, &cb, sizeof cb);
 }
 
 static inline void vecdd_sincos2pi(VECDD x, VECDD *c_out, VECDD *s_out) {
     const VEC zero = (VEC){};
-    const VEC one = (VEC){} + 1.0;
-    const VEC neg_one = (VEC){} + (-1.0);
-    const VEC half = (VEC){} + 0.5;
-    const VEC qtr = (VEC){} + 0.25;
-    const VEC_INT sign_bit = (VEC_INT){} + UINT64_C(0x8000000000000000);
+    const VECDD f = vecdd_sub(x, vecdd_make(vec_floor_d(x.hi), zero));
 
-    VECDD f = vecdd_sub(x, vecdd_make(vec_floor_d(x.hi), zero));
-    const VEC_INT lt_zero = (VEC_INT)(f.hi < zero);
-    const VEC_INT ge_one = (VEC_INT)(f.hi >= one);
-    VEC adj = vec_select_d(lt_zero, one, vec_select_d(ge_one, neg_one, zero));
-    f = vecdd_add(f, vecdd_make(adj, zero));
+    VEC k = (VEC){};
+    VEC_INT q = (VEC_INT){};
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
+    for (int i = 0; i < VEC_LEN; i++) k[i] = rint(f.hi[i] * 4.0);
+    for (int i = 0; i < VEC_LEN; i++) q[i] = (uint64_t)(int64_t)k[i];
+#else
+    for (int i = 0; i < VEC_LEN; i++) {
+        const int64_t qi = (int64_t)(f.hi[i] * 4.0 + (f.hi[i] >= 0.0 ? 0.5 : -0.5));
+        q[i] = (uint64_t)qi;
+        k[i] = (double)qi;
+    }
+#endif
+    const VECDD r = vecdd_sub(f, vecdd_make(k * ((VEC){} + 0.25), zero));
+    const VECDD f2 = vecdd_mul(r, r);
 
-    const VEC_INT ge_half = (VEC_INT)(f.hi > half) | ((VEC_INT)(f.hi == half) & (VEC_INT)(f.lo >= zero));
-    f = vecdd_sub(f, vecdd_make(vec_select_d(ge_half, half, zero), zero));
+    const VEC tc = (f2.hi * ((VEC){} + NANOFFT_COS2PIDD_C11) + ((VEC){} + NANOFFT_COS2PIDD_C10)) * f2.hi + ((VEC){} + NANOFFT_COS2PIDD_C9);
+    VECDD pc = vecdd_make(tc, zero);
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C8));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C7));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C6));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C5));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C4));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C3));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C2));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C1));
+    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat(NANOFFT_COS2PIDD_C0));
 
-    const VEC_INT gt_qtr = (VEC_INT)(f.hi > qtr) | ((VEC_INT)(f.hi == qtr) & (VEC_INT)(f.lo > zero));
-    const VECDD f_alt = vecdd_sub(vecdd_splat_d(0.5), f);
-    f = vecdd_make(vec_select_d(gt_qtr, f_alt.hi, f.hi), vec_select_d(gt_qtr, f_alt.lo, f.lo));
+    VEC ts = f2.hi * ((VEC){} + NANOFFT_SIN2PIDD_S11) + ((VEC){} + NANOFFT_SIN2PIDD_S10);
+    ts = ts * f2.hi + ((VEC){} + NANOFFT_SIN2PIDD_S9);
+    ts = ts * f2.hi + ((VEC){} + NANOFFT_SIN2PIDD_S8);
+    VECDD ps = vecdd_make(ts, zero);
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S7));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S6));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S5));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S4));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S3));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S2));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S1));
+    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat(NANOFFT_SIN2PIDD_S0));
+    ps = vecdd_mul(ps, r);
 
-    const VECDD f2 = vecdd_mul(f, f);
+    const VEC_INT one = (VEC_INT){} + UINT64_C(1);
+    const VEC_INT two = (VEC_INT){} + UINT64_C(2);
+    const VEC_INT swap = (VEC_INT)((q & one) != (VEC_INT){});
+    const VEC cm_hi = vec_select_d(swap, ps.hi, pc.hi);
+    const VEC cm_lo = vec_select_d(swap, ps.lo, pc.lo);
+    const VEC sm_hi = vec_select_d(swap, pc.hi, ps.hi);
+    const VEC sm_lo = vec_select_d(swap, pc.lo, ps.lo);
 
-    VECDD pc = vecdd_splat((dd_t){-1.3712976302871458e-06, -1.4907449409481538e-23});
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){2.3093788063462385e-05, 4.5435375960601516e-22}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){-0.00032299035911159625, -8.9810661988144363e-21}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){0.0037798341474950792, -1.9249220349568919e-19}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){-0.036382841139801829, 2.9056792650806832e-18}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){0.28200596845569187, 1.5852734583076034e-17}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){-1.7143907110886696, 5.0670981029021671e-17}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){7.9035363713184692, -4.4106464905449524e-16}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){-26.426256783374399, 1.1988182697337608e-15}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){60.244641371876661, -3.2213071685554461e-16}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){-85.456817206693728, 2.0361754233578647e-16}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){64.939394022668296, -4.2563201319361759e-15}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){-19.739208802178716, -1.2530591017478957e-15}));
-    pc = vecdd_add(vecdd_mul(pc, f2), vecdd_splat((dd_t){1.0, -7.4159205569012457e-33}));
-
-    VECDD ps = vecdd_splat((dd_t){-3.1937621498346393e-07, -4.2494386355335374e-24});
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){5.8042120014329398e-06, -3.9949772624199443e-22}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){-8.8235163179284102e-05, 9.9742533594686292e-22}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){0.0011309237346037141, 9.0689538417711371e-20}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){-0.012031585941374802, 3.5320565199955664e-19}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){0.10422916220811097, 3.2446843930090187e-18}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){-0.71812230177849967, -4.3916880697967638e-17}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){3.819952584848282, 7.214503754465747e-17}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){-15.09464257682299, -6.8142151350129174e-16}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){42.058693944897655, -1.9698158197627135e-15}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){-76.705859753061389, 3.6416334350664191e-15}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){81.605249276075057, -2.5379220305392744e-15}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){-41.341702240399762, 1.8132498260632083e-15}));
-    ps = vecdd_add(vecdd_mul(ps, f2), vecdd_splat((dd_t){6.2831853071795862, 2.4492935982947059e-16}));
-    ps = vecdd_mul(ps, f);
-
-    const VEC_INT s_flip = ge_half & sign_bit;
-    const VEC_INT c_flip = (ge_half ^ gt_qtr) & sign_bit;
+    const VEC_INT s_flip = (q & two) << 62;
+    const VEC_INT c_flip = ((q + one) & two) << 62;
     VEC_INT ch, cl, sh, sl;
-    memcpy(&ch, &pc.hi, sizeof ch);
-    memcpy(&cl, &pc.lo, sizeof cl);
-    memcpy(&sh, &ps.hi, sizeof sh);
-    memcpy(&sl, &ps.lo, sizeof sl);
+    memcpy(&ch, &cm_hi, sizeof ch);
+    memcpy(&cl, &cm_lo, sizeof cl);
+    memcpy(&sh, &sm_hi, sizeof sh);
+    memcpy(&sl, &sm_lo, sizeof sl);
     ch ^= c_flip;
     cl ^= c_flip;
     sh ^= s_flip;

@@ -164,81 +164,130 @@ static inline uint32_t nanofft_reverse_bits(uint32_t value, uint32_t bits) {
     return out;
 }
 
-static inline float sin2pif(float x) {
+/* Octant [0, 0.125] Chebyshev minimax coefficients for cos(2*pi*f) and
+ * sin(2*pi*f)/f, shared between scalar (nanofft.h) and SIMD (nanofft_vecmath.h)
+ * evaluators.  Reducing to [0, 0.125] (f^2 <= 1/64) cuts polynomial degree
+ * across all three precisions while hitting < 0.5 ULP and exact cos(0) = 1. */
+#define NANOFFT_COS2PIF_C3 (-83.5918198f)
+#define NANOFFT_COS2PIF_C2 64.9212341f
+#define NANOFFT_COS2PIF_C1 (-19.7391529f)
+#define NANOFFT_COS2PIF_C0 1.0f
+
+#define NANOFFT_SIN2PIF_S3 (-75.4016113f)
+#define NANOFFT_SIN2PIF_S2 81.5925446f
+#define NANOFFT_SIN2PIF_S1 (-41.3416634f)
+#define NANOFFT_SIN2PIF_S0 6.28318548f
+
+#define NANOFFT_COS2PI_C6 7.8102909681441908
+#define NANOFFT_COS2PI_C5 (-26.42425703488269)
+#define NANOFFT_COS2PI_C4 60.244620085930293
+#define NANOFFT_COS2PI_C3 (-85.456817090341147)
+#define NANOFFT_COS2PI_C2 64.939394022365377
+#define NANOFFT_COS2PI_C1 (-19.739208802178421)
+#define NANOFFT_COS2PI_C0 1.0
+
+#define NANOFFT_SIN2PI_S6 3.7808689593022957
+#define NANOFFT_SIN2PI_S5 (-15.093804209987114)
+#define NANOFFT_SIN2PI_S4 42.058685020160894
+#define NANOFFT_SIN2PI_S3 (-76.705859704274545)
+#define NANOFFT_SIN2PI_S2 81.60524927594804
+#define NANOFFT_SIN2PI_S1 (-41.341702240399634)
+#define NANOFFT_SIN2PI_S0 6.2831853071795862
+
+static inline float nanofft_cos2pif_oct1(float f2) {
+    float p = f2 * NANOFFT_COS2PIF_C3 + NANOFFT_COS2PIF_C2;
+    p = p * f2 + NANOFFT_COS2PIF_C1;
+    return p * f2 + NANOFFT_COS2PIF_C0;
+}
+
+static inline float nanofft_sin2pif_oct1(float f, float f2) {
+    float p = f2 * NANOFFT_SIN2PIF_S3 + NANOFFT_SIN2PIF_S2;
+    p = p * f2 + NANOFFT_SIN2PIF_S1;
+    p = p * f2 + NANOFFT_SIN2PIF_S0;
+    return p * f;
+}
+
+static inline void sincos2pif(float x, float *c_out, float *s_out) {
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
+    const float k = rintf(x * 4.0f);
+    const float r = x - k * 0.25f;
+    const uint32_t q = (uint32_t)(int32_t)k;
+#else
     float f = x - (float)((int)x);
     if (f < 0.0f) f += 1.0f;
-    float sign = 1.0f;
-    if (f >= 0.5f) {
-        sign = -1.0f;
-        f -= 0.5f;
-    }
-    if (f > 0.25f) f = 0.5f - f;
-    float f2 = f * f;
-    float p = f2 * 39.536706065730207835108712734262f - 76.549782293595742666226937116116f;
-    p = p * f2 + 81.601004073261773523492199897936f;
-    p = p * f2 - 41.341655031416278077153126232486f;
-    p = p * f2 + 6.2831851600894774430188071795666f;
-    p = p * f;
-    return p * sign;
+    const uint32_t q = (uint32_t)(int)(f * 4.0f + 0.5f);
+    const float r = f - (float)q * 0.25f;
+#endif
+    const float f2 = r * r;
+    const float pc = nanofft_cos2pif_oct1(f2);
+    const float ps = nanofft_sin2pif_oct1(r, f2);
+    const float cm = (q & 1u) ? ps : pc;
+    const float sm = (q & 1u) ? pc : ps;
+    *c_out = ((q + 1u) & 2u) ? -cm : cm;
+    *s_out = (q & 2u) ? -sm : sm;
+}
+
+static inline float sin2pif(float x) {
+    float c, s;
+    sincos2pif(x, &c, &s);
+    return s;
 }
 
 static inline float cos2pif(float x) {
-    float f = x - (float)((int)x);
-    if (f < 0.0f) f += 1.0f;
-    if (f > 0.5f) f = 1.0f - f;
-    float sign = 1.0f;
-    if (f > 0.25f) {
-        sign = -1.0f;
-        f = 0.5f - f;
-    }
-    float f2 = f * f;
-    float p = f2 * 56.242380464873243259663276802701f - 85.240330322699427859509454517828f;
-    p = p * f2 + 64.934590626780991246193352727536f;
-    p = p * f2 - 19.739171434702393618770795066531f;
-    p = p * f2 + 0.99999995346667013630639784578184f;
-    return p * sign;
+    float c, s;
+    sincos2pif(x, &c, &s);
+    return c;
+}
+
+static inline double nanofft_cos2pi_oct1(double f2) {
+    double p = f2 * NANOFFT_COS2PI_C6 + NANOFFT_COS2PI_C5;
+    p = p * f2 + NANOFFT_COS2PI_C4;
+    p = p * f2 + NANOFFT_COS2PI_C3;
+    p = p * f2 + NANOFFT_COS2PI_C2;
+    p = p * f2 + NANOFFT_COS2PI_C1;
+    return p * f2 + NANOFFT_COS2PI_C0;
+}
+
+static inline double nanofft_sin2pi_oct1(double f, double f2) {
+    double p = f2 * NANOFFT_SIN2PI_S6 + NANOFFT_SIN2PI_S5;
+    p = p * f2 + NANOFFT_SIN2PI_S4;
+    p = p * f2 + NANOFFT_SIN2PI_S3;
+    p = p * f2 + NANOFFT_SIN2PI_S2;
+    p = p * f2 + NANOFFT_SIN2PI_S1;
+    p = p * f2 + NANOFFT_SIN2PI_S0;
+    return p * f;
+}
+
+static inline void sincos2pi(double x, double *c_out, double *s_out) {
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
+    const double k = rint(x * 4.0);
+    const double r = x - k * 0.25;
+    const uint64_t q = (uint64_t)(int64_t)k;
+#else
+    double f = x - (double)((int64_t)x);
+    if (f < 0.0) f += 1.0;
+    const uint64_t q = (uint64_t)(int)(f * 4.0 + 0.5);
+    const double r = f - (double)q * 0.25;
+#endif
+    const double f2 = r * r;
+    const double pc = nanofft_cos2pi_oct1(f2);
+    const double ps = nanofft_sin2pi_oct1(r, f2);
+    const double cm = (q & 1u) ? ps : pc;
+    const double sm = (q & 1u) ? pc : ps;
+    *c_out = ((q + 1u) & 2u) ? -cm : cm;
+    *s_out = (q & 2u) ? -sm : sm;
 }
 
 static inline double sin2pi(double x) {
-    double f = x - (double)((int)x);
-    if (f < 0.0) f += 1.0;
-    double sign = 1.0;
-    if (f >= 0.5) {
-        sign = -1.0;
-        f -= 0.5;
-    }
-    if (f > 0.25) f = 0.5 - f;
-    double f2 = f * f;
-    double p = f2 * -0.69093588239655204752473229179535744712019258849149 + 3.816997428325180431886496831784263511664844308953;
-    p = p * f2 - 15.094471616631987517150792141240583632857536104374;
-    p = p * f2 + 42.058688305389948652978636940879319419236423555816;
-    p = p * f2 - 76.705859647469529848428028740175591232140822775877;
-    p = p * f2 + 81.605249275026290026468387665436788455350446194769;
-    p = p * f2 - 41.341702240395082626913754855518082730586045930014;
-    p = p * f2 + 6.2831853071795803915351819993098437430793561832783;
-    p = p * f;
-    return p * sign;
+    double c, s;
+    sincos2pi(x, &c, &s);
+    return s;
 }
 
 static inline double cos2pi(double x) {
-    double f = x - (double)((int)x);
-    if (f < 0.0) f += 1.0;
-    if (f > 0.5) f = 1.0 - f;
-    double sign = 1.0;
-    if (f > 0.25) {
-        sign = -1.0;
-        f = 0.5 - f;
-    }
-    double f2 = f * f;
-    double p = f2 * 0.2719476416639800139555005900627203625997526419121 - 1.7132188587562783227021022500030456711383616906867;
-    p = p * f2 + 7.9034625375924737942470808816341151858745136793854;
-    p = p * f2 - 26.426254069097002482358197039994768718882874895547;
-    p = p * f2 + 60.244641313230924425507669180781096172477629015917;
-    p = p * f2 - 85.456817205981735856122645737764931252180966287231;
-    p = p * f2 + 64.939394022663960757319625985316082107868087096872;
-    p = p * f2 - 19.739208802178707095137280041056835739350734071865;
-    p = p * f2 + 0.99999999999999999608981951072301324039762563006958;
-    return p * sign;
+    double c, s;
+    sincos2pi(x, &c, &s);
+    return c;
 }
 
 /* -------------------------------------------------------------------------
@@ -378,82 +427,106 @@ static inline dd_t dd_log(dd_t x) {
     return dd_add(y, dy);
 }
 
+/* Double-double octant [0, 0.125] Chebyshev minimax coefficients (deg 22 cos,
+ * deg 23 sin, <= 1.6e-32 max error = 106 bits).  The highest terms satisfy
+ * |c_k| * (1/64)^k * 2^-53 < 1e-34, so they are evaluated in plain double
+ * before entering the compensated dd_t Horner tail (cutting DD Horner steps
+ * from 13 to 9 for cos and 8 for sin). */
+#define NANOFFT_COS2PIDD_C11 (-0.00032083236829691917)
+#define NANOFFT_COS2PIDD_C10 0.0037797457541697286
+#define NANOFFT_COS2PIDD_C9 (-0.036382839059704221)
+#define NANOFFT_COS2PIDD_C8 ((dd_t){0.28200596842468023, -5.8346137740404667e-19})
+#define NANOFFT_COS2PIDD_C7 ((dd_t){-1.7143907110883652, 4.9665774462462369e-17})
+#define NANOFFT_COS2PIDD_C6 ((dd_t){7.9035363713184665, 2.4813881349981867e-16})
+#define NANOFFT_COS2PIDD_C5 ((dd_t){-26.426256783374399, 1.2070288783354739e-15})
+#define NANOFFT_COS2PIDD_C4 ((dd_t){60.244641371876661, -3.2215051856825278e-16})
+#define NANOFFT_COS2PIDD_C3 ((dd_t){-85.456817206693728, 2.0361756146129074e-16})
+#define NANOFFT_COS2PIDD_C2 ((dd_t){64.939394022668296, -4.2563201319203861e-15})
+#define NANOFFT_COS2PIDD_C1 ((dd_t){-19.739208802178716, -1.2530591017479316e-15})
+#define NANOFFT_COS2PIDD_C0 ((dd_t){1.0, 0.0})
+
+#define NANOFFT_SIN2PIDD_S11 (-8.7692667141639106e-05)
+#define NANOFFT_SIN2PIDD_S10 0.0011309015121999477
+#define NANOFFT_SIN2PIDD_S9 (-0.01203158541845983)
+#define NANOFFT_SIN2PIDD_S8 0.10422916220031785
+#define NANOFFT_SIN2PIDD_S7 ((dd_t){-0.71812230177842329, -4.7054679255853891e-17})
+#define NANOFFT_SIN2PIDD_S6 ((dd_t){3.8199525848482816, 2.3811552486513893e-17})
+#define NANOFFT_SIN2PIDD_S5 ((dd_t){-15.09464257682299, -6.7943115622588666e-16})
+#define NANOFFT_SIN2PIDD_S4 ((dd_t){42.058693944897655, -1.9698199606797813e-15})
+#define NANOFFT_SIN2PIDD_S3 ((dd_t){-76.705859753061389, 3.6416334340474009e-15})
+#define NANOFFT_SIN2PIDD_S2 ((dd_t){81.605249276075057, -2.5379220305126954e-15})
+#define NANOFFT_SIN2PIDD_S1 ((dd_t){-41.341702240399762, 1.8132498260631586e-15})
+#define NANOFFT_SIN2PIDD_S0 ((dd_t){6.2831853071795862, 2.4492935982947064e-16})
+
+static inline dd_t nanofft_cos2pidd_oct1(dd_t f2) {
+    const double t = (NANOFFT_COS2PIDD_C11 * f2.hi + NANOFFT_COS2PIDD_C10) * f2.hi + NANOFFT_COS2PIDD_C9;
+    dd_t p = dd_make(t, 0.0);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C8);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C7);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C6);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C5);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C4);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C3);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C2);
+    p = dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C1);
+    return dd_add(dd_mul(p, f2), NANOFFT_COS2PIDD_C0);
+}
+
+static inline dd_t nanofft_sin2pidd_oct1(dd_t f, dd_t f2) {
+    double t = NANOFFT_SIN2PIDD_S11 * f2.hi + NANOFFT_SIN2PIDD_S10;
+    t = t * f2.hi + NANOFFT_SIN2PIDD_S9;
+    t = t * f2.hi + NANOFFT_SIN2PIDD_S8;
+    dd_t p = dd_make(t, 0.0);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S7);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S6);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S5);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S4);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S3);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S2);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S1);
+    p = dd_add(dd_mul(p, f2), NANOFFT_SIN2PIDD_S0);
+    return dd_mul(p, f);
+}
+
+static inline dd_t nanofft_reduce_oct1_dd(dd_t x, uint32_t *q_out) {
+    const dd_t f = dd_sub(x, dd_make(floor(x.hi), 0.0));
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__AVX512F__) || defined(__aarch64__)
+    const double k = rint(f.hi * 4.0);
+    *q_out = (uint32_t)(int32_t)k;
+    return dd_sub(f, dd_make(k * 0.25, 0.0));
+#else
+    const int32_t k = (int32_t)(f.hi * 4.0 + (f.hi >= 0.0 ? 0.5 : -0.5));
+    *q_out = (uint32_t)k;
+    return dd_sub(f, dd_make((double)k * 0.25, 0.0));
+#endif
+}
+
+static inline void sincos2pidd(dd_t x, dd_t *c_out, dd_t *s_out) {
+    uint32_t q;
+    const dd_t r = nanofft_reduce_oct1_dd(x, &q);
+    const dd_t f2 = dd_mul(r, r);
+    const dd_t pc = nanofft_cos2pidd_oct1(f2);
+    const dd_t ps = nanofft_sin2pidd_oct1(r, f2);
+    const dd_t cm = (q & 1u) ? ps : pc;
+    const dd_t sm = (q & 1u) ? pc : ps;
+    *c_out = ((q + 1u) & 2u) ? dd_make(-cm.hi, -cm.lo) : cm;
+    *s_out = (q & 2u) ? dd_make(-sm.hi, -sm.lo) : sm;
+}
+
 static inline dd_t cos2pidd(dd_t x) {
-    // 1. Truncate argument modulo 1 using dd_t math
-    double int_part = (double)((int64_t)x.hi);
-    dd_t f = dd_sub(x, dd_make(int_part, 0.0));
-
-    if (f.hi < 0.0) f = dd_add(f, dd_make(1.0, 0.0));
-    if (f.hi > 0.5) f = dd_sub(dd_make(1.0, 0.0), f);
-
-    double sign = 1.0;
-    if (f.hi > 0.25) {
-        sign = -1.0;
-        f = dd_sub(dd_make(0.5, 0.0), f);
-    }
-
-    dd_t f2 = dd_mul(f, f);
-    dd_t p;
-
-    p = ((dd_t){-1.3712976302871458e-06, -1.4907449409481538e-23});
-    p = dd_add(dd_mul(p, f2), ((dd_t){2.3093788063462385e-05, 4.5435375960601516e-22}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-0.00032299035911159625, -8.9810661988144363e-21}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){0.0037798341474950792, -1.9249220349568919e-19}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-0.036382841139801829, 2.9056792650806832e-18}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){0.28200596845569187, 1.5852734583076034e-17}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-1.7143907110886696, 5.0670981029021671e-17}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){7.9035363713184692, -4.4106464905449524e-16}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-26.426256783374399, 1.1988182697337608e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){60.244641371876661, -3.2213071685554461e-16}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-85.456817206693728, 2.0361754233578647e-16}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){64.939394022668296, -4.2563201319361759e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-19.739208802178716, -1.2530591017478957e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){1, -7.4159205569012457e-33}));
-
-    return (sign < 0.0) ? dd_make(-p.hi, -p.lo) : p;
+    uint32_t q;
+    const dd_t r = nanofft_reduce_oct1_dd(x, &q);
+    const dd_t f2 = dd_mul(r, r);
+    const dd_t p = (q & 1u) ? nanofft_sin2pidd_oct1(r, f2) : nanofft_cos2pidd_oct1(f2);
+    return ((q + 1u) & 2u) ? dd_make(-p.hi, -p.lo) : p;
 }
 
 static inline dd_t sin2pidd(dd_t x) {
-    // 1. Truncate argument modulo 1 using dd_t math
-    double int_part = (double)((int64_t)x.hi);
-    dd_t f = dd_sub(x, dd_make(int_part, 0.0));
-
-    if (f.hi < 0.0) f = dd_add(f, dd_make(1.0, 0.0));
-
-    double sign = 1.0;
-    if (f.hi >= 0.5) {
-        sign = -1.0;
-        f = dd_sub(f, dd_make(0.5, 0.0));
-    }
-    if (f.hi > 0.25) {
-        f = dd_sub(dd_make(0.5, 0.0), f);
-    }
-
-    if (sign < 0.0) {
-        f = dd_make(-f.hi, -f.lo);
-    }
-    sign = 1.0;
-
-    dd_t f2 = dd_mul(f, f);
-    dd_t p;
-
-    p = ((dd_t){-3.1937621498346393e-07, -4.2494386355335374e-24});
-    p = dd_add(dd_mul(p, f2), ((dd_t){5.8042120014329398e-06, -3.9949772624199443e-22}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-8.8235163179284102e-05, 9.9742533594686292e-22}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){0.0011309237346037141, 9.0689538417711371e-20}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-0.012031585941374802, 3.5320565199955664e-19}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){0.10422916220811097, 3.2446843930090187e-18}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-0.71812230177849967, -4.3916880697967638e-17}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){3.819952584848282, 7.214503754465747e-17}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-15.09464257682299, -6.8142151350129174e-16}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){42.058693944897655, -1.9698158197627135e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-76.705859753061389, 3.6416334350664191e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){81.605249276075057, -2.5379220305392744e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){-41.341702240399762, 1.8132498260632083e-15}));
-    p = dd_add(dd_mul(p, f2), ((dd_t){6.2831853071795862, 2.4492935982947059e-16}));
-
-    p = dd_mul(p, f);
-    return dd_make(p.hi * sign, p.lo * sign);
+    uint32_t q;
+    const dd_t r = nanofft_reduce_oct1_dd(x, &q);
+    const dd_t f2 = dd_mul(r, r);
+    const dd_t p = (q & 1u) ? nanofft_cos2pidd_oct1(f2) : nanofft_sin2pidd_oct1(r, f2);
+    return (q & 2u) ? dd_make(-p.hi, -p.lo) : p;
 }
 NANOFFT_DIAG_POP
 

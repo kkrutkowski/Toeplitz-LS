@@ -1085,21 +1085,63 @@ intra_vector:;
 /* Twiddles of one fused pass: per stage t the (m, j) grid described above. */
 static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, FLOAT *real_buffer, FLOAT *imag_buffer) {
     const uint32_t q = step >> layers;
+    const double inv_step = 1.0 / (double)step; /* step is a power of 2, so inv_step is exact */
     uint32_t base = shift;
     for (uint32_t t = 0; t < layers; ++t) {
         const uint32_t half = step >> (t + 1);
         const uint32_t groups = half / q; /* 2^(layers-1-t) */
         const uint32_t mult = 1u << t;
+        const double step_mul = (double)mult * inv_step;
         for (uint32_t m = 0; m < groups; ++m) {
-            for (uint32_t j = 0; j < q; ++j) {
+            const uint32_t row_off = base + m * q;
+            const uint32_t k_base = m * q;
+            uint32_t j = 0;
 #if defined(DOUBLE_DOUBLE)
-                dd_t angle = dd_div(dd_make(-(double)(mult * (j + m * q)), 0.0), dd_make((double)step, 0.0));
-#else
-                double angle = -1.0 * (double)(mult * (j + m * q)) / (double)step;
-#endif
-                real_buffer[base + m * q + j] = M_COS2PI(angle);
-                imag_buffer[base + m * q + j] = NEG(M_SIN2PI(angle));
+            for (; j + (uint32_t)VECDD_LEN <= q; j += (uint32_t)VECDD_LEN) {
+                VEC ang_hi;
+                for (uint32_t l = 0; l < (uint32_t)VECDD_LEN; ++l) ang_hi[l] = (double)(k_base + j + l) * step_mul;
+                VECDD c, s;
+                vecdd_sincos2pi(vecdd_make(ang_hi, (VEC){}), &c, &s);
+                for (uint32_t l = 0; l < (uint32_t)VECDD_LEN; ++l) {
+                    real_buffer[row_off + j + l] = dd_make(c.hi[l], c.lo[l]);
+                    imag_buffer[row_off + j + l] = dd_make(s.hi[l], s.lo[l]);
+                }
             }
+            for (; j < q; ++j) {
+                /* k * mult / step is dyadic and exact in a single double (N < 2^31). */
+                const dd_t theta = dd_make((double)(k_base + j) * step_mul, 0.0);
+                M_SINCOS2PI(theta, &real_buffer[row_off + j], &imag_buffer[row_off + j]);
+            }
+#elif defined(DOUBLE)
+            for (; j + (uint32_t)VEC_LEN <= q; j += (uint32_t)VEC_LEN) {
+                VEC ang;
+                for (uint32_t l = 0; l < (uint32_t)VEC_LEN; ++l) ang[l] = (double)(k_base + j + l) * step_mul;
+                VEC c, s;
+                vec_sincos2pi(ang, &c, &s);
+                STORE_VEC(&real_buffer[row_off + j], c);
+                STORE_VEC(&imag_buffer[row_off + j], s);
+            }
+            for (; j < q; ++j) {
+                const double theta = (double)(k_base + j) * step_mul;
+                M_SINCOS2PI(theta, &real_buffer[row_off + j], &imag_buffer[row_off + j]);
+            }
+#else
+            for (; j + (uint32_t)VECF_LEN <= q; j += (uint32_t)VECF_LEN) {
+                VEC ang_lo, ang_hi;
+                for (uint32_t l = 0; l < (uint32_t)VEC_LEN; ++l) {
+                    ang_lo[l] = (double)(k_base + j + l) * step_mul;
+                    ang_hi[l] = (double)(k_base + j + (uint32_t)VEC_LEN + l) * step_mul;
+                }
+                VECF c, s;
+                vecf_sincos2pi_d(ang_lo, ang_hi, &c, &s);
+                STORE_VEC(&real_buffer[row_off + j], c);
+                STORE_VEC(&imag_buffer[row_off + j], s);
+            }
+            for (; j < q; ++j) {
+                const double theta = (double)(k_base + j) * step_mul;
+                M_SINCOS2PI(theta, &real_buffer[row_off + j], &imag_buffer[row_off + j]);
+            }
+#endif
         }
         base += half;
     }

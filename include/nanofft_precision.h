@@ -12,6 +12,7 @@
 #undef INTERNAL_VEC_LEN
 #undef M_COS2PI
 #undef M_SIN2PI
+#undef M_SINCOS2PI
 #undef M_FMA
 #undef M_EXP
 #undef M_FABS
@@ -57,6 +58,7 @@ typedef uint32_t INTERNAL_VEC_INT;
 #    define INTERNAL_VEC_LEN 1
 #    define M_COS2PI(x) cos2pidd((x))
 #    define M_SIN2PI(x) sin2pidd((x))
+#    define M_SINCOS2PI(x, c, s) sincos2pidd((x), (c), (s))
 #    define M_FMA(a, b, c) dd_add(dd_mul((a), (b)), (c))
 #    define M_EXP(a) dd_exp((a))
 #    define M_FABS(a) fabs(dd_to_double(a))
@@ -106,6 +108,7 @@ typedef VEC_INT INTERNAL_VEC_INT;
 #    define INTERNAL_VEC_LEN VEC_LEN
 #    define M_COS2PI(x) cos2pi((double)(x))
 #    define M_SIN2PI(x) sin2pi((double)(x))
+#    define M_SINCOS2PI(x, c, s) sincos2pi((double)(x), (c), (s))
 #    define M_FMA(a, b, c) fma((a), (b), (c))
 #    define M_FABS(a) fabs(a)
 #    define ADD(a, b) ((a) + (b))
@@ -157,6 +160,7 @@ typedef VECF_INT INTERNAL_VEC_INT;
 #    define INTERNAL_VEC_LEN VECF_LEN
 #    define M_COS2PI(x) cos2pif((float)(x))
 #    define M_SIN2PI(x) sin2pif((float)(x))
+#    define M_SINCOS2PI(x, c, s) sincos2pif((float)(x), (c), (s))
 #    define M_FMA(a, b, c) fmaf((a), (b), (c))
 #    define M_FABS(a) fabsf(a)
 #    define ADD(a, b) ((a) + (b))
