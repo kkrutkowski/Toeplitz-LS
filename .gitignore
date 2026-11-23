@@ -69,3 +69,5 @@ venv/
 .env
 *.log
 .DS_Store
+offload/refs
+ scratch*
