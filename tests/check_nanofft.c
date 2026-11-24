@@ -74,8 +74,8 @@ static void naive_dft(const float *r, const float *i, double *out_r, double *out
             acc_r += (double)r[m] * c - (double)i[m] * s;
             acc_i += (double)i[m] * c + (double)r[m] * s;
         }
-        out_r[k] = acc_r;
-        out_i[k] = acc_i;
+        out_r[k] = acc_r / (double)n;
+        out_i[k] = acc_i / (double)n;
     }
 }
 
@@ -678,8 +678,8 @@ static void check_breadth_double(void) {
                     ar += in_r[m][l] * c - in_i[m][l] * s;
                     ai += in_i[m][l] * c + in_r[m][l] * s;
                 }
-                ref_r[(size_t)l * n + k] = ar;
-                ref_i[(size_t)l * n + k] = ai;
+                ref_r[(size_t)l * n + k] = ar / (double)n;
+                ref_i[(size_t)l * n + k] = ai / (double)n;
             }
         }
 

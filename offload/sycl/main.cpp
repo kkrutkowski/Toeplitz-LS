@@ -41,8 +41,8 @@ void cpu_dif_radix2_ref(
         const long double ang_step = static_cast<long double>(sign) * kTwoPiLD / static_cast<long double>(step);
         for (size_t i = 0; i < N; i += step) {
             for (size_t j = 0; j < half; ++j) {
-                const long double ar = re[i + j], ai = im[i + j];
-                const long double br = re[i + j + half], bi = im[i + j + half];
+                const long double ar = 0.5L * re[i + j], ai = 0.5L * im[i + j];
+                const long double br = 0.5L * re[i + j + half], bi = 0.5L * im[i + j + half];
                 re[i + j] = ar + br;
                 im[i + j] = ai + bi;
                 const long double dr = ar - br;

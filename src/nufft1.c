@@ -76,6 +76,7 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define NANOFFT_DESTROY_PLAN nanofftdd_destroy_plan
 #    define LRA_BESSEL_TERMS 14
 #    define GL_NEWTON_TOL FCONST(5e-32, 0)
+#    define PSWF_KERNEL_MAX_EXP 26 /* (p_sig + 2) / 4; future FP16 tlsh (w <= 5) uses 3 */
 #elif defined(DOUBLE)
 #    define PFX(name) tls_nufft_##name
 #    define NANOFFT_PLAN nanofft_plan
@@ -90,6 +91,7 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define NANOFFT_DESTROY_PLAN nanofft_destroy_plan
 #    define LRA_BESSEL_TERMS 8
 #    define GL_NEWTON_TOL FCONST(2.0e-16)
+#    define PSWF_KERNEL_MAX_EXP 13
 #else
 #    define PFX(name) tlsf_nufft_##name
 #    define NANOFFT_PLAN nanofftf_plan
@@ -104,6 +106,7 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define NANOFFT_DESTROY_PLAN nanofftf_destroy_plan
 #    define LRA_BESSEL_TERMS 6
 #    define GL_NEWTON_TOL FCONST(1.0e-7)
+#    define PSWF_KERNEL_MAX_EXP 6
 #endif
 
 /* =========================================================================
@@ -938,6 +941,31 @@ static inline bool PFX(pswf_lut_lookup)(int w, bool mode43, const FLOAT **coeffs
     return false;
 }
 
+static inline int PFX(pswf_kernel_scale_exp)(int w, bool mode43, bool is_ppoly) {
+    if (w <= 1) return 0;
+    int safe_w = (w > PSWF_MAX_W) ? PSWF_MAX_W : w;
+    const FLOAT *coeffs = NULL;
+    int deg = 0;
+    FLOAT c_val = FCAST(0.0);
+    const bool uses_pswf = is_ppoly || PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c_val);
+    const double inv_4ln2 = 0.36067376022224085; /* 1 / (4 * ln(2)) */
+    double raw_e;
+    if (uses_pswf) {
+        double c = is_ppoly ? (NANOFFT_PI * (double)safe_w * (mode43 ? 0.625 : 0.75) - 0.05) : TO_DOUBLE(c_val);
+        if (c <= 1.0) return 0;
+        raw_e = (c - 0.5 * log(4.0 * NANOFFT_PI * c)) * inv_4ln2;
+    } else {
+        double beta = (mode43 ? 1.90 : 2.30) * (double)safe_w;
+        raw_e = beta * inv_4ln2;
+    }
+    int e = (int)floor(raw_e + 0.5);
+    if (e < 0) e = 0;
+    if (e > PSWF_KERNEL_MAX_EXP) e = PSWF_KERNEL_MAX_EXP;
+    return e;
+}
+
+static inline FLOAT PFX(pswf_log_scale)(int e) { return MUL(FCAST(e), FCONST(0.69314718055994529, 2.3190468138462996e-17)); }
+
 static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
     int safe_w = w;
     if (safe_w < 1) safe_w = 1;
@@ -947,18 +975,19 @@ static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
     const FLOAT *coeffs = NULL;
     int deg = 0;
     FLOAT c = FCAST(0.0);
+    const FLOAT log_scale = PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false));
 
     if (PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c)) {
         FLOAT poly = coeffs[deg];
         for (int i = deg - 1; i >= 0; --i) poly = M_FMA(poly, Z, coeffs[i]);
 
-        return MUL(M_EXP(MUL(MUL(NEG(c), Z), FCAST(0.5))), poly);
+        return MUL(M_EXP(ADD(log_scale, MUL(MUL(NEG(c), Z), FCAST(0.5)))), poly);
     } else {
         FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
         FLOAT inner = SUB(FCAST(1.0), Z);
         if (TO_DOUBLE(inner) < 0.0) inner = FCAST(0.0);
 
-        return M_EXP(MUL(beta, SUB(M_SQRT(inner), FCAST(1.0))));
+        return M_EXP(ADD(log_scale, MUL(beta, SUB(M_SQRT(inner), FCAST(1.0)))));
     }
 }
 
@@ -972,6 +1001,8 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
     int deg = 0;
     FLOAT c = FCAST(0.0);
     bool has_lut = PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c);
+    const FLOAT log_scale = PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false));
+    const INTERNAL_VEC v_log_scale = (INTERNAL_VEC){} + log_scale;
 
     int n_vec = n - (n % INTERNAL_VEC_LEN);
 
@@ -985,7 +1016,7 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
             INTERNAL_VEC v_poly = (INTERNAL_VEC){} + coeffs[deg];
             for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), (INTERNAL_VEC){} + coeffs[j]);
 
-            INTERNAL_VEC v_result = MUL(M_EXP(MUL(v_Z, neg_c_half)), v_poly);
+            INTERNAL_VEC v_result = MUL(M_EXP(ADD(v_log_scale, MUL(v_Z, neg_c_half))), v_poly);
             STORE_VEC(&out_arr[i], v_result);
         }
     } else {
@@ -1002,7 +1033,7 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
                 if (v_inner[lane] < FCAST(0.0)) v_inner[lane] = FCAST(0.0);
             }
 
-            INTERNAL_VEC v_result = M_EXP(MUL(v_beta, SUB(M_SQRT(v_inner), v_one)));
+            INTERNAL_VEC v_result = M_EXP(ADD(v_log_scale, MUL(v_beta, SUB(M_SQRT(v_inner), v_one))));
             STORE_VEC(&out_arr[i], v_result);
         }
     }
@@ -1342,11 +1373,12 @@ static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stri
         coeffs = PFX(allocate_aligned)((size_t)nc * (size_t)stride);
         if (!coeffs) return false;
         memset(coeffs, 0, (size_t)nc * (size_t)stride * sizeof(FLOAT));
+        const double kernel_scale = ldexp(1.0, PFX(pswf_kernel_scale_exp)(w, mode43, true));
         for (int k = 0; k < nc; ++k) {
             int power = (nc - 1) - k;
             for (int j = 0; j < w; ++j) {
                 double val = (power < nc_fit) ? panel_mono[j][power] : 0.0;
-                coeffs[(size_t)k * (size_t)stride + (size_t)j] = FCAST(val);
+                coeffs[(size_t)k * (size_t)stride + (size_t)j] = FCAST(val * kernel_scale);
             }
         }
         *out_coeffs = coeffs;
@@ -1821,7 +1853,8 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w, mode43);
 #endif
 
-    for (int j = 0; j < p; ++j) precomp_vals[j] = MUL(gl_weights[j], precomp_vals[j]);
+    const FLOAT fw = FCAST(plan->w);
+    for (int j = 0; j < p; ++j) precomp_vals[j] = MUL(MUL(fw, gl_weights[j]), precomp_vals[j]);
 
     for (int k = 0; k < plan->Nout; ++k) {
         FLOAT xi_k = MUL(plan->alpha, FCAST(k - plan->output_shift));
@@ -1829,7 +1862,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
 
         for (int j = 0; j < p; ++j) phi_hat_half = ADD(phi_hat_half, MUL(precomp_vals[j], M_COS2PI(MUL(xi_k, gl_nodes[j]))));
 
-        plan->deconv[k] = DIV(FCAST(1.0), MUL(FCAST(plan->w), phi_hat_half));
+        plan->deconv[k] = DIV(FCAST(1.0), phi_hat_half);
     }
 
     nanofft_aligned_free(precomp_vals);

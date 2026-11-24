@@ -21,6 +21,7 @@
 #undef SYCL_FFT_SUB
 #undef SYCL_FFT_NEG
 #undef SYCL_FFT_MUL
+#undef SYCL_FFT_SCALE_HALF
 #undef SYCL_FFT_CMUL
 #undef SYCL_FFT_CSQR
 #undef SYCL_FFT_CMUL_SQRT1_2
@@ -56,6 +57,7 @@
 #define SYCL_FFT_SUB(a, b) df_sub((a), (b))
 #define SYCL_FFT_NEG(a) df_neg((a))
 #define SYCL_FFT_MUL(a, b) df_mul((a), (b))
+#define SYCL_FFT_SCALE_HALF(x) df_scale_pow2((x), 0.5f)
 #define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi) df_cmul_fused((ar), (ai), (br), (bi), (or_), (oi))
 #define SYCL_FFT_CSQR(ar, ai, or_, oi) df_csqr_fused((ar), (ai), (or_), (oi))
 #define SYCL_FFT_CMUL_SQRT1_2(NegRe, NegIm, dr, di, or_, oi) \
@@ -109,6 +111,7 @@
 #define SYCL_FFT_SUB(a, b) ((a) - (b))
 #define SYCL_FFT_NEG(a) (-(a))
 #define SYCL_FFT_MUL(a, b) ((a) * (b))
+#define SYCL_FFT_SCALE_HALF(x) ((x) * 0.5)
 #define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi)              \
     do {                                                    \
         const double _ar = (ar), _ai = (ai);                \
@@ -190,6 +193,7 @@
 #define SYCL_FFT_SUB(a, b) ((a) - (b))
 #define SYCL_FFT_NEG(a) (-(a))
 #define SYCL_FFT_MUL(a, b) ((a) * (b))
+#define SYCL_FFT_SCALE_HALF(x) ((x) * 0.5f)
 #define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi)              \
     do {                                                    \
         const float _ar = (ar), _ai = (ai);                 \

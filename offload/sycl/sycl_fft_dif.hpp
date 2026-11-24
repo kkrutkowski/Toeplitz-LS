@@ -53,6 +53,7 @@
 #undef SYCL_FFT_SUB
 #undef SYCL_FFT_NEG
 #undef SYCL_FFT_MUL
+#undef SYCL_FFT_SCALE_HALF
 #undef SYCL_FFT_CMUL
 #undef SYCL_FFT_CSQR
 #undef SYCL_FFT_CMUL_SQRT1_2

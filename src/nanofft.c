@@ -94,6 +94,23 @@ NANOFFT_UNUSED static inline size_t align_up(size_t bytes) { return (bytes + (si
 NANOFFT_UNUSED static inline uint32_t intmin(uint32_t a, uint32_t b) { return (a < b) ? a : b; }
 NANOFFT_UNUSED static inline uint32_t intmax(int32_t a, int32_t b) { return (a > b) ? a : b; }
 
+#if defined(DOUBLE_DOUBLE)
+NANOFFT_UNUSED static inline dd_t half_scalar(dd_t x) { return dd_make(x.hi * 0.5, x.lo * 0.5); }
+NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return dd_make(x.hi * 0.5, x.lo * 0.5); }
+NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) {
+    const VEC h = (VEC){} + 0.5;
+    return vecdd_make(x.hi * h, x.lo * h);
+}
+#elif defined(DOUBLE)
+NANOFFT_UNUSED static inline double half_scalar(double x) { return x * 0.5; }
+NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return x * ((INTERNAL_VEC){} + 0.5); }
+NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * ((BREADTH_VEC){} + 0.5); }
+#else
+NANOFFT_UNUSED static inline float half_scalar(float x) { return x * 0.5f; }
+NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return x * ((INTERNAL_VEC){} + 0.5f); }
+NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * ((BREADTH_VEC){} + 0.5f); }
+#endif
+
 #define LOG_BLOCK_WIDTH 6
 #define BLOCK_WIDTH (1u << LOG_BLOCK_WIDTH)
 #define BLOCK_ELEMS (BLOCK_WIDTH * BLOCK_WIDTH)
@@ -672,8 +689,8 @@ static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint3
  * 2^(log2(len)-1-i), the inverse puts them back.
  */
 #    if INTERNAL_VEC_LEN == 16
-#        define W16_C1 ((FLOAT)0.9238795325112867)
-#        define W16_S1 ((FLOAT)0.3826834323650898)
+#        define W16_C1 ((FLOAT)(0.5 * 0.9238795325112867))
+#        define W16_S1 ((FLOAT)(0.5 * 0.3826834323650898))
 
 #        define NANOFFT_PERM_ENTRIES(X)                                \
             X(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) \
@@ -687,22 +704,24 @@ static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint3
             X(3, 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
 
 static const INTERNAL_VEC real_twiddles[4] __attribute__((aligned(64))) = {
-    {(FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2, W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)-NANOFFT_SQRT1_2, -W16_C1, (FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2,
-     W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)-NANOFFT_SQRT1_2, -W16_C1},
-    {(FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2,
-     (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2},
-    {(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0,
-     (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0},
-    {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0,
-     (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
+    {(FLOAT)0.5, W16_C1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), -W16_C1, (FLOAT)0.5, W16_C1,
+     (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), -W16_C1},
+    {(FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0,
+     (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5,
+     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2)},
+    {(FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5,
+     (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0},
+    {(FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5,
+     (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5}};
 
 static const INTERNAL_VEC imag_twiddles[4] __attribute__((aligned(64))) = {
-    {(FLOAT)0.0, W16_S1, (FLOAT)NANOFFT_SQRT1_2, W16_C1, (FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2, W16_S1, (FLOAT)0.0, W16_S1, (FLOAT)NANOFFT_SQRT1_2, W16_C1,
-     (FLOAT)1.0, W16_C1, (FLOAT)NANOFFT_SQRT1_2, W16_S1},
-    {(FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0,
-     (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2},
-    {(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0,
-     (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0},
+    {(FLOAT)0.0, W16_S1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_C1, (FLOAT)0.5, W16_C1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1, (FLOAT)0.0, W16_S1,
+     (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_C1, (FLOAT)0.5, W16_C1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1},
+    {(FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5,
+     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0,
+     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2)},
+    {(FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0,
+     (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5},
     {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0,
      (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
 
@@ -722,15 +741,17 @@ static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
             X(1, 0, 1, 4, 5, 2, 3, 6, 7)    \
             X(2, 0, 4, 1, 5, 2, 6, 3, 7)
 
-static const INTERNAL_VEC real_twiddles[3] __attribute__((aligned(64))) = {
-    {(FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)-NANOFFT_SQRT1_2},
-    {(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0},
-    {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
+static const INTERNAL_VEC real_twiddles[3]
+    __attribute__((aligned(64))) = {{(FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5,
+                                     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2)},
+                                    {(FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0},
+                                    {(FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5}};
 
-static const INTERNAL_VEC imag_twiddles[3] __attribute__((aligned(64))) = {
-    {(FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)0.0, (FLOAT)NANOFFT_SQRT1_2, (FLOAT)1.0, (FLOAT)NANOFFT_SQRT1_2},
-    {(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0},
-    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+static const INTERNAL_VEC imag_twiddles[3]
+    __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0,
+                                     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2)},
+                                    {(FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5},
+                                    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
     INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 2, 3, 8, 9, 10, 11);
@@ -747,9 +768,9 @@ static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
             X(1, 0, 2, 1, 3)
 
 static const INTERNAL_VEC real_twiddles[2]
-    __attribute__((aligned(64))) = {{(FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0}, {(FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0, (FLOAT)1.0}};
+    __attribute__((aligned(64))) = {{(FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0}, {(FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5}};
 static const INTERNAL_VEC imag_twiddles[2]
-    __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)1.0, (FLOAT)0.0, (FLOAT)1.0}, {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+    __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5}, {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
     INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 4, 5);
@@ -761,7 +782,7 @@ static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
 #        define NANOFFT_PERM_ENTRIES(X) X(0, 0, 1)
 #        define NANOFFT_INV_PERM_ENTRIES(X) X(0, 0, 1)
 
-static const INTERNAL_VEC real_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)1.0, (FLOAT)1.0}};
+static const INTERNAL_VEC real_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)0.5, (FLOAT)0.5}};
 static const INTERNAL_VEC imag_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
@@ -854,8 +875,8 @@ static inline void nanofft_vec_inv_perm(INTERNAL_VEC *a, INTERNAL_VEC *b, uint32
                             const INTERNAL_VEC si = ADD(vi[a], vi[b]);                               \
                             const INTERNAL_VEC dr = SUB(vr[a], vr[b]);                               \
                             const INTERNAL_VEC di = SUB(vi[a], vi[b]);                               \
-                            vr[a] = sr;                                                              \
-                            vi[a] = si;                                                              \
+                            vr[a] = half_ivec(sr);                                                   \
+                            vi[a] = half_ivec(si);                                                   \
                             vr[b] = SUB(MUL(dr, wr), MUL(di, wi));                                   \
                             vi[b] = ADD(MUL(dr, wi), MUL(di, wr));                                   \
                         }                                                                            \
@@ -907,8 +928,8 @@ static void sande_tukey_stages(FLOAT *real_signal, FLOAT *imag_signal, const FLO
                 INTERNAL_VEC r_odd = LOAD_VEC(&real_signal[i + j + half_step]);
                 INTERNAL_VEC i_odd = LOAD_VEC(&imag_signal[i + j + half_step]);
 
-                STORE_VEC(&real_signal[i + j], ADD(r_even, r_odd));
-                STORE_VEC(&imag_signal[i + j], ADD(i_even, i_odd));
+                STORE_VEC(&real_signal[i + j], half_ivec(ADD(r_even, r_odd)));
+                STORE_VEC(&imag_signal[i + j], half_ivec(ADD(i_even, i_odd)));
 
                 INTERNAL_VEC r_tmp = SUB(r_even, r_odd);
                 INTERNAL_VEC i_tmp = SUB(i_even, i_odd);
@@ -1043,8 +1064,8 @@ intra_vector:;
             INTERNAL_VEC r_tmp = SUB(r_even, r_odd);
             INTERNAL_VEC i_tmp = SUB(i_even, i_odd);
 
-            r_even = ADD(r_even, r_odd);
-            i_even = ADD(i_even, i_odd);
+            r_even = half_ivec(ADD(r_even, r_odd));
+            i_even = half_ivec(ADD(i_even, i_odd));
 
             r_odd = SUB(MUL(r_tmp, real_twiddles[i]), MUL(i_tmp, imag_twiddles[i]));
             i_odd = ADD(MUL(r_tmp, imag_twiddles[i]), MUL(i_tmp, real_twiddles[i]));
@@ -1069,8 +1090,8 @@ intra_vector:;
                 FLOAT re = real_signal[i + j], ie = imag_signal[i + j];
                 FLOAT ro = real_signal[i + j + half_step], io = imag_signal[i + j + half_step];
 
-                real_signal[i + j] = ADD(re, ro);
-                imag_signal[i + j] = ADD(ie, io);
+                real_signal[i + j] = half_scalar(ADD(re, ro));
+                imag_signal[i + j] = half_scalar(ADD(ie, io));
 
                 FLOAT rt = SUB(re, ro), it = SUB(ie, io);
                 real_signal[i + j + half_step] = SUB(MUL(rt, real_buffer[shift + j]), MUL(it, imag_buffer[shift + j]));
@@ -1103,14 +1124,17 @@ static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, 
                 VECDD c, s;
                 vecdd_sincos2pi(vecdd_make(ang_hi, (VEC){}), &c, &s);
                 for (uint32_t l = 0; l < (uint32_t)VECDD_LEN; ++l) {
-                    real_buffer[row_off + j + l] = dd_make(c.hi[l], c.lo[l]);
-                    imag_buffer[row_off + j + l] = dd_make(s.hi[l], s.lo[l]);
+                    real_buffer[row_off + j + l] = dd_make(c.hi[l] * 0.5, c.lo[l] * 0.5);
+                    imag_buffer[row_off + j + l] = dd_make(s.hi[l] * 0.5, s.lo[l] * 0.5);
                 }
             }
             for (; j < q; ++j) {
                 /* k * mult / step is dyadic and exact in a single double (N < 2^31). */
                 const dd_t theta = dd_make((double)(k_base + j) * step_mul, 0.0);
-                M_SINCOS2PI(theta, &real_buffer[row_off + j], &imag_buffer[row_off + j]);
+                dd_t c, s;
+                M_SINCOS2PI(theta, &c, &s);
+                real_buffer[row_off + j] = half_scalar(c);
+                imag_buffer[row_off + j] = half_scalar(s);
             }
 #elif defined(DOUBLE)
             for (; j + (uint32_t)VEC_LEN <= q; j += (uint32_t)VEC_LEN) {
@@ -1118,12 +1142,15 @@ static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, 
                 for (uint32_t l = 0; l < (uint32_t)VEC_LEN; ++l) ang[l] = (double)(k_base + j + l) * step_mul;
                 VEC c, s;
                 vec_sincos2pi(ang, &c, &s);
-                STORE_VEC(&real_buffer[row_off + j], c);
-                STORE_VEC(&imag_buffer[row_off + j], s);
+                STORE_VEC(&real_buffer[row_off + j], half_ivec(c));
+                STORE_VEC(&imag_buffer[row_off + j], half_ivec(s));
             }
             for (; j < q; ++j) {
                 const double theta = (double)(k_base + j) * step_mul;
-                M_SINCOS2PI(theta, &real_buffer[row_off + j], &imag_buffer[row_off + j]);
+                double c, s;
+                M_SINCOS2PI(theta, &c, &s);
+                real_buffer[row_off + j] = half_scalar(c);
+                imag_buffer[row_off + j] = half_scalar(s);
             }
 #else
             for (; j + (uint32_t)VECF_LEN <= q; j += (uint32_t)VECF_LEN) {
@@ -1134,12 +1161,15 @@ static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, 
                 }
                 VECF c, s;
                 vecf_sincos2pi_d(ang_lo, ang_hi, &c, &s);
-                STORE_VEC(&real_buffer[row_off + j], c);
-                STORE_VEC(&imag_buffer[row_off + j], s);
+                STORE_VEC(&real_buffer[row_off + j], half_ivec(c));
+                STORE_VEC(&imag_buffer[row_off + j], half_ivec(s));
             }
             for (; j < q; ++j) {
                 const double theta = (double)(k_base + j) * step_mul;
-                M_SINCOS2PI(theta, &real_buffer[row_off + j], &imag_buffer[row_off + j]);
+                float c, s;
+                M_SINCOS2PI(theta, &c, &s);
+                real_buffer[row_off + j] = half_scalar(c);
+                imag_buffer[row_off + j] = half_scalar(s);
             }
 #endif
         }
@@ -1192,8 +1222,8 @@ static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, 
                             const BREADTH_VEC si = BREADTH_ADD(vi[a], vi[b]);                        \
                             const BREADTH_VEC dr = BREADTH_SUB(vr[a], vr[b]);                        \
                             const BREADTH_VEC di = BREADTH_SUB(vi[a], vi[b]);                        \
-                            vr[a] = sr;                                                              \
-                            vi[a] = si;                                                              \
+                            vr[a] = half_bvec(sr);                                                   \
+                            vi[a] = half_bvec(si);                                                   \
                             vr[b] = BREADTH_SUB(BREADTH_MUL(dr, wr), BREADTH_MUL(di, wi));           \
                             vi[b] = BREADTH_ADD(BREADTH_MUL(dr, wi), BREADTH_MUL(di, wr));           \
                         }                                                                            \
@@ -1244,8 +1274,8 @@ static void sande_tukey_bstages(BREADTH_VEC *real_signal, BREADTH_VEC *imag_sign
                 const BREADTH_VEC r_odd = LOAD_BVEC(&real_signal[i + j + half_step]);
                 const BREADTH_VEC i_odd = LOAD_BVEC(&imag_signal[i + j + half_step]);
 
-                STORE_BVEC(&real_signal[i + j], BREADTH_ADD(r_even, r_odd));
-                STORE_BVEC(&imag_signal[i + j], BREADTH_ADD(i_even, i_odd));
+                STORE_BVEC(&real_signal[i + j], half_bvec(BREADTH_ADD(r_even, r_odd)));
+                STORE_BVEC(&imag_signal[i + j], half_bvec(BREADTH_ADD(i_even, i_odd)));
 
                 const BREADTH_VEC r_tmp = BREADTH_SUB(r_even, r_odd);
                 const BREADTH_VEC i_tmp = BREADTH_SUB(i_even, i_odd);

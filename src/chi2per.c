@@ -43,6 +43,17 @@ static void *checked_aligned_malloc(size_t count, size_t size) {
     return nanofft_aligned_alloc(align, padded);
 }
 
+static inline int chi2_bitceil(unsigned int n) {
+    if (n <= 1u) return 1;
+    unsigned int v = n - 1u;
+    int shift = 0;
+    while (v) {
+        v >>= 1;
+        ++shift;
+    }
+    return 1 << shift;
+}
+
 #if defined(DOUBLE_DOUBLE)
 #    define CHI2_PREFIX(name) tlsdd_##name
 #    define TIME_INPUT_T dd_t
@@ -2096,6 +2107,7 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
     const int vec_mode = choice.vec_mode;
     if (use_pswf43) plan_block = tls_pswf43_plan_len_from_base(plan_block);
     const int block = use_pswf43 ? tls_pswf43_output_len_for_plan(plan_block) : plan_block;
+    const int nfft = use_pswf ? chi2_bitceil((unsigned int)(2 * plan_block)) : chi2_bitceil((unsigned int)block);
     const bool use_breadth = (vec_mode == TLS_VEC_BREADTH);
     const int ladder_levels = use_breadth ? 0 : tls_twiddle_ladder_levels(N, block);
     const int max_factor = 2 * degree;
@@ -2125,34 +2137,77 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
         goto cleanup;
     }
 
-    FLOAT ws = FCAST(0.0);
-    FLOAT sum_w2 = FCAST(0.0);
-    FLOAT wy = FCAST(0.0);
     TIME_INPUT_T t_mid = MUL(FCONST(0.5), ADD(t[0], t[M - 1]));
+    FLOAT dy_min = dy[0];
+    double dy_min_d = TO_DOUBLE(dy_min);
     for (int m = 0; m < M; ++m) {
-        if (TO_DOUBLE(dy[m]) <= 0.0) {
+        const double dm = TO_DOUBLE(dy[m]);
+        if (dm <= 0.0) {
             status = CHI2PER_ERR_ARGUMENT;
             goto cleanup;
         }
-        TIME_INPUT_T centered_t = SUB(t[m], t_mid);
-        FLOAT inv_dy = DIV(FCAST(1.0), dy[m]);
-        w[m] = MUL(inv_dy, inv_dy);
-        ws = ADD(ws, w[m]);
-        sum_w2 = ADD(sum_w2, MUL(w[m], w[m]));
-        wy = ADD(wy, MUL(w[m], y[m]));
-        x[m] = time_to_nufft_input(centered_t);
+        if (dm < dy_min_d) {
+            dy_min_d = dm;
+            dy_min = dy[m];
+        }
+        x[m] = time_to_nufft_input(SUB(t[m], t_mid));
     }
 
+    FLOAT ws_raw = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        FLOAT inv_dy = DIV(dy_min, dy[m]);
+        w[m] = MUL(inv_dy, inv_dy);
+        ws_raw = ADD(ws_raw, w[m]);
+    }
+    if (TO_DOUBLE(ws_raw) == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT w_scale = DIV(M_SQRT(FCAST(M)), ws_raw);
+    FLOAT y0 = y[0];
+    FLOAT ws = FCAST(0.0);
+    FLOAT sum_w2 = FCAST(0.0);
+    FLOAT wy = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        w[m] = MUL(w[m], w_scale);
+        ws = ADD(ws, w[m]);
+        sum_w2 = ADD(sum_w2, MUL(w[m], w[m]));
+        wy = ADD(wy, MUL(w[m], SUB(y[m], y0)));
+    }
     if (TO_DOUBLE(ws) == 0.0) {
         status = CHI2PER_ERR_DEGENERATE;
         goto cleanup;
     }
 
-    FLOAT ymean = DIV(wy, ws);
+    FLOAT dy_mean = DIV(wy, ws);
+    double yc_max_d = 0.0;
+    for (int m = 0; m < M; ++m) {
+        FLOAT yc = SUB(SUB(y[m], y0), dy_mean);
+        const double a = (double)M_FABS(yc);
+        if (a > yc_max_d) yc_max_d = a;
+    }
+    if (yc_max_d == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT yc_max = FCAST(yc_max_d);
+    FLOAT chi2_tmp = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        FLOAT yc_u = DIV(SUB(SUB(y[m], y0), dy_mean), yc_max);
+        chi2_tmp = ADD(chi2_tmp, MUL(w[m], MUL(yc_u, yc_u)));
+    }
+    if (TO_DOUBLE(chi2_tmp) == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT inv_y_std_tmp = M_SQRT(DIV(ws, chi2_tmp));
     FLOAT chi2_ref = FCAST(0.0);
     FLOAT yws = FCAST(0.0);
     for (int m = 0; m < M; ++m) {
-        FLOAT yc = SUB(y[m], ymean);
+        FLOAT yc = MUL(DIV(SUB(SUB(y[m], y0), dy_mean), yc_max), inv_y_std_tmp);
         yw[m] = MUL(yc, w[m]);
         yws = ADD(yws, yw[m]);
         chi2_ref = ADD(chi2_ref, MUL(yc, yw[m]));
@@ -2198,6 +2253,11 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
     FLOAT b = (float)(0.5 * (neff_w - 1.0 - 2.0 * (double)degree));
 #endif
 
+    const FLOAT inv_nfft = DIV(FCAST(1.0), FCAST(nfft));
+    const FLOAT ws_fft = MUL(ws, inv_nfft);
+    const FLOAT yws_fft = MUL(yws, inv_nfft);
+    chi2_ref = MUL(chi2_ref, inv_nfft);
+
     const int defer = (tls_tuning_defer() != 0 && use_pswf && NUFFT_PSWF_SLOTS_AVAILABLE((PSWF_PLAN_T *)plan)) ? 1 : 0;
     const size_t num_blocks = ((size_t)N + (size_t)block - 1u) / (size_t)block;
     int nan_count = 0;
@@ -2211,8 +2271,8 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
         }
         const int slot_block = (defer && use_pswf) ? 1 : 0;
         const int mode = slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL;
-        const BREADTH_VEC v_ws = BREADTH_SPLAT(ws);
-        const BREADTH_VEC v_yws = BREADTH_SPLAT(yws);
+        const BREADTH_VEC v_ws = BREADTH_SPLAT(ws_fft);
+        const BREADTH_VEC v_yws = BREADTH_SPLAT(yws_fft);
         const BREADTH_VEC v_zero = BREADTH_ZERO;
 
         for (size_t block_base = 0; block_base < num_blocks; block_base += (size_t)BREADTH_VEC_LEN) {
@@ -2243,8 +2303,8 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
 
             int block_status;
             if (degree == 1) {
-                block_status = gls_impl_breadth(rows_b.Sw, rows_b.Cw, rows_b.Syw, rows_b.Cyw, block, active_lanes, ws, yws, chi2_ref, normalization, M, &cyb, b,
-                                                power_b, cond_b);
+                block_status = gls_impl_breadth(rows_b.Sw, rows_b.Cw, rows_b.Syw, rows_b.Cyw, block, active_lanes, ws_fft, yws_fft, chi2_ref, normalization, M,
+                                                &cyb, b, power_b, cond_b);
             } else {
                 block_status = solve_periodogram_breadth_vec(rows_b.Sw, rows_b.Cw, rows_b.Syw, rows_b.Cyw, block, active_lanes, degree, solver, chi2_ref,
                                                              normalization, M, &cyb, b, power_b, cond_b, &workspace);
@@ -2301,9 +2361,9 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
         block_ladder_advance(&ladder, (int)block_idx);
 
         for (int k = 0; k < count; ++k) {
-            rows.Cw[k] = ws;
+            rows.Cw[k] = ws_fft;
             rows.Sw[k] = FCAST(0.0);
-            rows.Cyw[k] = yws;
+            rows.Cyw[k] = yws_fft;
             rows.Syw[k] = FCAST(0.0);
         }
 
@@ -2325,7 +2385,7 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
 
         int block_status;
         if (degree == 1) {
-            block_status = gls_impl(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, ws, yws, chi2_ref, normalization, M, &cyb, b, power_block, cond_block);
+            block_status = gls_impl(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, ws_fft, yws_fft, chi2_ref, normalization, M, &cyb, b, power_block, cond_block);
         } else {
             block_status = solve_periodogram_vec(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, power_block,
                                                  cond_block, &workspace);
@@ -2412,6 +2472,7 @@ int CHI2_PREFIX(ihs_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
     const int vec_mode = choice.vec_mode;
     if (use_pswf43) plan_block = tls_pswf43_plan_len_from_base(plan_block);
     const int block = use_pswf43 ? tls_pswf43_output_len_for_plan(plan_block) : plan_block;
+    const int nfft = use_pswf ? chi2_bitceil((unsigned int)(2 * plan_block)) : chi2_bitceil((unsigned int)block);
     const bool use_breadth = (vec_mode == TLS_VEC_BREADTH);
     const int ladder_levels = use_breadth ? 0 : tls_twiddle_ladder_levels(N, block);
 
@@ -2430,33 +2491,76 @@ int CHI2_PREFIX(ihs_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         goto cleanup;
     }
 
-    FLOAT ws = FCAST(0.0);
-    FLOAT wy_sum_abs = FCAST(0.0);
-    FLOAT wy_sq_sum = FCAST(0.0);
-    FLOAT wy_mean = FCAST(0.0);
     TIME_INPUT_T t_mid = MUL(FCONST(0.5), ADD(t[0], t[M - 1]));
+    FLOAT dy_min = dy[0];
+    double dy_min_d = TO_DOUBLE(dy_min);
     for (int m = 0; m < M; ++m) {
-        if (TO_DOUBLE(dy[m]) <= 0.0) {
+        const double dm = TO_DOUBLE(dy[m]);
+        if (dm <= 0.0) {
             status = CHI2PER_ERR_ARGUMENT;
             goto cleanup;
         }
-        TIME_INPUT_T centered_t = SUB(t[m], t_mid);
-        FLOAT inv_dy = DIV(FCAST(1.0), dy[m]);
-        w[m] = MUL(inv_dy, inv_dy);
-        ws = ADD(ws, w[m]);
-        wy_mean = ADD(wy_mean, MUL(w[m], y[m]));
-        x[m] = time_to_nufft_input(centered_t);
+        if (dm < dy_min_d) {
+            dy_min_d = dm;
+            dy_min = dy[m];
+        }
+        x[m] = time_to_nufft_input(SUB(t[m], t_mid));
     }
 
+    FLOAT ws_raw = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        FLOAT inv_dy = DIV(dy_min, dy[m]);
+        w[m] = MUL(inv_dy, inv_dy);
+        ws_raw = ADD(ws_raw, w[m]);
+    }
+    if (TO_DOUBLE(ws_raw) == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT w_scale = DIV(M_SQRT(FCAST(M)), ws_raw);
+    FLOAT y0 = y[0];
+    FLOAT ws = FCAST(0.0);
+    FLOAT wy_mean = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        w[m] = MUL(w[m], w_scale);
+        ws = ADD(ws, w[m]);
+        wy_mean = ADD(wy_mean, MUL(w[m], SUB(y[m], y0)));
+    }
     if (TO_DOUBLE(ws) == 0.0) {
         status = CHI2PER_ERR_DEGENERATE;
         goto cleanup;
     }
 
-    FLOAT ymean = DIV(wy_mean, ws);
+    FLOAT dy_mean = DIV(wy_mean, ws);
+    double yc_max_d = 0.0;
+    for (int m = 0; m < M; ++m) {
+        FLOAT yc = SUB(SUB(y[m], y0), dy_mean);
+        const double a = (double)M_FABS(yc);
+        if (a > yc_max_d) yc_max_d = a;
+    }
+    if (yc_max_d == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT yc_max = FCAST(yc_max_d);
+    FLOAT chi2_tmp = FCAST(0.0);
+    for (int m = 0; m < M; ++m) {
+        FLOAT yc_u = DIV(SUB(SUB(y[m], y0), dy_mean), yc_max);
+        chi2_tmp = ADD(chi2_tmp, MUL(w[m], MUL(yc_u, yc_u)));
+    }
+    if (TO_DOUBLE(chi2_tmp) == 0.0) {
+        status = CHI2PER_ERR_DEGENERATE;
+        goto cleanup;
+    }
+
+    FLOAT inv_y_std_tmp = M_SQRT(DIV(ws, chi2_tmp));
+    FLOAT wy_sum_abs = FCAST(0.0);
+    FLOAT wy_sq_sum = FCAST(0.0);
     FLOAT chi2_ref = FCAST(0.0);
     for (int m = 0; m < M; ++m) {
-        FLOAT yc = SUB(y[m], ymean);
+        FLOAT yc = MUL(DIV(SUB(SUB(y[m], y0), dy_mean), yc_max), inv_y_std_tmp);
         wy[m] = MUL(w[m], yc);
         wy_sum_abs = ADD(wy_sum_abs, FCAST(M_FABS(wy[m])));
         wy_sq_sum = ADD(wy_sq_sum, MUL(wy[m], wy[m]));
@@ -2468,10 +2572,16 @@ int CHI2_PREFIX(ihs_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         goto cleanup;
     }
 
-    FLOAT standard_scale = DIV(FCAST(2.0), MUL(ws, chi2_ref));
+    const FLOAT inv_nfft = DIV(FCAST(1.0), FCAST(nfft));
+    const FLOAT ws_fft = MUL(ws, inv_nfft);
+    const FLOAT chi2_ref_fft = MUL(chi2_ref, inv_nfft);
+    FLOAT standard_scale = DIV(FCAST(2.0), MUL(ws_fft, chi2_ref_fft));
     FLOAT norm_neff = DIV(MUL(wy_sum_abs, wy_sum_abs), wy_sq_sum);
     FLOAT nll_scale = FCAST(0.0);
-    if (TO_DOUBLE(norm_neff) > 0.0) nll_scale = DIV(norm_neff, MUL(wy_sum_abs, wy_sum_abs));
+    if (TO_DOUBLE(norm_neff) > 0.0) {
+        FLOAT nfft_over_sum = DIV(FCAST(nfft), wy_sum_abs);
+        nll_scale = MUL(norm_neff, MUL(nfft_over_sum, nfft_over_sum));
+    }
     if (!double_is_finite_bits(TO_DOUBLE(nll_scale)) || TO_DOUBLE(nll_scale) < 0.0) nll_scale = FCAST(0.0);
 
     if (backend == CHI2PER_BACKEND_PSWF43) {

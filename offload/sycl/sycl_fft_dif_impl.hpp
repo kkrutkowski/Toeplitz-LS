@@ -28,8 +28,8 @@ SYCL_FFT_FORCE_INLINE void SYCL_FFT_SUFFIX(dif_radix2_reg_base)(
             unroll_for<Groups>([&](auto g_ic) SYCL_FFT_LAMBDA_INLINE {
                 constexpr int A = g_ic.value * Step + M;
                 constexpr int B = A + H;
-                const Real ar = r_re[A], ai = r_im[A];
-                const Real br = r_re[B], bi = r_im[B];
+                const Real ar = SYCL_FFT_SCALE_HALF(r_re[A]), ai = SYCL_FFT_SCALE_HALF(r_im[A]);
+                const Real br = SYCL_FFT_SCALE_HALF(r_re[B]), bi = SYCL_FFT_SCALE_HALF(r_im[B]);
                 const Real dr = SYCL_FFT_SUB(ar, br);
                 const Real di = SYCL_FFT_SUB(ai, bi);
                 r_re[A] = SYCL_FFT_ADD(ar, br);
@@ -269,8 +269,8 @@ SYCL_FFT_FORCE_INLINE void SYCL_FFT_SUFFIX(dif_radix2_subgroup)(
         }
         unroll_for<E>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
             constexpr int M = m_ic.value;
-            const Real my_re = r_re[M];
-            const Real my_im = r_im[M];
+            const Real my_re = SYCL_FFT_SCALE_HALF(r_re[M]);
+            const Real my_im = SYCL_FFT_SCALE_HALF(r_im[M]);
             const Real p_re = SYCL_FFT_SHUFFLE_XOR(sg, my_re, H);
             const Real p_im = SYCL_FFT_SHUFFLE_XOR(sg, my_im, H);
 
