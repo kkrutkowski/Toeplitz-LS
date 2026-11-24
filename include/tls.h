@@ -118,6 +118,47 @@ TLS_API int tls_ihs_opts(const double *t, const double *y, const double *dy, int
 TLS_API int tlsdd_ihs_opts(const dd_t *t, const dd_t *y, const dd_t *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
                            int spreading, int vectorize, dd_t *power);
 
+/* Half-precision (IEEE 754 binary16) periodogram API.
+ * Times `t` are raw double; `y`/`dy` are float (standard) or double (`_d`
+ * suffix); outputs `power` and `cond` are float to avoid binary16 overflow on
+ * high-SNR ANOVA/NLL and ill-conditioned `cond`. */
+TLS_API int tlsh_fastchi2(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                          int normalization, float *power, float *cond);
+
+TLS_API int tlsh_fastchi2_d(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                            int normalization, float *power, float *cond);
+
+TLS_API int tlsh_fastchi2_spread(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                                 int normalization, int spreading, float *power, float *cond);
+
+TLS_API int tlsh_fastchi2_spread_d(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                                   int normalization, int spreading, float *power, float *cond);
+
+TLS_API int tlsh_fastchi2_opts(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                               int normalization, int spreading, int vectorize, float *power, float *cond);
+
+TLS_API int tlsh_fastchi2_opts_d(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int solver,
+                                 int normalization, int spreading, int vectorize, float *power, float *cond);
+
+TLS_API int tlsh_ihs(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                     float *power);
+
+TLS_API int tlsh_ihs_d(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                       float *power);
+
+TLS_API int tlsh_ihs_spread(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                            int spreading, float *power);
+
+TLS_API int tlsh_ihs_spread_d(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend,
+                              int normalization, int spreading, float *power);
+
+TLS_API int tlsh_ihs_opts(const double *t, const float *y, const float *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                          int spreading, int vectorize, float *power);
+
+TLS_API int tlsh_ihs_opts_d(const double *t, const double *y, const double *dy, int M, double f0, double df, int N, int degree, int backend, int normalization,
+                            int spreading, int vectorize, float *power);
+
+TLS_API int tlsh_using_native_fp16(void);
 #ifdef __cplusplus
 }
 #endif

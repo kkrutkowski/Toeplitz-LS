@@ -39,6 +39,7 @@ PRECISIONS = (
     ("tlsf", None, ()),
     ("tls", "DOUBLE", ()),
     ("tlsdd", "DOUBLE_DOUBLE", ("-fno-fast-math",)),
+    ("tlsh", "HALF", ()),
 )
 # Compiled once each: they are precision independent.
 SHARED_SOURCES = ("tuning", "cpu_features", "probe_arm64")
@@ -88,6 +89,8 @@ def compile_library(build_dir: Path) -> Path:
     objects = []
     for name, define, extra in PRECISIONS:
         for source in SCALAR_SOURCES:
+            if source == "utils" and define == "HALF":
+                continue
             obj = build_dir / ("%s_%s.o" % (name, source))
             cmd = [_cc(), *flags, *extra]
             if define:

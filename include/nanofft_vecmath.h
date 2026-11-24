@@ -401,4 +401,188 @@ static inline void vecdd_sincos2pi(VECDD x, VECDD *c_out, VECDD *s_out) {
     *s_out = vecdd_make(s_hi, s_lo);
 }
 
+#if NANOFFT_NATIVE_FP16
+static inline VECH vech_sqrt(VECH v) {
+#    if defined(__AVX512FP16__) && VEC_BYTES == 64 && (defined(__x86_64__) || defined(_M_X64))
+    return (VECH)_mm512_sqrt_ph((__m512h)v);
+#    elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && VEC_BYTES == 16
+    return (VECH)vsqrtq_f16((float16x8_t)v);
+#    else
+    VECH r = (VECH){};
+    for (int i = 0; i < VECH_LEN; i++) r[i] = (_Float16)sqrtf((float)v[i]);
+    return r;
+#    endif
+}
+
+static inline VECH vech_exp(VECH v) {
+    /* Clamp finite inputs to [-20, 20] so v * inv_ln2 never overflows FP16
+     * (exp(-20) underflows to 0, exp(20) overflows to +inf). Inf/NaN are
+     * rebuilt from raw bits below. */
+    VECH vc = v;
+    for (int i = 0; i < VECH_LEN; i++) {
+        if (vc[i] < (_Float16)-20.0f)
+            vc[i] = (_Float16)-20.0f;
+        else if (vc[i] > (_Float16)20.0f)
+            vc[i] = (_Float16)20.0f;
+    }
+
+    VECH prod = vc * ((VECH){} + (_Float16)NANOFFT_EXP_INV_LN2_H);
+    VECH k;
+#    if defined(__AVX512FP16__) && VEC_BYTES == 64 && (defined(__x86_64__) || defined(_M_X64))
+    k = (VECH)_mm512_roundscale_ph((__m512h)prod, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+#    elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && VEC_BYTES == 16
+    k = (VECH)vrndnq_f16((float16x8_t)prod);
+#    else
+    for (int i = 0; i < VECH_LEN; i++) k[i] = (_Float16)rintf((float)prod[i]);
+#    endif
+
+    VECH r = vc - k * ((VECH){} + (_Float16)NANOFFT_EXP_LN2_HI_H);
+    r = r - k * ((VECH){} + (_Float16)NANOFFT_EXP_LN2_LO_H);
+
+    VECH p = (VECH){} + (_Float16)nanofft_exph_coeffs[NANOFFT_EXPH_DEGREE];
+    for (int j = NANOFFT_EXPH_DEGREE - 1; j >= 0; --j) {
+        p = p * r + ((VECH){} + (_Float16)nanofft_exph_coeffs[j]);
+    }
+
+    VECH_INT bits1, bits2;
+    for (int i = 0; i < VECH_LEN; i++) {
+        _Float16 kf = k[i];
+        _Float16 kh = kf < (_Float16)-14.0f ? (_Float16)-14.0f : (kf > (_Float16)15.0f ? (_Float16)15.0f : kf);
+        _Float16 kl = kf - kh;
+        kl = kl < (_Float16)-14.0f ? (_Float16)-14.0f : (kl > (_Float16)15.0f ? (_Float16)15.0f : kl);
+        bits1[i] = (uint16_t)(((int)kh + 15) << 10);
+        bits2[i] = (uint16_t)(((int)kl + 15) << 10);
+    }
+    VECH scale1, scale2;
+    memcpy(&scale1, &bits1, sizeof scale1);
+    memcpy(&scale2, &bits2, sizeof scale2);
+    VECH result = p * scale1 * scale2;
+
+    uint16_t raw[VECH_LEN];
+    memcpy(raw, &v, sizeof raw);
+    unsigned special = 0;
+    for (int i = 0; i < VECH_LEN; i++) special |= ((raw[i] & 0x7c00u) == 0x7c00u);
+    if (special) {
+        uint16_t out[VECH_LEN];
+        memcpy(out, &result, sizeof out);
+        for (int i = 0; i < VECH_LEN; i++) {
+            const uint16_t b = raw[i];
+            if ((b & 0x7c00u) != 0x7c00u) continue;
+            out[i] = (b & 0x03ffu) ? b : ((b & 0x8000u) ? (uint16_t)0u : (uint16_t)0x7c00u);
+        }
+        memcpy(&result, out, sizeof result);
+    }
+    return result;
+}
+
+static inline void vech_sincos2pi_d(const VEC *x_chunks, VECH *c_out, VECH *s_out) {
+    VECF c_lo, s_lo, c_hi, s_hi;
+    vecf_sincos2pi_d(x_chunks[0], x_chunks[1], &c_lo, &s_lo);
+    vecf_sincos2pi_d(x_chunks[2], x_chunks[3], &c_hi, &s_hi);
+    VECH c = (VECH){};
+    VECH s = (VECH){};
+    for (int i = 0; i < VECF_LEN; i++) {
+        c[i] = (_Float16)c_lo[i];
+        s[i] = (_Float16)s_lo[i];
+        c[VECF_LEN + i] = (_Float16)c_hi[i];
+        s[VECF_LEN + i] = (_Float16)s_hi[i];
+    }
+    *c_out = c;
+    *s_out = s;
+}
+#endif /* NANOFFT_NATIVE_FP16 */
+
+#if NANOFFT_NATIVE_FP16
+typedef VECH tls_half_ivec_t;
+#else
+typedef VECF tls_half_ivec_t;
+#endif
+
+static inline tls_half_ivec_t tls_half_ivec_add(const void *a, const void *b) {
+    tls_half_ivec_t va, vb;
+    memcpy(&va, a, sizeof va);
+    memcpy(&vb, b, sizeof vb);
+    return va + vb;
+}
+static inline tls_half_ivec_t tls_half_ivec_sub(const void *a, const void *b) {
+    tls_half_ivec_t va, vb;
+    memcpy(&va, a, sizeof va);
+    memcpy(&vb, b, sizeof vb);
+    return va - vb;
+}
+static inline tls_half_ivec_t tls_half_ivec_mul(const void *a, const void *b) {
+    tls_half_ivec_t va, vb;
+    memcpy(&va, a, sizeof va);
+    memcpy(&vb, b, sizeof vb);
+    return va * vb;
+}
+static inline tls_half_ivec_t tls_half_ivec_div(const void *a, const void *b) {
+    tls_half_ivec_t va, vb;
+    memcpy(&va, a, sizeof va);
+    memcpy(&vb, b, sizeof vb);
+    return va / vb;
+}
+static inline tls_half_ivec_t tls_half_ivec_neg(const void *a) {
+    tls_half_ivec_t va;
+    memcpy(&va, a, sizeof va);
+    return -va;
+}
+static inline tls_half_ivec_t tls_half_ivec_sqrt(const void *a) {
+    tls_half_ivec_t va;
+    memcpy(&va, a, sizeof va);
+#if NANOFFT_NATIVE_FP16
+    return vech_sqrt(va);
+#else
+    return vecf_sqrt(va);
+#endif
+}
+static inline tls_half_ivec_t tls_half_ivec_exp(const void *a) {
+    tls_half_ivec_t va;
+    memcpy(&va, a, sizeof va);
+#if NANOFFT_NATIVE_FP16
+    return vech_exp(va);
+#else
+    return vecf_exp(va);
+#endif
+}
+static inline tls_f16_t tls_half_s_add(const void *a, const void *b) {
+    tls_f16_t sa, sb;
+    memcpy(&sa, a, sizeof sa);
+    memcpy(&sb, b, sizeof sb);
+    return tls_f16_add(sa, sb);
+}
+static inline tls_f16_t tls_half_s_sub(const void *a, const void *b) {
+    tls_f16_t sa, sb;
+    memcpy(&sa, a, sizeof sa);
+    memcpy(&sb, b, sizeof sb);
+    return tls_f16_sub(sa, sb);
+}
+static inline tls_f16_t tls_half_s_mul(const void *a, const void *b) {
+    tls_f16_t sa, sb;
+    memcpy(&sa, a, sizeof sa);
+    memcpy(&sb, b, sizeof sb);
+    return tls_f16_mul(sa, sb);
+}
+static inline tls_f16_t tls_half_s_div(const void *a, const void *b) {
+    tls_f16_t sa, sb;
+    memcpy(&sa, a, sizeof sa);
+    memcpy(&sb, b, sizeof sb);
+    return tls_f16_div(sa, sb);
+}
+static inline tls_f16_t tls_half_s_neg(const void *a) {
+    tls_f16_t sa;
+    memcpy(&sa, a, sizeof sa);
+    return tls_f16_neg(sa);
+}
+static inline tls_f16_t tls_half_s_sqrt(const void *a) {
+    tls_f16_t sa;
+    memcpy(&sa, a, sizeof sa);
+    return tls_f16_sqrt(sa);
+}
+static inline tls_f16_t tls_half_s_exp(const void *a) {
+    tls_f16_t sa;
+    memcpy(&sa, a, sizeof sa);
+    return tls_f16_exp(sa);
+}
+
 #endif /* NANOFFT_VECMATH_H */

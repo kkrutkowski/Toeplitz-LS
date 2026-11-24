@@ -94,10 +94,11 @@ static unsigned long long tls_x86_features(void) {
     }
 
     if (max_leaf >= 7) {
-        unsigned ebx, ecx;
+        unsigned ebx, ecx, edx;
         tls_cpuid(7, 0, regs);
         ebx = regs[1];
         ecx = regs[2];
+        edx = regs[3];
 
         if (ymm_state) {
             if (ebx & (1u << 3)) f |= TLS_CPU_BMI1;
@@ -109,6 +110,7 @@ static unsigned long long tls_x86_features(void) {
                 if (ebx & (1u << 28)) f |= TLS_CPU_AVX512CD;
                 if (ebx & (1u << 30)) f |= TLS_CPU_AVX512BW;
                 if (ebx & (1u << 31)) f |= TLS_CPU_AVX512VL;
+                if (edx & (1u << 23)) f |= TLS_CPU_AVX512FP16;
             }
         }
         (void)ecx;
@@ -145,6 +147,12 @@ static unsigned long long tls_x86_features(void) {
 #        ifndef HWCAP_ASIMD
 #            define HWCAP_ASIMD (1ul << 1)
 #        endif
+#        ifndef HWCAP_FPHP
+#            define HWCAP_FPHP (1ul << 9)
+#        endif
+#        ifndef HWCAP_ASIMDHP
+#            define HWCAP_ASIMDHP (1ul << 10)
+#        endif
 #        ifndef HWCAP_SVE
 #            define HWCAP_SVE (1ul << 22)
 #        endif
@@ -165,12 +173,13 @@ static unsigned long long tls_arm_features(void) {
     if (IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE)) f |= TLS_CPU_ASIMD;
     if (IsProcessorFeaturePresent(PF_ARM_SVE_INSTRUCTIONS_AVAILABLE)) f |= TLS_CPU_SVE;
 #    elif defined(__APPLE__)
-    /* Apple silicon: NEON always, no SVE, no SVE2. */
-    f |= TLS_CPU_ASIMD;
+    /* Apple silicon: NEON + ARMv8.2 FP16 always, no SVE, no SVE2. */
+    f |= TLS_CPU_ASIMD | TLS_CPU_FP16;
 #    else
     {
         unsigned long hwcap = getauxval(AT_HWCAP);
         if (hwcap & HWCAP_ASIMD) f |= TLS_CPU_ASIMD;
+        if ((hwcap & (HWCAP_FPHP | HWCAP_ASIMDHP)) == (HWCAP_FPHP | HWCAP_ASIMDHP)) f |= TLS_CPU_FP16;
         if (hwcap & HWCAP_SVE) f |= TLS_CPU_SVE;
         {
             unsigned long hwcap2 = getauxval(AT_HWCAP2);

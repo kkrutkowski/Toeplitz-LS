@@ -22,6 +22,8 @@
 #    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_DD
 #elif defined(DOUBLE)
 #    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_DOUBLE
+#elif defined(HALF)
+#    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_HALF
 #else
 #    define NANOFFT_FFT_FUSE_BUILD NANOFFT_FFT_FUSE_FLOAT
 #endif
@@ -30,6 +32,8 @@
 #    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_DD
 #elif defined(DOUBLE)
 #    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_DOUBLE
+#elif defined(HALF)
+#    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_HALF
 #else
 #    define NANOFFT_FFT_BFUSE_BUILD NANOFFT_FFT_BFUSE_FLOAT
 #endif
@@ -43,6 +47,8 @@
 #        define NANOFFT_TUNED_DEPTH nanofft_depth_dd
 #    elif defined(DOUBLE)
 #        define NANOFFT_TUNED_DEPTH nanofft_depth_double
+#    elif defined(HALF)
+#        define NANOFFT_TUNED_DEPTH nanofft_depth_half
 #    else
 #        define NANOFFT_TUNED_DEPTH nanofft_depth_float
 #    endif
@@ -51,6 +57,8 @@
 #            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_dd
 #        elif defined(DOUBLE)
 #            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_double
+#        elif defined(HALF)
+#            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_half
 #        else
 #            define NANOFFT_TUNED_BDEPTH nanofft_bdepth_float
 #        endif
@@ -97,18 +105,22 @@ NANOFFT_UNUSED static inline uint32_t intmax(int32_t a, int32_t b) { return (a >
 #if defined(DOUBLE_DOUBLE)
 NANOFFT_UNUSED static inline dd_t half_scalar(dd_t x) { return dd_make(x.hi * 0.5, x.lo * 0.5); }
 NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return dd_make(x.hi * 0.5, x.lo * 0.5); }
-NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) {
+NANOFFT_UNUSED static inline BREADTH_COMPUTE_VEC half_bvec(BREADTH_COMPUTE_VEC x) {
     const VEC h = (VEC){} + 0.5;
     return vecdd_make(x.hi * h, x.lo * h);
 }
 #elif defined(DOUBLE)
 NANOFFT_UNUSED static inline double half_scalar(double x) { return x * 0.5; }
 NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return x * ((INTERNAL_VEC){} + 0.5); }
-NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * ((BREADTH_VEC){} + 0.5); }
+NANOFFT_UNUSED static inline BREADTH_COMPUTE_VEC half_bvec(BREADTH_COMPUTE_VEC x) { return x * ((BREADTH_COMPUTE_VEC){} + 0.5); }
+#elif defined(HALF)
+NANOFFT_UNUSED static inline tls_f16_t half_scalar(tls_f16_t x) { return tls_f16_mul(x, FCONST(0.5)); }
+NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return x * ((INTERNAL_VEC){} + (IVEC_SCALAR)0.5); }
+NANOFFT_UNUSED static inline BREADTH_COMPUTE_VEC half_bvec(BREADTH_COMPUTE_VEC x) { return x * ((BREADTH_COMPUTE_VEC){} + (IVEC_SCALAR)0.5); }
 #else
 NANOFFT_UNUSED static inline float half_scalar(float x) { return x * 0.5f; }
 NANOFFT_UNUSED static inline INTERNAL_VEC half_ivec(INTERNAL_VEC x) { return x * ((INTERNAL_VEC){} + 0.5f); }
-NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * ((BREADTH_VEC){} + 0.5f); }
+NANOFFT_UNUSED static inline BREADTH_COMPUTE_VEC half_bvec(BREADTH_COMPUTE_VEC x) { return x * ((BREADTH_COMPUTE_VEC){} + 0.5f); }
 #endif
 
 #define LOG_BLOCK_WIDTH 6
@@ -129,6 +141,8 @@ NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * (
  * elements are 8 bytes wide (measured; see tests/bench_permute.c). */
 #if defined(DOUBLE) || defined(DOUBLE_DOUBLE)
 #    define PAIRS_MAX_LOG 12
+#elif defined(HALF)
+#    define PAIRS_MAX_LOG 14
 #else
 #    define PAIRS_MAX_LOG 13
 #endif
@@ -137,9 +151,9 @@ NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * (
 #define COBRAVO_W6_LEN (1u << 12) /* 64x64 */
 #define COBRAVO_IDX_LEN (COBRAVO_W4_LEN + COBRAVO_W5_LEN + COBRAVO_W6_LEN)
 
-/* Gather-emitted tiles for the real types; double-double keeps the scalar
- * in-tile swap (its 16-byte elements have no gather). */
-#if !defined(DOUBLE_DOUBLE) && (defined(__AVX512F__) || defined(__AVX2__))
+/* Gather-emitted tiles for float/double; double-double (16B) and half (2B)
+ * keep the scalar in-tile swap (no matching x86 gather width). */
+#if !defined(DOUBLE_DOUBLE) && !defined(HALF) && (defined(__AVX512F__) || defined(__AVX2__))
 #    define COBRAVO_GATHER 1
 #    include <immintrin.h>
 #else
@@ -147,8 +161,10 @@ NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * (
 #endif
 
 /* Breadth-wise COBRAVO sizing: keep 4 staging tiles (A/B x real/imag) in L1.
- * Elements are BREADTH_VEC (VEC_BYTES, or 2*VEC_BYTES for VECDD). */
-#if VEC_BYTES >= 64 || (VEC_BYTES >= 32 && defined(DOUBLE_DOUBLE))
+ * Elements are BREADTH_VEC (VEC_BYTES, VEC_BYTES/2 for non-native HALF, or 2*VEC_BYTES for VECDD). */
+#if (defined(HALF) && !NANOFFT_NATIVE_FP16)
+#    define BCOBRA_MAX_W 4u
+#elif VEC_BYTES >= 64 || (VEC_BYTES >= 32 && defined(DOUBLE_DOUBLE))
 #    define BCOBRA_MAX_W 3u
 #else
 #    define BCOBRA_MAX_W 4u
@@ -163,6 +179,12 @@ NANOFFT_UNUSED static inline BREADTH_VEC half_bvec(BREADTH_VEC x) { return x * (
 #define BPAIRS_MIN_LOG 6u
 #if defined(DOUBLE_DOUBLE)
 #    define BPAIRS_MAX_LOG 13u
+#elif defined(HALF) && !NANOFFT_NATIVE_FP16
+#    if VEC_BYTES >= 64
+#        define BPAIRS_MAX_LOG 11u
+#    else
+#        define BPAIRS_MAX_LOG 12u
+#    endif
 #elif VEC_BYTES >= 64
 #    define BPAIRS_MAX_LOG 10u
 #else
@@ -504,12 +526,12 @@ static inline void table_shuffle_breadth(BREADTH_VEC *real, BREADTH_VEC *imag, u
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t j = reverse_bits(i, log_n);
         if (j > i) {
-            const BREADTH_VEC tr = LOAD_BVEC(&real[i]);
-            const BREADTH_VEC ti = LOAD_BVEC(&imag[i]);
-            STORE_BVEC(&real[i], LOAD_BVEC(&real[j]));
-            STORE_BVEC(&imag[i], LOAD_BVEC(&imag[j]));
-            STORE_BVEC(&real[j], tr);
-            STORE_BVEC(&imag[j], ti);
+            const BREADTH_VEC tr = real[i];
+            const BREADTH_VEC ti = imag[i];
+            real[i] = real[j];
+            imag[i] = imag[j];
+            real[j] = tr;
+            imag[j] = ti;
         }
     }
 }
@@ -519,9 +541,9 @@ static inline void table_shuffle_1d_breadth(BREADTH_VEC *values, uint32_t log_n)
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t j = reverse_bits(i, log_n);
         if (j > i) {
-            const BREADTH_VEC t = LOAD_BVEC(&values[i]);
-            STORE_BVEC(&values[i], LOAD_BVEC(&values[j]));
-            STORE_BVEC(&values[j], t);
+            const BREADTH_VEC t = values[i];
+            values[i] = values[j];
+            values[j] = t;
         }
     }
 }
@@ -530,12 +552,12 @@ static inline void pair_shuffle_breadth(BREADTH_VEC *real, BREADTH_VEC *imag, co
     for (uint32_t k = 0; k < npairs; ++k) {
         const uint32_t i = pairs[k].i;
         const uint32_t j = pairs[k].j;
-        const BREADTH_VEC tr = LOAD_BVEC(&real[i]);
-        const BREADTH_VEC ti = LOAD_BVEC(&imag[i]);
-        STORE_BVEC(&real[i], LOAD_BVEC(&real[j]));
-        STORE_BVEC(&imag[i], LOAD_BVEC(&imag[j]));
-        STORE_BVEC(&real[j], tr);
-        STORE_BVEC(&imag[j], ti);
+        const BREADTH_VEC tr = real[i];
+        const BREADTH_VEC ti = imag[i];
+        real[i] = real[j];
+        imag[i] = imag[j];
+        real[j] = tr;
+        imag[j] = ti;
     }
 }
 
@@ -543,9 +565,9 @@ static inline void pair_shuffle_1d_breadth(BREADTH_VEC *values, const rev_pair *
     for (uint32_t k = 0; k < npairs; ++k) {
         const uint32_t i = pairs[k].i;
         const uint32_t j = pairs[k].j;
-        const BREADTH_VEC t = LOAD_BVEC(&values[i]);
-        STORE_BVEC(&values[i], LOAD_BVEC(&values[j]));
-        STORE_BVEC(&values[j], t);
+        const BREADTH_VEC t = values[i];
+        values[i] = values[j];
+        values[j] = t;
     }
 }
 
@@ -564,16 +586,16 @@ static inline void cobravo_reverse_tile_breadth(BREADTH_VEC *tile_values, uint32
     for (uint32_t i = 0; i < tile; ++i) {
         const uint32_t j = reverse_bits(i, 2u * w);
         if (j > i) {
-            const BREADTH_VEC t = LOAD_BVEC(&tile_values[i]);
-            STORE_BVEC(&tile_values[i], LOAD_BVEC(&tile_values[j]));
-            STORE_BVEC(&tile_values[j], t);
+            const BREADTH_VEC t = tile_values[i];
+            tile_values[i] = tile_values[j];
+            tile_values[j] = t;
         }
     }
 }
 
 /* Direct vector-wide tile emit: each element is already one aligned BREADTH_VEC,
  * so sequential destination stores read reversed staging slots directly without
- * needing i32gather (portable across SSE2, AVX2, AVX-512, ARM64, and VECDD). */
+ * needing i32gather (portable across SSE2, AVX2, AVX-512, ARM64, HALF, and VECDD). */
 static inline void cobravo_emit_tile_breadth(BREADTH_VEC *src, BREADTH_VEC *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w, int vectorized) {
     if (vectorized) {
         const uint32_t width = 1u << w;
@@ -581,7 +603,7 @@ static inline void cobravo_emit_tile_breadth(BREADTH_VEC *src, BREADTH_VEC *dst,
         for (uint32_t a = 0; a < width; ++a) {
             BREADTH_VEC *row = dst + ((size_t)a << shift_top) + b_shifted;
             const uint16_t *idx_row = idx + (size_t)a * width;
-            for (uint32_t c = 0; c < width; ++c) STORE_BVEC(&row[c], LOAD_BVEC(&src[idx_row[c]]));
+            for (uint32_t c = 0; c < width; ++c) row[c] = src[idx_row[c]];
         }
         return;
     }
@@ -677,7 +699,7 @@ static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint3
  * Intra-vector butterfly pass
  * ========================================================================= */
 
-#if INTERNAL_VEC_LEN == 16 || INTERNAL_VEC_LEN == 8 || INTERNAL_VEC_LEN == 4 || INTERNAL_VEC_LEN == 2
+#if INTERNAL_VEC_LEN == 32 || INTERNAL_VEC_LEN == 16 || INTERNAL_VEC_LEN == 8 || INTERNAL_VEC_LEN == 4 || INTERNAL_VEC_LEN == 2
 #    define HAS_INTRA_VEC_PASS
 
 /*
@@ -688,9 +710,76 @@ static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint3
  * mask of stage `i`: forward it splits the lanes by a stride of
  * 2^(log2(len)-1-i), the inverse puts them back.
  */
-#    if INTERNAL_VEC_LEN == 16
-#        define W16_C1 ((FLOAT)(0.5 * 0.9238795325112867))
-#        define W16_S1 ((FLOAT)(0.5 * 0.3826834323650898))
+#    if INTERNAL_VEC_LEN == 32
+#        define W32_C1 ((IVEC_SCALAR)(0.5 * 0.9807852804032304))
+#        define W32_S1 ((IVEC_SCALAR)(0.5 * 0.1950903220161283))
+#        define W32_C2 ((IVEC_SCALAR)(0.5 * 0.9238795325112867))
+#        define W32_S2 ((IVEC_SCALAR)(0.5 * 0.3826834323650898))
+#        define W32_C3 ((IVEC_SCALAR)(0.5 * 0.8314696123025452))
+#        define W32_S3 ((IVEC_SCALAR)(0.5 * 0.5555702330196022))
+#        define W32_H ((IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2))
+#        define W32_MH ((IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2))
+
+#        define NANOFFT_PERM_ENTRIES(X)                                                                                                \
+            X(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31) \
+            X(1, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31) \
+            X(2, 0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27, 4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31) \
+            X(3, 0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29, 2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31) \
+            X(4, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31)
+#        define NANOFFT_INV_PERM_ENTRIES(X)                                                                                            \
+            X(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31) \
+            X(1, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31) \
+            X(2, 0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23, 8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31) \
+            X(3, 0, 1, 16, 17, 2, 3, 18, 19, 4, 5, 20, 21, 6, 7, 22, 23, 8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31) \
+            X(4, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23, 8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31)
+
+static const INTERNAL_VEC real_twiddles[5] __attribute__((aligned(64))) = {
+    {(IVEC_SCALAR)0.5, W32_C1, W32_C2, W32_C3, W32_H, W32_S3, W32_S2, W32_S1, (IVEC_SCALAR)0.0, -W32_S1, -W32_S2, -W32_S3, W32_MH, -W32_C3, -W32_C2, -W32_C1,
+     (IVEC_SCALAR)0.5, W32_C1, W32_C2, W32_C3, W32_H, W32_S3, W32_S2, W32_S1, (IVEC_SCALAR)0.0, -W32_S1, -W32_S2, -W32_S3, W32_MH, -W32_C3, -W32_C2, -W32_C1},
+    {(IVEC_SCALAR)0.5, W32_C2,  W32_H,  W32_S2,  (IVEC_SCALAR)0.0, -W32_S2, W32_MH, -W32_C2, (IVEC_SCALAR)0.5, W32_C2,  W32_H,  W32_S2,
+     (IVEC_SCALAR)0.0, -W32_S2, W32_MH, -W32_C2, (IVEC_SCALAR)0.5, W32_C2,  W32_H,  W32_S2,  (IVEC_SCALAR)0.0, -W32_S2, W32_MH, -W32_C2,
+     (IVEC_SCALAR)0.5, W32_C2,  W32_H,  W32_S2,  (IVEC_SCALAR)0.0, -W32_S2, W32_MH, -W32_C2},
+    {(IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH,
+     (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH,
+     (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_MH},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5}};
+
+static const INTERNAL_VEC imag_twiddles[5] __attribute__((aligned(64))) = {
+    {(IVEC_SCALAR)0.0, W32_S1, W32_S2, W32_S3, W32_H, W32_C3, W32_C2, W32_C1, (IVEC_SCALAR)0.5, W32_C1, W32_C2, W32_C3, W32_H, W32_S3, W32_S2, W32_S1,
+     (IVEC_SCALAR)0.0, W32_S1, W32_S2, W32_S3, W32_H, W32_C3, W32_C2, W32_C1, (IVEC_SCALAR)0.5, W32_C1, W32_C2, W32_C3, W32_H, W32_S3, W32_S2, W32_S1},
+    {(IVEC_SCALAR)0.0, W32_S2, W32_H, W32_C2, (IVEC_SCALAR)0.5, W32_C2, W32_H, W32_S2, (IVEC_SCALAR)0.0, W32_S2, W32_H, W32_C2,
+     (IVEC_SCALAR)0.5, W32_C2, W32_H, W32_S2, (IVEC_SCALAR)0.0, W32_S2, W32_H, W32_C2, (IVEC_SCALAR)0.5, W32_C2, W32_H, W32_S2,
+     (IVEC_SCALAR)0.0, W32_S2, W32_H, W32_C2, (IVEC_SCALAR)0.5, W32_C2, W32_H, W32_S2},
+    {(IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H,
+     (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H,
+     (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H, (IVEC_SCALAR)0.0, W32_H, (IVEC_SCALAR)0.5, W32_H},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0}};
+
+static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
+    INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
+                                        42, 43, 44, 45, 46, 47);
+    *b = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+                          59, 60, 61, 62, 63);
+    *a = tmp;
+}
+
+#    elif INTERNAL_VEC_LEN == 16
+#        define W16_C1 ((IVEC_SCALAR)(0.5 * 0.9238795325112867))
+#        define W16_S1 ((IVEC_SCALAR)(0.5 * 0.3826834323650898))
 
 #        define NANOFFT_PERM_ENTRIES(X)                                \
             X(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) \
@@ -704,26 +793,28 @@ static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint3
             X(3, 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
 
 static const INTERNAL_VEC real_twiddles[4] __attribute__((aligned(64))) = {
-    {(FLOAT)0.5, W16_C1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), -W16_C1, (FLOAT)0.5, W16_C1,
-     (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1, (FLOAT)0.0, -W16_S1, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), -W16_C1},
-    {(FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0,
-     (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5,
-     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2)},
-    {(FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5,
-     (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0},
-    {(FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5,
-     (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5}};
+    {(IVEC_SCALAR)0.5, W16_C1, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), W16_S1, (IVEC_SCALAR)0.0, -W16_S1, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2), -W16_C1,
+     (IVEC_SCALAR)0.5, W16_C1, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), W16_S1, (IVEC_SCALAR)0.0, -W16_S1, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2), -W16_C1},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2),
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2)},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5}};
 
 static const INTERNAL_VEC imag_twiddles[4] __attribute__((aligned(64))) = {
-    {(FLOAT)0.0, W16_S1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_C1, (FLOAT)0.5, W16_C1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1, (FLOAT)0.0, W16_S1,
-     (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_C1, (FLOAT)0.5, W16_C1, (FLOAT)(0.5 * NANOFFT_SQRT1_2), W16_S1},
-    {(FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5,
-     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0,
-     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2)},
-    {(FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0,
-     (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5},
-    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0,
-     (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+    {(IVEC_SCALAR)0.0, W16_S1, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), W16_C1, (IVEC_SCALAR)0.5, W16_C1, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), W16_S1,
+     (IVEC_SCALAR)0.0, W16_S1, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), W16_C1, (IVEC_SCALAR)0.5, W16_C1, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), W16_S1},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2),
+     (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2)},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
     INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23);
@@ -741,17 +832,17 @@ static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
             X(1, 0, 1, 4, 5, 2, 3, 6, 7)    \
             X(2, 0, 4, 1, 5, 2, 6, 3, 7)
 
-static const INTERNAL_VEC real_twiddles[3]
-    __attribute__((aligned(64))) = {{(FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5,
-                                     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0, (FLOAT)(-0.5 * NANOFFT_SQRT1_2)},
-                                    {(FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0},
-                                    {(FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5}};
+static const INTERNAL_VEC real_twiddles[3] __attribute__((aligned(64))) = {
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5,
+     (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0, (IVEC_SCALAR)(-0.5 * NANOFFT_SQRT1_2)},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0},
+    {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5}};
 
-static const INTERNAL_VEC imag_twiddles[3]
-    __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.0,
-                                     (FLOAT)(0.5 * NANOFFT_SQRT1_2), (FLOAT)0.5, (FLOAT)(0.5 * NANOFFT_SQRT1_2)},
-                                    {(FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5},
-                                    {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+static const INTERNAL_VEC imag_twiddles[3] __attribute__((aligned(64))) = {
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.0,
+     (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2), (IVEC_SCALAR)0.5, (IVEC_SCALAR)(0.5 * NANOFFT_SQRT1_2)},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5},
+    {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
     INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 2, 3, 8, 9, 10, 11);
@@ -767,10 +858,10 @@ static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
             X(0, 0, 1, 2, 3)                \
             X(1, 0, 2, 1, 3)
 
-static const INTERNAL_VEC real_twiddles[2]
-    __attribute__((aligned(64))) = {{(FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0}, {(FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5, (FLOAT)0.5}};
-static const INTERNAL_VEC imag_twiddles[2]
-    __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)0.5, (FLOAT)0.0, (FLOAT)0.5}, {(FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0, (FLOAT)0.0}};
+static const INTERNAL_VEC real_twiddles[2] __attribute__((aligned(64))) = {{(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0},
+                                                                           {(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5}};
+static const INTERNAL_VEC imag_twiddles[2] __attribute__((aligned(64))) = {{(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.5},
+                                                                           {(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
     INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 1, 4, 5);
@@ -782,8 +873,8 @@ static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
 #        define NANOFFT_PERM_ENTRIES(X) X(0, 0, 1)
 #        define NANOFFT_INV_PERM_ENTRIES(X) X(0, 0, 1)
 
-static const INTERNAL_VEC real_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)0.5, (FLOAT)0.5}};
-static const INTERNAL_VEC imag_twiddles[1] __attribute__((aligned(64))) = {{(FLOAT)0.0, (FLOAT)0.0}};
+static const INTERNAL_VEC real_twiddles[1] __attribute__((aligned(64))) = {{(IVEC_SCALAR)0.5, (IVEC_SCALAR)0.5}};
+static const INTERNAL_VEC imag_twiddles[1] __attribute__((aligned(64))) = {{(IVEC_SCALAR)0.0, (IVEC_SCALAR)0.0}};
 
 static inline void nanofft_vec_shuffle(INTERNAL_VEC *a, INTERNAL_VEC *b) {
     INTERNAL_VEC tmp = NANOFFT_SHUFFLE2(INTERNAL_VEC_INT, *a, *b, 0, 2);
@@ -1152,6 +1243,40 @@ static void generate_fused_pass(uint32_t step, uint32_t shift, uint32_t layers, 
                 real_buffer[row_off + j] = half_scalar(c);
                 imag_buffer[row_off + j] = half_scalar(s);
             }
+#elif defined(HALF)
+#    if NANOFFT_NATIVE_FP16
+            for (; j + (uint32_t)VECH_LEN <= q; j += (uint32_t)VECH_LEN) {
+                VEC ang[VECH_LEN / VEC_LEN];
+                for (uint32_t ch = 0; ch < (uint32_t)(VECH_LEN / VEC_LEN); ++ch) {
+                    for (uint32_t l = 0; l < (uint32_t)VEC_LEN; ++l) {
+                        ang[ch][l] = (double)(k_base + j + ch * (uint32_t)VEC_LEN + l) * step_mul;
+                    }
+                }
+                VECH c, s;
+                vech_sincos2pi_d(ang, &c, &s);
+                STORE_VEC(&real_buffer[row_off + j], half_ivec(c));
+                STORE_VEC(&imag_buffer[row_off + j], half_ivec(s));
+            }
+#    else
+            for (; j + (uint32_t)VECF_LEN <= q; j += (uint32_t)VECF_LEN) {
+                VEC ang_lo, ang_hi;
+                for (uint32_t l = 0; l < (uint32_t)VEC_LEN; ++l) {
+                    ang_lo[l] = (double)(k_base + j + l) * step_mul;
+                    ang_hi[l] = (double)(k_base + j + (uint32_t)VEC_LEN + l) * step_mul;
+                }
+                VECF c, s;
+                vecf_sincos2pi_d(ang_lo, ang_hi, &c, &s);
+                STORE_VEC(&real_buffer[row_off + j], half_ivec(c));
+                STORE_VEC(&imag_buffer[row_off + j], half_ivec(s));
+            }
+#    endif
+            for (; j < q; ++j) {
+                const double theta = (double)(k_base + j) * step_mul;
+                double c, s;
+                sincos2pi(theta, &c, &s);
+                real_buffer[row_off + j] = FCAST(c * 0.5);
+                imag_buffer[row_off + j] = FCAST(s * 0.5);
+            }
 #else
             for (; j + (uint32_t)VECF_LEN <= q; j += (uint32_t)VECF_LEN) {
                 VEC ang_lo, ang_hi;
@@ -1206,7 +1331,7 @@ static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, 
         }                                                                                            \
         for (uint32_t i = 0; i < n; i += step) {                                                     \
             for (uint32_t j = 0; j < q; ++j) {                                                       \
-                BREADTH_VEC vr[1 << (L)], vi[1 << (L)];                                              \
+                BREADTH_COMPUTE_VEC vr[1 << (L)], vi[1 << (L)];                                      \
                 _Pragma("GCC unroll 16") for (uint32_t m = 0; m < (1u << (L)); ++m) {                \
                     vr[m] = LOAD_BVEC(&real[i + j + m * q]);                                         \
                     vi[m] = LOAD_BVEC(&imag[i + j + m * q]);                                         \
@@ -1216,12 +1341,12 @@ static void generate_buffer(uint32_t N, FLOAT *real_buffer, FLOAT *imag_buffer, 
                     _Pragma("GCC unroll 16") for (uint32_t lo = 0; lo < (1u << (L)); lo += 2u * h) { \
                         _Pragma("GCC unroll 8") for (uint32_t m = 0; m < h; ++m) {                   \
                             const uint32_t a = lo + m, b = a + h;                                    \
-                            const BREADTH_VEC wr = BREADTH_SPLAT(tw_r[base[t] + m * q + j]);         \
-                            const BREADTH_VEC wi = BREADTH_SPLAT(tw_i[base[t] + m * q + j]);         \
-                            const BREADTH_VEC sr = BREADTH_ADD(vr[a], vr[b]);                        \
-                            const BREADTH_VEC si = BREADTH_ADD(vi[a], vi[b]);                        \
-                            const BREADTH_VEC dr = BREADTH_SUB(vr[a], vr[b]);                        \
-                            const BREADTH_VEC di = BREADTH_SUB(vi[a], vi[b]);                        \
+                            const BREADTH_COMPUTE_VEC wr = BREADTH_SPLAT(tw_r[base[t] + m * q + j]); \
+                            const BREADTH_COMPUTE_VEC wi = BREADTH_SPLAT(tw_i[base[t] + m * q + j]); \
+                            const BREADTH_COMPUTE_VEC sr = BREADTH_ADD(vr[a], vr[b]);                \
+                            const BREADTH_COMPUTE_VEC si = BREADTH_ADD(vi[a], vi[b]);                \
+                            const BREADTH_COMPUTE_VEC dr = BREADTH_SUB(vr[a], vr[b]);                \
+                            const BREADTH_COMPUTE_VEC di = BREADTH_SUB(vi[a], vi[b]);                \
                             vr[a] = half_bvec(sr);                                                   \
                             vi[a] = half_bvec(si);                                                   \
                             vr[b] = BREADTH_SUB(BREADTH_MUL(dr, wr), BREADTH_MUL(di, wi));           \
@@ -1269,19 +1394,18 @@ static void sande_tukey_bstages(BREADTH_VEC *real_signal, BREADTH_VEC *imag_sign
         const uint32_t half_step = step >> 1;
         for (uint32_t i = 0; i < N; i += step) {
             for (uint32_t j = 0; j < half_step; ++j) {
-                const BREADTH_VEC r_even = LOAD_BVEC(&real_signal[i + j]);
-                const BREADTH_VEC i_even = LOAD_BVEC(&imag_signal[i + j]);
-                const BREADTH_VEC r_odd = LOAD_BVEC(&real_signal[i + j + half_step]);
-                const BREADTH_VEC i_odd = LOAD_BVEC(&imag_signal[i + j + half_step]);
+                const BREADTH_COMPUTE_VEC r_even = LOAD_BVEC(&real_signal[i + j]);
+                const BREADTH_COMPUTE_VEC i_even = LOAD_BVEC(&imag_signal[i + j]);
+                const BREADTH_COMPUTE_VEC r_odd = LOAD_BVEC(&real_signal[i + j + half_step]);
+                const BREADTH_COMPUTE_VEC i_odd = LOAD_BVEC(&imag_signal[i + j + half_step]);
 
                 STORE_BVEC(&real_signal[i + j], half_bvec(BREADTH_ADD(r_even, r_odd)));
                 STORE_BVEC(&imag_signal[i + j], half_bvec(BREADTH_ADD(i_even, i_odd)));
 
-                const BREADTH_VEC r_tmp = BREADTH_SUB(r_even, r_odd);
-                const BREADTH_VEC i_tmp = BREADTH_SUB(i_even, i_odd);
-                const BREADTH_VEC b_real = BREADTH_SPLAT(real_buffer[shift + j]);
-                const BREADTH_VEC b_imag = BREADTH_SPLAT(imag_buffer[shift + j]);
-
+                const BREADTH_COMPUTE_VEC r_tmp = BREADTH_SUB(r_even, r_odd);
+                const BREADTH_COMPUTE_VEC i_tmp = BREADTH_SUB(i_even, i_odd);
+                const BREADTH_COMPUTE_VEC b_real = BREADTH_SPLAT(real_buffer[shift + j]);
+                const BREADTH_COMPUTE_VEC b_imag = BREADTH_SPLAT(imag_buffer[shift + j]);
                 STORE_BVEC(&real_signal[i + j + half_step], BREADTH_SUB(BREADTH_MUL(r_tmp, b_real), BREADTH_MUL(i_tmp, b_imag)));
                 STORE_BVEC(&imag_signal[i + j + half_step], BREADTH_ADD(BREADTH_MUL(r_tmp, b_imag), BREADTH_MUL(i_tmp, b_real)));
             }
@@ -1466,7 +1590,7 @@ void PREFIX(execute_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC
  * nanofft-f.o and nanofft-dd.o whenever they share a COMDAT constant pool
  * symbol.  Windows builds always link all three precisions together.
  * ========================================================================= */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(HALF)
 
 // Macro stringification helpers
 #    define STR_HELPER(x) #x
@@ -1649,4 +1773,4 @@ __attribute__((weak)) void FALLBACK_PREFIX(execute_breadth)(FALLBACK_PLAN_T *pla
     FALLBACK_PREFIX(execute_raw_breadth)(plan, real, imag);
     FALLBACK_PREFIX(permute_breadth)(plan, real, imag);
 }
-#endif /* !defined(_WIN32) */
+#endif /* !defined(_WIN32) && !defined(HALF) */

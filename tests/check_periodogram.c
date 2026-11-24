@@ -631,6 +631,172 @@ static void run_vectorize_dd_and_errors(void) {
     free(pdd_as_d);
 }
 
+static int f32_is_nan_bits(float v) {
+    uint32_t u;
+    memcpy(&u, &v, sizeof u);
+    return (u & 0x7fffffffu) > 0x7f800000u;
+}
+static int f64_is_nan_bits(double v) {
+    uint64_t u;
+    memcpy(&u, &v, sizeof u);
+    return (u & UINT64_C(0x7fffffffffffffff)) > UINT64_C(0x7ff0000000000000);
+}
+
+static void run_half_precision_suite(void) {
+    const int M = 400;
+    const int N = 513;
+    double *t = (double *)test_alloc((size_t)M * sizeof(double));
+    double *yd = (double *)test_alloc((size_t)M * sizeof(double));
+    double *dyd = (double *)test_alloc((size_t)M * sizeof(double));
+    float *yf = (float *)test_alloc((size_t)M * sizeof(float));
+    float *dyf = (float *)test_alloc((size_t)M * sizeof(float));
+    double *pref = (double *)test_alloc((size_t)N * sizeof(double));
+    float *ph0 = (float *)test_alloc((size_t)N * sizeof(float));
+    float *ph1 = (float *)test_alloc((size_t)N * sizeof(float));
+    float *phd = (float *)test_alloc((size_t)N * sizeof(float));
+    float *ch = (float *)test_alloc((size_t)N * sizeof(float));
+
+    make_curve(M, t, yd);
+    for (int m = 0; m < M; ++m) {
+        dyd[m] = 0.1 + 0.02 * urand();
+        yf[m] = (float)yd[m];
+        dyf[m] = (float)dyd[m];
+    }
+
+    const int native_fp16 = tlsh_using_native_fp16();
+    CHECK(native_fp16 == 0 || native_fp16 == 1, "tlsh_using_native_fp16 invalid return %d", native_fp16);
+    printf("  tlsh_using_native_fp16 = %d\n", native_fp16);
+
+    /* Backends x solvers x spreads x vectorize x defer x normalizations */
+    struct {
+        const char *name;
+        int degree;
+        int backend;
+        int solver;
+        int norm;
+    } cases[] = {
+        {"h_gls_pswf43", 1, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD},
+        {"h_gls_pswf21", 1, TLS_BACKEND_PSWF21, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD},
+        {"h_d2_levinson", 2, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD},
+        {"h_d3_levinson_nll", 3, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_NLL},
+        {"h_d2_zohar_anova", 2, TLS_BACKEND_PSWF21, TLS_SOLVER_ZOHAR, TLS_NORM_ANOVA},
+        {"h_d2_bareiss_reg", 2, TLS_BACKEND_PSWF43, TLS_SOLVER_BAREISS, TLS_NORM_REGULARIZED},
+        {"h_d2_ldlt", 2, TLS_BACKEND_PSWF43, TLS_SOLVER_LDLT, TLS_NORM_STANDARD},
+        {"h_d2_svd", 2, TLS_BACKEND_PSWF43, TLS_SOLVER_SVD, TLS_NORM_STANDARD},
+        {"h_d2_lra", 2, TLS_BACKEND_LRA, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD},
+    };
+    const int ncases = (int)(sizeof(cases) / sizeof(cases[0]));
+    for (int ci = 0; ci < ncases; ++ci) {
+        const int spread_max = (cases[ci].backend == TLS_BACKEND_LRA) ? 1 : 2;
+        const int spreads[2] = {TLS_SPREAD_MINMAX, TLS_SPREAD_PIECEWISE};
+        int s_ref = tls_fastchi2_opts(t, yd, dyd, M, 0.001, 0.0005, N, cases[ci].degree, cases[ci].backend, cases[ci].solver, cases[ci].norm, TLS_SPREAD_MINMAX,
+                                      TLS_VEC_DEPTH, pref, NULL);
+        CHECK(s_ref >= 0, "%s: double reference failed (%d)", cases[ci].name, s_ref);
+
+        for (int si = 0; si < spread_max; ++si) {
+            for (int defer = 0; defer <= 1; ++defer) {
+                tls_tuning_set_defer(defer);
+                int s0 = tlsh_fastchi2_opts(t, yf, dyf, M, 0.001, 0.0005, N, cases[ci].degree, cases[ci].backend, cases[ci].solver, cases[ci].norm, spreads[si],
+                                            TLS_VEC_DEPTH, ph0, NULL);
+                int s1 = tlsh_fastchi2_opts(t, yf, dyf, M, 0.001, 0.0005, N, cases[ci].degree, cases[ci].backend, cases[ci].solver, cases[ci].norm, spreads[si],
+                                            TLS_VEC_BREADTH, ph1, NULL);
+                int sd = tlsh_fastchi2_opts_d(t, yd, dyd, M, 0.001, 0.0005, N, cases[ci].degree, cases[ci].backend, cases[ci].solver, cases[ci].norm,
+                                              spreads[si], TLS_VEC_DEPTH, phd, NULL);
+                CHECK(s0 >= 0 && s1 >= 0 && sd >= 0, "%s (sp=%d defer=%d): status %d %d %d", cases[ci].name, spreads[si], defer, s0, s1, sd);
+                /* Depth vs breadth and float vs double inputs must match within FP16 rounding */
+                CHECK(same_values(ph0, ph1, N, 2e-2, 2e-2), "%s (sp=%d defer=%d): depth vs breadth", cases[ci].name, spreads[si], defer);
+                CHECK(same_values(ph0, phd, N, 1e-2, 1e-2), "%s (sp=%d defer=%d): float vs double input", cases[ci].name, spreads[si], defer);
+                if (cases[ci].norm == TLS_NORM_STANDARD && defer == 1 && si == 0) {
+                    double max_diff = 0.0;
+                    for (int k = 0; k < N; ++k) {
+                        if (!f32_is_nan_bits(ph0[k]) && !f64_is_nan_bits(pref[k])) {
+                            double d = fabs((double)ph0[k] - pref[k]);
+                            if (d > max_diff) max_diff = d;
+                        }
+                    }
+                    CHECK(max_diff < 2.5e-2, "%s: FP16 vs FP64 max |dR2|=%.3e", cases[ci].name, max_diff);
+                }
+            }
+        }
+    }
+
+    /* IHS across backends, normalizations, depth/breadth, float/double inputs */
+    const int ihs_norms[3] = {TLS_NORM_IHS_RAW, TLS_NORM_IHS_DEFAULT, TLS_NORM_NLL};
+    const int ihs_backends[3] = {TLS_BACKEND_PSWF43, TLS_BACKEND_PSWF21, TLS_BACKEND_LRA};
+    for (int bi = 0; bi < 3; ++bi) {
+        for (int ni = 0; ni < 3; ++ni) {
+            for (int defer = 0; defer <= 1; ++defer) {
+                tls_tuning_set_defer(defer);
+                int s0 = tlsh_ihs_opts(t, yf, dyf, M, 0.001, 0.0005, N, 3, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, ph0);
+                int s1 = tlsh_ihs_opts(t, yf, dyf, M, 0.001, 0.0005, N, 3, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_BREADTH, ph1);
+                int sd = tlsh_ihs_opts_d(t, yd, dyd, M, 0.001, 0.0005, N, 3, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, phd);
+                CHECK(s0 == 0 && s1 == 0 && sd == 0, "ihs half be=%d nm=%d defer=%d status %d %d %d", ihs_backends[bi], ihs_norms[ni], defer, s0, s1, sd);
+                CHECK(same_values(ph0, ph1, N, 2e-2, 2e-2), "ihs half depth vs breadth be=%d nm=%d defer=%d", ihs_backends[bi], ihs_norms[ni], defer);
+                CHECK(same_values(ph0, phd, N, 1e-2, 1e-2), "ihs half float vs double be=%d nm=%d defer=%d", ihs_backends[bi], ihs_norms[ni], defer);
+            }
+        }
+    }
+
+    /* Ill-conditioned clustered sampling: verify condition threshold flags
+     * inaccurate bins as NaN when cond==NULL and reports finite/inf cond when cond!=NULL. */
+    {
+        const int M_ill = 120;
+        const int N_ill = 256;
+        double *ti = (double *)test_alloc((size_t)M_ill * sizeof(double));
+        double *yi = (double *)test_alloc((size_t)M_ill * sizeof(double));
+        double *dyi = (double *)test_alloc((size_t)M_ill * sizeof(double));
+        float *pi_nan = (float *)test_alloc((size_t)N_ill * sizeof(float));
+        float *pi_cond = (float *)test_alloc((size_t)N_ill * sizeof(float));
+        float *ci_arr = (float *)test_alloc((size_t)N_ill * sizeof(float));
+        double *pi_ref = (double *)test_alloc((size_t)N_ill * sizeof(double));
+        for (int m = 0; m < M_ill; ++m) {
+            /* Clustered around integers -> strong aliasing at f = 0.5, 1.0, ... */
+            ti[m] = (double)(m % 20) + 0.02 * ((double)(m / 20) - 2.5);
+            yi[m] = sin(2.0 * 3.141592653589793 * 0.23 * ti[m]) + 0.1 * urand();
+            dyi[m] = 0.1;
+        }
+        tls_tuning_set_defer(1);
+        int snan = tlsh_fastchi2_opts_d(ti, yi, dyi, M_ill, 0.05, 0.01, N_ill, 3, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX,
+                                        TLS_VEC_DEPTH, pi_nan, NULL);
+        int scond = tlsh_fastchi2_opts_d(ti, yi, dyi, M_ill, 0.05, 0.01, N_ill, 3, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD,
+                                         TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, pi_cond, ci_arr);
+        int sref = tls_fastchi2_opts(ti, yi, dyi, M_ill, 0.05, 0.01, N_ill, 3, TLS_BACKEND_PSWF43, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD, TLS_SPREAD_MINMAX,
+                                     TLS_VEC_DEPTH, pi_ref, NULL);
+        CHECK(snan > 0 && scond == 0 && sref >= 0, "half ill-cond: expected NaNs (snan=%d scond=%d sref=%d)", snan, scond, sref);
+        int high_cond_flagged = 0;
+        double max_kept_err = 0.0;
+        for (int k = 0; k < N_ill; ++k) {
+            if (ci_arr[k] > 500.0f) {
+                CHECK(f32_is_nan_bits(pi_nan[k]), "half ill-cond bin %d cond=%.1f not NaN", k, (double)ci_arr[k]);
+                ++high_cond_flagged;
+            } else if (!f32_is_nan_bits(pi_nan[k]) && !f64_is_nan_bits(pi_ref[k])) {
+                double e = fabs((double)pi_nan[k] - pi_ref[k]);
+                if (e > max_kept_err) max_kept_err = e;
+            }
+        }
+        CHECK(high_cond_flagged > 0, "half ill-cond: expected some cond > 500 bins");
+        printf("  half ill-cond: %d/%d bins flagged NaN (max kept |dR2| = %.3e)\n", snan, N_ill, max_kept_err);
+        free(ti);
+        free(yi);
+        free(dyi);
+        free(pi_nan);
+        free(pi_cond);
+        free(ci_arr);
+        free(pi_ref);
+    }
+
+    free(t);
+    free(yd);
+    free(dyd);
+    free(yf);
+    free(dyf);
+    free(pref);
+    free(ph0);
+    free(ph1);
+    free(phd);
+    free(ch);
+}
+
 int main(int argc, char **argv) {
     dump_mode = (argc > 1 && strcmp(argv[1], "--dump") == 0);
 
@@ -697,6 +863,9 @@ int main(int argc, char **argv) {
     run_vectorize_ihs_case("v_ihs_d3_lra", 500, 777, 3, TLS_BACKEND_LRA, TLS_NORM_NLL, TLS_SPREAD_MINMAX);
     run_vectorize_dd_and_errors();
     tls_tuning_set_vectorize(TLS_VEC_AUTO);
+
+    printf("check_periodogram: half precision (FP16)\n");
+    run_half_precision_suite();
 
     tls_tuning_set_defer(TLS_TUNING_DEFER_DEFAULT);
     tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);

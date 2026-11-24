@@ -39,7 +39,7 @@ INCLUDE = ROOT / "include"
 SRC = ROOT / "src"
 
 PRECISION_SOURCES = ("nanofft", "nufft1", "linalg", "chi2per", "utils")
-PRECISIONS = (("", "f"), ("DOUBLE", "d"), ("DOUBLE_DOUBLE", "dd"))
+PRECISIONS = (("", "f"), ("DOUBLE", "d"), ("DOUBLE_DOUBLE", "dd"), ("HALF", "h"))
 
 BASE_DEFINES = ("MAX_TWIDDLE_REUSE=16",)
 
@@ -162,9 +162,11 @@ def _empty_depth_table(path: Path, note: str) -> Path:
         "static const unsigned char nanofft_depth_float[32] = {0};\n"
         "static const unsigned char nanofft_depth_double[32] = {0};\n"
         "static const unsigned char nanofft_depth_dd[32] = {0};\n"
+        "static const unsigned char nanofft_depth_half[32] = {0};\n"
         "static const unsigned char nanofft_bdepth_float[32] = {0};\n"
         "static const unsigned char nanofft_bdepth_double[32] = {0};\n"
         "static const unsigned char nanofft_bdepth_dd[32] = {0};\n"
+        "static const unsigned char nanofft_bdepth_half[32] = {0};\n"
         "#endif\n" % note
     )
     return path
@@ -202,7 +204,7 @@ def _measure_inputs(tc, variant, workdir: Path, *, note: str) -> tuple[Path, Pat
     )
 
     # scaling.h: the generator appends one precision's constants per run.
-    for (define, tag), precision in zip(PRECISIONS, ("Single", "Double", "Double-Double")):
+    for (define, tag), precision in zip(PRECISIONS, ("Single", "Double", "Double-Double", "Half")):
         gen = workdir / f"scaling-{tag}"
         cmd = [
             *tc.cc,
@@ -233,7 +235,17 @@ def _measure_inputs(tc, variant, workdir: Path, *, note: str) -> tuple[Path, Pat
     if tc.sysroot:
         cmd.append("--sysroot=" + tc.sysroot)
     cmd += ["-L" + d for d in tc.lib_dirs]
-    cmd += [str(tuner_src), str(objs[("nanofft", "f")]), str(objs[("nanofft", "d")]), str(objs[("nanofft", "dd")]), str(tuning_obj), "-o", str(tuner), "-lm"]
+    cmd += [
+        str(tuner_src),
+        str(objs[("nanofft", "f")]),
+        str(objs[("nanofft", "d")]),
+        str(objs[("nanofft", "dd")]),
+        str(objs[("nanofft", "h")]),
+        str(tuning_obj),
+        "-o",
+        str(tuner),
+        "-lm",
+    ]
     _run_quietly(cmd)
 
     table = workdir / "nanofft_depth_table.h"
@@ -368,6 +380,8 @@ def build_variant(target, variant, tc: T.Toolchain, *, run: bool, reference: tup
     objs = []
     for src_name in PRECISION_SOURCES:
         for define, tag in PRECISIONS:
+            if src_name == "utils" and define == "HALF":
+                continue
             obj = work / f"{src_name}-{tag}.o"
             _run_quietly(
                 env=tc.env,

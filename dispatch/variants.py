@@ -104,6 +104,32 @@ X86_VARIANTS: tuple[Variant, ...] = (
         ),
         clang_cl_flags=("-march=x86-64-v4",),
     ),
+    Variant(
+        name="x86-64-v4+fp16",
+        arch="x86_64",
+        cflags=("-march=x86-64-v4", "-mavx512fp16", "-mtune=generic"),
+        requires=(
+            ("sse4_2",),
+            ("popcnt",),
+            ("cx16",),
+            ("avx",),
+            ("xsave",),
+            ("avx2",),
+            ("fma",),
+            ("bmi1",),
+            ("bmi2",),
+            ("f16c",),
+            ("lzcnt",),
+            ("movbe",),
+            ("avx512f",),
+            ("avx512bw",),
+            ("avx512cd",),
+            ("avx512dq",),
+            ("avx512vl",),
+            ("avx512_fp16", "avx512fp16"),
+        ),
+        clang_cl_flags=("-march=x86-64-v4", "-mavx512fp16"),
+    ),
 )
 
 # Windows and macOS expose far fewer queryable features; the requirement sets
@@ -120,6 +146,13 @@ X86_VARIANTS_WINDOWS: tuple[Variant, ...] = (
     ),
     Variant(name="x86-64-v3", arch="x86_64", cflags=("-march=x86-64-v3",), requires=(("avx2",),), clang_cl_flags=("-march=x86-64-v3",)),
     Variant(name="x86-64-v4", arch="x86_64", cflags=("-march=x86-64-v4",), requires=(("avx512f",),), clang_cl_flags=("-march=x86-64-v4",)),
+    Variant(
+        name="x86-64-v4+fp16",
+        arch="x86_64",
+        cflags=("-march=x86-64-v4", "-mavx512fp16"),
+        requires=(("avx512f",), ("avx512_fp16", "avx512fp16")),
+        clang_cl_flags=("-march=x86-64-v4", "-mavx512fp16"),
+    ),
 )
 
 # zig spells the microarchitecture levels with LLVM CPU names; `westmere` is
@@ -130,10 +163,23 @@ X86_VARIANTS_MACOS: tuple[Variant, ...] = (
     Variant(name="x86-64-v2+avx", arch="x86_64", cflags=("-mcpu=westmere",), requires=(("sse4_2",), ("avx",))),
     Variant(name="x86-64-v3", arch="x86_64", cflags=("-mcpu=x86_64_v3",), requires=(("avx2",),)),
     Variant(name="x86-64-v4", arch="x86_64", cflags=("-mcpu=x86_64_v4",), requires=(("avx512f",),)),
+    Variant(
+        name="x86-64-v4+fp16",
+        arch="x86_64",
+        cflags=("-mcpu=x86_64_v4", "-mavx512fp16"),
+        requires=(("avx512f",), ("avx512_fp16", "avx512fp16")),
+    ),
 )
 
 ARM_VARIANTS: tuple[Variant, ...] = (
     Variant(name="armv8-a", arch="aarch64", cflags=("-march=armv8-a+simd",), requires=(), sve_bytes=0),
+    Variant(
+        name="armv8.2-a+fp16",
+        arch="aarch64",
+        cflags=("-march=armv8.2-a+fp16",),
+        requires=(("asimdhp",),),
+        sve_bytes=0,
+    ),
     Variant(
         name="armv8.2-a+sve-256",
         arch="aarch64",

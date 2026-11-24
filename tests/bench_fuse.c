@@ -238,7 +238,7 @@ DEFINE_BENCH(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nano
  * scaling.h; the release build regenerates it per variant (or copies it from
  * the runnable variant with the same vector width when cross-compiling).
  * ========================================================================= */
-#define DEFINE_TUNE(TAG, PLAN_T_, MAKE, DESTROY, EXEC, TYPE, MAXDEPTH)                                       \
+#define DEFINE_TUNE(TAG, PLAN_T_, MAKE, DESTROY, EXEC, TYPE, MAXDEPTH, CAST_FN)                              \
     static void tune_##TAG(unsigned char *table, const uint32_t *sizes, int nsizes, int layouts, int reps) { \
         printf("  %-6s %-6s", "grid", "ns/e");                                                               \
         for (int d = 1; d <= (MAXDEPTH); ++d) printf(" %9s", "depth");                                       \
@@ -257,11 +257,11 @@ DEFINE_BENCH(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nano
                 rng ^= rng << 13;                                                                            \
                 rng ^= rng >> 17;                                                                            \
                 rng ^= rng << 5;                                                                             \
-                tmpl_r[k] = (TYPE)((double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0);                             \
+                tmpl_r[k] = CAST_FN((double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0);                            \
                 rng ^= rng << 13;                                                                            \
                 rng ^= rng >> 17;                                                                            \
                 rng ^= rng << 5;                                                                             \
-                tmpl_i[k] = (TYPE)((double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0);                             \
+                tmpl_i[k] = CAST_FN((double)(rng & 0xFFFFFFu) / 8388608.0 - 1.0);                            \
             }                                                                                                \
             double best[NANOFFT_FFT_FUSE_MAX + 1];                                                           \
             for (int d = 1; d <= (MAXDEPTH); ++d) {                                                          \
@@ -319,9 +319,12 @@ DEFINE_BENCH(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nano
         }                                                                                                    \
     }
 
-DEFINE_TUNE(float, nanofftf_plan, nanofftf_make_plan, nanofftf_destroy_plan, nanofftf_execute_raw, float, NANOFFT_FFT_FUSE_FLOAT)
-DEFINE_TUNE(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nanofft_execute_raw, double, NANOFFT_FFT_FUSE_DOUBLE)
-
+#define CAST_F(x) ((float)(x))
+#define CAST_D(x) ((double)(x))
+#define CAST_H(x) tls_f32_to_f16((float)(x))
+DEFINE_TUNE(float, nanofftf_plan, nanofftf_make_plan, nanofftf_destroy_plan, nanofftf_execute_raw, float, NANOFFT_FFT_FUSE_FLOAT, CAST_F)
+DEFINE_TUNE(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nanofft_execute_raw, double, NANOFFT_FFT_FUSE_DOUBLE, CAST_D)
+DEFINE_TUNE(half, nanoffth_plan, nanoffth_make_plan, nanoffth_destroy_plan, nanoffth_execute_raw, tls_f16_t, NANOFFT_FFT_FUSE_HALF, CAST_H)
 #define DEFINE_BTUNE(TAG, PLAN_T_, MAKE, DESTROY, EXEC, VTYPE, LANES, MAXDEPTH, INIT_LANE)                         \
     static void btune_##TAG(unsigned char *table, const uint32_t *sizes, int nsizes, int layouts, int reps) {      \
         printf("  %-6s %-6s", "grid", "ns/b");                                                                     \
@@ -411,6 +414,11 @@ DEFINE_TUNE(double, nanofft_plan, nanofft_make_plan, nanofft_destroy_plan, nanof
         (v).hi[(l)] = (double)(x); \
         (v).lo[(l)] = 0.0;         \
     } while (0)
+#if NANOFFT_NATIVE_FP16
+#    define INIT_LANE_H(v, l, x) ((v)[(l)] = (_Float16)(x))
+#else
+#    define INIT_LANE_H(v, l, x) ((v).elems[(l)] = tls_f32_to_f16((float)(x)))
+#endif
 
 DEFINE_BTUNE(float, nanofftf_plan, nanofftf_make_plan_breadth, nanofftf_destroy_plan, nanofftf_execute_raw_breadth, VECF, VECF_LEN, NANOFFT_FFT_BFUSE_FLOAT,
              INIT_LANE_F)
@@ -418,9 +426,11 @@ DEFINE_BTUNE(double, nanofft_plan, nanofft_make_plan_breadth, nanofft_destroy_pl
              INIT_LANE_D)
 DEFINE_BTUNE(dd, nanofftdd_plan, nanofftdd_make_plan_breadth, nanofftdd_destroy_plan, nanofftdd_execute_raw_breadth, VECDD, VECDD_LEN, NANOFFT_FFT_BFUSE_DD,
              INIT_LANE_DD)
+DEFINE_BTUNE(half, nanoffth_plan, nanoffth_make_plan_breadth, nanoffth_destroy_plan, nanoffth_execute_raw_breadth, VECH, VECH_LEN, NANOFFT_FFT_BFUSE_HALF,
+             INIT_LANE_H)
 
-static void emit_depth_header(const char *path, const unsigned char *tf, const unsigned char *td, const unsigned char *btf, const unsigned char *btd,
-                              const unsigned char *btdd, const char *note) {
+static void emit_depth_header(const char *path, const unsigned char *tf, const unsigned char *td, const unsigned char *th, const unsigned char *btf,
+                              const unsigned char *btd, const unsigned char *btdd, const unsigned char *bth, const char *note) {
     FILE *f = fopen(path, "w");
     if (!f) {
         fprintf(stderr, "cannot open %s\n", path);
@@ -442,20 +452,20 @@ static void emit_depth_header(const char *path, const unsigned char *tf, const u
             "#define NANOFFT_DEPTH_TABLE_H\n\n"
             "#define NANOFFT_BDEPTH_TABLE 1\n\n",
             note);
-    const char *names[3] = {"nanofft_depth_float", "nanofft_depth_double", "nanofft_depth_dd"};
-    const unsigned char *tabs[3] = {tf, td, NULL};
-    for (int t = 0; t < 2; ++t) {
+    const char *names[4] = {"nanofft_depth_float", "nanofft_depth_double", "nanofft_depth_half", "nanofft_depth_dd"};
+    const unsigned char *tabs[4] = {tf, td, th, NULL};
+    for (int t = 0; t < 3; ++t) {
         fprintf(f, "static const unsigned char %s[32] = {", names[t]);
         for (int i = 0; i < 32; ++i) fprintf(f, "%s%d", (i % 16) ? ", " : (i ? ",\n    " : ""), (int)tabs[t][i]);
         fprintf(f, "};\n");
     }
     fprintf(f, "/* Double-double is scalar (one lane) and keeps its 2-stage default. */\n");
-    fprintf(f, "static const unsigned char %s[32] = {", names[2]);
+    fprintf(f, "static const unsigned char %s[32] = {", names[3]);
     for (int i = 0; i < 32; ++i) fprintf(f, "%s0", (i % 16) ? ", " : (i ? ",\n    " : ""));
     fprintf(f, "};\n\n");
-    const char *bnames[3] = {"nanofft_bdepth_float", "nanofft_bdepth_double", "nanofft_bdepth_dd"};
-    const unsigned char *btabs[3] = {btf, btd, btdd};
-    for (int t = 0; t < 3; ++t) {
+    const char *bnames[4] = {"nanofft_bdepth_float", "nanofft_bdepth_double", "nanofft_bdepth_dd", "nanofft_bdepth_half"};
+    const unsigned char *btabs[4] = {btf, btd, btdd, bth};
+    for (int t = 0; t < 4; ++t) {
         fprintf(f, "static const unsigned char %s[32] = {", bnames[t]);
         for (int i = 0; i < 32; ++i) fprintf(f, "%s%d", (i % 16) ? ", " : (i ? ",\n    " : ""), (int)btabs[t][i]);
         fprintf(f, "};\n");
@@ -492,7 +502,8 @@ int main(int argc, char **argv) {
         if (layouts > NLAYOUTS) layouts = NLAYOUTS;
         if (reps < 1) reps = 1;
 
-        const int floor_log = exact_log2(2u * ((VECF_LEN > VEC_LEN) ? VECF_LEN : VEC_LEN));
+        const uint32_t max_lanes = (VECH_LEN > VECF_LEN) ? (uint32_t)VECH_LEN : ((VECF_LEN > VEC_LEN) ? (uint32_t)VECF_LEN : (uint32_t)VEC_LEN);
+        const int floor_log = exact_log2(2u * max_lanes);
         if (min_log < floor_log) min_log = floor_log;
         if (max_log > 20) max_log = 20;
         if (max_log < min_log) max_log = min_log;
@@ -503,15 +514,20 @@ int main(int argc, char **argv) {
 
         static unsigned char table_float[32];
         static unsigned char table_double[32];
+        static unsigned char table_half[32];
         static unsigned char btable_float[32];
         static unsigned char btable_double[32];
         static unsigned char btable_dd[32];
-        printf("tune: grids 2^%d..2^%d, %d layouts, %d reps, depths 1..%d/%d (breadth 1..%d/%d/%d)\n", min_log, max_log, layouts, reps, NANOFFT_FFT_FUSE_FLOAT,
-               NANOFFT_FFT_FUSE_DOUBLE, NANOFFT_FFT_BFUSE_FLOAT, NANOFFT_FFT_BFUSE_DOUBLE, NANOFFT_FFT_BFUSE_DD);
+        static unsigned char btable_half[32];
+        printf("tune: grids 2^%d..2^%d, %d layouts, %d reps, depths 1..%d/%d/%d (breadth 1..%d/%d/%d/%d)\n", min_log, max_log, layouts, reps,
+               NANOFFT_FFT_FUSE_FLOAT, NANOFFT_FFT_FUSE_DOUBLE, NANOFFT_FFT_FUSE_HALF, NANOFFT_FFT_BFUSE_FLOAT, NANOFFT_FFT_BFUSE_DOUBLE, NANOFFT_FFT_BFUSE_DD,
+               NANOFFT_FFT_BFUSE_HALF);
         printf("== double ==\n");
         tune_double(table_double, sizes, nsizes, layouts, reps);
         printf("== float ==\n");
         tune_float(table_float, sizes, nsizes, layouts, reps);
+        printf("== half ==\n");
+        tune_half(table_half, sizes, nsizes, layouts, reps);
         uint32_t bsizes[MAX_SIZES];
         int nbsizes = 0;
         const int bmax = (max_log > 16) ? 16 : max_log;
@@ -520,9 +536,11 @@ int main(int argc, char **argv) {
         btune_double(btable_double, bsizes, nbsizes, layouts, reps);
         printf("== breadth float (VECF_LEN=%d) ==\n", VECF_LEN);
         btune_float(btable_float, bsizes, nbsizes, layouts, reps);
+        printf("== breadth half (VECH_LEN=%d) ==\n", VECH_LEN);
+        btune_half(btable_half, bsizes, nbsizes, layouts, reps);
         printf("== breadth dd (VECDD_LEN=%d) ==\n", VECDD_LEN);
         btune_dd(btable_dd, bsizes, nbsizes, layouts, reps);
-        if (emit) emit_depth_header(emit, table_float, table_double, btable_float, btable_double, btable_dd, note);
+        if (emit) emit_depth_header(emit, table_float, table_double, table_half, btable_float, btable_double, btable_dd, btable_half, note);
         tls_tuning_set_fft_fuse(TLS_TUNING_FFT_FUSE_DEFAULT);
         tls_tuning_set_fft_bfuse(TLS_TUNING_FFT_FUSE_DEFAULT);
         tls_tuning_set_fft_order(TLS_FFT_ORDER_END);

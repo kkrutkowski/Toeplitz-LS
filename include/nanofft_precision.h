@@ -1,6 +1,6 @@
 /* Precision-selection macros shared by nanoFFT and NuFFT1 implementation
  * passes. This header is intentionally re-includable after changing
- * DOUBLE/DOUBLE_DOUBLE.
+ * DOUBLE/DOUBLE_DOUBLE/HALF.
  */
 
 #undef FLOAT
@@ -10,6 +10,8 @@
 #undef INTERNAL_VEC
 #undef INTERNAL_VEC_INT
 #undef INTERNAL_VEC_LEN
+#undef IVEC_SCALAR
+#undef IVEC_SPLAT
 #undef M_COS2PI
 #undef M_SIN2PI
 #undef M_SINCOS2PI
@@ -41,6 +43,9 @@
 #undef BREADTH_ZERO
 #undef BREADTH_GET_LANE
 #undef BREADTH_SET_LANE
+#undef BREADTH_COMPUTE_VEC
+#undef LOAD_VEC
+#undef STORE_VEC
 #undef LOAD_BVEC
 #undef STORE_BVEC
 
@@ -56,6 +61,8 @@ typedef dd_t INTERNAL_VEC;
 typedef uint32_t INTERNAL_VEC_INT;
 #    endif
 #    define INTERNAL_VEC_LEN 1
+#    define IVEC_SCALAR dd_t
+#    define IVEC_SPLAT(s) (s)
 #    define M_COS2PI(x) cos2pidd((x))
 #    define M_SIN2PI(x) sin2pidd((x))
 #    define M_SINCOS2PI(x, c, s) sincos2pidd((x), (c), (s))
@@ -78,6 +85,7 @@ typedef uint32_t INTERNAL_VEC_INT;
 #    define FROM_FALLBACK(a) dd_make((double)(a), 0.0)
 #    define TO_FALLBACK(a) ((a).hi)
 #    define BREADTH_VEC VECDD
+#    define BREADTH_COMPUTE_VEC VECDD
 #    define BREADTH_VEC_LEN VECDD_LEN
 #    define BREADTH_ADD(a, b) vecdd_add((a), (b))
 #    define BREADTH_SUB(a, b) vecdd_sub((a), (b))
@@ -106,6 +114,8 @@ typedef VEC INTERNAL_VEC;
 typedef VEC_INT INTERNAL_VEC_INT;
 #    endif
 #    define INTERNAL_VEC_LEN VEC_LEN
+#    define IVEC_SCALAR double
+#    define IVEC_SPLAT(s) ((VEC){} + (double)(s))
 #    define M_COS2PI(x) cos2pi((double)(x))
 #    define M_SIN2PI(x) sin2pi((double)(x))
 #    define M_SINCOS2PI(x, c, s) sincos2pi((double)(x), (c), (s))
@@ -132,6 +142,7 @@ typedef VEC_INT INTERNAL_VEC_INT;
 #    define FROM_FALLBACK(a) ((double)(a))
 #    define TO_FALLBACK(a) ((float)(a))
 #    define BREADTH_VEC VEC
+#    define BREADTH_COMPUTE_VEC VEC
 #    define BREADTH_VEC_LEN VEC_LEN
 #    define BREADTH_ADD(a, b) ((a) + (b))
 #    define BREADTH_SUB(a, b) ((a) - (b))
@@ -146,6 +157,123 @@ typedef VEC_INT INTERNAL_VEC_INT;
             (v)[(lane)] = (val);           \
         } while (0)
 
+#elif defined(HALF)
+
+#    define FLOAT tls_f16_t
+#    ifdef HALF_NATIVE_EMBED
+#        define PREFIX(name) nanoffth_nat_##name
+#    else
+#        define PREFIX(name) nanoffth_##name
+#    endif
+#    define FALLBACK_PREFIX(name) nanofftf_##name
+#    define FALLBACK_FLOAT float
+
+#    define M_COS2PI(x) tls_f16_cos2pi((x))
+#    define M_SIN2PI(x) tls_f16_sin2pi((x))
+#    define M_SINCOS2PI(x, c, s) tls_f16_sincos2pi((x), (c), (s))
+#    define M_FMA(a, b, c) tls_f16_fma((a), (b), (c))
+#    define M_FABS(a) tls_f16_fabs((a))
+#    define FCAST(a) tls_f32_to_f16((float)(a))
+#    define FCONST(hi, ...) tls_f32_to_f16((float)(hi))
+#    define TO_DOUBLE(a) ((double)tls_f16_to_f32((a)))
+#    define FROM_FALLBACK(a) tls_f32_to_f16((a))
+#    define TO_FALLBACK(a) tls_f16_to_f32((a))
+
+#    define ADD(a, b)                                                                                                                   \
+        __extension__({                                                                                                                 \
+            __typeof__(a) _add_a_ = (a);                                                                                                \
+            __typeof__(b) _add_b_ = (b);                                                                                                \
+            _Generic((_add_a_), tls_half_ivec_t: tls_half_ivec_add(&_add_a_, &_add_b_), tls_f16_t: tls_half_s_add(&_add_a_, &_add_b_)); \
+        })
+#    define SUB(a, b)                                                                                                                   \
+        __extension__({                                                                                                                 \
+            __typeof__(a) _sub_a_ = (a);                                                                                                \
+            __typeof__(b) _sub_b_ = (b);                                                                                                \
+            _Generic((_sub_a_), tls_half_ivec_t: tls_half_ivec_sub(&_sub_a_, &_sub_b_), tls_f16_t: tls_half_s_sub(&_sub_a_, &_sub_b_)); \
+        })
+#    define MUL(a, b)                                                                                                                   \
+        __extension__({                                                                                                                 \
+            __typeof__(a) _mul_a_ = (a);                                                                                                \
+            __typeof__(b) _mul_b_ = (b);                                                                                                \
+            _Generic((_mul_a_), tls_half_ivec_t: tls_half_ivec_mul(&_mul_a_, &_mul_b_), tls_f16_t: tls_half_s_mul(&_mul_a_, &_mul_b_)); \
+        })
+#    define DIV(a, b)                                                                                                                   \
+        __extension__({                                                                                                                 \
+            __typeof__(a) _div_a_ = (a);                                                                                                \
+            __typeof__(b) _div_b_ = (b);                                                                                                \
+            _Generic((_div_a_), tls_half_ivec_t: tls_half_ivec_div(&_div_a_, &_div_b_), tls_f16_t: tls_half_s_div(&_div_a_, &_div_b_)); \
+        })
+#    define NEG(a)                                                                                                  \
+        __extension__({                                                                                             \
+            __typeof__(a) _neg_a_ = (a);                                                                            \
+            _Generic((_neg_a_), tls_half_ivec_t: tls_half_ivec_neg(&_neg_a_), tls_f16_t: tls_half_s_neg(&_neg_a_)); \
+        })
+#    define M_SQRT(a)                                                                                                       \
+        __extension__({                                                                                                     \
+            __typeof__(a) _msqrt_a_ = (a);                                                                                  \
+            _Generic((_msqrt_a_), tls_half_ivec_t: tls_half_ivec_sqrt(&_msqrt_a_), tls_f16_t: tls_half_s_sqrt(&_msqrt_a_)); \
+        })
+#    define M_EXP(a)                                                                                                   \
+        __extension__({                                                                                                \
+            __typeof__(a) _mexp_a_ = (a);                                                                              \
+            _Generic((_mexp_a_), tls_half_ivec_t: tls_half_ivec_exp(&_mexp_a_), tls_f16_t: tls_half_s_exp(&_mexp_a_)); \
+        })
+
+#    if NANOFFT_NATIVE_FP16
+#        ifdef NANOFFT_NEEDS_INTERNAL_VEC
+typedef VECH INTERNAL_VEC;
+typedef VECH_INT INTERNAL_VEC_INT;
+#        endif
+#        define INTERNAL_VEC_LEN VECH_LEN
+#        define IVEC_SCALAR _Float16
+#        define IVEC_SPLAT(s) ((VECH){} + tls_f16_to_fp16((s)))
+#        define LOAD_VEC(ptr) (*(const VECH *)(const void *)(ptr))
+#        define STORE_VEC(ptr, val) (*(VECH *)(void *)(ptr) = (val))
+#        define BREADTH_VEC VECH
+#        define BREADTH_COMPUTE_VEC VECH
+#        define BREADTH_VEC_LEN VECH_LEN
+#        define LOAD_BVEC(ptr) (*(const VECH *)(const void *)(ptr))
+#        define STORE_BVEC(ptr, val) (*(VECH *)(void *)(ptr) = (val))
+#        define BREADTH_ADD(a, b) ((a) + (b))
+#        define BREADTH_SUB(a, b) ((a) - (b))
+#        define BREADTH_MUL(a, b) ((a) * (b))
+#        define BREADTH_MUL_S(v, s) ((v) * IVEC_SPLAT((s)))
+#        define BREADTH_NEG(a) (-(a))
+#        define BREADTH_SPLAT(s) IVEC_SPLAT((s))
+#        define BREADTH_ZERO ((VECH){})
+#        define BREADTH_GET_LANE(v, lane) tls_fp16_to_f16((v)[(lane)])
+#        define BREADTH_SET_LANE(v, lane, val)        \
+            do {                                      \
+                (v)[(lane)] = tls_f16_to_fp16((val)); \
+            } while (0)
+#    else
+#        ifdef NANOFFT_NEEDS_INTERNAL_VEC
+typedef VECF INTERNAL_VEC;
+typedef VECF_INT INTERNAL_VEC_INT;
+#        endif
+#        define INTERNAL_VEC_LEN VECF_LEN
+#        define IVEC_SCALAR float
+#        define IVEC_SPLAT(s) ((VECF){} + tls_f16_to_f32((s)))
+#        define LOAD_VEC(ptr) vech_load_f32((const tls_f16_t *)(ptr))
+#        define STORE_VEC(ptr, val) vech_store_f32((tls_f16_t *)(ptr), (val))
+#        define BREADTH_VEC VECH
+#        define BREADTH_COMPUTE_VEC VECF
+#        define BREADTH_VEC_LEN VECH_LEN
+#        define LOAD_BVEC(ptr) vech_to_vecf(*(const VECH *)(const void *)(ptr))
+#        define STORE_BVEC(ptr, val) (*(VECH *)(void *)(ptr) = vecf_to_vech((val)))
+#        define BREADTH_ADD(a, b) ((a) + (b))
+#        define BREADTH_SUB(a, b) ((a) - (b))
+#        define BREADTH_MUL(a, b) ((a) * (b))
+#        define BREADTH_MUL_S(v, s) ((v) * IVEC_SPLAT((s)))
+#        define BREADTH_NEG(a) (-(a))
+#        define BREADTH_SPLAT(s) IVEC_SPLAT((s))
+#        define BREADTH_ZERO ((VECF){})
+#        define BREADTH_GET_LANE(v, lane) tls_f32_to_f16((v)[(lane)])
+#        define BREADTH_SET_LANE(v, lane, val)       \
+            do {                                     \
+                (v)[(lane)] = tls_f16_to_f32((val)); \
+            } while (0)
+#    endif
 #else
 
 #    define FLOAT float
@@ -158,6 +286,8 @@ typedef VECF INTERNAL_VEC;
 typedef VECF_INT INTERNAL_VEC_INT;
 #    endif
 #    define INTERNAL_VEC_LEN VECF_LEN
+#    define IVEC_SCALAR float
+#    define IVEC_SPLAT(s) ((VECF){} + (float)(s))
 #    define M_COS2PI(x) cos2pif((float)(x))
 #    define M_SIN2PI(x) sin2pif((float)(x))
 #    define M_SINCOS2PI(x, c, s) sincos2pif((float)(x), (c), (s))
@@ -184,6 +314,7 @@ typedef VECF_INT INTERNAL_VEC_INT;
 #    define FROM_FALLBACK(a) ((float)(a))
 #    define TO_FALLBACK(a) ((double)(a))
 #    define BREADTH_VEC VECF
+#    define BREADTH_COMPUTE_VEC VECF
 #    define BREADTH_VEC_LEN VECF_LEN
 #    define BREADTH_ADD(a, b) ((a) + (b))
 #    define BREADTH_SUB(a, b) ((a) - (b))
@@ -204,7 +335,11 @@ typedef VECF_INT INTERNAL_VEC_INT;
  * Vector load / store helpers
  * ========================================================================= */
 
-#define LOAD_VEC(ptr) (*(const INTERNAL_VEC *)(ptr))
-#define STORE_VEC(ptr, val) (*(INTERNAL_VEC *)(ptr) = (val))
-#define LOAD_BVEC(ptr) (*(const BREADTH_VEC *)(ptr))
-#define STORE_BVEC(ptr, val) (*(BREADTH_VEC *)(ptr) = (val))
+#ifndef LOAD_VEC
+#    define LOAD_VEC(ptr) (*(const INTERNAL_VEC *)(ptr))
+#    define STORE_VEC(ptr, val) (*(INTERNAL_VEC *)(ptr) = (val))
+#endif
+#ifndef LOAD_BVEC
+#    define LOAD_BVEC(ptr) (*(const BREADTH_VEC *)(ptr))
+#    define STORE_BVEC(ptr, val) (*(BREADTH_VEC *)(ptr) = (val))
+#endif

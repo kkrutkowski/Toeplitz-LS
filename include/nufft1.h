@@ -60,4 +60,40 @@ TLS_API void tlsdd_nufft_pswf_precompute(tlsdd_nufft_pswf_plan *plan, const dd_t
 TLS_API void tlsdd_nufft_pswf_execute(tlsdd_nufft_pswf_plan *plan, const dd_t *y_real, const dd_t *y_imag, dd_t *out_real, dd_t *out_imag, int freq_factor);
 TLS_API void tlsdd_nufft_free_pswf_plan(tlsdd_nufft_pswf_plan *plan);
 
+/* =========================================================================
+ * Half Precision API (tls_f16_t)
+ * ========================================================================= */
+
+typedef struct tlsh_nufft_lra_plan tlsh_nufft_lra_plan;
+
+TLS_API tlsh_nufft_lra_plan *tlsh_nufft_lra_initialize(int max_Mpoints, int max_N, int max_rank, double df, int freq_factor);
+TLS_API void tlsh_nufft_lra_precompute(tlsh_nufft_lra_plan *plan, const double *x, int Mpoints, int N, int rank);
+TLS_API void tlsh_nufft_lra_execute(const tlsh_nufft_lra_plan *plan, const tls_f16_t *y_real, const tls_f16_t *y_imag, tls_f16_t *out_real, tls_f16_t *out_imag,
+                                    int freq_factor);
+TLS_API void tlsh_nufft_free_lra_plan(tlsh_nufft_lra_plan *plan);
+
+typedef struct tlsh_nufft_pswf_plan tlsh_nufft_pswf_plan;
+
+TLS_API tlsh_nufft_pswf_plan *tlsh_nufft_pswf_initialize(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2]);
+TLS_API void tlsh_nufft_pswf_precompute(tlsh_nufft_pswf_plan *plan, const double *x);
+TLS_API void tlsh_nufft_pswf_execute(tlsh_nufft_pswf_plan *plan, const tls_f16_t *y_real, const tls_f16_t *y_imag, tls_f16_t *out_real, tls_f16_t *out_imag,
+                                     int freq_factor);
+TLS_API void tlsh_nufft_free_pswf_plan(tlsh_nufft_pswf_plan *plan);
+
+#ifdef HALF_NATIVE_EMBED
+typedef struct tlsh_nat_nufft_lra_plan tlsh_nat_nufft_lra_plan;
+tlsh_nat_nufft_lra_plan *tlsh_nat_nufft_lra_initialize(int max_Mpoints, int max_N, int max_rank, double df, int freq_factor);
+void tlsh_nat_nufft_lra_precompute(tlsh_nat_nufft_lra_plan *plan, const double *x, int Mpoints, int N, int rank);
+void tlsh_nat_nufft_lra_execute(const tlsh_nat_nufft_lra_plan *plan, const tls_f16_t *y_real, const tls_f16_t *y_imag, tls_f16_t *out_real, tls_f16_t *out_imag,
+                                int freq_factor);
+void tlsh_nat_nufft_free_lra_plan(tlsh_nat_nufft_lra_plan *plan);
+
+typedef struct tlsh_nat_nufft_pswf_plan tlsh_nat_nufft_pswf_plan;
+tlsh_nat_nufft_pswf_plan *tlsh_nat_nufft_pswf_initialize(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2]);
+void tlsh_nat_nufft_pswf_precompute(tlsh_nat_nufft_pswf_plan *plan, const double *x);
+void tlsh_nat_nufft_pswf_execute(tlsh_nat_nufft_pswf_plan *plan, const tls_f16_t *y_real, const tls_f16_t *y_imag, tls_f16_t *out_real, tls_f16_t *out_imag,
+                                 int freq_factor);
+void tlsh_nat_nufft_free_pswf_plan(tlsh_nat_nufft_pswf_plan *plan);
+#endif
+
 #endif /* NUFFT1_H */

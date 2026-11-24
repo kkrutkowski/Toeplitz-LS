@@ -8,14 +8,13 @@
  * argument and evaluates this Remez polynomial, which makes the vector path
  * identical everywhere and removes the libmvec dependency entirely.
  *
- * Pipeline (the one used for the PSWF LUT in pswf_remez_lut.cpp, extended):
+ * Pipeline (IRLS progression followed by Remez exchange):
  *
- *   1. Chebyshev-node least-squares regression at degree 4;
- *   2. iteratively reweighted least squares (weights ~ 1/residual) at degree 8
- *      and then 16, which drives the fit towards the minimax solution;
+ *   1. L2 least-squares regression on Chebyshev nodes at target degree;
+ *   2. L^p iteratively reweighted least squares on uniform nodes for
+ *      p = 4 -> 8 -> 12 -> 16 with Kahng damping alpha = 1 / (p - 1);
  *   3. true Remez exchange iterations at the target degree, seeded with the
- *      alternation points of the degree-16 IRLS fit.
- *
+ *      alternation points of the L16 IRLS fit.
  * The relative error |p(r) exp(-r) - 1| is minimised on r in [-ln2/2, ln2/2],
  * which is the exact range left by the x = k ln2 + r reduction the kernel
  * performs.  All arithmetic is boost::multiprecision::float128 (113-bit
@@ -33,6 +32,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -117,20 +117,33 @@ static std::vector<float128> weighted_lsq(const std::vector<float128> &xs, const
     return solve_dense(ata, atb);
 }
 
-/* IRLS: reweight each sample by 1/|relative residual| and refit. */
-static std::vector<float128> irls_fit(const std::vector<float128> &xs, const std::vector<float128> &ys, const std::vector<float128> &base_weights, int degree,
-                                      int iterations) {
-    std::vector<float128> weights = base_weights;
-    std::vector<float128> coeffs;
+/* L^p IRLS on uniform nodes with Kahng damping alpha = 1 / (p - 1). */
+static std::vector<float128> irls_lp_stage(const std::vector<float128> &xs, const std::vector<float128> &ys, const std::vector<float128> &base_weights,
+                                           int degree, int p, int iterations, std::vector<float128> coeffs) {
+    const float128 alpha = float128(1) / float128(p - 1);
+    const float128 exp_p = float128(p - 2);
+    std::vector<float128> weights(xs.size());
     for (int it = 0; it < iterations; ++it) {
-        coeffs = weighted_lsq(xs, ys, weights, degree);
         float128 worst = 0;
-        for (size_t i = 0; i < xs.size(); ++i) worst = std::max(worst, abs(poly_eval(coeffs, xs[i]) / ys[i] - 1));
+        std::vector<float128> errs(xs.size());
+        for (size_t i = 0; i < xs.size(); ++i) {
+            errs[i] = abs(poly_eval(coeffs, xs[i]) / ys[i] - 1);
+            if (errs[i] > worst) worst = errs[i];
+        }
         if (worst == 0) break;
         for (size_t i = 0; i < xs.size(); ++i) {
-            float128 e = abs(poly_eval(coeffs, xs[i]) / ys[i] - 1);
-            weights[i] = base_weights[i] / std::max(e, worst * float128(1e-3));
+            float128 ratio = std::max(errs[i] / worst, float128(1e-3));
+            weights[i] = base_weights[i] * pow(ratio, exp_p);
         }
+        std::vector<float128> a_wls = weighted_lsq(xs, ys, weights, degree);
+        float128 step_inf = 0, c_inf = 0;
+        for (size_t j = 0; j < coeffs.size(); ++j) {
+            float128 nxt = (float128(1) - alpha) * coeffs[j] + alpha * a_wls[j];
+            step_inf = std::max(step_inf, abs(nxt - coeffs[j]));
+            c_inf = std::max(c_inf, abs(coeffs[j]));
+            coeffs[j] = nxt;
+        }
+        if (c_inf > 0 && step_inf <= float128(1e-20) * c_inf) break;
     }
     return coeffs;
 }
@@ -241,7 +254,8 @@ static std::string hex_double(double v) {
     return buf;
 }
 
-static void emit_header(const char *path, const std::vector<float128> &c_float, const std::vector<float128> &c_double) {
+static void emit_header(const char *path, const std::vector<float128> &c_half, const std::vector<float128> &c_float,
+                        const std::vector<float128> &c_double) {
     FILE *f = std::fopen(path, "w");
     if (!f) {
         std::perror("fopen");
@@ -257,6 +271,16 @@ static void emit_header(const char *path, const std::vector<float128> &c_float, 
                  " */\n"
                  "#ifndef NANOFFT_EXP_COEFFS_H\n"
                  "#define NANOFFT_EXP_COEFFS_H\n\n");
+
+    std::fprintf(f, "/* half (IEEE binary16): degree %d */\n", (int)c_half.size() - 1);
+    std::fprintf(f, "#define NANOFFT_EXPH_DEGREE %d\n", (int)c_half.size() - 1);
+    std::fprintf(f, "static const float nanofft_exph_coeffs[NANOFFT_EXPH_DEGREE + 1] = {");
+    for (size_t i = 0; i < c_half.size(); ++i) {
+        double v = (double)c_half[i];
+        std::fprintf(f, "%s%s", i ? ", " : "", hex_double(v).c_str());
+        if (i && (i % 3) == 0 && i + 1 < c_half.size()) std::fprintf(f, "\n    ");
+    }
+    std::fprintf(f, "};\n\n");
 
     std::fprintf(f, "/* float: degree %d */\n", (int)c_float.size() - 1);
     std::fprintf(f, "#define NANOFFT_EXPF_DEGREE %d\n", (int)c_float.size() - 1);
@@ -278,43 +302,109 @@ static void emit_header(const char *path, const std::vector<float128> &c_float, 
     }
     std::fprintf(f, "};\n\n");
 
-    /* ln2 split: the high part has its low 27/12 mantissa bits zero so that
+    /* ln2 split: the high part has enough low mantissa bits zero so that
      * k * hi is exact for every k the reduction can produce. */
-    /* The remainder must be taken against the *true* ln2, not against its
-     * double rounding: k can reach 1021, so an error of half an ulp in the
-     * double ln2 would be amplified to ~5e-14 in the reduced argument. */
     const double ln2_hi_d = 0x1.62e42fee00000p-1; /* 21 low mantissa bits zero */
     const double ln2_lo_d = (double)(LN2 - (float128)ln2_hi_d);
-    /* The high part must have enough low mantissa bits zero that k * hi is
-     * exact for every k the reduction can produce (|k| <= 1024 here), so the
-     * subtraction x - k*hi is exact by Sterbenz and the reduction error comes
-     * only from k * lo. */
     const float ln2_hi_f = 0x1.62e4p-1f; /* 10 low mantissa bits zero */
     const float ln2_lo_f = (float)(LN2 - (float128)ln2_hi_f);
+    const double ln2_hi_h = 0x1.64p-1; /* 5 low FP16 mantissa bits zero; exact for |k| <= 24 */
+    const double ln2_lo_h = (double)(LN2 - (float128)ln2_hi_h);
 
     std::fprintf(f,
                  "/* ln2 = hi + lo, hi chosen so that k * hi is exact in the reduction\n"
                  " * for every |k| the exponential can produce. */\n"
+                 "#define NANOFFT_EXP_LN2_HI_H %s\n"
+                 "#define NANOFFT_EXP_LN2_LO_H %s\n"
+                 "#define NANOFFT_EXP_INV_LN2_H %s\n"
                  "#define NANOFFT_EXP_LN2_HI_F %s\n"
                  "#define NANOFFT_EXP_LN2_LO_F %s\n"
                  "#define NANOFFT_EXP_INV_LN2_F %s\n"
                  "#define NANOFFT_EXP_LN2_HI %s\n"
                  "#define NANOFFT_EXP_LN2_LO %s\n"
                  "#define NANOFFT_EXP_INV_LN2 %s\n",
-                 hex_double((double)ln2_hi_f).c_str(), hex_double((double)ln2_lo_f).c_str(), hex_double((double)(1 / LN2)).c_str(), hex_double(ln2_hi_d).c_str(),
-                 hex_double(ln2_lo_d).c_str(), hex_double((double)(1 / LN2)).c_str());
+                 hex_double(ln2_hi_h).c_str(), hex_double(ln2_lo_h).c_str(), hex_double((double)(1 / LN2)).c_str(),
+                 hex_double((double)ln2_hi_f).c_str(), hex_double((double)ln2_lo_f).c_str(), hex_double((double)(1 / LN2)).c_str(),
+                 hex_double(ln2_hi_d).c_str(), hex_double(ln2_lo_d).c_str(), hex_double((double)(1 / LN2)).c_str());
 
     std::fprintf(f, "\n#endif /* NANOFFT_EXP_COEFFS_H */\n");
     std::fclose(f);
     std::printf("[emit] wrote %s\n", path);
 }
 
+/* Exact IEEE 754 binary16 round-to-nearest-even helper for FP16 kernel simulation. */
+static uint16_t f32_to_f16_bits(float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    uint32_t sign = (u >> 16) & 0x8000u;
+    uint32_t exp = (u >> 23) & 0xffu;
+    uint32_t frac = u & 0x7fffffu;
+    if (exp == 0xffu) {
+        return (uint16_t)(sign | 0x7c00u | (frac ? (0x0200u | (frac >> 13)) : 0u));
+    }
+    int e = (int)exp - 127 + 15;
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return (uint16_t)sign;
+        uint32_t m = frac | 0x800000u;
+        int shift = 14 - e;
+        uint32_t round_bit = 1u << (shift - 1);
+        uint32_t sticky = m & (round_bit - 1u);
+        uint32_t out = m >> shift;
+        if ((m & round_bit) && (sticky || (out & 1u))) out++;
+        return (uint16_t)(sign | out);
+    }
+    uint32_t round_bit = 0x1000u;
+    uint32_t sticky = frac & 0x0fffu;
+    uint32_t out = frac >> 13;
+    if ((frac & round_bit) && (sticky || (out & 1u))) {
+        out++;
+        if (out == 0x0400u) {
+            out = 0;
+            e++;
+            if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)e << 10) | out);
+}
+
+static float f16_bits_to_f32(uint16_t h) {
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t frac = h & 0x03ffu;
+    uint32_t out;
+    if (exp == 0) {
+        if (frac == 0) {
+            out = sign;
+        } else {
+            int e = -14;
+            while ((frac & 0x0400u) == 0) {
+                frac <<= 1;
+                e--;
+            }
+            frac &= 0x03ffu;
+            out = sign | ((uint32_t)(e + 127) << 23) | (frac << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (frac << 13);
+    } else {
+        out = sign | ((exp - 15 + 127) << 23) | (frac << 13);
+    }
+    float f;
+    std::memcpy(&f, &out, 4);
+    return f;
+}
+
+static float f16_round(float x) { return f16_bits_to_f32(f32_to_f16_bits(x)); }
+
 /* Simulated kernel: reduction + polynomial + scaling in the target precision,
  * compared against float128 exp.  This is the number that matters. */
-static void report_kernel(const std::vector<float128> &cf, const std::vector<float128> &cd) {
+static void report_kernel(const std::vector<float128> &ch, const std::vector<float128> &cf, const std::vector<float128> &cd) {
     const float128 half = LN2 / 2;
+    accuracy ah = measure(ch, -half, half, 20000, 11);
     accuracy af = measure(cf, -half, half, 20000, 24);
     accuracy ad = measure(cd, -half, half, 20000, 53);
+    std::printf("[poly] half   deg %2d  max_rel %.3e  max_ulp %.2f\n", (int)ch.size() - 1, (double)ah.max_rel, ah.max_ulp);
     std::printf("[poly] float  deg %2d  max_rel %.3e  max_ulp %.2f\n", (int)cf.size() - 1, (double)af.max_rel, af.max_ulp);
     std::printf("[poly] double deg %2d  max_rel %.3e  max_ulp %.2f\n", (int)cd.size() - 1, (double)ad.max_rel, ad.max_ulp);
 
@@ -375,41 +465,73 @@ static void report_kernel(const std::vector<float128> &cf, const std::vector<flo
         }
     }
 
+    /* Exhaustive IEEE binary16 kernel simulation over [-16, 11] */
+    double worst_h_ulp = 0, at_h = 0;
+    const float ln2_hi_h = f16_round((float)0x1.64p-1);
+    const float ln2_lo_h = f16_round((float)(LN2 - (float128)0x1.64p-1));
+    const float inv_ln2_h = f16_round((float)(1 / LN2));
+    for (uint32_t bits = 0; bits < 65536u; ++bits) {
+        if ((bits & 0x7c00u) == 0x7c00u) continue;
+        float xh = f16_bits_to_f32((uint16_t)bits);
+        if (xh < -16.0f || xh > 11.0f) continue;
+        float kh = f16_round(std::nearbyint(f16_round(xh * inv_ln2_h)));
+        float r = f16_round(xh - f16_round(kh * ln2_hi_h));
+        r = f16_round(r - f16_round(kh * ln2_lo_h));
+        float ph = f16_round((float)ch.back());
+        for (int j = (int)ch.size() - 2; j >= 0; --j) {
+            ph = f16_round(f16_round(ph * r) + f16_round((float)ch[j]));
+        }
+        int k1 = (int)std::max(-14.0f, std::min(15.0f, kh));
+        int k2 = (int)std::max(-14.0f, std::min(15.0f, kh - (float)k1));
+        float s1 = f16_bits_to_f32((uint16_t)((k1 + 15) << 10));
+        float s2 = f16_bits_to_f32((uint16_t)((k2 + 15) << 10));
+        uint16_t got_bits = f32_to_f16_bits(f16_round(f16_round(ph * s1) * s2));
+        uint16_t want_bits = f32_to_f16_bits((float)exp((float128)xh));
+        if ((want_bits & 0x7fffu) == 0u || (want_bits & 0x7c00u) == 0x7c00u) continue;
+        double ulps = std::fabs((double)(int)got_bits - (double)(int)want_bits);
+        if (ulps > worst_h_ulp) {
+            worst_h_ulp = ulps;
+            at_h = (double)xh;
+        }
+    }
+
+    std::printf("[kernel] half   max %5.2f ulp at x=%.6g\n", worst_h_ulp, at_h);
     std::printf("[kernel] float  max %5.2f ulp at x=%.6g\n", worst_f_ulp, at_f);
     std::printf("[kernel] double max %5.2f ulp at x=%.6g\n", worst_d_ulp, at_d);
 }
 
 static std::vector<float128> fit_chain(int degree, int samples_per_unit) {
     const float128 half = LN2 / 2;
-    /* Dense sampling for the regression stages. */
+    /* Stage 1: L2 least-squares regression on Chebyshev nodes at target degree. */
+    const int n_cheb = std::max(4 * degree + 8, 64);
+    std::vector<float128> cheb = chebyshev_nodes(n_cheb, half);
+    std::vector<float128> cy(n_cheb), cw(n_cheb);
+    for (int i = 0; i < n_cheb; ++i) {
+        cy[i] = exp(cheb[i]);
+        cw[i] = 1 / (cy[i] * cy[i]);
+    }
+    std::vector<float128> seed = weighted_lsq(cheb, cy, cw, degree);
+    std::printf("[init] deg %2d L2  (Cheb): max_rel %.3e\n", degree, (double)measure(seed, -half, half, 4000).max_rel);
+
+    /* Stages 2-5: L^p IRLS on uniform nodes for p = 4 -> 8 -> 12 -> 16. */
     const int samples = std::max(200, samples_per_unit * (degree + 1));
     std::vector<float128> xs(samples), ys(samples), ws(samples);
     for (int i = 0; i < samples; ++i) {
         xs[i] = -half + float128(2) * half * i / float128(samples - 1);
         ys[i] = exp(xs[i]);
-        ws[i] = 1 / ys[i];
+        ws[i] = 1 / (ys[i] * ys[i]);
+    }
+    const int lp_stages[4] = {4, 8, 12, 16};
+    for (int s = 0; s < 4; ++s) {
+        int p = lp_stages[s];
+        seed = irls_lp_stage(xs, ys, ws, degree, p, 12, seed);
+        std::printf("[init] deg %2d L%-2d (Unif): max_rel %.3e\n", degree, p, (double)measure(seed, -half, half, 4000).max_rel);
     }
 
-    /* 1-2: Chebyshev-node regression, then IRLS at degree 4 -> 8 -> 16. */
-    std::vector<float128> cheb = chebyshev_nodes(std::max(2 * degree + 2, 24), half);
-    std::vector<float128> cx(cheb.size()), cy(cheb.size()), cw(cheb.size());
-    for (size_t i = 0; i < cheb.size(); ++i) {
-        cx[i] = cheb[i];
-        cy[i] = exp(cheb[i]);
-        cw[i] = 1 / cy[i];
-    }
-    std::vector<float128> seed = weighted_lsq(cx, cy, cw, 4);
-    std::printf("[init] degree 4 lsq: max_rel %.3e\n", (double)measure(seed, -half, half, 4000).max_rel);
-    seed = irls_fit(cx, cy, cw, 8, 12);
-    std::printf("[init] degree 8 irls: max_rel %.3e\n", (double)measure(seed, -half, half, 4000).max_rel);
-    seed = irls_fit(cx, cy, cw, 16, 12);
-    std::printf("[init] degree 16 irls: max_rel %.3e\n", (double)measure(seed, -half, half, 4000).max_rel);
-
-    /* 3: true Remez at the target degree, seeded by the IRLS fit's extrema. */
-    std::vector<float128> extrema = find_extrema(seed, half, 2001);
+    /* Stage 6: true Remez at the target degree, seeded by the L16 fit's extrema. */
+    std::vector<float128> extrema = find_extrema(seed, half, 4001);
     std::vector<float128> ref;
     if ((int)extrema.size() >= degree + 2) {
-        /* take the degree+2 outermost alternation points, evenly */
         for (int i = 0; i < degree + 2; ++i) {
             size_t idx = (size_t)((double)i * (extrema.size() - 1) / (double)(degree + 1));
             ref.push_back(extrema[idx]);
@@ -428,11 +550,12 @@ int main(int argc, char **argv) {
     const float128 half = LN2 / 2;
     std::printf("range [-ln2/2, ln2/2] = [%.18g, %.18g]\n", (double)-half, (double)half);
 
+    std::vector<float128> ch = fit_chain(3, 200);
     std::vector<float128> cf = fit_chain(6, 200);
     std::vector<float128> cd = fit_chain(13, 200);
 
-    report_kernel(cf, cd);
+    report_kernel(ch, cf, cd);
 
-    if (argc > 1 && std::strcmp(argv[1], "--emit") == 0 && argc > 2) emit_header(argv[2], cf, cd);
+    if (argc > 1 && std::strcmp(argv[1], "--emit") == 0 && argc > 2) emit_header(argv[2], ch, cf, cd);
     return 0;
 }

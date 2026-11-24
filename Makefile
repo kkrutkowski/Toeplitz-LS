@@ -39,8 +39,25 @@ TWIDDLE_CFLAGS := -DMAX_TWIDDLE_REUSE=$(MAX_TWIDDLE_REUSE)
 #   make FFT_FUSE_FLOAT=2 FFT_FUSE_DOUBLE=4
 FUSE_CFLAGS := $(if $(FFT_FUSE_FLOAT),-DNANOFFT_FFT_FUSE_FLOAT=$(FFT_FUSE_FLOAT)) \
                $(if $(FFT_FUSE_DOUBLE),-DNANOFFT_FFT_FUSE_DOUBLE=$(FFT_FUSE_DOUBLE)) \
-               $(if $(FFT_FUSE_DD),-DNANOFFT_FFT_FUSE_DD=$(FFT_FUSE_DD))
+               $(if $(FFT_FUSE_DD),-DNANOFFT_FFT_FUSE_DD=$(FFT_FUSE_DD)) \
+               $(if $(FFT_FUSE_HALF),-DNANOFFT_FFT_FUSE_HALF=$(FFT_FUSE_HALF))
 
+# Probe whether the compiler can emit embedded native-FP16 kernels alongside the
+# portable FP16-storage + F16C/FP32-compute kernels for single-.so runtime dispatch.
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_ARCH),x86_64)
+NATIVE_FP16_FLAGS := -march=x86-64-v4 -mavx512fp16
+CC_HAS_NATIVE_FP16 := $(shell printf '_Float16 f(_Float16 x){return x;}\n' | $(CC) -x c -c $(NATIVE_FP16_FLAGS) - -o /dev/null 2>/dev/null && echo 1 || echo 0)
+else ifeq ($(HOST_ARCH),aarch64)
+NATIVE_FP16_FLAGS := -march=armv8.2-a+fp16
+CC_HAS_NATIVE_FP16 := $(shell printf '_Float16 f(_Float16 x){return x;}\n' | $(CC) -x c -c $(NATIVE_FP16_FLAGS) - -o /dev/null 2>/dev/null && echo 1 || echo 0)
+else
+NATIVE_FP16_FLAGS :=
+CC_HAS_NATIVE_FP16 := 0
+endif
+NATIVE_ALREADY_FP16 := $(shell $(CC) -dM -E $(NATIVE_FLAGS) -x c /dev/null 2>/dev/null | grep -qE '__AVX512FP16__|__ARM_FEATURE_FP16_VECTOR_ARITHMETIC' && echo 1 || echo 0)
+GENERIC_EMBED_FP16 := $(CC_HAS_NATIVE_FP16)
+NATIVE_EMBED_FP16 := $(if $(filter 1,$(NATIVE_ALREADY_FP16)),0,$(CC_HAS_NATIVE_FP16))
 SCALING_GENERIC := $(INC_DIR)/scaling_generic.h
 LIB_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/linalg.c $(SRC_DIR)/chi2per.c $(SRC_DIR)/utils.c $(SRC_DIR)/tuning.c $(SRC_DIR)/cpu_features.c $(SRC_DIR)/probe_arm64.c
 SCALING_SOURCES := $(SRC_DIR)/nanofft.c $(SRC_DIR)/nufft1.c $(SRC_DIR)/scaling.c
@@ -79,15 +96,19 @@ GENERIC_OBJS := \
 	$(GENERIC_DIR)/nanofftf.o \
 	$(GENERIC_DIR)/nanofft.o \
 	$(GENERIC_DIR)/nanofftdd.o \
+	$(GENERIC_DIR)/nanoffth.o \
 	$(GENERIC_DIR)/tlsf_nufft1.o \
 	$(GENERIC_DIR)/tls_nufft1.o \
 	$(GENERIC_DIR)/tlsdd_nufft1.o \
+	$(GENERIC_DIR)/tlsh_nufft1.o \
 	$(GENERIC_DIR)/tlsf_linalg.o \
 	$(GENERIC_DIR)/tls_linalg.o \
 	$(GENERIC_DIR)/tlsdd_linalg.o \
+	$(GENERIC_DIR)/tlsh_linalg.o \
 	$(GENERIC_DIR)/tlsf_chi2per.o \
 	$(GENERIC_DIR)/tls_chi2per.o \
 	$(GENERIC_DIR)/tlsdd_chi2per.o \
+	$(GENERIC_DIR)/tlsh_chi2per.o \
 	$(GENERIC_DIR)/tlsf_utils.o \
 	$(GENERIC_DIR)/tls_utils.o \
 	$(GENERIC_DIR)/tlsdd_utils.o \
@@ -95,19 +116,34 @@ GENERIC_OBJS := \
 	$(GENERIC_DIR)/cpu_features.o \
 	$(GENERIC_DIR)/probe_arm64.o
 
+ifeq ($(GENERIC_EMBED_FP16),1)
+GENERIC_OBJS += \
+	$(GENERIC_DIR)/nanoffth_nat.o \
+	$(GENERIC_DIR)/tlsh_nat_nufft1.o \
+	$(GENERIC_DIR)/tlsh_nat_linalg.o \
+	$(GENERIC_DIR)/tlsh_nat_chi2per.o
+GENERIC_HALF_DISPATCH_FLAG := -DTLS_HALF_HAS_NATIVE_EMBED
+else
+GENERIC_HALF_DISPATCH_FLAG :=
+endif
+
 NATIVE_OBJS := \
 	$(NATIVE_DIR)/nanofftf.o \
 	$(NATIVE_DIR)/nanofft.o \
 	$(NATIVE_DIR)/nanofftdd.o \
+	$(NATIVE_DIR)/nanoffth.o \
 	$(NATIVE_DIR)/tlsf_nufft1.o \
 	$(NATIVE_DIR)/tls_nufft1.o \
 	$(NATIVE_DIR)/tlsdd_nufft1.o \
+	$(NATIVE_DIR)/tlsh_nufft1.o \
 	$(NATIVE_DIR)/tlsf_linalg.o \
 	$(NATIVE_DIR)/tls_linalg.o \
 	$(NATIVE_DIR)/tlsdd_linalg.o \
+	$(NATIVE_DIR)/tlsh_linalg.o \
 	$(NATIVE_DIR)/tlsf_chi2per.o \
 	$(NATIVE_DIR)/tls_chi2per.o \
 	$(NATIVE_DIR)/tlsdd_chi2per.o \
+	$(NATIVE_DIR)/tlsh_chi2per.o \
 	$(NATIVE_DIR)/tlsf_utils.o \
 	$(NATIVE_DIR)/tls_utils.o \
 	$(NATIVE_DIR)/tlsdd_utils.o \
@@ -115,6 +151,16 @@ NATIVE_OBJS := \
 	$(NATIVE_DIR)/cpu_features.o \
 	$(NATIVE_DIR)/probe_arm64.o
 
+ifeq ($(NATIVE_EMBED_FP16),1)
+NATIVE_OBJS += \
+	$(NATIVE_DIR)/nanoffth_nat.o \
+	$(NATIVE_DIR)/tlsh_nat_nufft1.o \
+	$(NATIVE_DIR)/tlsh_nat_linalg.o \
+	$(NATIVE_DIR)/tlsh_nat_chi2per.o
+NATIVE_HALF_DISPATCH_FLAG := -DTLS_HALF_HAS_NATIVE_EMBED
+else
+NATIVE_HALF_DISPATCH_FLAG :=
+endif
 .PHONY: all generic native clean wheels wheels-check sdist tune dispatch-list toolchains format format-check
 
 # --- release wheels ------------------------------------------------------
@@ -184,18 +230,21 @@ $(NATIVE_SCALING_HEADER): | $(NATIVE_DIR) $(NATIVE_SCALING_DIR)
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofftf.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofft.o
 	$(CC) $(NATIVE_FLAGS) $(DD_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanofftdd.o
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D HALF -c $(SRC_DIR)/nanofft.c -o $(NATIVE_SCALING_DIR)/nanoffth.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tls_nufft1.o
 	$(CC) $(NATIVE_FLAGS) $(DD_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D HALF -c $(SRC_DIR)/nufft1.c -o $(NATIVE_SCALING_DIR)/tlsh_nufft1.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -c $(SRC_DIR)/tuning.c -o $(NATIVE_SCALING_DIR)/tuning.o
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftf.o $(NATIVE_SCALING_DIR)/tlsf_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsf_nufft_scaling $(LDLIBS)
 	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofft.o $(NATIVE_SCALING_DIR)/tls_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tls_nufft_scaling $(LDLIBS)
 	$(CC) $(NATIVE_FLAGS) $(DD_FLAGS) -I$(INC_DIR) -D DOUBLE_DOUBLE -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanofftdd.o $(NATIVE_SCALING_DIR)/tlsdd_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsdd_nufft_scaling $(LDLIBS)
+	$(CC) $(NATIVE_FLAGS) -I$(INC_DIR) -D HALF -DSAVE $(SRC_DIR)/scaling.c $(NATIVE_SCALING_DIR)/nanoffth.o $(NATIVE_SCALING_DIR)/tlsh_nufft1.o $(NATIVE_SCALING_DIR)/tuning.o -o $(NATIVE_SCALING_DIR)/tlsh_nufft_scaling $(LDLIBS)
 	cd $(NATIVE_DIR) && ../native-scaling/tlsf_nufft_scaling
 	cd $(NATIVE_DIR) && ../native-scaling/tls_nufft_scaling
 	cd $(NATIVE_DIR) && ../native-scaling/tlsdd_nufft_scaling
+	cd $(NATIVE_DIR) && ../native-scaling/tlsh_nufft_scaling
 	rm -rf $(NATIVE_SCALING_DIR)
-
 $(GENERIC_DIR)/nanofftf.o: $(SRC_DIR)/nanofft.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
 
@@ -204,6 +253,12 @@ $(GENERIC_DIR)/nanofft.o: $(SRC_DIR)/nanofft.c | $(GENERIC_DIR)
 
 $(GENERIC_DIR)/nanofftdd.o: $(SRC_DIR)/nanofft.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+$(GENERIC_DIR)/nanoffth.o: $(SRC_DIR)/nanofft.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -D HALF -c $< -o $@
+
+$(GENERIC_DIR)/nanoffth_nat.o: $(SRC_DIR)/nanofft.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
 
 $(GENERIC_DIR)/tlsf_nufft1.o: $(SRC_DIR)/nufft1.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
@@ -214,6 +269,12 @@ $(GENERIC_DIR)/tls_nufft1.o: $(SRC_DIR)/nufft1.c | $(GENERIC_DIR)
 $(GENERIC_DIR)/tlsdd_nufft1.o: $(SRC_DIR)/nufft1.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
+$(GENERIC_DIR)/tlsh_nufft1.o: $(SRC_DIR)/nufft1.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -D HALF -c $< -o $@
+
+$(GENERIC_DIR)/tlsh_nat_nufft1.o: $(SRC_DIR)/nufft1.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
+
 $(GENERIC_DIR)/tlsf_linalg.o: $(SRC_DIR)/linalg.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
 
@@ -223,6 +284,12 @@ $(GENERIC_DIR)/tls_linalg.o: $(SRC_DIR)/linalg.c | $(GENERIC_DIR)
 $(GENERIC_DIR)/tlsdd_linalg.o: $(SRC_DIR)/linalg.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
+$(GENERIC_DIR)/tlsh_linalg.o: $(SRC_DIR)/linalg.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) -D HALF -c $< -o $@
+
+$(GENERIC_DIR)/tlsh_nat_linalg.o: $(SRC_DIR)/linalg.c | $(GENERIC_DIR)
+	$(CC) $(GENERIC_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
+
 $(GENERIC_DIR)/tlsf_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
 
@@ -231,6 +298,12 @@ $(GENERIC_DIR)/tls_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 
 $(GENERIC_DIR)/tlsdd_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
 	$(CC) $(GENERIC_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+$(GENERIC_DIR)/tlsh_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
+	$(CC) $(GENERIC_CFLAGS) -D HALF $(GENERIC_HALF_DISPATCH_FLAG) -c $< -o $@
+
+$(GENERIC_DIR)/tlsh_nat_chi2per.o: $(SRC_DIR)/chi2per.c $(GENERIC_SCALING_HEADER)
+	$(CC) $(GENERIC_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
 
 $(GENERIC_DIR)/tlsf_utils.o: $(SRC_DIR)/utils.c | $(GENERIC_DIR)
 	$(CC) $(GENERIC_CFLAGS) -c $< -o $@
@@ -259,6 +332,12 @@ $(NATIVE_DIR)/nanofft.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
 $(NATIVE_DIR)/nanofftdd.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
+$(NATIVE_DIR)/nanoffth.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -D HALF -c $< -o $@
+
+$(NATIVE_DIR)/nanoffth_nat.o: $(SRC_DIR)/nanofft.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
+
 $(NATIVE_DIR)/tlsf_nufft1.o: $(SRC_DIR)/nufft1.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
 
@@ -267,6 +346,12 @@ $(NATIVE_DIR)/tls_nufft1.o: $(SRC_DIR)/nufft1.c | $(NATIVE_DIR)
 
 $(NATIVE_DIR)/tlsdd_nufft1.o: $(SRC_DIR)/nufft1.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+$(NATIVE_DIR)/tlsh_nufft1.o: $(SRC_DIR)/nufft1.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -D HALF -c $< -o $@
+
+$(NATIVE_DIR)/tlsh_nat_nufft1.o: $(SRC_DIR)/nufft1.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
 
 $(NATIVE_DIR)/tlsf_linalg.o: $(SRC_DIR)/linalg.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
@@ -277,6 +362,12 @@ $(NATIVE_DIR)/tls_linalg.o: $(SRC_DIR)/linalg.c | $(NATIVE_DIR)
 $(NATIVE_DIR)/tlsdd_linalg.o: $(SRC_DIR)/linalg.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
 
+$(NATIVE_DIR)/tlsh_linalg.o: $(SRC_DIR)/linalg.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) -D HALF -c $< -o $@
+
+$(NATIVE_DIR)/tlsh_nat_linalg.o: $(SRC_DIR)/linalg.c | $(NATIVE_DIR)
+	$(CC) $(NATIVE_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
+
 $(NATIVE_DIR)/tlsf_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@
 
@@ -285,6 +376,12 @@ $(NATIVE_DIR)/tls_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 
 $(NATIVE_DIR)/tlsdd_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
 	$(CC) $(NATIVE_CFLAGS) $(DD_FLAGS) -D DOUBLE_DOUBLE -c $< -o $@
+
+$(NATIVE_DIR)/tlsh_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
+	$(CC) $(NATIVE_CFLAGS) -D HALF $(NATIVE_HALF_DISPATCH_FLAG) -c $< -o $@
+
+$(NATIVE_DIR)/tlsh_nat_chi2per.o: $(SRC_DIR)/chi2per.c $(NATIVE_SCALING_HEADER)
+	$(CC) $(NATIVE_CFLAGS) $(NATIVE_FP16_FLAGS) -D HALF -D HALF_NATIVE_EMBED -c $< -o $@
 
 $(NATIVE_DIR)/tlsf_utils.o: $(SRC_DIR)/utils.c | $(NATIVE_DIR)
 	$(CC) $(NATIVE_CFLAGS) -c $< -o $@

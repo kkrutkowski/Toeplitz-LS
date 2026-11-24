@@ -114,7 +114,7 @@ def _macos_sysctl(name):
 def _macos_features():
     features = set()
     if platform.machine() == "arm64":
-        features.add("asimd")  # Apple silicon always has NEON, never SVE
+        features.update(("asimd", "asimdhp"))  # Apple silicon always has NEON + FP16, never SVE
         return features
     leaf = _macos_sysctl("machdep.cpu.features").split()
     leaf7 = _macos_sysctl("machdep.cpu.leaf7_features").split()
@@ -139,6 +139,7 @@ def _macos_features():
         "AVX512CD": ("avx512cd",),
         "AVX512DQ": ("avx512dq",),
         "AVX512VL": ("avx512vl",),
+        "AVX512FP16": ("avx512_fp16",),
         "BMI1": ("bmi1",),
         "BMI2": ("bmi2",),
         "FMA": ("fma",),
@@ -180,6 +181,8 @@ _FEATURE_BITS = (
     "dotprod",
     "i8mm",
     "bf16",
+    "avx512_fp16",
+    "asimdhp",
 )
 
 

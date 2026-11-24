@@ -88,6 +88,34 @@ TLS_API VECDD tlsdd_solve_zohar(size_t n, const VECDD *R_r, const VECDD *R_i, co
                                 VECDD *e_hat_i, VECDD *e_hat_prev_r, VECDD *e_hat_prev_i);
 
 TLS_API VECDD tlsdd_solve_svd(size_t n, const VECDD *A, const VECDD *b, VECDD *x, VECDD *Q, VECDD *S, VECDD *D, VECDD *y, VECDD max_cond);
+
+/* =========================================================================
+ * half  (tlsh_, SIMD VECH batches)
+ * ========================================================================= */
+
+TLS_API VECH tlsh_solve_ldlt(size_t n, const VECH *A, const VECH *b, VECH *x, VECH *L, VECH *D, VECH *y, VECH *z);
+
+TLS_API VECH tlsh_solve_levinson(size_t n, const VECH *R_r, const VECH *R_i, const VECH *y_r, const VECH *y_i, VECH *x_r, VECH *x_i, VECH *a_r, VECH *a_i,
+                                 VECH *a_prev_r, VECH *a_prev_i);
+
+TLS_API VECH tlsh_solve_bareiss(size_t n, const VECH *R_r, const VECH *R_i, const VECH *y_r, const VECH *y_i, VECH *x_r, VECH *x_i, VECH *U_r, VECH *U_i,
+                                VECH *D, VECH *u_r, VECH *u_i, VECH *v_r, VECH *v_i, VECH *w_r, VECH *w_i);
+
+TLS_API VECH tlsh_solve_zohar(size_t n, const VECH *R_r, const VECH *R_i, const VECH *y_r, const VECH *y_i, VECH *s_r, VECH *s_i, VECH *e_hat_r, VECH *e_hat_i,
+                              VECH *e_hat_prev_r, VECH *e_hat_prev_i);
+
+TLS_API VECH tlsh_solve_svd(size_t n, const VECH *A, const VECH *b, VECH *x, VECH *Q, VECH *S, VECH *D, VECH *y, VECH max_cond);
+
+#ifdef HALF_NATIVE_EMBED
+VECH tlsh_nat_solve_ldlt(size_t n, const VECH *A, const VECH *b, VECH *x, VECH *L, VECH *D, VECH *y, VECH *z);
+VECH tlsh_nat_solve_levinson(size_t n, const VECH *R_r, const VECH *R_i, const VECH *y_r, const VECH *y_i, VECH *x_r, VECH *x_i, VECH *a_r, VECH *a_i,
+                             VECH *a_prev_r, VECH *a_prev_i);
+VECH tlsh_nat_solve_bareiss(size_t n, const VECH *R_r, const VECH *R_i, const VECH *y_r, const VECH *y_i, VECH *x_r, VECH *x_i, VECH *U_r, VECH *U_i, VECH *D,
+                            VECH *u_r, VECH *u_i, VECH *v_r, VECH *v_i, VECH *w_r, VECH *w_i);
+VECH tlsh_nat_solve_zohar(size_t n, const VECH *R_r, const VECH *R_i, const VECH *y_r, const VECH *y_i, VECH *s_r, VECH *s_i, VECH *e_hat_r, VECH *e_hat_i,
+                          VECH *e_hat_prev_r, VECH *e_hat_prev_i);
+VECH tlsh_nat_solve_svd(size_t n, const VECH *A, const VECH *b, VECH *x, VECH *Q, VECH *S, VECH *D, VECH *y, VECH max_cond);
+#endif
 #ifdef __cplusplus
 }
 #endif

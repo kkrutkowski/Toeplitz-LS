@@ -168,7 +168,7 @@ EpsContext build_context(std::string name, double eps, int w, double sigma) {
 // Execution Phases
 // ---------------------------------------------------------
 VectorXmp run_regression_single(EpsContext& ctx, int degree_z, int reg_nodes, int eval_nodes) {
-    std::cout << "--- 1. Regression Search (COD) for " << ctx.name << " ---\n";
+    std::cout << "--- 1. IRLS Regression (L2 Cheb -> L4 -> L8 -> L12 -> L16) for " << ctx.name << " ---\n";
     std::cout << "Input w     : " << ctx.w << "\n";
     std::cout << "Input sigma : " << ctx.sigma << "\n";
     std::cout << "Computed c  : " << static_cast<double>(ctx.c_param) << "\n\n";
@@ -178,35 +178,92 @@ VectorXmp run_regression_single(EpsContext& ctx, int degree_z, int reg_nodes, in
 
     std::vector<int> powers_x;
     for (int i = 0; i <= degree_z; ++i) powers_x.push_back(2 * i);
-    int n_unknowns = powers_x.size();
+    int n_unknowns = static_cast<int>(powers_x.size());
 
     MatrixXmp A_ls(reg_nodes, n_unknowns);
     VectorXmp Y_ls(reg_nodes);
     float128 pi = boost::math::constants::pi<float128>();
 
+    // Stage 1: L2 least squares on Chebyshev nodes in z = x^2
     for (int k = 0; k < reg_nodes; ++k) {
         float128 z = 0.5 * (1.0 - cos((2 * k + 1) * pi / (2 * reg_nodes)));
         float128 x = sqrt(z);
-
-        float128 pswf_val = fx(x);
         float128 gauss_val = Wx(x);
-
-        float128 sqrt_w = abs(pswf_val);
-        float128 target_y = pswf_val / gauss_val;
-
-        Y_ls(k) = sqrt_w * target_y;
-        for (size_t j = 0; j < powers_x.size(); ++j) {
-            A_ls(k, j) = sqrt_w * pow(x, powers_x[j]);
+        Y_ls(k) = fx(x);
+        for (int j = 0; j < n_unknowns; ++j) {
+            A_ls(k, j) = gauss_val * pow(x, powers_x[j]);
         }
     }
 
-    VectorXmp initial_an = A_ls.completeOrthogonalDecomposition().solve(Y_ls);
-    float128 lsq_err = evaluate_dense_max_error(initial_an, fx, Wx, powers_x, eval_nodes);
+    VectorXmp an = A_ls.completeOrthogonalDecomposition().solve(Y_ls);
+    float128 err = evaluate_dense_max_error(an, fx, Wx, powers_x, eval_nodes);
+    std::cout << "Target Z-Degree " << std::setw(2) << degree_z
+              << " | Stage L2  (Cheb) Max Err: " << std::scientific << std::setprecision(5)
+              << static_cast<double>(err) << "\n";
 
-    std::cout << "Target Z-Degree " << std::setw(2) << degree_z << " | Initial COD Max Err: " << std::scientific << std::setprecision(5)
-              << static_cast<double>(lsq_err) << "\n\n";
+    // Precompute uniform nodes and targets for L^p IRLS stages
+    std::vector<float128> ux(reg_nodes), uf(reg_nodes), uw(reg_nodes);
+    MatrixXmp U_basis(reg_nodes, n_unknowns);
+    for (int k = 0; k < reg_nodes; ++k) {
+        ux[k] = float128(k) / float128(reg_nodes - 1);
+        uf[k] = fx(ux[k]);
+        uw[k] = Wx(ux[k]);
+        for (int j = 0; j < n_unknowns; ++j) {
+            U_basis(k, j) = uw[k] * pow(ux[k], powers_x[j]);
+        }
+    }
 
-    return initial_an;
+    // Stages 2-5: L^p IRLS on uniform nodes with Kahng damping alpha = 1 / (p - 1)
+    const int lp_stages[4] = {4, 8, 12, 16};
+    for (int s = 0; s < 4; ++s) {
+        int p = lp_stages[s];
+        float128 alpha = float128(1.0) / float128(p - 1);
+        float128 half_exp = float128(p - 2) / float128(2.0);
+
+        for (int it = 0; it < 12; ++it) {
+            std::vector<float128> r(reg_nodes);
+            float128 r_max = 0.0;
+            for (int k = 0; k < reg_nodes; ++k) {
+                float128 pred = 0.0;
+                for (int j = 0; j < n_unknowns; ++j) pred += U_basis(k, j) * an(j);
+                r[k] = pred - uf[k];
+                float128 ar = abs(r[k]);
+                if (ar > r_max) r_max = ar;
+            }
+            if (r_max == 0.0) break;
+
+            for (int k = 0; k < reg_nodes; ++k) {
+                float128 ratio = abs(r[k]) / r_max;
+                if (ratio < float128(1e-3)) ratio = float128(1e-3);
+                float128 row_scale = pow(ratio, half_exp);
+                Y_ls(k) = row_scale * uf[k];
+                for (int j = 0; j < n_unknowns; ++j) {
+                    A_ls(k, j) = row_scale * U_basis(k, j);
+                }
+            }
+
+            VectorXmp a_wls = A_ls.completeOrthogonalDecomposition().solve(Y_ls);
+            VectorXmp a_new = (float128(1.0) - alpha) * an + alpha * a_wls;
+
+            float128 step_inf = 0.0, an_inf = 0.0;
+            for (int j = 0; j < n_unknowns; ++j) {
+                float128 dj = abs(a_new(j) - an(j));
+                float128 aj = abs(an(j));
+                if (dj > step_inf) step_inf = dj;
+                if (aj > an_inf) an_inf = aj;
+            }
+            an = a_new;
+            if (an_inf > 0.0 && step_inf <= float128(1e-20) * an_inf) break;
+        }
+
+        err = evaluate_dense_max_error(an, fx, Wx, powers_x, eval_nodes);
+        std::cout << "Target Z-Degree " << std::setw(2) << degree_z
+                  << " | Stage L" << std::setw(2) << std::left << p << std::right
+                  << " (Unif) Max Err: " << std::scientific << std::setprecision(5)
+                  << static_cast<double>(err) << "\n";
+    }
+    std::cout << "\n";
+    return an;
 }
 
 void run_remez_single(EpsContext& ctx, int d, VectorXmp initial_an, int eval_nodes) {
@@ -215,7 +272,7 @@ void run_remez_single(EpsContext& ctx, int d, VectorXmp initial_an, int eval_nod
 
     std::vector<int> powers_x;
     for (int i = 0; i <= d; ++i) powers_x.push_back(2 * i);
-    int n_unknowns = powers_x.size();
+    int n_unknowns = static_cast<int>(powers_x.size());
     float128 pi = boost::math::constants::pi<float128>();
 
     auto fx = [&](float128 x) { return pswf0_eval(x, ctx.workdata) * ctx.xv0; };
@@ -225,15 +282,71 @@ void run_remez_single(EpsContext& ctx, int d, VectorXmp initial_an, int eval_nod
 
     VectorXmp an = initial_an;
 
-    std::vector<float128> xn(n_unknowns + 1);
-    for (int k = 0; k <= n_unknowns; ++k) {
-        float128 z = 0.5 * (1.0 - cos(k * pi / n_unknowns));
-        xn[k] = sqrt(z);
+    // Seed alternation nodes from local extrema of the L16 residual on [0, 1]
+    std::vector<float128> grid_x(eval_nodes + 1), grid_r(eval_nodes + 1);
+    for (int k = 0; k <= eval_nodes; ++k) {
+        float128 x = float128(k) / float128(eval_nodes);
+        grid_x[k] = x;
+        float128 px = 0.0;
+        for (int j = 0; j < n_unknowns; ++j) px += an(j) * pow(x, powers_x[j]);
+        grid_r[k] = Wx(x) * px - fx(x);
     }
-    std::sort(xn.begin(), xn.end());
-    xn[0] = 0.0;
-    xn.back() = 1.0;
 
+    struct Extremum {
+        float128 x;
+        float128 r;
+    };
+    std::vector<Extremum> alt_extrema;
+    for (int k = 0; k <= eval_nodes; ++k) {
+        float128 rk = grid_r[k];
+        if (rk == 0.0) continue;
+        bool is_ext = false;
+        if (k == 0) {
+            is_ext = (abs(rk) >= abs(grid_r[1]));
+        } else if (k == eval_nodes) {
+            is_ext = (abs(rk) >= abs(grid_r[eval_nodes - 1]));
+        } else if ((rk > 0.0 && rk >= grid_r[k - 1] && rk >= grid_r[k + 1]) ||
+                   (rk < 0.0 && rk <= grid_r[k - 1] && rk <= grid_r[k + 1])) {
+            is_ext = true;
+        }
+        if (!is_ext) continue;
+        if (!alt_extrema.empty() && ((alt_extrema.back().r > 0.0) == (rk > 0.0))) {
+            if (abs(rk) > abs(alt_extrema.back().r)) {
+                alt_extrema.back() = {grid_x[k], rk};
+            }
+        } else {
+            alt_extrema.push_back({grid_x[k], rk});
+        }
+    }
+
+    std::vector<float128> xn(n_unknowns + 1);
+    if (static_cast<int>(alt_extrema.size()) >= n_unknowns + 1) {
+        // Pick contiguous alternating window of length n_unknowns + 1 with largest min |r|
+        size_t best_start = 0;
+        float128 best_min_r = -1.0;
+        for (size_t st = 0; st + n_unknowns < alt_extrema.size(); ++st) {
+            float128 cur_min = abs(alt_extrema[st].r);
+            for (int j = 1; j <= n_unknowns; ++j) {
+                float128 ar = abs(alt_extrema[st + j].r);
+                if (ar < cur_min) cur_min = ar;
+            }
+            if (cur_min > best_min_r) {
+                best_min_r = cur_min;
+                best_start = st;
+            }
+        }
+        for (int k = 0; k <= n_unknowns; ++k) xn[k] = alt_extrema[best_start + k].x;
+        std::cout << "  Seeded " << (n_unknowns + 1) << " alternation nodes from L16 residual extrema.\n";
+    } else {
+        for (int k = 0; k <= n_unknowns; ++k) {
+            float128 z = 0.5 * (1.0 - cos(k * pi / n_unknowns));
+            xn[k] = sqrt(z);
+        }
+        std::sort(xn.begin(), xn.end());
+        xn[0] = 0.0;
+        xn.back() = 1.0;
+        std::cout << "  Seeded " << (n_unknowns + 1) << " Chebyshev fallback nodes.\n";
+    }
     float128 min_true_err = 1e300;
     VectorXmp best_coeffs = an;
     float128 prev_true_err = -1.0;

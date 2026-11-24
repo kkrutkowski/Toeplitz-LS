@@ -74,6 +74,26 @@ static double get_time_sec(void) {
 #    define NUFFT_RANK 16
 #    define NUFFT_W21 16
 #    define NUFFT_W43 18
+#elif defined(HALF)
+#    define NUFFT_LRA_INIT tlsh_nufft_lra_initialize
+#    define NUFFT_LRA_PRE tlsh_nufft_lra_precompute
+#    define NUFFT_LRA_EXEC tlsh_nufft_lra_execute
+#    define NUFFT_LRA_FREE tlsh_nufft_free_lra_plan
+#    define NUFFT_PSWF_INIT tlsh_nufft_pswf_initialize
+#    define NUFFT_PSWF_INIT_MODE tlsh_nufft_pswf_initialize_mode
+#    define NUFFT_PSWF_BENCH_PPOLY tlsh_nufft_pswf_bench_ppoly_gen
+#    define NUFFT_PSWF_PRE tlsh_nufft_pswf_precompute
+#    define NUFFT_PSWF_EXEC tlsh_nufft_pswf_execute
+#    define NUFFT_PSWF_FREE tlsh_nufft_free_pswf_plan
+#    define NUFFT_LRA_INIT_OPTS tlsh_nufft_lra_initialize_opts
+#    define NUFFT_LRA_EXEC_BREADTH tlsh_nufft_lra_execute_breadth
+#    define NUFFT_PSWF_INIT_OPTS tlsh_nufft_pswf_initialize_opts
+#    define NUFFT_PSWF_EXEC_BREADTH tlsh_nufft_pswf_execute_breadth
+#    define LRA_PLAN_T tlsh_nufft_lra_plan
+#    define PSWF_PLAN_T tlsh_nufft_pswf_plan
+#    define NUFFT_RANK 5
+#    define NUFFT_W21 4
+#    define NUFFT_W43 5
 #else /* single (default) */
 #    define NUFFT_LRA_INIT tlsf_nufft_lra_initialize
 #    define NUFFT_LRA_PRE tlsf_nufft_lra_precompute
@@ -107,6 +127,9 @@ int main(int argc, char **argv) {
 #elif defined(DOUBLE)
     int k_start = 8, k_end = 20;
     const char *precision_name = "Double";
+#elif defined(HALF)
+    int k_start = 9, k_end = 22;
+    const char *precision_name = "Half";
 #else
     int k_start = 9, k_end = 22;
     const char *precision_name = "Single";
@@ -146,8 +169,8 @@ int main(int argc, char **argv) {
             re[i] = dd_make(r1, 0.0);
             im[i] = dd_make(r2, 0.0);
 #else
-            re[i] = (FLOAT)r1;
-            im[i] = (FLOAT)r2;
+            re[i] = FCAST(r1);
+            im[i] = FCAST(r2);
 #endif
         }
 
@@ -377,8 +400,8 @@ int main(int argc, char **argv) {
         y_re_src[i] = dd_make(r1, 0.0);
         y_im_src[i] = dd_make(r2, 0.0);
 #else
-        y_re_src[i] = (FLOAT)r1;
-        y_im_src[i] = (FLOAT)r2;
+        y_re_src[i] = FCAST(r1);
+        y_im_src[i] = FCAST(r2);
 #endif
     }
 
@@ -734,13 +757,13 @@ int main(int argc, char **argv) {
             BREADTH_VEC *bre = (BREADTH_VEC *)aligned_alloc(64, (size_t)N * sizeof(BREADTH_VEC));
             BREADTH_VEC *bim = (BREADTH_VEC *)aligned_alloc(64, (size_t)N * sizeof(BREADTH_VEC));
             for (uint32_t i = 0; i < N; ++i) {
-                BREADTH_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
+                BREADTH_COMPUTE_VEC vr = BREADTH_ZERO, vi = BREADTH_ZERO;
                 for (int l = 0; l < BREADTH_VEC_LEN; ++l) {
                     BREADTH_SET_LANE(vr, l, FCAST((double)rand() / RAND_MAX));
                     BREADTH_SET_LANE(vi, l, FCAST((double)rand() / RAND_MAX));
                 }
-                bre[i] = vr;
-                bim[i] = vi;
+                STORE_BVEC(&bre[i], vr);
+                STORE_BVEC(&bim[i], vi);
             }
             PREFIX(plan) *bplan = PREFIX(make_plan_breadth)(N);
             for (int i = 0; i < bwups; ++i) PREFIX(execute_breadth)(bplan, bre, bim);
@@ -949,6 +972,8 @@ int main(int argc, char **argv) {
 #        define PFX "DD"
 #    elif defined(DOUBLE)
 #        define PFX "D"
+#    elif defined(HALF)
+#        define PFX "H"
 #    else
 #        define PFX "F"
 #    endif

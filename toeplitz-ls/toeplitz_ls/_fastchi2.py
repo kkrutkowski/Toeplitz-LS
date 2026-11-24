@@ -393,6 +393,213 @@ def _load_library():
         ctypes.POINTER(DD),
     ]
     lib.tlsdd_ihs_opts.restype = ctypes.c_int
+
+    lib.tlsh_fastchi2.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_fastchi2.restype = ctypes.c_int
+
+    lib.tlsh_fastchi2_d.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_fastchi2_d.restype = ctypes.c_int
+
+    lib.tlsh_fastchi2_spread.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_fastchi2_spread.restype = ctypes.c_int
+
+    lib.tlsh_fastchi2_spread_d.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_fastchi2_spread_d.restype = ctypes.c_int
+
+    lib.tlsh_fastchi2_opts.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_fastchi2_opts.restype = ctypes.c_int
+
+    lib.tlsh_fastchi2_opts_d.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_fastchi2_opts_d.restype = ctypes.c_int
+
+    lib.tlsh_ihs.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_ihs.restype = ctypes.c_int
+
+    lib.tlsh_ihs_d.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_ihs_d.restype = ctypes.c_int
+
+    lib.tlsh_ihs_spread.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_ihs_spread.restype = ctypes.c_int
+
+    lib.tlsh_ihs_spread_d.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_ihs_spread_d.restype = ctypes.c_int
+
+    lib.tlsh_ihs_opts.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_ihs_opts.restype = ctypes.c_int
+
+    lib.tlsh_ihs_opts_d.argtypes = [
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.tlsh_ihs_opts_d.restype = ctypes.c_int
+
+    lib.tlsh_using_native_fp16.argtypes = []
+    lib.tlsh_using_native_fp16.restype = ctypes.c_int
     _LIB = lib
     return lib
 
@@ -545,6 +752,13 @@ def _prepare_numpy_inputs(t, y, dy, y_dtype):
     return t_arr, y_arr, dy_arr
 
 
+def _prepare_half_inputs(t, y, dy):
+    use_double = isinstance(y, np.ndarray) and y.dtype == np.float64 and (dy is None or (isinstance(dy, np.ndarray) and dy.dtype == np.float64))
+    y_dtype = np.float64 if use_double else np.float32
+    t_arr, y_arr, dy_arr = _prepare_numpy_inputs(t, y, dy, y_dtype)
+    return t_arr, y_arr, dy_arr, use_double
+
+
 def _check_observation_count(num_observations, nterms):
     if num_observations > _C_INT_MAX:
         raise ValueError(f"number of observations must be at most {_C_INT_MAX}")
@@ -593,6 +807,137 @@ def _as_dd_array(values):
 def _dd_to_mpf(value):
     mp = _require_mpmath()
     return mp.mpf(value.hi) + mp.mpf(value.lo)
+
+
+class tlsh:
+    """Half-precision (IEEE binary16) FastChi2 periodogram wrapper.
+
+    Accepts raw ``float64`` times ``t`` and ``float32`` or ``float64`` values
+    ``y`` / ``dy`` (matching :class:`tlsf` parameter types), preprocesses in
+    double precision, runs FFT/NuFFT/solvers in IEEE binary16, and returns
+    ``float32`` ``power`` (and ``cond`` when ``autonan=False``).
+    """
+
+    @staticmethod
+    def power(
+        Nf,
+        df,
+        f0,
+        t,
+        y,
+        dy=None,
+        backend="pswf43",
+        solver=None,
+        nterms=3,
+        normalization="standard",
+        spreading="auto",
+        vectorize="auto",
+        *,
+        autonan=True,
+    ):
+        """Return periodogram power on the grid ``f0 + df * arange(Nf)``."""
+        normalization = _check_normalization(normalization)
+        backend = _backend_id(backend)
+        spreading = _spreading_id(spreading)
+        vectorize = _vectorize_id(vectorize)
+        min_Nf = 32 if backend == _BACKENDS["lra"] else 16
+        Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
+        solver = _solver_id_for_nterms(solver, nterms)
+        t_arr, y_arr, dy_arr, use_double = _prepare_half_inputs(t, y, dy)
+        _check_observation_count(t_arr.size, nterms)
+        out = np.empty(Nf, dtype=np.float32)
+        cond = None if autonan else np.empty(Nf, dtype=np.float32)
+        cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        lib = _load_library()
+        if use_double:
+            status = lib.tlsh_fastchi2_opts_d(
+                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                t_arr.size,
+                f0,
+                df,
+                Nf,
+                nterms,
+                backend,
+                solver,
+                normalization,
+                spreading,
+                vectorize,
+                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                cond_ptr,
+            )
+            _raise_status("tlsh_fastchi2_opts_d", status)
+        else:
+            status = lib.tlsh_fastchi2_opts(
+                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                t_arr.size,
+                f0,
+                df,
+                Nf,
+                nterms,
+                backend,
+                solver,
+                normalization,
+                spreading,
+                vectorize,
+                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                cond_ptr,
+            )
+            _raise_status("tlsh_fastchi2_opts", status)
+        if autonan:
+            return out
+        return out, cond
+
+    @staticmethod
+    def autopower(
+        x,
+        y,
+        dy=None,
+        fmin=None,
+        fmax=12,
+        oversampling=5,
+        normalization="standard",
+        nterms=3,
+        backend="pswf43",
+        solver=None,
+        spreading="auto",
+        vectorize="auto",
+        *,
+        autonan=True,
+    ):
+        """Return automatic frequency and power arrays."""
+        nterms = _check_int("nterms", nterms, 1)
+        _solver_id_for_nterms(solver, nterms)
+        _spreading_id(spreading)
+        _vectorize_id(vectorize)
+        t_arr, y_arr, dy_arr, _ = _prepare_half_inputs(x, y, dy)
+        _check_observation_count(t_arr.size, nterms)
+        delta_t = np.max(t_arr) - np.min(t_arr)
+        Nf, df, f0 = _auto_grid(delta_t, fmin, fmax, oversampling, nterms=nterms)
+        frequency = f0 + df * np.arange(Nf, dtype=np.float64)
+        result = tlsh.power(
+            Nf,
+            df,
+            f0,
+            t_arr,
+            y_arr,
+            dy_arr,
+            backend=backend,
+            solver=solver,
+            normalization=normalization,
+            spreading=spreading,
+            vectorize=vectorize,
+            nterms=nterms,
+            autonan=autonan,
+        )
+        if autonan:
+            return frequency, result
+        power, cond = result
+        return frequency, power, cond
 
 
 class tlsf:

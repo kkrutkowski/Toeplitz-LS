@@ -274,6 +274,49 @@ static void check_sqrt(void) {
     }
 }
 
+static void check_fp16_conversions(void) {
+    /* Exhaustive 65,536-value IEEE 754 binary16 round-trip check. */
+    for (uint32_t b = 0; b < 65536u; ++b) {
+        tls_f16_t h = {(uint16_t)b};
+        float f = tls_f16_to_f32(h);
+        tls_f16_t rt = tls_f32_to_f16(f);
+        checks++;
+        const int is_nan = ((b & 0x7c00u) == 0x7c00u) && ((b & 0x03ffu) != 0u);
+        if (is_nan) {
+            const int rt_nan = ((rt.bits & 0x7c00u) == 0x7c00u) && ((rt.bits & 0x03ffu) != 0u);
+            if (!rt_nan) {
+                failures++;
+                printf("FAIL fp16 roundtrip NaN: in=0x%04x got=0x%04x\n", b, rt.bits);
+            }
+        } else if (rt.bits != h.bits) {
+            failures++;
+            if (failures <= 20) printf("FAIL fp16 roundtrip: in=0x%04x f=%.9g got=0x%04x\n", b, (double)f, rt.bits);
+        }
+    }
+#if !NANOFFT_NATIVE_FP16
+    /* Vector load/store conversion check across all 65,536 bit patterns. */
+    tls_f16_t in_buf[VECH_LEN];
+    tls_f16_t out_buf[VECH_LEN];
+    for (uint32_t base = 0; base < 65536u; base += (uint32_t)VECH_LEN) {
+        for (int l = 0; l < VECH_LEN; ++l) in_buf[l].bits = (uint16_t)(base + (uint32_t)l);
+        VECF v = vech_load_f32(in_buf);
+        vech_store_f32(out_buf, v);
+        for (int l = 0; l < VECH_LEN; ++l) {
+            checks++;
+            const uint16_t b = in_buf[l].bits;
+            const int is_nan = ((b & 0x7c00u) == 0x7c00u) && ((b & 0x03ffu) != 0u);
+            if (is_nan) {
+                const int rt_nan = ((out_buf[l].bits & 0x7c00u) == 0x7c00u) && ((out_buf[l].bits & 0x03ffu) != 0u);
+                if (!rt_nan) failures++;
+            } else if (out_buf[l].bits != b) {
+                failures++;
+                if (failures <= 20) printf("FAIL vech vec roundtrip: in=0x%04x got=0x%04x\n", b, out_buf[l].bits);
+            }
+        }
+    }
+#endif
+}
+
 int main(void) {
     printf("check_vecmath: %d float lanes, %d double lanes\n", (int)VECF_LEN, (int)VEC_LEN);
 
@@ -291,6 +334,7 @@ int main(void) {
     check_float_specials();
     check_double_specials();
     check_sqrt();
+    check_fp16_conversions();
 
     if (failures) {
         printf("check_vecmath: %d FAILURES out of %d checks\n", failures, checks);

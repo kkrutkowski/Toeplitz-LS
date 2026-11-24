@@ -30,6 +30,12 @@
 #    endif
 #endif
 
+#if defined(__AVX512FP16__) || defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#    define NANOFFT_NATIVE_FP16 1
+#else
+#    define NANOFFT_NATIVE_FP16 0
+#endif
+
 /* Alignment the plan and the transform buffers ask the allocator for: exactly
  * one vector, which is all an aligned vector load needs. */
 #define NANOFFT_ALIGN VEC_BYTES
@@ -77,6 +83,13 @@
 #    define NANOFFT_FFT_FUSE_DOUBLE_DEFAULT 1 /* VEC_LEN  = 2 */
 #endif
 #define NANOFFT_FFT_FUSE_DD_DEFAULT 2
+#if VEC_BYTES >= 64
+#    define NANOFFT_FFT_FUSE_HALF_DEFAULT 3
+#elif VEC_BYTES >= 32
+#    define NANOFFT_FFT_FUSE_HALF_DEFAULT 2
+#else
+#    define NANOFFT_FFT_FUSE_HALF_DEFAULT 1
+#endif
 
 #ifndef NANOFFT_FFT_FUSE_FLOAT
 #    define NANOFFT_FFT_FUSE_FLOAT NANOFFT_FFT_FUSE_FLOAT_DEFAULT
@@ -86,6 +99,9 @@
 #endif
 #ifndef NANOFFT_FFT_FUSE_DD
 #    define NANOFFT_FFT_FUSE_DD NANOFFT_FFT_FUSE_DD_DEFAULT
+#endif
+#ifndef NANOFFT_FFT_FUSE_HALF
+#    define NANOFFT_FFT_FUSE_HALF NANOFFT_FFT_FUSE_HALF_DEFAULT
 #endif
 
 /* Breadth-wise fused-twiddle FFT depth defaults (stages fused per pass). */
@@ -102,6 +118,7 @@
 #    define NANOFFT_FFT_BFUSE_DOUBLE_DEFAULT 2
 #    define NANOFFT_FFT_BFUSE_DD_DEFAULT 1
 #endif
+#define NANOFFT_FFT_BFUSE_HALF_DEFAULT 2
 
 #ifndef NANOFFT_FFT_BFUSE_FLOAT
 #    define NANOFFT_FFT_BFUSE_FLOAT NANOFFT_FFT_BFUSE_FLOAT_DEFAULT
@@ -111,6 +128,9 @@
 #endif
 #ifndef NANOFFT_FFT_BFUSE_DD
 #    define NANOFFT_FFT_BFUSE_DD NANOFFT_FFT_BFUSE_DD_DEFAULT
+#endif
+#ifndef NANOFFT_FFT_BFUSE_HALF
+#    define NANOFFT_FFT_BFUSE_HALF NANOFFT_FFT_BFUSE_HALF_DEFAULT
 #endif
 
 /*
@@ -127,6 +147,8 @@ TLS_API int nanofftdd_depth_for(uint32_t N);
 TLS_API int nanofftf_breadth_depth_for(uint32_t N);
 TLS_API int nanofft_breadth_depth_for(uint32_t N);
 TLS_API int nanofftdd_breadth_depth_for(uint32_t N);
+TLS_API int nanoffth_depth_for(uint32_t N);
+TLS_API int nanoffth_breadth_depth_for(uint32_t N);
 
 /* Largest depth any precision may be built with. */
 #ifndef NANOFFT_FFT_FUSE_MAX
@@ -150,6 +172,12 @@ TLS_API int nanofftdd_breadth_depth_for(uint32_t N);
 #endif
 #if NANOFFT_FFT_BFUSE_DD < 1 || NANOFFT_FFT_BFUSE_DD > NANOFFT_FFT_FUSE_MAX
 #    error "NANOFFT_FFT_BFUSE_DD must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_FUSE_HALF < 1 || NANOFFT_FFT_FUSE_HALF > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_FUSE_HALF must be between 1 and NANOFFT_FFT_FUSE_MAX"
+#endif
+#if NANOFFT_FFT_BFUSE_HALF < 1 || NANOFFT_FFT_BFUSE_HALF > NANOFFT_FFT_FUSE_MAX
+#    error "NANOFFT_FFT_BFUSE_HALF must be between 1 and NANOFFT_FFT_FUSE_MAX"
 #endif
 
 /* -------------------------------------------------------------------------
@@ -545,6 +573,233 @@ NANOFFT_DIAG_POP
 typedef float VECF __attribute__((vector_size(VEC_BYTES)));
 typedef uint32_t VECF_INT __attribute__((vector_size(VEC_BYTES)));
 
+/* -------------------------------------------------------------------------
+ * Half Precision Types & Converters (IEEE 754 binary16)
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    uint16_t bits;
+} tls_f16_t;
+
+#if NANOFFT_NATIVE_FP16
+static inline _Float16 tls_f16_to_fp16(tls_f16_t h) {
+    _Float16 f;
+    memcpy(&f, &h.bits, sizeof f);
+    return f;
+}
+
+static inline tls_f16_t tls_fp16_to_f16(_Float16 f) {
+    tls_f16_t h;
+    memcpy(&h.bits, &f, sizeof h.bits);
+    return h;
+}
+
+static inline float tls_f16_to_f32(tls_f16_t h) { return (float)tls_f16_to_fp16(h); }
+static inline tls_f16_t tls_f32_to_f16(float f) { return tls_fp16_to_f16((_Float16)f); }
+#elif (defined(__F16C__) || defined(__AVX512F__)) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+static inline float tls_f16_to_f32(tls_f16_t h) { return _cvtsh_ss(h.bits); }
+static inline tls_f16_t tls_f32_to_f16(float f) {
+    tls_f16_t h;
+    h.bits = _cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    return h;
+}
+#elif defined(__aarch64__)
+static inline float tls_f16_to_f32(tls_f16_t h) {
+    uint16x4_t u = vdup_n_u16(h.bits);
+    return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(u)), 0);
+}
+static inline tls_f16_t tls_f32_to_f16(float f) {
+    float32x4_t v = vdupq_n_f32(f);
+    tls_f16_t h;
+    h.bits = vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(v)), 0);
+    return h;
+}
+#else
+static inline float tls_f16_to_f32(tls_f16_t h) {
+    uint32_t sign = ((uint32_t)h.bits & 0x8000u) << 16;
+    uint32_t exp = (h.bits >> 10) & 0x1fu;
+    uint32_t frac = h.bits & 0x03ffu;
+    uint32_t out;
+    if (exp == 0u) {
+        if (frac == 0u) {
+            out = sign;
+        } else {
+            int e = -14;
+            while ((frac & 0x0400u) == 0u) {
+                frac <<= 1;
+                e--;
+            }
+            frac &= 0x03ffu;
+            out = sign | ((uint32_t)(e + 127) << 23) | (frac << 13);
+        }
+    } else if (exp == 31u) {
+        out = sign | 0x7f800000u | (frac << 13);
+    } else {
+        out = sign | ((exp - 15u + 127u) << 23) | (frac << 13);
+    }
+    float f;
+    memcpy(&f, &out, sizeof f);
+    return f;
+}
+
+static inline tls_f16_t tls_f32_to_f16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    uint32_t sign = (u >> 16) & 0x8000u;
+    uint32_t exp = (u >> 23) & 0xffu;
+    uint32_t frac = u & 0x7fffffu;
+    tls_f16_t h;
+    if (exp == 0xffu) {
+        h.bits = (uint16_t)(sign | 0x7c00u | (frac ? (0x0200u | (frac >> 13)) : 0u));
+        return h;
+    }
+    int e = (int)exp - 127 + 15;
+    if (e >= 31) {
+        h.bits = (uint16_t)(sign | 0x7c00u);
+        return h;
+    }
+    if (e <= 0) {
+        if (e < -10) {
+            h.bits = (uint16_t)sign;
+            return h;
+        }
+        uint32_t m = frac | 0x800000u;
+        int shift = 14 - e;
+        uint32_t round_bit = 1u << (shift - 1);
+        uint32_t sticky = m & (round_bit - 1u);
+        uint32_t out = m >> shift;
+        if ((m & round_bit) && (sticky || (out & 1u))) out++;
+        h.bits = (uint16_t)(sign | out);
+        return h;
+    }
+    uint32_t round_bit = 0x1000u;
+    uint32_t sticky = frac & 0x0fffu;
+    uint32_t out = frac >> 13;
+    if ((frac & round_bit) && (sticky || (out & 1u))) {
+        out++;
+        if (out == 0x0400u) {
+            out = 0u;
+            e++;
+            if (e >= 31) {
+                h.bits = (uint16_t)(sign | 0x7c00u);
+                return h;
+            }
+        }
+    }
+    h.bits = (uint16_t)(sign | ((uint32_t)e << 10) | out);
+    return h;
+}
+#endif
+
+#if NANOFFT_NATIVE_FP16
+#    define VECH_LEN (VEC_BYTES / 2)
+typedef _Float16 VECH __attribute__((vector_size(VEC_BYTES)));
+typedef uint16_t VECH_INT __attribute__((vector_size(VEC_BYTES)));
+
+static inline tls_f16_t tls_f16_add(tls_f16_t a, tls_f16_t b) { return tls_fp16_to_f16(tls_f16_to_fp16(a) + tls_f16_to_fp16(b)); }
+static inline tls_f16_t tls_f16_sub(tls_f16_t a, tls_f16_t b) { return tls_fp16_to_f16(tls_f16_to_fp16(a) - tls_f16_to_fp16(b)); }
+static inline tls_f16_t tls_f16_mul(tls_f16_t a, tls_f16_t b) { return tls_fp16_to_f16(tls_f16_to_fp16(a) * tls_f16_to_fp16(b)); }
+static inline tls_f16_t tls_f16_div(tls_f16_t a, tls_f16_t b) { return tls_fp16_to_f16(tls_f16_to_fp16(a) / tls_f16_to_fp16(b)); }
+static inline tls_f16_t tls_f16_fma(tls_f16_t a, tls_f16_t b, tls_f16_t c) {
+    return tls_fp16_to_f16(tls_f16_to_fp16(a) * tls_f16_to_fp16(b) + tls_f16_to_fp16(c));
+}
+#else
+#    define VECH_LEN VECF_LEN
+typedef struct {
+    tls_f16_t elems[VECH_LEN];
+} VECH __attribute__((aligned(VEC_BYTES / 2)));
+
+static inline VECF vech_load_f32(const tls_f16_t *p) {
+#    if VEC_BYTES == 64 && defined(__AVX512F__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    return (VECF)_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(const void *)p));
+#    elif VEC_BYTES == 32 && defined(__F16C__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    return (VECF)_mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(const void *)p));
+#    elif VEC_BYTES == 16 && defined(__F16C__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    return (VECF)_mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(const void *)p));
+#    elif defined(__aarch64__) && VEC_BYTES == 16
+    return (VECF)vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *)(const void *)p)));
+#    else
+    VECF v = (VECF){};
+    for (int i = 0; i < VECH_LEN; i++) v[i] = tls_f16_to_f32(p[i]);
+    return v;
+#    endif
+}
+
+static inline void vech_store_f32(tls_f16_t *p, VECF v) {
+#    if VEC_BYTES == 64 && defined(__AVX512F__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    _mm256_storeu_si256((__m256i *)(void *)p, _mm512_cvtps_ph((__m512)v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+#    elif VEC_BYTES == 32 && defined(__F16C__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    _mm_storeu_si128((__m128i *)(void *)p, _mm256_cvtps_ph((__m256)v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+#    elif VEC_BYTES == 16 && defined(__F16C__) && (defined(__x86_64__) || defined(_M_X64) || defined(__i386__))
+    _mm_storel_epi64((__m128i *)(void *)p, _mm_cvtps_ph((__m128)v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+#    elif defined(__aarch64__) && VEC_BYTES == 16
+    vst1_u16((uint16_t *)(void *)p, vreinterpret_u16_f16(vcvt_f16_f32((float32x4_t)v)));
+#    else
+    for (int i = 0; i < VECH_LEN; i++) p[i] = tls_f32_to_f16(v[i]);
+#    endif
+}
+
+static inline VECF vech_to_vecf(VECH h) { return vech_load_f32(h.elems); }
+static inline VECH vecf_to_vech(VECF v) {
+    VECH h;
+    vech_store_f32(h.elems, v);
+    return h;
+}
+
+static inline tls_f16_t tls_f16_add(tls_f16_t a, tls_f16_t b) { return tls_f32_to_f16(tls_f16_to_f32(a) + tls_f16_to_f32(b)); }
+static inline tls_f16_t tls_f16_sub(tls_f16_t a, tls_f16_t b) { return tls_f32_to_f16(tls_f16_to_f32(a) - tls_f16_to_f32(b)); }
+static inline tls_f16_t tls_f16_mul(tls_f16_t a, tls_f16_t b) { return tls_f32_to_f16(tls_f16_to_f32(a) * tls_f16_to_f32(b)); }
+static inline tls_f16_t tls_f16_div(tls_f16_t a, tls_f16_t b) { return tls_f32_to_f16(tls_f16_to_f32(a) / tls_f16_to_f32(b)); }
+static inline tls_f16_t tls_f16_fma(tls_f16_t a, tls_f16_t b, tls_f16_t c) {
+    return tls_f32_to_f16(fmaf(tls_f16_to_f32(a), tls_f16_to_f32(b), tls_f16_to_f32(c)));
+}
+#endif
+
+static inline tls_f16_t tls_f16_neg(tls_f16_t a) {
+    tls_f16_t r;
+    r.bits = (uint16_t)(a.bits ^ 0x8000u);
+    return r;
+}
+static inline tls_f16_t tls_f16_sqrt(tls_f16_t a) { return tls_f32_to_f16(sqrtf(tls_f16_to_f32(a))); }
+static inline tls_f16_t tls_f16_exp(tls_f16_t a) { return tls_f32_to_f16(expf(tls_f16_to_f32(a))); }
+static inline float tls_f16_fabs(tls_f16_t a) { return fabsf(tls_f16_to_f32(a)); }
+static inline void tls_f16_sincos2pi(tls_f16_t x, tls_f16_t *c_out, tls_f16_t *s_out) {
+    float cf, sf;
+    sincos2pif(tls_f16_to_f32(x), &cf, &sf);
+    *c_out = tls_f32_to_f16(cf);
+    *s_out = tls_f32_to_f16(sf);
+}
+static inline tls_f16_t tls_f16_cos2pi(tls_f16_t x) { return tls_f32_to_f16(cos2pif(tls_f16_to_f32(x))); }
+static inline tls_f16_t tls_f16_sin2pi(tls_f16_t x) { return tls_f32_to_f16(sin2pif(tls_f16_to_f32(x))); }
+
+typedef struct nanoffth_plan nanoffth_plan;
+TLS_API nanoffth_plan *nanoffth_make_plan(uint32_t N);
+TLS_API void nanoffth_destroy_plan(nanoffth_plan *plan);
+TLS_API void nanoffth_execute(nanoffth_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
+TLS_API void nanoffth_execute_raw(nanoffth_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
+TLS_API void nanoffth_permute(nanoffth_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
+TLS_API void nanoffth_permute_1d(nanoffth_plan *plan, tls_f16_t *values);
+TLS_API nanoffth_plan *nanoffth_make_plan_breadth(uint32_t N);
+TLS_API void nanoffth_execute_breadth(nanoffth_plan *plan, VECH *real_signal, VECH *imag_signal);
+TLS_API void nanoffth_execute_raw_breadth(nanoffth_plan *plan, VECH *real_signal, VECH *imag_signal);
+TLS_API void nanoffth_permute_breadth(nanoffth_plan *plan, VECH *real_signal, VECH *imag_signal);
+TLS_API void nanoffth_permute_1d_breadth(nanoffth_plan *plan, VECH *values);
+
+#ifdef HALF_NATIVE_EMBED
+typedef struct nanoffth_nat_plan nanoffth_nat_plan;
+int nanoffth_nat_depth_for(uint32_t N);
+int nanoffth_nat_breadth_depth_for(uint32_t N);
+nanoffth_nat_plan *nanoffth_nat_make_plan(uint32_t N);
+void nanoffth_nat_destroy_plan(nanoffth_nat_plan *plan);
+void nanoffth_nat_execute(nanoffth_nat_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
+void nanoffth_nat_execute_raw(nanoffth_nat_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
+void nanoffth_nat_permute(nanoffth_nat_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
+void nanoffth_nat_permute_1d(nanoffth_nat_plan *plan, tls_f16_t *values);
+nanoffth_nat_plan *nanoffth_nat_make_plan_breadth(uint32_t N);
+void nanoffth_nat_execute_breadth(nanoffth_nat_plan *plan, VECH *real_signal, VECH *imag_signal);
+void nanoffth_nat_execute_raw_breadth(nanoffth_nat_plan *plan, VECH *real_signal, VECH *imag_signal);
+void nanoffth_nat_permute_breadth(nanoffth_nat_plan *plan, VECH *real_signal, VECH *imag_signal);
+void nanoffth_nat_permute_1d_breadth(nanoffth_nat_plan *plan, VECH *values);
+#endif
 typedef struct nanofftf_plan nanofftf_plan;
 TLS_API nanofftf_plan *nanofftf_make_plan(uint32_t N);
 TLS_API void nanofftf_destroy_plan(nanofftf_plan *plan);

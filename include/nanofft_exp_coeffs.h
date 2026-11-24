@@ -8,6 +8,10 @@
 #ifndef NANOFFT_EXP_COEFFS_H
 #define NANOFFT_EXP_COEFFS_H
 
+/* half (IEEE binary16): degree 3 */
+#define NANOFFT_EXPH_DEGREE 3
+static const float nanofft_exph_coeffs[NANOFFT_EXPH_DEGREE + 1] = {0x1.fff6c054e1c7bp-1, 0x1.ffda3e03921e8p-1, 0x1.02879c565f72ap-1, 0x1.5d9f93771b0f6p-3};
+
 /* float: degree 6 */
 #define NANOFFT_EXPF_DEGREE 6
 static const float nanofft_expf_coeffs[NANOFFT_EXPF_DEGREE + 1] = {0x1.fffffff9d531p-1,  0x1.0000009a7913ep+0, 0x1.000003ce728eep-1, 0x1.55540c179fef7p-3,
@@ -32,6 +36,9 @@ static const double nanofft_exp_coeffs[NANOFFT_EXP_DEGREE + 1] = {0x1p+0,
 
 /* ln2 = hi + lo, hi chosen so that k * hi is exact in the reduction
  * for every |k| the exponential can produce. */
+#define NANOFFT_EXP_LN2_HI_H 0x1.64p-1
+#define NANOFFT_EXP_LN2_LO_H -0x1.1bd0105c610cbp-9
+#define NANOFFT_EXP_INV_LN2_H 0x1.71547652b82fep+0
 #define NANOFFT_EXP_LN2_HI_F 0x1.62e4p-1
 #define NANOFFT_EXP_LN2_LO_F 0x1.7f7d1cp-20
 #define NANOFFT_EXP_INV_LN2_F 0x1.71547652b82fep+0

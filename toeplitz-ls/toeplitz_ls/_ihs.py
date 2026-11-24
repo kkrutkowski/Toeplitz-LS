@@ -52,6 +52,7 @@ from ._fastchi2 import (
     _check_observation_count,
     _dd_to_mpf,
     _load_library,
+    _prepare_half_inputs,
     _prepare_numpy_inputs,
     _raise_status,
     _require_mpmath,
@@ -99,6 +100,87 @@ def _warn_if_ihs_undersampled(n_eff, nterms):
             RuntimeWarning,
             stacklevel=3,
         )
+
+
+class ihsh:
+    """Half-precision (IEEE binary16) IHS periodogram wrapper."""
+
+    @staticmethod
+    def power(Nf, df, f0, t, y, dy=None, backend="pswf43", nterms=3, normalization="default", spreading="auto", vectorize="auto"):
+        """Return the IHS power on the grid ``f0 + df * arange(Nf)``."""
+        normalization = _check_ihs_normalization(normalization)
+        backend = _backend_id(backend)
+        spreading = _spreading_id(spreading)
+        vectorize = _vectorize_id(vectorize)
+        min_Nf = 32 if backend == _BACKENDS["lra"] else 16
+        Nf, df, f0, nterms = _check_grid(Nf, df, f0, nterms, min_Nf=min_Nf)
+        t_arr, y_arr, dy_arr, use_double = _prepare_half_inputs(t, y, dy)
+        _check_observation_count(t_arr.size, nterms)
+        _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
+        out = np.empty(Nf, dtype=np.float32)
+
+        lib = _load_library()
+        if use_double:
+            status = lib.tlsh_ihs_opts_d(
+                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                t_arr.size,
+                f0,
+                df,
+                Nf,
+                nterms,
+                backend,
+                normalization,
+                spreading,
+                vectorize,
+                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            )
+            _raise_status("tlsh_ihs_opts_d", status)
+        else:
+            status = lib.tlsh_ihs_opts(
+                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                t_arr.size,
+                f0,
+                df,
+                Nf,
+                nterms,
+                backend,
+                normalization,
+                spreading,
+                vectorize,
+                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            )
+            _raise_status("tlsh_ihs_opts", status)
+        return out
+
+    @staticmethod
+    def autopower(x, y, dy=None, fmin=None, fmax=12, oversampling=5, normalization="default", nterms=3, backend="pswf43", spreading="auto", vectorize="auto"):
+        """Return automatic half-precision IHS frequency and power arrays."""
+        nterms = _check_int("nterms", nterms, 1)
+        _spreading_id(spreading)
+        _vectorize_id(vectorize)
+        t_arr, y_arr, dy_arr, _ = _prepare_half_inputs(x, y, dy)
+        _check_observation_count(t_arr.size, nterms)
+        delta_t = np.max(t_arr) - np.min(t_arr)
+        Nf, df, f0 = _auto_grid(delta_t, fmin, fmax, oversampling, nterms=nterms)
+        frequency = f0 + df * np.arange(Nf, dtype=np.float64)
+        result = ihsh.power(
+            Nf,
+            df,
+            f0,
+            t_arr,
+            y_arr,
+            dy_arr,
+            backend=backend,
+            normalization=normalization,
+            spreading=spreading,
+            vectorize=vectorize,
+            nterms=nterms,
+        )
+        return frequency, result
 
 
 class ihsf:

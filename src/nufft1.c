@@ -16,7 +16,9 @@
  * Common Helpers
  * ========================================================================= */
 
+#if !defined(HALF)
 static const int pswf_degrees[19] = {0, 0, 1, 2, 3, 4, 6, 7, 8, 10, 11, 14, 14, 16, 18, 18, 20, 20, 23};
+#endif
 enum { PSWF_MAX_W = 36 };
 
 static inline size_t sz_max(size_t a, size_t b) { return (a > b) ? a : b; }
@@ -92,6 +94,35 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #    define LRA_BESSEL_TERMS 8
 #    define GL_NEWTON_TOL FCONST(2.0e-16)
 #    define PSWF_KERNEL_MAX_EXP 13
+#elif defined(HALF)
+#    ifdef HALF_NATIVE_EMBED
+#        define PFX(name) tlsh_nat_nufft_##name
+#        define NANOFFT_PLAN nanoffth_nat_plan
+#        define NANOFFT_MAKE_PLAN nanoffth_nat_make_plan
+#        define NANOFFT_EXECUTE nanoffth_nat_execute
+#        define NANOFFT_EXECUTE_RAW nanoffth_nat_execute_raw
+#        define NANOFFT_PERMUTE_1D nanoffth_nat_permute_1d
+#        define NANOFFT_MAKE_PLAN_BREADTH nanoffth_nat_make_plan_breadth
+#        define NANOFFT_EXECUTE_BREADTH nanoffth_nat_execute_breadth
+#        define NANOFFT_EXECUTE_RAW_BREADTH nanoffth_nat_execute_raw_breadth
+#        define NANOFFT_PERMUTE_1D_BREADTH nanoffth_nat_permute_1d_breadth
+#        define NANOFFT_DESTROY_PLAN nanoffth_nat_destroy_plan
+#    else
+#        define PFX(name) tlsh_nufft_##name
+#        define NANOFFT_PLAN nanoffth_plan
+#        define NANOFFT_MAKE_PLAN nanoffth_make_plan
+#        define NANOFFT_EXECUTE nanoffth_execute
+#        define NANOFFT_EXECUTE_RAW nanoffth_execute_raw
+#        define NANOFFT_PERMUTE_1D nanoffth_permute_1d
+#        define NANOFFT_MAKE_PLAN_BREADTH nanoffth_make_plan_breadth
+#        define NANOFFT_EXECUTE_BREADTH nanoffth_execute_breadth
+#        define NANOFFT_EXECUTE_RAW_BREADTH nanoffth_execute_raw_breadth
+#        define NANOFFT_PERMUTE_1D_BREADTH nanoffth_permute_1d_breadth
+#        define NANOFFT_DESTROY_PLAN nanoffth_destroy_plan
+#    endif
+#    define LRA_BESSEL_TERMS 4
+#    define GL_NEWTON_TOL FCONST(1.0e-4)
+#    define PSWF_KERNEL_MAX_EXP 3
 #else
 #    define PFX(name) tlsf_nufft_##name
 #    define NANOFFT_PLAN nanofftf_plan
@@ -115,6 +146,32 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 
 static void PFX(get_lege_roots)(int n, FLOAT *roots, FLOAT *weights) {
     int half_n = (n + 1) / 2;
+#if defined(HALF)
+    for (int i = 1; i <= half_n; i++) {
+        double x = cos2pi(0.5 * ((double)i - 0.25) / ((double)n + 0.5));
+        double p1 = 0.0, p2 = 0.0, dp = 0.0, step = 0.0;
+        int iter = 0;
+        do {
+            p1 = 1.0;
+            p2 = 0.0;
+            for (int j = 1; j <= n; j++) {
+                double p0 = ((double)(2 * j - 1) * x * p1 - (double)(j - 1) * p2) / (double)j;
+                p2 = p1;
+                p1 = p0;
+            }
+            dp = (double)n * (x * p1 - p2) / (x * x - 1.0);
+            step = p1 / dp;
+            x -= step;
+        } while (fabs(step) > 1.0e-12 && ++iter < 64);
+
+        FLOAT rx = FCAST(x);
+        FLOAT rw = FCAST(2.0 / ((1.0 - x * x) * dp * dp));
+        roots[i - 1] = rx;
+        weights[i - 1] = rw;
+        roots[n - i] = NEG(rx);
+        weights[n - i] = rw;
+    }
+#else
     for (int i = 1; i <= half_n; i++) {
         FLOAT x = M_COS2PI(DIV(MUL(FCAST(0.5), FCAST(i - 0.25)), FCAST(n + 0.5)));
         FLOAT p1 = FCAST(0.0), p2 = FCAST(0.0), dp = FCAST(0.0);
@@ -139,12 +196,66 @@ static void PFX(get_lege_roots)(int n, FLOAT *roots, FLOAT *weights) {
         roots[n - i] = NEG(x);
         weights[n - i] = weights[i - 1];
     }
+#endif
 }
 
 /* =========================================================================
  * Lookup Tables
  * ========================================================================= */
 
+#if defined(HALF)
+static const double PFX(fact_d)[28] = {1.0,
+                                       1.0,
+                                       2.0,
+                                       6.0,
+                                       24.0,
+                                       120.0,
+                                       720.0,
+                                       5040.0,
+                                       40320.0,
+                                       362880.0,
+                                       3628800.0,
+                                       39916800.0,
+                                       479001600.0,
+                                       6227020800.0,
+                                       87178291200.0,
+                                       1307674368000.0,
+                                       20922789888000.0,
+                                       355687428096000.0,
+                                       6402373705728000.0,
+                                       1.21645100408832e+17,
+                                       2.43290200817664e+18,
+                                       5.109094217170944e+19,
+                                       1.1240007277776077e+21,
+                                       2.5852016738884978e+22,
+                                       6.2044840173323941e+23,
+                                       1.5511210043330986e+25,
+                                       4.0329146112660565e+26,
+                                       1.0888869450418352e+28};
+
+/* Hardcoded FP16 PSWF Remez degree-5 LUTs (w = 4 and w = 5 ONLY, generated by
+ * src/miscellaneous/pswf_remez_lut.cpp with IRLS L2->L4->L8->L12->L16->Remez). */
+static const tls_f16_t PFX(pswf21_h_c)[2] = {
+    {0x48b0u}, /* w=4: c=9.37477796 */
+    {0x49deu}, /* w=5: c=11.73097245 */
+};
+static const tls_f16_t PFX(pswf21_h_coeffs)[2][6] = {
+    /* w=4: {1.000004, 0.3867161, -0.9216739, -0.7881353, -0.2697224, 0.6903307} */
+    {{0x3c00u}, {0x3630u}, {0xbb60u}, {0xba4eu}, {0xb451u}, {0x3986u}},
+    /* w=5: {1.000018, 0.3816939, -1.172602, -1.331939, 0.5295519, 0.6331383} */
+    {{0x3c00u}, {0x361bu}, {0xbcb1u}, {0xbd54u}, {0x383du}, {0x3911u}},
+};
+static const tls_f16_t PFX(pswf43_h_c)[2] = {
+    {0x47ceu}, /* w=4: c=7.80398163 */
+    {0x48e2u}, /* w=5: c=9.76747704 */
+};
+static const tls_f16_t PFX(pswf43_h_coeffs)[2][6] = {
+    /* w=4: {0.9999901, 0.3908943, -0.7396056, -0.5325859, -0.4544860, 0.5283378} */
+    {{0x3c00u}, {0x3641u}, {0xb9ebu}, {0xb843u}, {0xb746u}, {0x383au}},
+    /* w=5: {1.000006, 0.3856690, -0.9628945, -0.8759618, -0.1640284, 0.6995837} */
+    {{0x3c00u}, {0x362cu}, {0xbbb4u}, {0xbb02u}, {0xb140u}, {0x3999u}},
+};
+#else
 static const FLOAT PFX(fact)[28] = {FCONST(1, 0),
                                     FCONST(1, 0),
                                     FCONST(2, 0),
@@ -309,6 +420,7 @@ static const FLOAT PFX(pswf_coeffs)[19][24] = {
      FCONST(3.4936129332440493, 3.5321480431593956e-20),
      FCONST(1.2845375935583203, 2.9466888110619039e-20)},
 };
+#endif /* !defined(HALF) */
 
 #ifdef DOUBLE
 static const int PFX(pswf43_degrees)[19] = {
@@ -383,16 +495,21 @@ NANOFFT_EXACT_FP __attribute__((noinline)) static void PFX(kahan_add_soa)(FLOAT 
 }
 
 NANOFFT_EXACT_FP __attribute__((noinline)) static void PFX(kahan_add_soa_breadth)(BREADTH_VEC *sum_r, BREADTH_VEC *sum_i, BREADTH_VEC *comp_r,
-                                                                                  BREADTH_VEC *comp_i, BREADTH_VEC input_r, BREADTH_VEC input_i) {
+                                                                                  BREADTH_VEC *comp_i, BREADTH_COMPUTE_VEC input_r,
+                                                                                  BREADTH_COMPUTE_VEC input_i) {
     NANOFFT_EXACT_FP_PRAGMA
-    BREADTH_VEC yr = BREADTH_SUB(input_r, *comp_r);
-    BREADTH_VEC yi = BREADTH_SUB(input_i, *comp_i);
-    BREADTH_VEC tr = BREADTH_ADD(*sum_r, yr);
-    BREADTH_VEC ti = BREADTH_ADD(*sum_i, yi);
-    *comp_r = BREADTH_SUB(BREADTH_SUB(tr, *sum_r), yr);
-    *comp_i = BREADTH_SUB(BREADTH_SUB(ti, *sum_i), yi);
-    *sum_r = tr;
-    *sum_i = ti;
+    const BREADTH_COMPUTE_VEC sr = LOAD_BVEC(sum_r);
+    const BREADTH_COMPUTE_VEC si = LOAD_BVEC(sum_i);
+    const BREADTH_COMPUTE_VEC cr = LOAD_BVEC(comp_r);
+    const BREADTH_COMPUTE_VEC ci = LOAD_BVEC(comp_i);
+    const BREADTH_COMPUTE_VEC yr = BREADTH_SUB(input_r, cr);
+    const BREADTH_COMPUTE_VEC yi = BREADTH_SUB(input_i, ci);
+    const BREADTH_COMPUTE_VEC tr = BREADTH_ADD(sr, yr);
+    const BREADTH_COMPUTE_VEC ti = BREADTH_ADD(si, yi);
+    STORE_BVEC(comp_r, BREADTH_SUB(BREADTH_SUB(tr, sr), yr));
+    STORE_BVEC(comp_i, BREADTH_SUB(BREADTH_SUB(ti, si), yi));
+    STORE_BVEC(sum_r, tr);
+    STORE_BVEC(sum_i, ti);
 }
 
 /* =========================================================================
@@ -517,6 +634,20 @@ static FLOAT PFX(jn_approx)(int n, FLOAT x, int num_terms) {
     int max_terms = 28 - n_abs;
     if (max_terms < 0) max_terms = 0;
     int terms = (num_terms < max_terms) ? num_terms : max_terms;
+#if defined(HALF)
+    double half_x = 0.5 * TO_DOUBLE(x);
+    double half_x2 = half_x * half_x;
+    double term_numer = 1.0;
+    for (int i = 0; i < n_abs; i++) term_numer *= half_x;
+    double result = 0.0;
+    for (int k = 0; k < terms; ++k) {
+        double denom = PFX(fact_d)[k] * PFX(fact_d)[n_abs + k];
+        result += term_numer / denom;
+        term_numer *= -half_x2;
+    }
+    if (n < 0 && (n & 1)) result = -result;
+    return FCAST(result);
+#else
     FLOAT half_x = MUL(FCAST(0.5), x);
     FLOAT half_x2 = MUL(half_x, half_x);
     FLOAT term_numer = FCAST(1.0);
@@ -529,6 +660,7 @@ static FLOAT PFX(jn_approx)(int n, FLOAT x, int num_terms) {
     }
     if (n < 0 && (n & 1)) result = NEG(result);
     return result;
+#endif
 }
 
 /* =========================================================================
@@ -698,7 +830,11 @@ void PFX(lra_precompute)(struct PFX(lra_plan) * plan, const nufft_input_t *x, in
 
     FLOAT *X = (FLOAT *)nanofft_malloc((size_t)Nfft * sizeof(FLOAT));
     for (int w = 0; w < Nfft; ++w) {
+#if defined(HALF)
+        X[w] = FCAST((2.0 * (double)w) / (double)Nfft - 1.0);
+#else
         X[w] = SUB(DIV(FCAST(2.0 * w), FCAST(Nfft)), FCAST(1.0));
+#endif
     }
     PFX(MatrixF) *Tcheb_V = PFX(chebyshev_mat)(rank - 1, X, Nfft);
     nanofft_aligned_free(X);
@@ -796,6 +932,13 @@ void PFX(lra_execute_breadth)(const struct PFX(lra_plan) * plan, const nufft_inp
 #elif defined(DOUBLE)
     VEC v_freq;
     for (int v = 0; v < VEC_LEN; ++v) v_freq[v] = (double)freq_factor * (f0 + (double)(block_base + v) * (double)block * plan->df);
+#elif defined(HALF) && NANOFFT_NATIVE_FP16
+    VEC v_freq[VECH_LEN / VEC_LEN];
+    for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) {
+        for (int v = 0; v < VEC_LEN; ++v) {
+            v_freq[ch][v] = (double)freq_factor * (f0 + (double)(block_base + ch * VEC_LEN + v) * (double)block * plan->df);
+        }
+    }
 #else
     VEC v_freq_lo, v_freq_hi;
     for (int v = 0; v < VEC_LEN; ++v) {
@@ -807,23 +950,28 @@ void PFX(lra_execute_breadth)(const struct PFX(lra_plan) * plan, const nufft_inp
     for (int m = 0; m < plan->Mpoints; ++m) {
         const int t = current_Tidx[m];
         if (t < 0 || t >= plan->Nfft) continue;
-        BREADTH_VEC c, s;
+        BREADTH_COMPUTE_VEC c, s;
 #if defined(DOUBLE_DOUBLE)
         vecdd_sincos2pi(vecdd_mul(vecdd_splat(x[m]), v_freq), &c, &s);
 #elif defined(DOUBLE)
         vec_sincos2pi(((VEC){} + x[m]) * v_freq, &c, &s);
+#elif defined(HALF) && NANOFFT_NATIVE_FP16
+        const VEC xm_v = (VEC){} + x[m];
+        VEC ang[VECH_LEN / VEC_LEN];
+        for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) ang[ch] = xm_v * v_freq[ch];
+        vech_sincos2pi_d(ang, &c, &s);
 #else
         const VEC xm_v = (VEC){} + x[m];
         vecf_sincos2pi_d(xm_v * v_freq_lo, xm_v * v_freq_hi, &c, &s);
 #endif
-        const BREADTH_VEC yr = BREADTH_MUL_S(c, val[m]);
-        const BREADTH_VEC yi = BREADTH_MUL_S(s, val[m]);
+        const BREADTH_COMPUTE_VEC yr = BREADTH_MUL_S(c, val[m]);
+        const BREADTH_COMPUTE_VEC yi = BREADTH_MUL_S(s, val[m]);
         for (int k = 0; k < plan->K; ++k) {
             const size_t cu_idx = (size_t)m * (size_t)plan->K + (size_t)k;
-            const BREADTH_VEC cur = BREADTH_SPLAT(current_conjU_r[cu_idx]);
-            const BREADTH_VEC cui = BREADTH_SPLAT(current_conjU_i[cu_idx]);
-            const BREADTH_VEC term_r = BREADTH_SUB(BREADTH_MUL(cur, yr), BREADTH_MUL(cui, yi));
-            const BREADTH_VEC term_i = BREADTH_ADD(BREADTH_MUL(cur, yi), BREADTH_MUL(cui, yr));
+            const BREADTH_COMPUTE_VEC cur = BREADTH_SPLAT(current_conjU_r[cu_idx]);
+            const BREADTH_COMPUTE_VEC cui = BREADTH_SPLAT(current_conjU_i[cu_idx]);
+            const BREADTH_COMPUTE_VEC term_r = BREADTH_SUB(BREADTH_MUL(cur, yr), BREADTH_MUL(cui, yi));
+            const BREADTH_COMPUTE_VEC term_i = BREADTH_ADD(BREADTH_MUL(cur, yi), BREADTH_MUL(cui, yr));
             const size_t t_idx = (size_t)t * (size_t)plan->K + (size_t)k;
             PFX(kahan_add_soa_breadth)(&plan->btemp_r[t_idx], &plan->btemp_i[t_idx], &plan->btemp_comp_r[t_idx], &plan->btemp_comp_i[t_idx], term_r, term_i);
         }
@@ -842,13 +990,13 @@ void PFX(lra_execute_breadth)(const struct PFX(lra_plan) * plan, const nufft_inp
     }
 
     for (int n = 0; n < plan->N; ++n) {
-        BREADTH_VEC acc_r = BREADTH_ZERO;
-        BREADTH_VEC acc_i = BREADTH_ZERO;
+        BREADTH_COMPUTE_VEC acc_r = BREADTH_ZERO;
+        BREADTH_COMPUTE_VEC acc_i = BREADTH_ZERO;
         for (int k = 0; k < plan->K; ++k) {
             const size_t idx = (size_t)n * (size_t)plan->K + (size_t)k;
             const FLOAT cvr = plan->conjV[idx];
-            acc_r = BREADTH_ADD(acc_r, BREADTH_MUL_S(plan->btemp_r[idx], cvr));
-            acc_i = BREADTH_ADD(acc_i, BREADTH_MUL_S(plan->btemp_i[idx], cvr));
+            acc_r = BREADTH_ADD(acc_r, BREADTH_MUL_S(LOAD_BVEC(&plan->btemp_r[idx]), cvr));
+            acc_i = BREADTH_ADD(acc_i, BREADTH_MUL_S(LOAD_BVEC(&plan->btemp_i[idx]), cvr));
         }
         STORE_BVEC(&out_real[n], acc_r);
         STORE_BVEC(&out_imag[n], acc_i);
@@ -922,14 +1070,24 @@ static inline int PFX(positive_mod_int)(int value, int modulus) {
 static inline int PFX(round_up_int)(int value, int multiple) { return ((value + multiple - 1) / multiple) * multiple; }
 
 static inline bool PFX(pswf_lut_lookup)(int w, bool mode43, const FLOAT **coeffs, int *deg, FLOAT *c) {
-#ifdef DOUBLE
+#if defined(HALF)
+    if (w == 4 || w == 5) {
+        int idx = w - 4;
+        *coeffs = mode43 ? PFX(pswf43_h_coeffs)[idx] : PFX(pswf21_h_coeffs)[idx];
+        *deg = 5;
+        *c = mode43 ? PFX(pswf43_h_c)[idx] : PFX(pswf21_h_c)[idx];
+        return true;
+    }
+    return false;
+#else
+#    ifdef DOUBLE
     if (mode43 && (w == 8 || w == 9 || w == 16 || w == 18)) {
         *coeffs = PFX(pswf43_coeffs)[w];
         *deg = PFX(pswf43_degrees)[w];
         *c = PFX(pswf43_c)[w];
         return true;
     }
-#endif
+#    endif
 
     if (!mode43 && w < 19) {
         *coeffs = PFX(pswf_coeffs)[w];
@@ -939,6 +1097,7 @@ static inline bool PFX(pswf_lut_lookup)(int w, bool mode43, const FLOAT **coeffs
     }
 
     return false;
+#endif
 }
 
 static inline int PFX(pswf_kernel_scale_exp)(int w, bool mode43, bool is_ppoly) {
@@ -1002,27 +1161,27 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
     FLOAT c = FCAST(0.0);
     bool has_lut = PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c);
     const FLOAT log_scale = PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false));
-    const INTERNAL_VEC v_log_scale = (INTERNAL_VEC){} + log_scale;
+    const INTERNAL_VEC v_log_scale = IVEC_SPLAT(log_scale);
 
     int n_vec = n - (n % INTERNAL_VEC_LEN);
 
     if (has_lut) {
-        FLOAT neg_c_half = NEG(MUL(c, FCAST(0.5)));
+        const INTERNAL_VEC v_neg_c_half = IVEC_SPLAT(NEG(MUL(c, FCAST(0.5))));
 
         for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
             INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
             INTERNAL_VEC v_Z = MUL(v_z, v_z);
 
-            INTERNAL_VEC v_poly = (INTERNAL_VEC){} + coeffs[deg];
-            for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), (INTERNAL_VEC){} + coeffs[j]);
+            INTERNAL_VEC v_poly = IVEC_SPLAT(coeffs[deg]);
+            for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), IVEC_SPLAT(coeffs[j]));
 
-            INTERNAL_VEC v_result = MUL(M_EXP(ADD(v_log_scale, MUL(v_Z, neg_c_half))), v_poly);
+            INTERNAL_VEC v_result = MUL(M_EXP(ADD(v_log_scale, MUL(v_Z, v_neg_c_half))), v_poly);
             STORE_VEC(&out_arr[i], v_result);
         }
     } else {
         FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
-        INTERNAL_VEC v_one = (INTERNAL_VEC){} + FCAST(1.0);
-        INTERNAL_VEC v_beta = (INTERNAL_VEC){} + beta;
+        INTERNAL_VEC v_one = IVEC_SPLAT(FCAST(1.0));
+        INTERNAL_VEC v_beta = IVEC_SPLAT(beta);
 
         for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
             INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
@@ -1030,7 +1189,7 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
             INTERNAL_VEC v_inner = SUB(v_one, v_Z);
 
             for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
-                if (v_inner[lane] < FCAST(0.0)) v_inner[lane] = FCAST(0.0);
+                if (v_inner[lane] < (IVEC_SCALAR)0.0) v_inner[lane] = (IVEC_SCALAR)0.0;
             }
 
             INTERNAL_VEC v_result = M_EXP(ADD(v_log_scale, MUL(v_beta, SUB(M_SQRT(v_inner), v_one))));
@@ -1321,6 +1480,8 @@ static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stri
     double panel_mono[PSWF_MAX_W][PSWF_PPOLY_MAX_NC];
 #    if defined(DOUBLE)
     const double tol = 1e-15;
+#    elif defined(HALF)
+    const double tol = 2e-4;
 #    else
     const double tol = 1e-7;
 #    endif
@@ -1389,7 +1550,7 @@ static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stri
 }
 
 static inline FLOAT PFX(ppoly_eval_scalar)(FLOAT z, int w, int nc, int stride, const FLOAT *coeffs) {
-    double zd = (double)z;
+    double zd = TO_DOUBLE(z);
     if (zd < -1.0) zd = -1.0;
     if (zd > 1.0) zd = 1.0;
     double s = 0.5 * (double)w * (zd + 1.0);
@@ -1418,12 +1579,22 @@ int PFX(pswf_bench_ppoly_gen)(int w, const char upsamp[2], int reps) {
 }
 
 static inline INTERNAL_VEC PFX(load_vec_u)(const FLOAT *p) {
+#    if defined(HALF) && !NANOFFT_NATIVE_FP16
+    return LOAD_VEC(p);
+#    else
     INTERNAL_VEC v;
     memcpy(&v, p, sizeof(v));
     return v;
+#    endif
 }
 
-static inline void PFX(store_vec_u)(FLOAT *p, INTERNAL_VEC v) { memcpy(p, &v, sizeof(v)); }
+static inline void PFX(store_vec_u)(FLOAT *p, INTERNAL_VEC v) {
+#    if defined(HALF) && !NANOFFT_NATIVE_FP16
+    STORE_VEC(p, v);
+#    else
+    memcpy(p, &v, sizeof(v));
+#    endif
+}
 
 static inline INTERNAL_VEC PFX(rev_vec)(INTERNAL_VEC v) {
 #    if INTERNAL_VEC_LEN == 2
@@ -1434,6 +1605,9 @@ static inline INTERNAL_VEC PFX(rev_vec)(INTERNAL_VEC v) {
     return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 7, 6, 5, 4, 3, 2, 1, 0);
 #    elif INTERNAL_VEC_LEN == 16
     return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+#    elif INTERNAL_VEC_LEN == 32
+    return NANOFFT_SHUFFLE1(INTERNAL_VEC_INT, v, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
+                            1, 0);
 #    else
     INTERNAL_VEC out;
     for (int i = 0; i < INTERNAL_VEC_LEN; ++i) out[i] = v[INTERNAL_VEC_LEN - 1 - i];
@@ -1454,10 +1628,10 @@ static inline void PFX(scatter_vec_u)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NANOFFT
  * stalls, no wasted padded-tail RMWs).  Requires nc even >= 2. */
 static inline void PFX(ppoly_spread_point)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NANOFFT_RESTRICT fi, const FLOAT *NANOFFT_RESTRICT coeffs, int first, FLOAT u,
                                            FLOAT sy_r, FLOAT sy_i, int w, int nc, int stride) {
-    const INTERNAL_VEC v_u = (INTERNAL_VEC){} + u;
+    const INTERNAL_VEC v_u = IVEC_SPLAT(u);
     const INTERNAL_VEC v_u2 = MUL(v_u, v_u);
-    const INTERNAL_VEC v_sy_r = (INTERNAL_VEC){} + sy_r;
-    const INTERNAL_VEC v_sy_i = (INTERNAL_VEC){} + sy_i;
+    const INTERNAL_VEC v_sy_r = IVEC_SPLAT(sy_r);
+    const INTERNAL_VEC v_sy_i = IVEC_SPLAT(sy_i);
     const int V = INTERNAL_VEC_LEN;
 
     if (w <= V) {
@@ -1529,7 +1703,7 @@ static inline void PFX(ppoly_spread_point)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NA
             INTERNAL_VEC v_sym = SUB(k_even, u_odd);
             int tail = rem - V;
             for (int t = 0; t < tail; ++t) {
-                FLOAT kt = v_sym[t];
+                FLOAT kt = FCAST(v_sym[t]);
                 int idx = first + w - mid - 1 - t;
                 fr[idx] = ADD(fr[idx], MUL(sy_r, kt));
                 fi[idx] = ADD(fi[idx], MUL(sy_i, kt));
@@ -1571,7 +1745,7 @@ static inline void PFX(ppoly_spread_point)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NA
  * one point into aligned stack storage `kval[0..w-1]`, shared across all
  * BREADTH_VEC_LEN lanes in breadth spreading. */
 static inline void PFX(ppoly_eval_weights)(FLOAT *NANOFFT_RESTRICT kval, const FLOAT *NANOFFT_RESTRICT coeffs, FLOAT u, int w, int nc, int stride) {
-    const INTERNAL_VEC v_u = (INTERNAL_VEC){} + u;
+    const INTERNAL_VEC v_u = IVEC_SPLAT(u);
     const INTERNAL_VEC v_u2 = MUL(v_u, v_u);
     const int V = INTERNAL_VEC_LEN;
 
@@ -1638,7 +1812,7 @@ static inline void PFX(ppoly_eval_weights)(FLOAT *NANOFFT_RESTRICT kval, const F
         if (rem > V) {
             const INTERNAL_VEC v_sym = SUB(k_even, u_odd);
             const int tail = rem - V;
-            for (int t = 0; t < tail; ++t) kval[w - mid - 1 - t] = v_sym[t];
+            for (int t = 0; t < tail; ++t) kval[w - mid - 1 - t] = FCAST(v_sym[t]);
         }
         return;
     }
@@ -1688,7 +1862,11 @@ struct PFX(pswf_plan) * PFX(pswf_initialize_opts)(int Mpoints, int N, int w, dou
     plan->df = df;
     plan->is_breadth = (vec_mode == TLS_VEC_BREADTH) ? 1 : 0;
     plan->Nfft = next_fast_len(2 * N);
+#if defined(HALF)
+    plan->alpha = FCAST((double)plan->w * 0.5 / (double)plan->Nfft);
+#else
     plan->alpha = DIV(MUL(FCAST(plan->w), FCONST(0.5)), FCAST(plan->Nfft));
+#endif
 
 #if !defined(DOUBLE_DOUBLE)
     if (spread_mode == TLS_SPREAD_PIECEWISE) {
@@ -1856,6 +2034,19 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     const FLOAT fw = FCAST(plan->w);
     for (int j = 0; j < p; ++j) precomp_vals[j] = MUL(MUL(fw, gl_weights[j]), precomp_vals[j]);
 
+#if defined(HALF)
+    {
+        const double alpha_d = (double)plan->w * 0.5 / (double)plan->Nfft;
+        for (int k = 0; k < plan->Nout; ++k) {
+            const double xi_k = alpha_d * (double)(k - plan->output_shift);
+            double phi_hat_half = 0.0;
+            for (int j = 0; j < p; ++j) {
+                phi_hat_half += TO_DOUBLE(precomp_vals[j]) * cos2pi(xi_k * TO_DOUBLE(gl_nodes[j]));
+            }
+            plan->deconv[k] = FCAST(1.0 / phi_hat_half);
+        }
+    }
+#else
     for (int k = 0; k < plan->Nout; ++k) {
         FLOAT xi_k = MUL(plan->alpha, FCAST(k - plan->output_shift));
         FLOAT phi_hat_half = FCAST(0.0);
@@ -1864,6 +2055,7 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
 
         plan->deconv[k] = DIV(FCAST(1.0), phi_hat_half);
     }
+#endif
 
     nanofft_aligned_free(precomp_vals);
     nanofft_aligned_free(gl_nodes);
@@ -2134,8 +2326,8 @@ static void PFX(pswf_emit_slots_breadth)(const struct PFX(pswf_plan) * plan, con
         for (int k = 0; k < nvalid; ++k) {
             const int src = (int)plan->slot_offsets[k];
             const FLOAT d = sd[src];
-            *dst_r++ = BREADTH_MUL_S(LOAD_BVEC(&sr[src]), d);
-            *dst_i++ = BREADTH_MUL_S(LOAD_BVEC(&si[src]), d);
+            STORE_BVEC(dst_r++, BREADTH_MUL_S(LOAD_BVEC(&sr[src]), d));
+            STORE_BVEC(dst_i++, BREADTH_MUL_S(LOAD_BVEC(&si[src]), d));
         }
     }
 }
@@ -2160,10 +2352,61 @@ void PFX(pswf_finish_slots_breadth)(struct PFX(pswf_plan) * plan, const BREADTH_
         const int count_v = (rem < block) ? rem : block;
         const int first = (split < count_v) ? split : count_v;
         FLOAT *dst = out + (size_t)v * (size_t)block;
-        for (int k = 0; k < first; ++k) dst[k] = BREADTH_GET_LANE(padded[first_bin + k], v);
-        for (int k = first; k < count_v; ++k) dst[k] = BREADTH_GET_LANE(padded[k - split], v);
+        for (int k = 0; k < first; ++k) dst[k] = BREADTH_GET_LANE(LOAD_BVEC(&padded[first_bin + k]), v);
+        for (int k = first; k < count_v; ++k) dst[k] = BREADTH_GET_LANE(LOAD_BVEC(&padded[k - split]), v);
     }
 }
+
+#if defined(HALF)
+static inline uint32_t PFX(log2_u32)(uint32_t n) {
+    uint32_t bits = 0u;
+    while (n > 1u) {
+        n >>= 1u;
+        ++bits;
+    }
+    return bits;
+}
+
+void PFX(pswf_finish_slots_f32)(struct PFX(pswf_plan) * plan, const float *compact, float *out, int count) {
+    if (!plan || !compact || !out || count <= 0 || plan->period <= 0) return;
+    const uint32_t log_nfft = PFX(log2_u32)((uint32_t)plan->Nfft);
+    const int split = plan->output_shift;
+    const int first_bin = plan->Nfft - split;
+    int s = 0;
+    for (int base = 0; base < plan->slots; base += plan->period) {
+        for (int k = 0; k < plan->nvalid; ++k) {
+            const uint32_t slot_pos = (uint32_t)(base + (int)plan->slot_offsets[k]);
+            const int bin = (int)nanofft_reverse_bits(slot_pos, log_nfft);
+            const int out_idx = (bin >= first_bin) ? (bin - first_bin) : (bin + split);
+            if (out_idx >= 0 && out_idx < count) out[out_idx] = compact[s];
+            ++s;
+        }
+    }
+}
+
+void PFX(pswf_finish_slots_breadth_f32)(struct PFX(pswf_plan) * plan, const float *compact, float *out, int block, int active_lanes, int total_remaining) {
+    if (!plan || !plan->is_breadth || !compact || !out || active_lanes <= 0 || total_remaining <= 0 || plan->period <= 0) return;
+    const uint32_t log_nfft = PFX(log2_u32)((uint32_t)plan->Nfft);
+    const int split = plan->output_shift;
+    const int first_bin = plan->Nfft - split;
+    int s = 0;
+    for (int base = 0; base < plan->slots; base += plan->period) {
+        for (int k = 0; k < plan->nvalid; ++k) {
+            const uint32_t slot_pos = (uint32_t)(base + (int)plan->slot_offsets[k]);
+            const int bin = (int)nanofft_reverse_bits(slot_pos, log_nfft);
+            const int out_idx = (bin >= first_bin) ? (bin - first_bin) : (bin + split);
+            const float *src = compact + (size_t)s * (size_t)BREADTH_VEC_LEN;
+            if (out_idx >= 0 && out_idx < block) {
+                for (int v = 0; v < active_lanes; ++v) {
+                    const int rem = total_remaining - v * block;
+                    if (out_idx < rem) out[(size_t)v * (size_t)block + (size_t)out_idx] = src[v];
+                }
+            }
+            ++s;
+        }
+    }
+}
+#endif
 
 /* Slot support is built on demand: a plan that only ever produces frequency
  * order (the IHS d = 1 path, every natural-order call) never pays for it.
@@ -2225,8 +2468,8 @@ void PFX(pswf_execute_mode)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, c
             size_t w_base = (size_t)m * plan->spread_stride;
 
 #if INTERNAL_VEC_LEN > 1
-            INTERNAL_VEC v_sy_r = (INTERNAL_VEC){} + sy_r;
-            INTERNAL_VEC v_sy_i = (INTERNAL_VEC){} + sy_i;
+            INTERNAL_VEC v_sy_r = IVEC_SPLAT(sy_r);
+            INTERNAL_VEC v_sy_i = IVEC_SPLAT(sy_i);
 
             for (int l = 0; l < plan->spread_stride; l += INTERNAL_VEC_LEN) {
                 int idx = base + l;
@@ -2301,6 +2544,13 @@ void PFX(pswf_execute_breadth)(struct PFX(pswf_plan) * plan, const nufft_input_t
     for (int v = 0; v < VEC_LEN; ++v) {
         v_freq[v] = (double)freq_factor * (f0 + ((double)(block_base + v) * (double)block + (double)plan->output_shift) * plan->df);
     }
+#elif defined(HALF) && NANOFFT_NATIVE_FP16
+    VEC v_freq[VECH_LEN / VEC_LEN];
+    for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) {
+        for (int v = 0; v < VEC_LEN; ++v) {
+            v_freq[ch][v] = (double)freq_factor * (f0 + ((double)(block_base + ch * VEC_LEN + v) * (double)block + (double)plan->output_shift) * plan->df);
+        }
+    }
 #else
     VEC v_freq_lo, v_freq_hi;
     for (int v = 0; v < VEC_LEN; ++v) {
@@ -2321,15 +2571,20 @@ void PFX(pswf_execute_breadth)(struct PFX(pswf_plan) * plan, const nufft_input_t
         FLOAT kval[64] __attribute__((aligned(64)));
 
         for (int m = 0; m < plan->Mpoints; ++m) {
-            BREADTH_VEC c, s;
+            BREADTH_COMPUTE_VEC c, s;
 #    if defined(DOUBLE)
             vec_sincos2pi(((VEC){} + x[m]) * v_freq, &c, &s);
+#    elif defined(HALF) && NANOFFT_NATIVE_FP16
+            const VEC xm_v = (VEC){} + x[m];
+            VEC ang[VECH_LEN / VEC_LEN];
+            for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) ang[ch] = xm_v * v_freq[ch];
+            vech_sincos2pi_d(ang, &c, &s);
 #    else
             const VEC xm_v = (VEC){} + x[m];
             vecf_sincos2pi_d(xm_v * v_freq_lo, xm_v * v_freq_hi, &c, &s);
 #    endif
-            const BREADTH_VEC sy_r = BREADTH_MUL_S(c, val[m]);
-            const BREADTH_VEC sy_i = BREADTH_MUL_S(s, val[m]);
+            const BREADTH_COMPUTE_VEC sy_r = BREADTH_MUL_S(c, val[m]);
+            const BREADTH_COMPUTE_VEC sy_i = BREADTH_MUL_S(s, val[m]);
             const int first = current_first_idx[m];
             PFX(ppoly_eval_weights)(kval, coeffs, current_z[m], w, nc, stride);
             for (int l = 0; l < w; ++l) {
@@ -2344,17 +2599,22 @@ void PFX(pswf_execute_breadth)(struct PFX(pswf_plan) * plan, const nufft_input_t
     {
         const FLOAT *current_spread_weight = plan->spread_weight + offset_base * (size_t)w;
         for (int m = 0; m < plan->Mpoints; ++m) {
-            BREADTH_VEC c, s;
+            BREADTH_COMPUTE_VEC c, s;
 #if defined(DOUBLE_DOUBLE)
             vecdd_sincos2pi(vecdd_mul(vecdd_splat(x[m]), v_freq), &c, &s);
 #elif defined(DOUBLE)
             vec_sincos2pi(((VEC){} + x[m]) * v_freq, &c, &s);
+#elif defined(HALF) && NANOFFT_NATIVE_FP16
+            const VEC xm_v = (VEC){} + x[m];
+            VEC ang[VECH_LEN / VEC_LEN];
+            for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) ang[ch] = xm_v * v_freq[ch];
+            vech_sincos2pi_d(ang, &c, &s);
 #else
             const VEC xm_v = (VEC){} + x[m];
             vecf_sincos2pi_d(xm_v * v_freq_lo, xm_v * v_freq_hi, &c, &s);
 #endif
-            const BREADTH_VEC sy_r = BREADTH_MUL_S(c, val[m]);
-            const BREADTH_VEC sy_i = BREADTH_MUL_S(s, val[m]);
+            const BREADTH_COMPUTE_VEC sy_r = BREADTH_MUL_S(c, val[m]);
+            const BREADTH_COMPUTE_VEC sy_i = BREADTH_MUL_S(s, val[m]);
             const int first = current_first_idx[m];
             const FLOAT *kw = current_spread_weight + (size_t)m * (size_t)w;
             for (int l = 0; l < w; ++l) {

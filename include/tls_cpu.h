@@ -59,6 +59,8 @@ TLS_API unsigned long tls_probe_sve_vector_length(void);
 #define TLS_CPU_DOTPROD (1ull << 22)
 #define TLS_CPU_I8MM (1ull << 23)
 #define TLS_CPU_BF16 (1ull << 24)
+#define TLS_CPU_AVX512FP16 (1ull << 25)
+#define TLS_CPU_FP16 (1ull << 26)
 
 TLS_API unsigned long long tls_cpu_features(void);
 
