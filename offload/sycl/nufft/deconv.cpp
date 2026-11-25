@@ -10,8 +10,8 @@
 #  define SYCL_FFT_DF 1
 #endif
 
-#define SYCL_NUFFT_KERNEL_ONLY 1
 #include "nufft/nufft1.hpp"
+#include "nufft/pswf_coeffs.hpp"
 #include "common/precision.hpp"
 
 namespace sycl_nufft {

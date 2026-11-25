@@ -1,9 +1,6 @@
 // Pure-Host NuFFT-1 Plan Orchestration Unit (ZERO SYCL device kernels / 0 KiB HCF).
 // Derives all spreading, transposition, deconvolution, and L2-chunking parameters dynamically
 // from DeviceFftConfig + BankModel + persistent AutotuneCache (zero hardcoded GPU constants).
-#define SYCL_FFT_EXTERN_DEVICE 1
-#define SYCL_FFT_USE_EXTERN_TEMPLATES 1
-#define SYCL_NUFFT_PLAN_IMPLEMENTATION_TU 1
 #include "nufft/nufft1.hpp"
 
 #include <chrono>

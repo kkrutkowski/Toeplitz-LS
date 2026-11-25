@@ -36,31 +36,28 @@ TARGET := $(TEST_BUILD)/sycl_bench
 COMMON_HEADERS := \
 	$(ROOT)/common/math.hpp \
 	$(ROOT)/common/layout.hpp \
-	$(ROOT)/common/device.hpp \
-	$(ROOT)/common/precision.hpp
+	$(ROOT)/common/device.hpp
 
 FFT_HEADERS := \
 	$(COMMON_HEADERS) \
 	$(ROOT)/bitrev/bitrev.hpp \
-	$(ROOT)/fft/dif.hpp \
-	$(ROOT)/fft/dif_impl.hpp
+	$(ROOT)/fft/dif.hpp
 
 NUFFT_BASE_HEADERS := \
 	$(FFT_HEADERS) \
-	$(ROOT)/nufft/pswf_coeffs.hpp \
 	$(ROOT)/nufft/nufft1.hpp
 
 CORE_OBJS := \
 	$(OBJDIR)/common/device.o \
-	$(OBJDIR)/bitrev/inst.o \
-	$(OBJDIR)/fft/inst_fp16_small.o \
-	$(OBJDIR)/fft/inst_fp16_large.o \
-	$(OBJDIR)/fft/inst_fp32_small.o \
-	$(OBJDIR)/fft/inst_fp32_large.o \
-	$(OBJDIR)/fft/inst_fp64_small.o \
-	$(OBJDIR)/fft/inst_fp64_large.o \
-	$(OBJDIR)/fft/inst_df_small.o \
-	$(OBJDIR)/fft/inst_df_large.o \
+	$(OBJDIR)/bitrev/bitrev.o \
+	$(OBJDIR)/fft/dif_fp16_small.o \
+	$(OBJDIR)/fft/dif_fp16_large.o \
+	$(OBJDIR)/fft/dif_fp32_small.o \
+	$(OBJDIR)/fft/dif_fp32_large.o \
+	$(OBJDIR)/fft/dif_fp64_small.o \
+	$(OBJDIR)/fft/dif_fp64_large.o \
+	$(OBJDIR)/fft/dif_df_small.o \
+	$(OBJDIR)/fft/dif_df_large.o \
 	$(OBJDIR)/nufft/aux.o \
 	$(OBJDIR)/nufft/spread_fp16.o \
 	$(OBJDIR)/nufft/spread_fp32.o \
@@ -88,7 +85,7 @@ $(TARGET): $(TEST_OBJS) $(CORE_OBJS)
 
 $(TEST_BUILD)/main.o: main.cpp $(NUFFT_BASE_HEADERS)
 	@mkdir -p $(dir $@)
-	$(ACPP) $(ACPP_FLAGS) -DSYCL_FFT_USE_EXTERN_TEMPLATES=1 -DSYCL_FFT_EXTERN_DEVICE=1 -c $< -o $@
+	$(ACPP) $(ACPP_FLAGS) -c $< -o $@
 
 run: all
 	$(TARGET)

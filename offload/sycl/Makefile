@@ -43,31 +43,28 @@ TARGET_SO := $(LIBDIR)/tls_sycl.so
 COMMON_HEADERS := \
 	common/math.hpp \
 	common/layout.hpp \
-	common/device.hpp \
-	common/precision.hpp
+	common/device.hpp
 
 FFT_HEADERS := \
 	$(COMMON_HEADERS) \
 	bitrev/bitrev.hpp \
-	fft/dif.hpp \
-	fft/dif_impl.hpp
+	fft/dif.hpp
 
 NUFFT_BASE_HEADERS := \
 	$(FFT_HEADERS) \
-	nufft/pswf_coeffs.hpp \
 	nufft/nufft1.hpp
 
 CORE_OBJS := \
 	$(OBJDIR)/common/device.o \
-	$(OBJDIR)/bitrev/inst.o \
-	$(OBJDIR)/fft/inst_fp16_small.o \
-	$(OBJDIR)/fft/inst_fp16_large.o \
-	$(OBJDIR)/fft/inst_fp32_small.o \
-	$(OBJDIR)/fft/inst_fp32_large.o \
-	$(OBJDIR)/fft/inst_fp64_small.o \
-	$(OBJDIR)/fft/inst_fp64_large.o \
-	$(OBJDIR)/fft/inst_df_small.o \
-	$(OBJDIR)/fft/inst_df_large.o \
+	$(OBJDIR)/bitrev/bitrev.o \
+	$(OBJDIR)/fft/dif_fp16_small.o \
+	$(OBJDIR)/fft/dif_fp16_large.o \
+	$(OBJDIR)/fft/dif_fp32_small.o \
+	$(OBJDIR)/fft/dif_fp32_large.o \
+	$(OBJDIR)/fft/dif_fp64_small.o \
+	$(OBJDIR)/fft/dif_fp64_large.o \
+	$(OBJDIR)/fft/dif_df_small.o \
+	$(OBJDIR)/fft/dif_df_large.o \
 	$(OBJDIR)/nufft/aux.o \
 	$(OBJDIR)/nufft/spread_fp16.o \
 	$(OBJDIR)/nufft/spread_fp32.o \
@@ -102,7 +99,7 @@ $(OBJDIR)/common/device.o: common/device.cpp $(COMMON_HEADERS)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
 
-$(OBJDIR)/bitrev/inst.o: bitrev/inst.cpp $(COMMON_HEADERS) bitrev/bitrev.hpp
+$(OBJDIR)/bitrev/bitrev.o: bitrev/bitrev.cpp $(COMMON_HEADERS) bitrev/bitrev.hpp
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
 
@@ -111,23 +108,23 @@ PREC_FLAG_fp32 := -DSYCL_FFT_FLOAT
 PREC_FLAG_fp64 := -DSYCL_FFT_DOUBLE
 PREC_FLAG_df   := -DSYCL_FFT_DF
 
-$(OBJDIR)/fft/inst_%_small.o: fft/inst.cpp $(FFT_HEADERS)
+$(OBJDIR)/fft/dif_%_small.o: fft/dif.cpp $(FFT_HEADERS) common/precision.hpp
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -DSYCL_FFT_INST_SMALL_ONLY -c $< -o $@
 
-$(OBJDIR)/fft/inst_%_large.o: fft/inst.cpp $(FFT_HEADERS)
+$(OBJDIR)/fft/dif_%_large.o: fft/dif.cpp $(FFT_HEADERS) common/precision.hpp
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -DSYCL_FFT_INST_LARGE_ONLY -c $< -o $@
 
-$(OBJDIR)/nufft/aux.o: nufft/aux.cpp common/math.hpp nufft/nufft1.hpp
+$(OBJDIR)/nufft/aux.o: nufft/aux.cpp $(NUFFT_BASE_HEADERS)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
 
-$(OBJDIR)/nufft/spread_%.o: nufft/spread.cpp common/math.hpp common/precision.hpp nufft/pswf_coeffs.hpp nufft/nufft1.hpp
+$(OBJDIR)/nufft/spread_%.o: nufft/spread.cpp $(NUFFT_BASE_HEADERS) common/precision.hpp nufft/pswf_coeffs.hpp
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -c $< -o $@
 
-$(OBJDIR)/nufft/deconv_%.o: nufft/deconv.cpp common/math.hpp common/precision.hpp nufft/pswf_coeffs.hpp nufft/nufft1.hpp
+$(OBJDIR)/nufft/deconv_%.o: nufft/deconv.cpp $(NUFFT_BASE_HEADERS) common/precision.hpp nufft/pswf_coeffs.hpp
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -c $< -o $@
 

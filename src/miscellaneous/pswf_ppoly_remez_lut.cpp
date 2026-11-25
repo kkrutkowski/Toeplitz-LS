@@ -820,10 +820,13 @@ void emit_header(const std::string &path,
     out << "// Pipeline: Chebyshev L^2 -> Uniform L^4 -> L^8 -> L^12 -> L^16 IRLS -> Remez.\n\n";
     out << "#include \"common/math.hpp\"\n\n";
     out << "namespace sycl_nufft {\n\n";
+    out << "#ifndef SYCL_NUFFT_PSWF_MODE_DEFINED\n";
+    out << "#define SYCL_NUFFT_PSWF_MODE_DEFINED 1\n";
     out << "enum class PswfMode : int {\n";
     out << "    PSWF21 = 0, // sigma = 2.0,  N_out = N,     output_shift = N/2,   N_fft = bitceil(2N)\n";
     out << "    PSWF43 = 1  // sigma = 4/3,  N_out = 3N/2,  output_shift = 3N/4,  N_fft = bitceil(2N)\n";
-    out << "};\n\n";
+    out << "};\n";
+    out << "#endif\n\n";
 
     out << "template <int W, int NEven, int NOdd>\n";
     out << "struct PswfPiecewiseTableF16 {\n";

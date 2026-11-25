@@ -12,21 +12,7 @@
 //   - FINUFFT-adjacent Gauss-Legendre-free self-FT deconvolution pass
 //   - Primary fast path: Natural-to-bit-reversed (SlotBitReversed) transform
 
-#if !defined(SYCL_NUFFT_KERNEL_ONLY)
 #include "fft/dif.hpp"
-#else
-#include "common/math.hpp"
-#endif
-#if !defined(SYCL_NUFFT_NO_COEFFS)
-#include "nufft/pswf_coeffs.hpp"
-#else
-namespace sycl_nufft {
-enum class PswfMode : int {
-    PSWF21 = 0,
-    PSWF43 = 1
-};
-} // namespace sycl_nufft
-#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -36,12 +22,19 @@ enum class PswfMode : int {
 
 namespace sycl_nufft {
 
+#ifndef SYCL_NUFFT_PSWF_MODE_DEFINED
+#define SYCL_NUFFT_PSWF_MODE_DEFINED 1
+enum class PswfMode : int {
+    PSWF21 = 0, // sigma = 2.0,  N_out = N,     output_shift = N/2,   N_fft = bitceil(2N)
+    PSWF43 = 1  // sigma = 4/3,  N_out = 3N/2,  output_shift = 3N/4,  N_fft = bitceil(2N)
+};
+#endif
+
 enum class NufftOutOrder : int {
     SlotBitReversed = 0, // Primary fast path: raw DIF slot order (no bit-reversal pass)
     Natural         = 1  // Verification path: natural frequency order k in [0, N_out)
 };
 
-#if !defined(SYCL_NUFFT_KERNEL_ONLY)
 // Hardware-generalized NuFFT-1 launch configuration (all fields auto-derived when 0/empty)
 struct Nufft1LaunchConfig {
     sycl_fft::FftLaunchConfig fft_cfg{};
@@ -59,7 +52,6 @@ struct Nufft1LaunchConfig {
         return !deconv_variant_override.empty();
     }
 };
-#endif
 
 // Runtime spreading execution parameters (derived dynamically from DeviceFftConfig & BankModel)
 struct SpreadConfig {
@@ -306,7 +298,6 @@ void launch_deconv_emitdf(
 
 } // namespace detail
 
-#if !defined(SYCL_NUFFT_KERNEL_ONLY)
 namespace detail {
 // --- Precision tags for Nufft1PlanBase ---
 struct HalfPlanTraits {
@@ -490,18 +481,14 @@ private:
     ComplexT*          d_fft_buf_        = nullptr;
 };
 
-#if !defined(SYCL_NUFFT_PLAN_IMPLEMENTATION_TU)
 extern template class Nufft1PlanBase<detail::HalfPlanTraits>;
 extern template class Nufft1PlanBase<detail::FloatPlanTraits>;
 extern template class Nufft1PlanBase<detail::DoublePlanTraits>;
 extern template class Nufft1PlanBase<detail::DfPlanTraits>;
-#endif
 
 using Nufft1Planh  = Nufft1PlanBase<detail::HalfPlanTraits>;
 using Nufft1Planf  = Nufft1PlanBase<detail::FloatPlanTraits>;
 using Nufft1Plan   = Nufft1PlanBase<detail::DoublePlanTraits>;
 using Nufft1Plandf = Nufft1PlanBase<detail::DfPlanTraits>;
-
-#endif // !SYCL_NUFFT_KERNEL_ONLY
 
 } // namespace sycl_nufft

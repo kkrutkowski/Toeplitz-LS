@@ -1,13 +1,13 @@
 #pragma once
 
-// Quadruple-Precision SYCL DIF (Sande-Tukey) Radix-2 FFT Umbrella Header:
-//   FP16 (2x):   h suffix   (Complexh,  DifFftPlanh,  sin2pih/cos2pih,   ...)
-//   FP32:        f suffix   (Complexf,  DifFftPlanf,  sin2pif/cos2pif,   ...)
-//   FP64:        no suffix  (Complex,   DifFftPlan,   sin2pi/cos2pi,     ...)
-//   DoubleFloat: df suffix  (Complexdf, DifFftPlandf, sin2pidf/cos2pidf, ...)
+// Quadruple-Precision SYCL DIF (Sande-Tukey) Radix-2 FFT Header (Declarations Only):
+//   FP16 (2x):   h suffix   (Complexh,  DifFftPlanh,  ...)
+//   FP32:        f suffix   (Complexf,  DifFftPlanf,  ...)
+//   FP64:        no suffix  (Complex,   DifFftPlan,   ...)
+//   DoubleFloat: df suffix  (Complexdf, DifFftPlandf, ...)
 //
-// Optional selective-instantiation guards:
-//   SYCL_FFT_ONLY_HALF / SYCL_FFT_ONLY_FLOAT / SYCL_FFT_ONLY_DOUBLE / SYCL_FFT_ONLY_DF
+// All FFT kernels and DifFftPlan implementations live in fft/dif.cpp (compiled per
+// precision and small/large split into isolated HCF modules).
 //
 // Sign convention compile-time controls (default: +1 only):
 //   SYCL_FFT_ENABLE_POS_SIGN (0 or 1, default 1)
@@ -36,82 +36,159 @@
 #define SYCL_FFT_DEFAULT_SIGN (-1)
 #endif
 #endif
+
 #include "common/math.hpp"
 #include "common/layout.hpp"
 #include "common/device.hpp"
 #include "bitrev/bitrev.hpp"
-#include <algorithm>
+
+#include <cstddef>
 #include <memory>
-#include <new>
-#include <stdexcept>
+#include <string>
+#include <vector>
 
-#if !defined(SYCL_FFT_ONLY_FLOAT) && !defined(SYCL_FFT_ONLY_DOUBLE) && !defined(SYCL_FFT_ONLY_DF)
-#undef SYCL_FFT_DOUBLE
-#undef SYCL_FFT_DF
-#define SYCL_FFT_HALF
-#include "common/precision.hpp"
-#include "fft/dif_impl.hpp"
-#undef SYCL_FFT_HALF
+namespace sycl_fft {
+
+#if SYCL_FFT_ENABLE_NEG_SIGN
+#define SYCL_FFT_EXTERN_DECL_NEG(PlanName) extern template class PlanName<-1>;
+#else
+#define SYCL_FFT_EXTERN_DECL_NEG(PlanName)
 #endif
 
-#if !defined(SYCL_FFT_ONLY_HALF) && !defined(SYCL_FFT_ONLY_DOUBLE) && !defined(SYCL_FFT_ONLY_DF)
-#undef SYCL_FFT_HALF
-#undef SYCL_FFT_DOUBLE
-#undef SYCL_FFT_DF
-#include "common/precision.hpp"
-#include "fft/dif_impl.hpp"
+#if SYCL_FFT_ENABLE_POS_SIGN
+#define SYCL_FFT_EXTERN_DECL_POS(PlanName) extern template class PlanName<+1>;
+#else
+#define SYCL_FFT_EXTERN_DECL_POS(PlanName)
 #endif
 
-#if !defined(SYCL_FFT_ONLY_HALF) && !defined(SYCL_FFT_ONLY_FLOAT) && !defined(SYCL_FFT_ONLY_DF)
-#undef SYCL_FFT_HALF
-#undef SYCL_FFT_DF
-#define SYCL_FFT_DOUBLE
-#include "common/precision.hpp"
-#include "fft/dif_impl.hpp"
-#undef SYCL_FFT_DOUBLE
-#endif
+#define SYCL_FFT_DECLARE_DIF_PLAN(CandName, PlanName, ComplexType, SmemType)                  \
+struct CandName {                                                                             \
+    using ComplexT = ComplexType;                                                             \
+    using LaunchFn = void (*)(sycl::queue&, const ComplexT*, ComplexT*, size_t, bool, bool);  \
+    using ProbeFn  = KernelProbeInfo (*)(sycl::queue&, const sycl::device&);                  \
+                                                                                              \
+    const char*   variant_id;                                                                 \
+    int           logN;                                                                       \
+    size_t        wg_size;                                                                    \
+    size_t        smem_bytes;                                                                 \
+    size_t        req_sg;                                                                     \
+    int           pinned_sg;                                                                  \
+    bool          uses_wide_2t;                                                               \
+    bool          uses_stash_8192;                                                            \
+    BankModelKind bank_kind;                                                                  \
+    LaunchFn      launch;                                                                     \
+    ProbeFn       probe_bundle;                                                               \
+};                                                                                            \
+                                                                                              \
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>                                                   \
+class PlanName {                                                                              \
+    static_assert(Sign == -1 || Sign == +1, "DifFftPlan Sign must be -1 or +1");              \
+    static_assert((Sign == +1 && SYCL_FFT_ENABLE_POS_SIGN) ||                                 \
+                      (Sign == -1 && SYCL_FFT_ENABLE_NEG_SIGN),                               \
+                  "Requested DifFftPlan<Sign> is disabled at compile time (build with SIGN=pos|neg|both)"); \
+public:                                                                                       \
+    static constexpr bool kPosSign = (Sign > 0);                                              \
+    using ComplexT  = ComplexType;                                                            \
+    using SmemT     = SmemType;                                                               \
+    using Candidate = CandName;                                                               \
+                                                                                              \
+    PlanName(sycl::queue& q, int logN, size_t max_bs, const FftLaunchConfig& cfg = {});       \
+    PlanName(sycl::queue& q, int logN, size_t max_bs, size_t l2_chunk_bytes);                 \
+    ~PlanName();                                                                              \
+                                                                                              \
+    PlanName(const PlanName&) = delete;                                                       \
+    PlanName& operator=(const PlanName&) = delete;                                            \
+                                                                                              \
+    void execute_raw(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0); \
+    void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0); \
+    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs);                          \
+    void bit_reverse(ComplexT* buf, size_t bs);                                               \
+    const char* bitrev_variant_name(bool in_place = true);                                    \
+    bool bitrev_cache_hit(bool in_place = true);                                              \
+    BitRevPlan<ComplexT>& bitrev_plan();                                                      \
+                                                                                              \
+    size_t chunk_bs() const { return chunk_bs_; }                                             \
+    size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }                  \
+    size_t pass0_wg_size() const { return pass0_wg_size_; }                                   \
+    size_t bitrev_wg_size() const { return bitrev_wg_size_; }                                 \
+    int    two_pass_min_logN() const { return two_pass_min_logN_; }                           \
+    bool   is_two_pass() const { return exec_mode_ == PlanExecMode::TwoPass; }                \
+    bool   is_multistage() const { return exec_mode_ == PlanExecMode::MultiStageGlobal; }     \
+    PlanExecMode exec_mode() const { return exec_mode_; }                                     \
+    int    log_n1() const { return log_n1_; }                                                 \
+    int    log_n2() const { return log_n2_; }                                                 \
+    const char* variant_name() const { return variant_name_.c_str(); }                        \
+    size_t effective_sg_size() const { return effective_sg_size_; }                           \
+    double fp64_to_fp32_ratio() const { return fp64_to_fp32_ratio_; }                         \
+    bool   is_compute_heavy() const { return is_compute_heavy_; }                             \
+    bool   cache_hit() const { return cache_hit_; }                                           \
+    const DeviceFftConfig& device_config() const { return dev_cfg_; }                         \
+    const FftLaunchConfig& launch_config() const { return launch_cfg_; }                      \
+                                                                                              \
+private:                                                                                      \
+    struct FilteredCandidate {                                                                \
+        Candidate       cand;                                                                 \
+        KernelProbeInfo kinfo;                                                                \
+    };                                                                                        \
+                                                                                              \
+    static FftLaunchConfig make_chunk_config(size_t l2_chunk_bytes);                          \
+    static std::string format_multistage_name(int logN);                                      \
+    bool fits_candidate(const Candidate& c, bool apply_variant_override,                      \
+                        KernelProbeInfo& out_kinfo) const;                                    \
+    std::vector<FilteredCandidate> collect_candidates(int n, bool apply_variant_override) const; \
+    static bool find_by_id(const std::vector<FilteredCandidate>& valid,                       \
+                           const std::string& id, Candidate& out);                            \
+    static Candidate pick_heuristic(const std::vector<FilteredCandidate>& valid);             \
+    std::vector<FilteredCandidate> shortlist_single_pass(                                     \
+        const std::vector<FilteredCandidate>& valid) const;                                   \
+    size_t representative_tune_bs(int n) const;                                               \
+    bool tune_single_pass(int n, const std::vector<FilteredCandidate>& valid,                 \
+                          Candidate& out_winner, double& out_best_ms);                        \
+    bool resolve_single_pass_for(int n, bool apply_variant_override, bool allow_cache,        \
+                                 bool force_tune, Candidate& out_cand, bool& out_cache_hit,   \
+                                 double* out_ms = nullptr);                                   \
+    void setup_multistage(size_t max_bs);                                                     \
+    void configure_plan(size_t max_bs);                                                       \
+    BitRevPlan<ComplexT>& ensure_bitrev_plan();                                               \
+                                                                                              \
+    sycl::queue&    q_;                                                                       \
+    int             logN_;                                                                    \
+    size_t          N_;                                                                       \
+    DeviceFftConfig dev_cfg_;                                                                 \
+    FftLaunchConfig launch_cfg_;                                                              \
+    std::string     cache_path_;                                                              \
+                                                                                              \
+    PlanExecMode    exec_mode_ = PlanExecMode::SinglePass;                                    \
+    Candidate       single_pass_cand_{};                                                      \
+    std::string     variant_name_;                                                            \
+    int             two_pass_min_logN_ = 0;                                                   \
+    int             log_n1_ = 0;                                                              \
+    int             log_n2_ = 0;                                                              \
+    size_t          pass0_wg_size_ = 256;                                                     \
+    size_t          bitrev_wg_size_ = 256;                                                    \
+    size_t          chunk_bs_ = 0;                                                            \
+    size_t          scratch_elems_ = 0;                                                       \
+    ComplexT*       scratch_ = nullptr;                                                       \
+                                                                                              \
+    size_t          effective_sg_size_ = 1;                                                   \
+    bool            sg_linear_ok_ = false;                                                    \
+    bool            sg_tile_sync_ok_ = false;                                                 \
+    double          fp64_to_fp32_ratio_ = 0.0;                                                \
+    bool            is_compute_heavy_ = false;                                                \
+    bool            cache_hit_ = false;                                                       \
+    std::unique_ptr<BitRevPlan<ComplexT>> bitrev_plan_;                                       \
+};                                                                                            \
+                                                                                              \
+SYCL_FFT_EXTERN_DECL_NEG(PlanName)                                                            \
+SYCL_FFT_EXTERN_DECL_POS(PlanName)
 
-#if !defined(SYCL_FFT_ONLY_HALF) && !defined(SYCL_FFT_ONLY_FLOAT) && !defined(SYCL_FFT_ONLY_DOUBLE)
-#undef SYCL_FFT_HALF
-#undef SYCL_FFT_DOUBLE
-#define SYCL_FFT_DF
-#include "common/precision.hpp"
-#include "fft/dif_impl.hpp"
-#undef SYCL_FFT_DF
-#endif
+SYCL_FFT_DECLARE_DIF_PLAN(SinglePassCandidateh,  DifFftPlanh,  Complexh,  uint32_t)
+SYCL_FFT_DECLARE_DIF_PLAN(SinglePassCandidatef,  DifFftPlanf,  Complexf,  float)
+SYCL_FFT_DECLARE_DIF_PLAN(SinglePassCandidate,   DifFftPlan,   Complex,   double)
+SYCL_FFT_DECLARE_DIF_PLAN(SinglePassCandidatedf, DifFftPlandf, Complexdf, df_t)
 
-// Cleanly undefine internal precision macros so caller translation units stay clean
-#undef SYCL_FFT_SUFFIX
-#undef SYCL_FFT_REAL
-#undef SYCL_FFT_COMPLEX
-#undef SYCL_FFT_SMEM_T
-#undef SYCL_FFT_ANGLE_T
-#undef SYCL_FFT_WIDE
-#undef SYCL_FFT_PREC_TAG
-#undef SYCL_FFT_IS_DOUBLE
-#undef SYCL_FFT_IS_DF
-#undef SYCL_FFT_IS_HALF
-#undef SYCL_FFT_PACKED_BATCH
-#undef SYCL_FFT_ZERO
-#undef SYCL_FFT_ONE
-#undef SYCL_FFT_SQRT1_2
-#undef SYCL_FFT_ADD
-#undef SYCL_FFT_SUB
-#undef SYCL_FFT_NEG
-#undef SYCL_FFT_MUL
-#undef SYCL_FFT_SCALE_HALF
-#undef SYCL_FFT_CMUL
-#undef SYCL_FFT_CSQR
-#undef SYCL_FFT_CMUL_SQRT1_2
-#undef SYCL_FFT_LOAD_COMPLEX
-#undef SYCL_FFT_STORE_COMPLEX
-#undef SYCL_FFT_TO_SMEM
-#undef SYCL_FFT_FROM_SMEM
-#undef SYCL_FFT_SHUFFLE_XOR
-#undef SYCL_FFT_COND_NEG
-#undef SYCL_FFT_TWIDDLE256_RE
-#undef SYCL_FFT_TWIDDLE256_IM
-#undef SYCL_FFT_TWIDDLE32_RE
-#undef SYCL_FFT_TWIDDLE32_IM
-#undef SYCL_FFT_SINCOS2PI_OCT1
-#undef SYCL_FFT_SINCOS2PI_HALF
+#undef SYCL_FFT_DECLARE_DIF_PLAN
+#undef SYCL_FFT_EXTERN_DECL_NEG
+#undef SYCL_FFT_EXTERN_DECL_POS
+
+} // namespace sycl_fft

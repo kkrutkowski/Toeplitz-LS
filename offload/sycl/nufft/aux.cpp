@@ -2,8 +2,6 @@
 //   1. High-precision x-axis coordinate gridding (FP64 for FP64; Dekker df_t for DF/FP32/FP16)
 //   2. O(M) GPU window-bucket builder for multi-window shared-memory spreading
 //   3. Raw-size-deduplicated grid transpose + L2 zeroing (4B FP32, shared 8B FP64/DF, 2xFP16 pair)
-#define SYCL_NUFFT_KERNEL_ONLY 1
-#define SYCL_NUFFT_NO_COEFFS 1
 #include "nufft/nufft1.hpp"
 
 namespace sycl_nufft {

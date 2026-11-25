@@ -1,114 +1,184 @@
-// Multi-includable Triple-Precision SYCL DIF (Sande-Tukey) Radix-2 FFT Kernels & Plan.
-// Intentionally has no #pragma once; included 3x by sycl_fft_dif.hpp with
-// sycl_fft_precision.hpp configured for FP32 (f), FP64 (raw), and DF (df).
+// Quadruple-Precision SYCL DIF (Sande-Tukey) Radix-2 FFT Implementation.
+// Compiled multiple times with -D flags into isolated HCF object modules:
+//   Precision (defaults to SYCL_FFT_DF when no half/float/double is selected):
+//     -DSYCL_FFT_HALF | -DSYCL_FFT_FLOAT | -DSYCL_FFT_DOUBLE | -DSYCL_FFT_DF
+//   Size split (optional; omit to compile both small & large kernels + DifFftPlan):
+//     -DSYCL_FFT_INST_SMALL_ONLY | -DSYCL_FFT_INST_LARGE_ONLY
+#if !defined(SYCL_FFT_HALF) && !defined(SYCL_FFT_FLOAT) && \
+    !defined(SYCL_FFT_DOUBLE) && !defined(SYCL_FFT_DF)
+#  define SYCL_FFT_DF 1
+#endif
+
+#include "fft/dif.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <new>
+#include <stdexcept>
 
 namespace sycl_fft {
 
-#if defined(SYCL_FFT_USE_EXTERN_TEMPLATES)
-
-struct SYCL_FFT_SUFFIX(SinglePassCandidate) {
-    using ComplexT = SYCL_FFT_COMPLEX;
-    using LaunchFn = void (*)(sycl::queue&, const ComplexT*, ComplexT*, size_t, bool, bool);
-    using ProbeFn  = KernelProbeInfo (*)(sycl::queue&, const sycl::device&);
-
-    const char*   variant_id;
-    int           logN;
-    size_t        wg_size;
-    size_t        smem_bytes;
-    size_t        req_sg;
-    int           pinned_sg;
-    bool          uses_wide_2t;
-    bool          uses_stash_8192;
-    BankModelKind bank_kind;
-    LaunchFn      launch;
-    ProbeFn       probe_bundle;
+// ============================================================================
+// Exact Compile-Time W_32^k & W_256^k FFT Twiddle Tables (FFT-internal)
+// ============================================================================
+constexpr double kCos32[16] = {
+     1.00000000000000000e+00,  9.80785280403230431e-01,  9.23879532511286738e-01,  8.31469612302545236e-01,
+     7.07106781186547573e-01,  5.55570233019602178e-01,  3.82683432365089782e-01,  1.95090322016128276e-01,
+     0.00000000000000000e+00, -1.95090322016128276e-01, -3.82683432365089782e-01, -5.55570233019602178e-01,
+    -7.07106781186547573e-01, -8.31469612302545236e-01, -9.23879532511286738e-01, -9.80785280403230431e-01
 };
 
-template <int Sign = SYCL_FFT_DEFAULT_SIGN>
-class SYCL_FFT_SUFFIX(DifFftPlan) {
-    static_assert(Sign == -1 || Sign == +1, "DifFftPlan Sign must be -1 or +1");
-    static_assert((Sign == +1 && SYCL_FFT_ENABLE_POS_SIGN) ||
-                      (Sign == -1 && SYCL_FFT_ENABLE_NEG_SIGN),
-                  "Requested DifFftPlan<Sign> is disabled at compile time (build with SIGN=pos|neg|both)");
-public:
-    using ComplexT  = SYCL_FFT_COMPLEX;
-    using SmemT     = SYCL_FFT_SMEM_T;
-    using Candidate = SYCL_FFT_SUFFIX(SinglePassCandidate);
-
-    SYCL_FFT_SUFFIX(DifFftPlan)(
-        sycl::queue& q, int logN, size_t max_bs, const FftLaunchConfig& cfg = {});
-    SYCL_FFT_SUFFIX(DifFftPlan)(
-        sycl::queue& q, int logN, size_t max_bs, size_t l2_chunk_bytes);
-    ~SYCL_FFT_SUFFIX(DifFftPlan)();
-
-    SYCL_FFT_SUFFIX(DifFftPlan)(const SYCL_FFT_SUFFIX(DifFftPlan)&) = delete;
-    SYCL_FFT_SUFFIX(DifFftPlan)& operator=(const SYCL_FFT_SUFFIX(DifFftPlan)&) = delete;
-
-    void execute_raw(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0);
-    void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0);
-    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs);
-    void bit_reverse(ComplexT* buf, size_t bs);
-    const char* bitrev_variant_name(bool in_place = true);
-    bool bitrev_cache_hit(bool in_place = true);
-    BitRevPlan<ComplexT>& bitrev_plan();
-
-    size_t chunk_bs() const { return chunk_bs_; }
-    size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }
-    size_t pass0_wg_size() const { return pass0_wg_size_; }
-    size_t bitrev_wg_size() const { return bitrev_wg_size_; }
-    int    two_pass_min_logN() const { return two_pass_min_logN_; }
-    bool   is_two_pass() const { return exec_mode_ == PlanExecMode::TwoPass; }
-    bool   is_multistage() const { return exec_mode_ == PlanExecMode::MultiStageGlobal; }
-    PlanExecMode exec_mode() const { return exec_mode_; }
-    int    log_n1() const { return log_n1_; }
-    int    log_n2() const { return log_n2_; }
-    const char* variant_name() const { return variant_name_.c_str(); }
-    size_t effective_sg_size() const { return effective_sg_size_; }
-    double fp64_to_fp32_ratio() const { return fp64_to_fp32_ratio_; }
-    bool   is_compute_heavy() const { return is_compute_heavy_; }
-    bool   cache_hit() const { return cache_hit_; }
-    const DeviceFftConfig& device_config() const { return dev_cfg_; }
-    const FftLaunchConfig& launch_config() const { return launch_cfg_; }
-
-private:
-    BitRevPlan<ComplexT>& ensure_bitrev_plan();
-
-    sycl::queue&    q_;
-    int             logN_;
-    size_t          N_;
-    DeviceFftConfig dev_cfg_;
-    FftLaunchConfig launch_cfg_;
-    std::string     cache_path_;
-
-    PlanExecMode    exec_mode_ = PlanExecMode::SinglePass;
-    Candidate       single_pass_cand_{};
-    std::string     variant_name_;
-    int             two_pass_min_logN_ = 0;
-    int             log_n1_ = 0;
-    int             log_n2_ = 0;
-    size_t          pass0_wg_size_ = 256;
-    size_t          bitrev_wg_size_ = 256;
-    size_t          chunk_bs_ = 0;
-    size_t          scratch_elems_ = 0;
-    ComplexT*       scratch_ = nullptr;
-
-    size_t          effective_sg_size_ = 1;
-    bool            sg_linear_ok_ = false;
-    bool            sg_tile_sync_ok_ = false;
-    double          fp64_to_fp32_ratio_ = 0.0;
-    bool            is_compute_heavy_ = false;
-    bool            cache_hit_ = false;
-    std::unique_ptr<BitRevPlan<ComplexT>> bitrev_plan_;
+constexpr double kSin32Neg[16] = {
+     0.00000000000000000e+00, -1.95090322016128276e-01, -3.82683432365089782e-01, -5.55570233019602178e-01,
+    -7.07106781186547573e-01, -8.31469612302545236e-01, -9.23879532511286738e-01, -9.80785280403230431e-01,
+    -1.00000000000000000e+00, -9.80785280403230431e-01, -9.23879532511286738e-01, -8.31469612302545236e-01,
+    -7.07106781186547573e-01, -5.55570233019602178e-01, -3.82683432365089782e-01, -1.95090322016128276e-01
 };
 
-#if SYCL_FFT_ENABLE_NEG_SIGN
-extern template class SYCL_FFT_SUFFIX(DifFftPlan)<-1>;
-#endif
-#if SYCL_FFT_ENABLE_POS_SIGN
-extern template class SYCL_FFT_SUFFIX(DifFftPlan)<+1>;
-#endif
+constexpr float kCos32f[16] = {
+    static_cast<float>(kCos32[0]),  static_cast<float>(kCos32[1]),  static_cast<float>(kCos32[2]),  static_cast<float>(kCos32[3]),
+    static_cast<float>(kCos32[4]),  static_cast<float>(kCos32[5]),  static_cast<float>(kCos32[6]),  static_cast<float>(kCos32[7]),
+    static_cast<float>(kCos32[8]),  static_cast<float>(kCos32[9]),  static_cast<float>(kCos32[10]), static_cast<float>(kCos32[11]),
+    static_cast<float>(kCos32[12]), static_cast<float>(kCos32[13]), static_cast<float>(kCos32[14]), static_cast<float>(kCos32[15])
+};
 
-#else // !SYCL_FFT_USE_EXTERN_TEMPLATES
+constexpr float kSin32Negf[16] = {
+    static_cast<float>(kSin32Neg[0]),  static_cast<float>(kSin32Neg[1]),  static_cast<float>(kSin32Neg[2]),  static_cast<float>(kSin32Neg[3]),
+    static_cast<float>(kSin32Neg[4]),  static_cast<float>(kSin32Neg[5]),  static_cast<float>(kSin32Neg[6]),  static_cast<float>(kSin32Neg[7]),
+    static_cast<float>(kSin32Neg[8]),  static_cast<float>(kSin32Neg[9]),  static_cast<float>(kSin32Neg[10]), static_cast<float>(kSin32Neg[11]),
+    static_cast<float>(kSin32Neg[12]), static_cast<float>(kSin32Neg[13]), static_cast<float>(kSin32Neg[14]), static_cast<float>(kSin32Neg[15])
+};
+
+constexpr df_t kCos32df[16] = {
+    df_from_double(kCos32[0]),  df_from_double(kCos32[1]),  df_from_double(kCos32[2]),  df_from_double(kCos32[3]),
+    df_from_double(kCos32[4]),  df_from_double(kCos32[5]),  df_from_double(kCos32[6]),  df_from_double(kCos32[7]),
+    df_from_double(kCos32[8]),  df_from_double(kCos32[9]),  df_from_double(kCos32[10]), df_from_double(kCos32[11]),
+    df_from_double(kCos32[12]), df_from_double(kCos32[13]), df_from_double(kCos32[14]), df_from_double(kCos32[15])
+};
+
+constexpr df_t kSin32Negdf[16] = {
+    df_from_double(kSin32Neg[0]),  df_from_double(kSin32Neg[1]),  df_from_double(kSin32Neg[2]),  df_from_double(kSin32Neg[3]),
+    df_from_double(kSin32Neg[4]),  df_from_double(kSin32Neg[5]),  df_from_double(kSin32Neg[6]),  df_from_double(kSin32Neg[7]),
+    df_from_double(kSin32Neg[8]),  df_from_double(kSin32Neg[9]),  df_from_double(kSin32Neg[10]), df_from_double(kSin32Neg[11]),
+    df_from_double(kSin32Neg[12]), df_from_double(kSin32Neg[13]), df_from_double(kSin32Neg[14]), df_from_double(kSin32Neg[15])
+};
+
+template <int Sign>
+constexpr float twiddle32_ref(int idx32) {
+    return kCos32f[idx32];
+}
+
+template <int Sign>
+constexpr float twiddle32_imf(int idx32) {
+    return (Sign < 0) ? kSin32Negf[idx32] : -kSin32Negf[idx32];
+}
+
+constexpr f16x2_t kCos32h[16] = {
+    f16x2_splat_f(kCos32f[0]),  f16x2_splat_f(kCos32f[1]),  f16x2_splat_f(kCos32f[2]),  f16x2_splat_f(kCos32f[3]),
+    f16x2_splat_f(kCos32f[4]),  f16x2_splat_f(kCos32f[5]),  f16x2_splat_f(kCos32f[6]),  f16x2_splat_f(kCos32f[7]),
+    f16x2_splat_f(kCos32f[8]),  f16x2_splat_f(kCos32f[9]),  f16x2_splat_f(kCos32f[10]), f16x2_splat_f(kCos32f[11]),
+    f16x2_splat_f(kCos32f[12]), f16x2_splat_f(kCos32f[13]), f16x2_splat_f(kCos32f[14]), f16x2_splat_f(kCos32f[15])
+};
+
+constexpr f16x2_t kSin32Negh[16] = {
+    f16x2_splat_f(kSin32Negf[0]),  f16x2_splat_f(kSin32Negf[1]),  f16x2_splat_f(kSin32Negf[2]),  f16x2_splat_f(kSin32Negf[3]),
+    f16x2_splat_f(kSin32Negf[4]),  f16x2_splat_f(kSin32Negf[5]),  f16x2_splat_f(kSin32Negf[6]),  f16x2_splat_f(kSin32Negf[7]),
+    f16x2_splat_f(kSin32Negf[8]),  f16x2_splat_f(kSin32Negf[9]),  f16x2_splat_f(kSin32Negf[10]), f16x2_splat_f(kSin32Negf[11]),
+    f16x2_splat_f(kSin32Negf[12]), f16x2_splat_f(kSin32Negf[13]), f16x2_splat_f(kSin32Negf[14]), f16x2_splat_f(kSin32Negf[15])
+};
+
+template <int Sign>
+SYCL_FFT_FORCE_INLINE constexpr f16x2_t twiddle32_reh(int idx32) {
+    return kCos32h[idx32];
+}
+
+template <int Sign>
+SYCL_FFT_FORCE_INLINE constexpr f16x2_t twiddle32_imh(int idx32) {
+    return (Sign < 0) ? kSin32Negh[idx32] : -kSin32Negh[idx32];
+}
+
+template <int Sign>
+constexpr double twiddle32_re(int idx32) {
+    return kCos32[idx32];
+}
+
+template <int Sign>
+constexpr double twiddle32_im(int idx32) {
+    return (Sign < 0) ? kSin32Neg[idx32] : -kSin32Neg[idx32];
+}
+
+template <int Sign>
+constexpr df_t twiddle32_redf(int idx32) {
+    return kCos32df[idx32];
+}
+
+template <int Sign>
+constexpr df_t twiddle32_imdf(int idx32) {
+    return (Sign < 0) ? kSin32Negdf[idx32]
+                      : df_t{-kSin32Negdf[idx32].hi, -kSin32Negdf[idx32].lo};
+}
+
+// Exact compile-time W_256^k = exp(-i 2pi k / 256) table (k = 0..15).
+// Also serves W_128^k (idx = 2*k, k=0..7) and W_64^k (idx = 4*k, k=0..3) with zero trig ops.
+constexpr double kW256Re[16] = {
+     1.00000000000000000e+00,  9.99698818696204250e-01,  9.98795456205172405e-01,  9.97290456678690207e-01,
+     9.95184726672196929e-01,  9.92479534598709967e-01,  9.89176509964781014e-01,  9.85277642388941222e-01,
+     9.80785280403230431e-01,  9.75702130038528570e-01,  9.70031253194543974e-01,  9.63776065795439840e-01,
+     9.56940335732208824e-01,  9.49528180593036675e-01,  9.41544065183020806e-01,  9.32992798834738846e-01
+};
+
+constexpr double kW256ImNeg[16] = {
+     0.00000000000000000e+00, -2.45412285229122881e-02, -4.90676743274180149e-02, -7.35645635996674263e-02,
+    -9.80171403295606036e-02, -1.22410675199216196e-01, -1.46730474455361748e-01, -1.70961888760301217e-01,
+    -1.95090322016128276e-01, -2.19101240156869798e-01, -2.42980179903263899e-01, -2.66712757474898365e-01,
+    -2.90284677254462387e-01, -3.13681740398891462e-01, -3.36889853392220051e-01, -3.59895036534988166e-01
+};
+
+constexpr float kW256Ref[16] = {
+    static_cast<float>(kW256Re[0]),  static_cast<float>(kW256Re[1]),  static_cast<float>(kW256Re[2]),  static_cast<float>(kW256Re[3]),
+    static_cast<float>(kW256Re[4]),  static_cast<float>(kW256Re[5]),  static_cast<float>(kW256Re[6]),  static_cast<float>(kW256Re[7]),
+    static_cast<float>(kW256Re[8]),  static_cast<float>(kW256Re[9]),  static_cast<float>(kW256Re[10]), static_cast<float>(kW256Re[11]),
+    static_cast<float>(kW256Re[12]), static_cast<float>(kW256Re[13]), static_cast<float>(kW256Re[14]), static_cast<float>(kW256Re[15])
+};
+
+constexpr float kW256ImNegf[16] = {
+    static_cast<float>(kW256ImNeg[0]),  static_cast<float>(kW256ImNeg[1]),  static_cast<float>(kW256ImNeg[2]),  static_cast<float>(kW256ImNeg[3]),
+    static_cast<float>(kW256ImNeg[4]),  static_cast<float>(kW256ImNeg[5]),  static_cast<float>(kW256ImNeg[6]),  static_cast<float>(kW256ImNeg[7]),
+    static_cast<float>(kW256ImNeg[8]),  static_cast<float>(kW256ImNeg[9]),  static_cast<float>(kW256ImNeg[10]), static_cast<float>(kW256ImNeg[11]),
+    static_cast<float>(kW256ImNeg[12]), static_cast<float>(kW256ImNeg[13]), static_cast<float>(kW256ImNeg[14]), static_cast<float>(kW256ImNeg[15])
+};
+
+constexpr df_t kW256Redf[16] = {
+    df_from_double(kW256Re[0]),  df_from_double(kW256Re[1]),  df_from_double(kW256Re[2]),  df_from_double(kW256Re[3]),
+    df_from_double(kW256Re[4]),  df_from_double(kW256Re[5]),  df_from_double(kW256Re[6]),  df_from_double(kW256Re[7]),
+    df_from_double(kW256Re[8]),  df_from_double(kW256Re[9]),  df_from_double(kW256Re[10]), df_from_double(kW256Re[11]),
+    df_from_double(kW256Re[12]), df_from_double(kW256Re[13]), df_from_double(kW256Re[14]), df_from_double(kW256Re[15])
+};
+
+constexpr df_t kW256ImNegdf[16] = {
+    df_from_double(kW256ImNeg[0]),  df_from_double(kW256ImNeg[1]),  df_from_double(kW256ImNeg[2]),  df_from_double(kW256ImNeg[3]),
+    df_from_double(kW256ImNeg[4]),  df_from_double(kW256ImNeg[5]),  df_from_double(kW256ImNeg[6]),  df_from_double(kW256ImNeg[7]),
+    df_from_double(kW256ImNeg[8]),  df_from_double(kW256ImNeg[9]),  df_from_double(kW256ImNeg[10]), df_from_double(kW256ImNeg[11]),
+    df_from_double(kW256ImNeg[12]), df_from_double(kW256ImNeg[13]), df_from_double(kW256ImNeg[14]), df_from_double(kW256ImNeg[15])
+};
+
+template <int Sign>
+constexpr float twiddle256_ref(int idx) { return kW256Ref[idx]; }
+template <int Sign>
+constexpr float twiddle256_imf(int idx) { return (Sign < 0) ? kW256ImNegf[idx] : -kW256ImNegf[idx]; }
+template <int Sign>
+constexpr double twiddle256_re(int idx) { return kW256Re[idx]; }
+template <int Sign>
+constexpr double twiddle256_im(int idx) { return (Sign < 0) ? kW256ImNeg[idx] : -kW256ImNeg[idx]; }
+template <int Sign>
+constexpr df_t twiddle256_redf(int idx) { return kW256Redf[idx]; }
+template <int Sign>
+constexpr df_t twiddle256_imdf(int idx) {
+    return (Sign < 0) ? kW256ImNegdf[idx]
+                      : df_t{-kW256ImNegdf[idx].hi, -kW256ImNegdf[idx].lo};
+}
+
+#include "common/precision.hpp"
 
 // ============================================================================
 // Pure Radix-2 DIF stages in registers on E = 2^LogE elements (no inter-thread
@@ -1320,27 +1390,6 @@ struct SYCL_FFT_SUFFIX(SinglePassSpec) {
     }
 };
 
-// ============================================================================
-// Typed Single-Pass Candidate Descriptor & Single-Source Candidate Tables
-// ============================================================================
-struct SYCL_FFT_SUFFIX(SinglePassCandidate) {
-    using ComplexT = SYCL_FFT_COMPLEX;
-    using LaunchFn = void (*)(sycl::queue&, const ComplexT*, ComplexT*, size_t, bool, bool);
-    using ProbeFn  = KernelProbeInfo (*)(sycl::queue&, const sycl::device&);
-
-    const char*   variant_id;
-    int           logN;
-    size_t        wg_size;
-    size_t        smem_bytes;
-    size_t        req_sg;
-    int           pinned_sg;
-    bool          uses_wide_2t;
-    bool          uses_stash_8192;
-    BankModelKind bank_kind;
-    LaunchFn      launch;
-    ProbeFn       probe_bundle;
-};
-
 template <typename SpecT>
 constexpr SYCL_FFT_SUFFIX(SinglePassCandidate) SYCL_FFT_SUFFIX(make_candidate)(const char* id) {
     return SYCL_FFT_SUFFIX(SinglePassCandidate){
@@ -1358,8 +1407,9 @@ constexpr SYCL_FFT_SUFFIX(SinglePassCandidate) SYCL_FFT_SUFFIX(make_candidate)(c
     };
 }
 
+#if !defined(SYCL_FFT_INST_LARGE_ONLY)
 template <BankModelKind BK, int ReqdSG>
-inline void SYCL_FFT_SUFFIX(append_candidates_small_for_bank)(
+static void SYCL_FFT_SUFFIX(append_candidates_small_for_bank)(
     int logN, std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)>& out) {
     constexpr auto Split = StagingPolicy::Split;
     constexpr auto Seq   = StagingPolicy::Seq;
@@ -1471,10 +1521,11 @@ inline void SYCL_FFT_SUFFIX(append_candidates_small_for_bank)(
     }
 #endif
 }
+#endif // !SYCL_FFT_INST_LARGE_ONLY
 
 #if !defined(SYCL_FFT_INST_SMALL_ONLY)
 template <BankModelKind BK, int ReqdSG>
-inline void SYCL_FFT_SUFFIX(append_candidates_large_for_bank)(
+static void SYCL_FFT_SUFFIX(append_candidates_large_for_bank)(
     int logN, std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)>& out) {
     constexpr auto Seq   = StagingPolicy::Seq;
     constexpr auto Aff   = T1LayoutPolicy::Affine;
@@ -1550,7 +1601,7 @@ std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pas
 #if defined(SYCL_FFT_INST_SMALL_ONLY)
 std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(
 #else
-inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(
+static std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(
 #endif
     int logN, BankModelKind bank_kind) {
     std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> cands;
@@ -1580,7 +1631,7 @@ inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_sin
 #endif // SYCL_FFT_INST_LARGE_ONLY
 
 #if !defined(SYCL_FFT_INST_SMALL_ONLY)
-inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_large)(
+static std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_large)(
     int logN, BankModelKind bank_kind) {
     std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> cands;
 #if defined(SYCL_FFT_ENABLE_BANK32X8)
@@ -1607,7 +1658,7 @@ inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_sin
     return cands;
 }
 
-inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates)(
+static std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates)(
     int logN, BankModelKind bank_kind) {
     if (logN <= 12) {
         return SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(logN, bank_kind);
@@ -1715,7 +1766,7 @@ struct SYCL_FFT_SUFFIX(Pass0Functor) {
 };
 
 template <int LogN1, bool HasTwiddles>
-void SYCL_FFT_SUFFIX(launch_pass0_reg)(
+static void SYCL_FFT_SUFFIX(launch_pass0_reg)(
     sycl::queue& q,
     const SYCL_FFT_COMPLEX* in,
     SYCL_FFT_COMPLEX* tmp,
@@ -1746,7 +1797,7 @@ void SYCL_FFT_SUFFIX(launch_pass0_reg)(
     });
 }
 
-inline void SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
+static void SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
     sycl::queue& q,
     int log_n1,
     int log_n2,
@@ -1773,7 +1824,7 @@ inline void SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
     throw std::invalid_argument("Unsupported Pass-0 stage factorization");
 }
 
-inline KernelProbeInfo SYCL_FFT_SUFFIX(probe_pass0_stage)(
+static KernelProbeInfo SYCL_FFT_SUFFIX(probe_pass0_stage)(
     sycl::queue& q, const sycl::device& dev, int log_n1, int log_n2) {
     if (log_n2 <= 0) return KernelProbeInfo{};
     switch (log_n1) {
@@ -1785,7 +1836,7 @@ inline KernelProbeInfo SYCL_FFT_SUFFIX(probe_pass0_stage)(
 }
 
 // Zero-smem, zero-shuffle multi-stage decomposition for logN = 10..18
-inline int SYCL_FFT_SUFFIX(multistage_plan_factors)(int logN, int (&stages)[4]) {
+static int SYCL_FFT_SUFFIX(multistage_plan_factors)(int logN, int (&stages)[4]) {
     switch (logN) {
         case 10: stages[0] = 4; stages[1] = 3; stages[2] = 3; return 3;
         case 11: stages[0] = 4; stages[1] = 4; stages[2] = 3; return 3;
@@ -1800,7 +1851,7 @@ inline int SYCL_FFT_SUFFIX(multistage_plan_factors)(int logN, int (&stages)[4]) 
     }
 }
 
-inline void SYCL_FFT_SUFFIX(execute_multistage_global)(
+static void SYCL_FFT_SUFFIX(execute_multistage_global)(
     sycl::queue& q,
     const SYCL_FFT_COMPLEX* in,
     SYCL_FFT_COMPLEX* out,
@@ -1837,648 +1888,641 @@ inline void SYCL_FFT_SUFFIX(execute_multistage_global)(
 }
 
 // ============================================================================
-// GPU Bit-Reversal Permutation Kernel (for correctness verification)
+// Adaptive Hardware-Generalized DifFftPlan Member Definitions (logN = 10..18)
 // ============================================================================
-inline void SYCL_FFT_SUFFIX(launch_bit_reverse)(
-    sycl::queue& q,
-    const SYCL_FFT_COMPLEX* src,
-    SYCL_FFT_COMPLEX* dst,
-    int logN,
-    size_t bs,
-    size_t wg_size = 256) {
-    if (bs == 0) return;
-    FftLaunchConfig cfg{};
-    cfg.autotune = AutotuneMode::Off;
-    cfg.bitrev_wg_size = wg_size;
-    BitRevPlan<SYCL_FFT_COMPLEX> plan(
-        q, logN, SYCL_FFT_PREC_TAG, DeviceFftConfig::query(q.get_device()), cfg);
-    plan.execute(src, dst, bs);
+template <int Sign>
+SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::SYCL_FFT_SUFFIX(DifFftPlan)(
+    sycl::queue& q, int logN, size_t max_bs, const FftLaunchConfig& cfg)
+    : q_(q), logN_(logN), N_(size_t{1} << logN),
+      dev_cfg_(DeviceFftConfig::query(q.get_device())), launch_cfg_(cfg) {
+    if (logN < 10 || logN > 18) {
+        throw std::invalid_argument("Supported logN range is 10..18");
+    }
+    configure_plan(max_bs);
 }
 
-// ============================================================================
-// Adaptive Hardware-Generalized Plan & Dispatcher (logN = 10..18)
-//   - Enforces hardware capability guards (has_fp64, DF KAT, has_native_local_mem).
-//   - Probes runtime sub-group topology & FP64:FP32 throughput ratio once/device.
-//   - Selects kernels from single-source typed descriptors (no magic-number switches).
-//   - Supports SYCL 2020 kernel_bundle queries (DPC++) + default-on persistent
-//     micro-autotuning (candidates, 2-pass splits, Pass-0 WG, L2 chunk size).
-//   - Falls back cleanly to zero-smem multi-stage global FFT on CPU/emulated-smem.
-// ============================================================================
-template <int Sign = SYCL_FFT_DEFAULT_SIGN>
-class SYCL_FFT_SUFFIX(DifFftPlan) {
-    static_assert(Sign == -1 || Sign == +1, "DifFftPlan Sign must be -1 or +1");
-    static_assert((Sign == +1 && SYCL_FFT_ENABLE_POS_SIGN) ||
-                      (Sign == -1 && SYCL_FFT_ENABLE_NEG_SIGN),
-                  "Requested DifFftPlan<Sign> is disabled at compile time (build with SIGN=pos|neg|both)");
-public:
-    static constexpr bool kPosSign = (Sign > 0);
-    using ComplexT  = SYCL_FFT_COMPLEX;
-    using SmemT     = SYCL_FFT_SMEM_T;
-    using Candidate = SYCL_FFT_SUFFIX(SinglePassCandidate);
-    SYCL_FFT_SUFFIX(DifFftPlan)(
-        sycl::queue& q, int logN, size_t max_bs, const FftLaunchConfig& cfg = {})
-        : q_(q), logN_(logN), N_(size_t{1} << logN),
-          dev_cfg_(DeviceFftConfig::query(q.get_device())), launch_cfg_(cfg) {
-        if (logN < 10 || logN > 18) {
-            throw std::invalid_argument("Supported logN range is 10..18");
-        }
-        configure_plan(max_bs);
+template <int Sign>
+SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::SYCL_FFT_SUFFIX(DifFftPlan)(
+    sycl::queue& q, int logN, size_t max_bs, size_t l2_chunk_bytes)
+    : SYCL_FFT_SUFFIX(DifFftPlan)(q, logN, max_bs, make_chunk_config(l2_chunk_bytes)) {}
+
+template <int Sign>
+SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::~SYCL_FFT_SUFFIX(DifFftPlan)() {
+    if (scratch_) sycl::free(scratch_, q_);
+}
+
+template <int Sign>
+void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::execute_raw(
+    const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override) {
+    if (bs == 0) return;
+    if (exec_mode_ == PlanExecMode::SinglePass) {
+        single_pass_cand_.launch(q_, in, out, bs, sg_tile_sync_ok_, kPosSign);
+        return;
     }
-
-    SYCL_FFT_SUFFIX(DifFftPlan)(
-        sycl::queue& q, int logN, size_t max_bs, size_t l2_chunk_bytes)
-        : SYCL_FFT_SUFFIX(DifFftPlan)(q, logN, max_bs, make_chunk_config(l2_chunk_bytes)) {}
-
-    ~SYCL_FFT_SUFFIX(DifFftPlan)() {
-        if (scratch_) sycl::free(scratch_, q_);
+    const size_t eff_chunk = (chunk_bs_override > 0)
+        ? std::min(chunk_bs_, chunk_bs_override)
+        : chunk_bs_;
+    if (exec_mode_ == PlanExecMode::MultiStageGlobal) {
+        SYCL_FFT_SUFFIX(execute_multistage_global)(
+            q_, in, out, logN_, bs, eff_chunk, kPosSign, pass0_wg_size_);
+        return;
     }
-
-    SYCL_FFT_SUFFIX(DifFftPlan)(const SYCL_FFT_SUFFIX(DifFftPlan)&) = delete;
-    SYCL_FFT_SUFFIX(DifFftPlan)& operator=(const SYCL_FFT_SUFFIX(DifFftPlan)&) = delete;
-
-    void execute_raw(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0) {
-        if (bs == 0) return;
-        if (exec_mode_ == PlanExecMode::SinglePass) {
-            single_pass_cand_.launch(q_, in, out, bs, sg_tile_sync_ok_, kPosSign);
-            return;
-        }
-        const size_t eff_chunk = (chunk_bs_override > 0)
-            ? std::min(chunk_bs_, chunk_bs_override)
-            : chunk_bs_;
-        if (exec_mode_ == PlanExecMode::MultiStageGlobal) {
-            SYCL_FFT_SUFFIX(execute_multistage_global)(
-                q_, in, out, logN_, bs, eff_chunk, kPosSign, pass0_wg_size_);
-            return;
-        }
-        // PlanExecMode::TwoPass
-        const size_t n1 = size_t{1} << log_n1_;
-        size_t done = 0;
-        while (done < bs) {
-            const size_t cur = std::min(eff_chunk, bs - done);
-            const ComplexT* c_in = in + done * N_;
-            ComplexT* c_out = out + done * N_;
-            SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
-                q_, log_n1_, log_n2_, c_in, scratch_, cur, kPosSign, pass0_wg_size_);
-            single_pass_cand_.launch(q_, scratch_, c_out, cur * n1, sg_tile_sync_ok_, kPosSign);
-            done += cur;
-        }
+    // PlanExecMode::TwoPass
+    const size_t n1 = size_t{1} << log_n1_;
+    size_t done = 0;
+    while (done < bs) {
+        const size_t cur = std::min(eff_chunk, bs - done);
+        const ComplexT* c_in = in + done * N_;
+        ComplexT* c_out = out + done * N_;
+        SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
+            q_, log_n1_, log_n2_, c_in, scratch_, cur, kPosSign, pass0_wg_size_);
+        single_pass_cand_.launch(q_, scratch_, c_out, cur * n1, sg_tile_sync_ok_, kPosSign);
+        done += cur;
     }
+}
 
-    void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0) {
-        if (bs == 0) return;
-        execute_raw(in, out, bs, chunk_bs_override);
-        bit_reverse(out, bs);
+template <int Sign>
+void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::execute(
+    const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override) {
+    if (bs == 0) return;
+    execute_raw(in, out, bs, chunk_bs_override);
+    bit_reverse(out, bs);
+}
+
+template <int Sign>
+void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::bit_reverse(
+    const ComplexT* src, ComplexT* dst, size_t bs) {
+    ensure_bitrev_plan().execute(src, dst, bs);
+}
+
+template <int Sign>
+void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::bit_reverse(ComplexT* buf, size_t bs) {
+    ensure_bitrev_plan().execute_in_place(buf, bs);
+}
+
+template <int Sign>
+const char* SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::bitrev_variant_name(bool in_place) {
+    return ensure_bitrev_plan().variant_name(in_place);
+}
+
+template <int Sign>
+bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::bitrev_cache_hit(bool in_place) {
+    return ensure_bitrev_plan().cache_hit(in_place);
+}
+
+template <int Sign>
+BitRevPlan<SYCL_FFT_COMPLEX>& SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::bitrev_plan() {
+    return ensure_bitrev_plan();
+}
+
+template <int Sign>
+FftLaunchConfig SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::make_chunk_config(size_t l2_chunk_bytes) {
+    FftLaunchConfig c{};
+    c.l2_chunk_bytes = l2_chunk_bytes;
+    return c;
+}
+
+template <int Sign>
+std::string SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::format_multistage_name(int logN) {
+    int stages[4] = {};
+    const int k = SYCL_FFT_SUFFIX(multistage_plan_factors)(logN, stages);
+    std::string s = "ms_";
+    for (int i = 0; i < k; ++i) {
+        if (i > 0) s.push_back('x');
+        s += std::to_string(1 << stages[i]);
     }
+    return s;
+}
 
-    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs) {
-        ensure_bitrev_plan().execute(src, dst, bs);
-    }
-
-    void bit_reverse(ComplexT* buf, size_t bs) {
-        ensure_bitrev_plan().execute_in_place(buf, bs);
-    }
-
-    const char* bitrev_variant_name(bool in_place = true) {
-        return ensure_bitrev_plan().variant_name(in_place);
-    }
-
-    bool bitrev_cache_hit(bool in_place = true) {
-        return ensure_bitrev_plan().cache_hit(in_place);
-    }
-
-    BitRevPlan<ComplexT>& bitrev_plan() { return ensure_bitrev_plan(); }
-    size_t chunk_bs() const { return chunk_bs_; }
-    size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }
-    size_t pass0_wg_size() const { return pass0_wg_size_; }
-    size_t bitrev_wg_size() const { return bitrev_wg_size_; }
-    int    two_pass_min_logN() const { return two_pass_min_logN_; }
-    bool   is_two_pass() const { return exec_mode_ == PlanExecMode::TwoPass; }
-    bool   is_multistage() const { return exec_mode_ == PlanExecMode::MultiStageGlobal; }
-    PlanExecMode exec_mode() const { return exec_mode_; }
-    int    log_n1() const { return log_n1_; }
-    int    log_n2() const { return log_n2_; }
-    const char* variant_name() const { return variant_name_.c_str(); }
-    size_t effective_sg_size() const { return effective_sg_size_; }
-    double fp64_to_fp32_ratio() const { return fp64_to_fp32_ratio_; }
-    bool   is_compute_heavy() const { return is_compute_heavy_; }
-    bool   cache_hit() const { return cache_hit_; }
-    const DeviceFftConfig& device_config() const { return dev_cfg_; }
-    const FftLaunchConfig& launch_config() const { return launch_cfg_; }
-
-private:
-    static FftLaunchConfig make_chunk_config(size_t l2_chunk_bytes) {
-        FftLaunchConfig c{};
-        c.l2_chunk_bytes = l2_chunk_bytes;
-        return c;
-    }
-
-    static std::string format_multistage_name(int logN) {
-        int stages[4] = {};
-        const int k = SYCL_FFT_SUFFIX(multistage_plan_factors)(logN, stages);
-        std::string s = "ms_";
-        for (int i = 0; i < k; ++i) {
-            if (i > 0) s.push_back('x');
-            s += std::to_string(1 << stages[i]);
-        }
-        return s;
-    }
-
-    struct FilteredCandidate {
-        Candidate       cand;
-        KernelProbeInfo kinfo;
-    };
-
-    bool fits_candidate(const Candidate& c, bool apply_variant_override, KernelProbeInfo& out_kinfo) const {
-        out_kinfo = KernelProbeInfo{};
-        if (!dev_cfg_.has_native_local_mem && !launch_cfg_.allow_emulated_local_mem) return false;
-        if (c.wg_size > dev_cfg_.max_work_group_size) return false;
-        if (c.smem_bytes > dev_cfg_.local_mem_size) return false;
-        if (c.uses_wide_2t && !launch_cfg_.allow_wide_kernels) return false;
+template <int Sign>
+bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::fits_candidate(
+    const Candidate& c, bool apply_variant_override, KernelProbeInfo& out_kinfo) const {
+    out_kinfo = KernelProbeInfo{};
+    if (!dev_cfg_.has_native_local_mem && !launch_cfg_.allow_emulated_local_mem) return false;
+    if (c.wg_size > dev_cfg_.max_work_group_size) return false;
+    if (c.smem_bytes > dev_cfg_.local_mem_size) return false;
+    if (c.uses_wide_2t && !launch_cfg_.allow_wide_kernels) return false;
 
 #if SYCL_FFT_HAS_REQD_SG_SIZE
-        if (c.req_sg > 1) {
-            const size_t wanted_sg = dev_cfg_.pick_sub_group_size(c.req_sg);
-            const bool has_pinned = (wanted_sg == 8 || wanted_sg == 16 || wanted_sg == 32 || wanted_sg == 64);
-            if (has_pinned) {
-                if (c.pinned_sg != static_cast<int>(wanted_sg)) return false;
-            } else {
-                if (c.pinned_sg != 0 || c.req_sg > effective_sg_size_ || !sg_linear_ok_) return false;
-            }
-        } else if (c.pinned_sg != 0) {
-            return false;
+    if (c.req_sg > 1) {
+        const size_t wanted_sg = dev_cfg_.pick_sub_group_size(c.req_sg);
+        const bool has_pinned = (wanted_sg == 8 || wanted_sg == 16 || wanted_sg == 32 || wanted_sg == 64);
+        if (has_pinned) {
+            if (c.pinned_sg != static_cast<int>(wanted_sg)) return false;
+        } else {
+            if (c.pinned_sg != 0 || c.req_sg > effective_sg_size_ || !sg_linear_ok_) return false;
         }
+    } else if (c.pinned_sg != 0) {
+        return false;
+    }
 #else
-        if (c.pinned_sg != 0) return false;
-        if (c.req_sg > 1 && (c.req_sg > effective_sg_size_ || !sg_linear_ok_)) return false;
+    if (c.pinned_sg != 0) return false;
+    if (c.req_sg > 1 && (c.req_sg > effective_sg_size_ || !sg_linear_ok_)) return false;
 #endif
 
 #if SYCL_FFT_WIDE
-        if (c.logN == 13 && launch_cfg_.stash_8192_override >= 0) {
-            if (c.uses_stash_8192 != (launch_cfg_.stash_8192_override != 0)) return false;
-        }
+    if (c.logN == 13 && launch_cfg_.stash_8192_override >= 0) {
+        if (c.uses_stash_8192 != (launch_cfg_.stash_8192_override != 0)) return false;
+    }
 #endif
-        if (apply_variant_override && !launch_cfg_.variant_override.empty()) {
-            if (launch_cfg_.variant_override != c.variant_id) return false;
-        }
-
-        out_kinfo = c.probe_bundle(q_, q_.get_device());
-        if (out_kinfo.available) {
-            if (out_kinfo.max_wg_size > 0 && c.wg_size > out_kinfo.max_wg_size) return false;
-            if (out_kinfo.compile_sg_size > 0 && c.req_sg > static_cast<size_t>(out_kinfo.compile_sg_size)) {
-                return false;
-            }
-        }
-        return true;
+    if (apply_variant_override && !launch_cfg_.variant_override.empty()) {
+        if (launch_cfg_.variant_override != c.variant_id) return false;
     }
 
-    std::vector<FilteredCandidate> collect_candidates(int n, bool apply_variant_override) const {
-        std::vector<FilteredCandidate> valid;
-        const auto all = SYCL_FFT_SUFFIX(get_single_pass_candidates)(n, dev_cfg_.bank_model);
-        for (const auto& c : all) {
-            KernelProbeInfo ki{};
-            if (fits_candidate(c, apply_variant_override, ki)) {
-                valid.push_back(FilteredCandidate{c, ki});
-            }
+    out_kinfo = c.probe_bundle(q_, q_.get_device());
+    if (out_kinfo.available) {
+        if (out_kinfo.max_wg_size > 0 && c.wg_size > out_kinfo.max_wg_size) return false;
+        if (out_kinfo.compile_sg_size > 0 && c.req_sg > static_cast<size_t>(out_kinfo.compile_sg_size)) {
+            return false;
         }
-        return valid;
     }
+    return true;
+}
 
-    static bool find_by_id(
-        const std::vector<FilteredCandidate>& valid, const std::string& id, Candidate& out) {
-        if (id.empty()) return false;
-        for (const auto& fc : valid) {
-            if (id == fc.cand.variant_id) {
-                out = fc.cand;
-                return true;
-            }
+template <int Sign>
+std::vector<typename SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::FilteredCandidate>
+SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::collect_candidates(int n, bool apply_variant_override) const {
+    std::vector<FilteredCandidate> valid;
+    const auto all = SYCL_FFT_SUFFIX(get_single_pass_candidates)(n, dev_cfg_.bank_model);
+    for (const auto& c : all) {
+        KernelProbeInfo ki{};
+        if (fits_candidate(c, apply_variant_override, ki)) {
+            valid.push_back(FilteredCandidate{c, ki});
         }
-        return false;
     }
+    return valid;
+}
 
-    static Candidate pick_heuristic(const std::vector<FilteredCandidate>& valid) {
-        // Prefer zero private_mem_size (no register spills) when bundle probe is available.
-        for (const auto& fc : valid) {
-            if (fc.kinfo.available && fc.kinfo.private_mem_bytes == 0) {
-                return fc.cand;
-            }
-        }
-        return valid.front().cand;
-    }
-
-    // Analytical shortlist: avoid JIT-compiling fallback/low-priority variants when
-    // primary hardware-matched candidates exist; test at most the top 2 contenders.
-    std::vector<FilteredCandidate> shortlist_single_pass(
-        const std::vector<FilteredCandidate>& valid) const {
-        if (valid.size() <= 2) return valid;
-        std::vector<FilteredCandidate> primary;
-#if !SYCL_FFT_WIDE
-        // When sub-group shuffles are verified, prefer SubgroupShuffle over SG=1 2-transpose fallbacks
-        if (sg_linear_ok_) {
-            for (const auto& fc : valid) {
-                if (!fc.cand.uses_wide_2t) primary.push_back(fc);
-            }
-        }
-#endif
-        const auto& pool = primary.empty() ? valid : primary;
-        const size_t limit = std::min<size_t>(pool.size(), 2);
-        return std::vector<FilteredCandidate>(pool.begin(), pool.begin() + limit);
-    }
-
-    size_t representative_tune_bs(int n) const {
-        const size_t fft_bytes = (size_t{1} << n) * sizeof(ComplexT);
-        const size_t eff_l2 = dev_cfg_.effective_l2_bytes();
-        size_t max_bytes = size_t{32} * 1024 * 1024;
-        if (dev_cfg_.global_mem_size > 0) {
-            max_bytes = std::min(max_bytes, std::max(size_t{4} * fft_bytes, dev_cfg_.global_mem_size / 16));
-        }
-        if (dev_cfg_.max_mem_alloc_size > 0) {
-            max_bytes = std::min(max_bytes, std::max(size_t{4} * fft_bytes, dev_cfg_.max_mem_alloc_size / 8));
-        }
-        const size_t target = std::clamp<size_t>(
-            std::max<size_t>(eff_l2, size_t{16} * 1024 * 1024),
-            size_t{4} * fft_bytes,
-            std::max(size_t{4} * fft_bytes, max_bytes));
-        return std::max<size_t>(4, target / fft_bytes);
-    }
-
-    // Benchmark valid single-pass candidates for size 2^n; catches launch failures cleanly.
-    bool tune_single_pass(
-        int n,
-        const std::vector<FilteredCandidate>& valid,
-        Candidate& out_winner,
-        double& out_best_ms) {
-        if (valid.empty()) return false;
-        const size_t sub_n = size_t{1} << n;
-        size_t tune_bs = representative_tune_bs(n);
-        ComplexT* d_in = nullptr;
-        ComplexT* d_out = nullptr;
-        while (tune_bs >= 2) {
-            d_in = sycl::malloc_device<ComplexT>(tune_bs * sub_n, q_);
-            d_out = d_in ? sycl::malloc_device<ComplexT>(tune_bs * sub_n, q_) : nullptr;
-            if (d_in && d_out) break;
-            if (d_in) sycl::free(d_in, q_);
-            if (d_out) sycl::free(d_out, q_);
-            d_in = nullptr;
-            d_out = nullptr;
-            tune_bs >>= 1;
-        }
-        if (!d_in || !d_out) {
-            out_winner = pick_heuristic(valid);
-            out_best_ms = 0.0;
+template <int Sign>
+bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::find_by_id(
+    const std::vector<FilteredCandidate>& valid, const std::string& id, Candidate& out) {
+    if (id.empty()) return false;
+    for (const auto& fc : valid) {
+        if (id == fc.cand.variant_id) {
+            out = fc.cand;
             return true;
         }
-        q_.memset(d_in, 0, tune_bs * sub_n * sizeof(ComplexT)).wait();
+    }
+    return false;
+}
 
-        // Single-candidate fast path: 1-shot safety launch only (no multi-rep timing loop).
-        if (valid.size() == 1) {
-            try {
-                valid[0].cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
-                q_.wait_and_throw();
-                out_winner = valid[0].cand;
-                out_best_ms = 0.0;
-                sycl::free(d_out, q_);
-                sycl::free(d_in, q_);
-                return true;
-            } catch (...) {
-                sycl::free(d_out, q_);
-                sycl::free(d_in, q_);
-                return false;
-            }
+template <int Sign>
+typename SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::Candidate
+SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::pick_heuristic(const std::vector<FilteredCandidate>& valid) {
+    // Prefer zero private_mem_size (no register spills) when bundle probe is available.
+    for (const auto& fc : valid) {
+        if (fc.kinfo.available && fc.kinfo.private_mem_bytes == 0) {
+            return fc.cand;
         }
+    }
+    return valid.front().cand;
+}
 
-        // Prime GPU clocks (P8 -> P0) before comparing candidates so candidate 0 isn't penalized.
+template <int Sign>
+std::vector<typename SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::FilteredCandidate>
+SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::shortlist_single_pass(
+    const std::vector<FilteredCandidate>& valid) const {
+    if (valid.size() <= 2) return valid;
+    std::vector<FilteredCandidate> primary;
+#if !SYCL_FFT_WIDE
+    // When sub-group shuffles are verified, prefer SubgroupShuffle over SG=1 2-transpose fallbacks
+    if (sg_linear_ok_) {
+        for (const auto& fc : valid) {
+            if (!fc.cand.uses_wide_2t) primary.push_back(fc);
+        }
+    }
+#endif
+    const auto& pool = primary.empty() ? valid : primary;
+    const size_t limit = std::min<size_t>(pool.size(), 2);
+    return std::vector<FilteredCandidate>(pool.begin(), pool.begin() + limit);
+}
+
+template <int Sign>
+size_t SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::representative_tune_bs(int n) const {
+    const size_t fft_bytes = (size_t{1} << n) * sizeof(ComplexT);
+    const size_t eff_l2 = dev_cfg_.effective_l2_bytes();
+    size_t max_bytes = size_t{32} * 1024 * 1024;
+    if (dev_cfg_.global_mem_size > 0) {
+        max_bytes = std::min(max_bytes, std::max(size_t{4} * fft_bytes, dev_cfg_.global_mem_size / 16));
+    }
+    if (dev_cfg_.max_mem_alloc_size > 0) {
+        max_bytes = std::min(max_bytes, std::max(size_t{4} * fft_bytes, dev_cfg_.max_mem_alloc_size / 8));
+    }
+    const size_t target = std::clamp<size_t>(
+        std::max<size_t>(eff_l2, size_t{16} * 1024 * 1024),
+        size_t{4} * fft_bytes,
+        std::max(size_t{4} * fft_bytes, max_bytes));
+    return std::max<size_t>(4, target / fft_bytes);
+}
+
+template <int Sign>
+bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::tune_single_pass(
+    int n,
+    const std::vector<FilteredCandidate>& valid,
+    Candidate& out_winner,
+    double& out_best_ms) {
+    if (valid.empty()) return false;
+    const size_t sub_n = size_t{1} << n;
+    size_t tune_bs = representative_tune_bs(n);
+    ComplexT* d_in = nullptr;
+    ComplexT* d_out = nullptr;
+    while (tune_bs >= 2) {
+        d_in = sycl::malloc_device<ComplexT>(tune_bs * sub_n, q_);
+        d_out = d_in ? sycl::malloc_device<ComplexT>(tune_bs * sub_n, q_) : nullptr;
+        if (d_in && d_out) break;
+        if (d_in) sycl::free(d_in, q_);
+        if (d_out) sycl::free(d_out, q_);
+        d_in = nullptr;
+        d_out = nullptr;
+        tune_bs >>= 1;
+    }
+    if (!d_in || !d_out) {
+        out_winner = pick_heuristic(valid);
+        out_best_ms = 0.0;
+        return true;
+    }
+    q_.memset(d_in, 0, tune_bs * sub_n * sizeof(ComplexT)).wait();
+
+    // Single-candidate fast path: 1-shot safety launch only (no multi-rep timing loop).
+    if (valid.size() == 1) {
         try {
-            for (int p = 0; p < 3; ++p) {
-                valid[0].cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
-            }
+            valid[0].cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
             q_.wait_and_throw();
+            out_winner = valid[0].cand;
+            out_best_ms = 0.0;
+            sycl::free(d_out, q_);
+            sycl::free(d_in, q_);
+            return true;
         } catch (...) {
+            sycl::free(d_out, q_);
+            sycl::free(d_in, q_);
+            return false;
         }
+    }
 
-        const auto shortlisted = shortlist_single_pass(valid);
-        bool found = false;
-        double best_ms = 1e30;
-        for (const auto& fc : shortlisted) {
+    // Prime GPU clocks (P8 -> P0) before comparing candidates so candidate 0 isn't penalized.
+    try {
+        for (int p = 0; p < 3; ++p) {
+            valid[0].cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
+        }
+        q_.wait_and_throw();
+    } catch (...) {
+    }
+
+    const auto shortlisted = shortlist_single_pass(valid);
+    bool found = false;
+    double best_ms = 1e30;
+    for (const auto& fc : shortlisted) {
+        try {
+            fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
+            q_.wait_and_throw();
+
+            constexpr int reps = 3;
+            double samples[3] = {};
+            for (int r = 0; r < reps; ++r) {
+                const auto t0 = std::chrono::steady_clock::now();
+                fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
+                q_.wait_and_throw();
+                samples[r] = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+            }
+            std::sort(samples, samples + reps);
+            const double ms = samples[reps / 2];
+
+            if (!found || ms < best_ms) {
+                found = true;
+                best_ms = ms;
+                out_winner = fc.cand;
+            }
+        } catch (...) {
+            // Kernel failed to launch (e.g. per-kernel register WG ceiling) -> disqualify cleanly.
+        }
+    }
+    // If every shortlisted contender failed to launch, fall back to remaining valid candidates.
+    if (!found && shortlisted.size() < valid.size()) {
+        for (const auto& fc : valid) {
             try {
                 fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
                 q_.wait_and_throw();
-
-                constexpr int reps = 3;
-                double samples[3] = {};
-                for (int r = 0; r < reps; ++r) {
-                    const auto t0 = std::chrono::steady_clock::now();
-                    fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
-                    q_.wait_and_throw();
-                    samples[r] = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t0).count();
-                }
-                std::sort(samples, samples + reps);
-                const double ms = samples[reps / 2];
-
-                if (!found || ms < best_ms) {
-                    found = true;
-                    best_ms = ms;
-                    out_winner = fc.cand;
-                }
+                found = true;
+                out_winner = fc.cand;
+                best_ms = 0.0;
+                break;
             } catch (...) {
-                // Kernel failed to launch (e.g. per-kernel register WG ceiling) -> disqualify cleanly.
             }
         }
-        // If every shortlisted contender failed to launch, fall back to remaining valid candidates.
-        if (!found && shortlisted.size() < valid.size()) {
-            for (const auto& fc : valid) {
-                try {
-                    fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign);
-                    q_.wait_and_throw();
-                    found = true;
-                    out_winner = fc.cand;
-                    best_ms = 0.0;
-                    break;
-                } catch (...) {
-                }
-            }
-        }
-        sycl::free(d_out, q_);
-        sycl::free(d_in, q_);
-        out_best_ms = best_ms;
-        return found;
     }
+    sycl::free(d_out, q_);
+    sycl::free(d_in, q_);
+    out_best_ms = best_ms;
+    return found;
+}
 
-    // Resolve best single-pass candidate for size 2^n (used by both 1-pass and 2-pass Pass 1).
-    bool resolve_single_pass_for(
-        int n,
-        bool apply_variant_override,
-        bool allow_cache,
-        bool force_tune,
-        Candidate& out_cand,
-        bool& out_cache_hit,
-        double* out_ms = nullptr) {
-        out_cache_hit = false;
-        const auto valid = collect_candidates(n, apply_variant_override);
-        if (valid.empty()) return false;
+template <int Sign>
+bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::resolve_single_pass_for(
+    int n,
+    bool apply_variant_override,
+    bool allow_cache,
+    bool force_tune,
+    Candidate& out_cand,
+    bool& out_cache_hit,
+    double* out_ms) {
+    out_cache_hit = false;
+    const auto valid = collect_candidates(n, apply_variant_override);
+    if (valid.empty()) return false;
 
-        const std::string key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, n);
-        if (allow_cache && !force_tune) {
-            AutotuneEntry cached{};
-            if (AutotuneCache::get(cache_path_, key, cached) &&
-                cached.mode == PlanExecMode::SinglePass &&
-                find_by_id(valid, cached.variant_id, out_cand)) {
-                out_cache_hit = true;
-                return true;
-            }
-        }
-
-        if (launch_cfg_.autotune == AutotuneMode::Off && !force_tune) {
-            out_cand = pick_heuristic(valid);
+    const std::string key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, n);
+    if (allow_cache && !force_tune) {
+        AutotuneEntry cached{};
+        if (AutotuneCache::get(cache_path_, key, cached) &&
+            cached.mode == PlanExecMode::SinglePass &&
+            find_by_id(valid, cached.variant_id, out_cand)) {
+            out_cache_hit = true;
             return true;
         }
+    }
 
-        double best_ms = 0.0;
-        if (!tune_single_pass(n, valid, out_cand, best_ms)) {
-            return false;
-        }
-        if (out_ms) *out_ms = best_ms;
-        if ((allow_cache || force_tune) && !launch_cfg_.has_plan_overrides()) {
-            AutotuneEntry e{};
-            e.mode = PlanExecMode::SinglePass;
-            e.variant_id = out_cand.variant_id;
-            e.log_n1 = 0;
-            e.pass0_wg = 0;
-            e.l2_chunk_bytes = 0;
-            AutotuneCache::put(cache_path_, key, e);
-        }
+    if (launch_cfg_.autotune == AutotuneMode::Off && !force_tune) {
+        out_cand = pick_heuristic(valid);
         return true;
     }
 
-    void setup_multistage(size_t max_bs) {
-        exec_mode_ = PlanExecMode::MultiStageGlobal;
-        variant_name_ = format_multistage_name(logN_);
-        const size_t fft_bytes = N_ * sizeof(ComplexT);
-        const size_t l2_bytes = (launch_cfg_.l2_chunk_bytes > 0)
-            ? launch_cfg_.l2_chunk_bytes
-            : dev_cfg_.compute_l2_chunk_bytes(
-                  fft_bytes,
-                  size_t{16},
-                  is_compute_heavy_,
-                  launch_cfg_.l2_budget_num,
-                  launch_cfg_.l2_budget_den,
-                  launch_cfg_.min_waves_per_cu);
-        chunk_bs_ = std::min(max_bs, std::max<size_t>(1, l2_bytes / fft_bytes));
-        if (chunk_bs_ == 0) chunk_bs_ = 1;
-        const size_t reg_wg_cap = SYCL_FFT_WIDE ? 256 : 512;
-        pass0_wg_size_ = (launch_cfg_.pass0_wg_size > 0)
-            ? dev_cfg_.clamp_pow2_wg(N_, launch_cfg_.pass0_wg_size, reg_wg_cap)
-            : dev_cfg_.default_wg_size(N_, std::min<size_t>(256, reg_wg_cap));
-        // Multi-stage executes strictly in-place on output buffer -> zero scratch needed.
-        scratch_elems_ = 0;
-        scratch_ = nullptr;
+    double best_ms = 0.0;
+    if (!tune_single_pass(n, valid, out_cand, best_ms)) {
+        return false;
     }
+    if (out_ms) *out_ms = best_ms;
+    if ((allow_cache || force_tune) && !launch_cfg_.has_plan_overrides()) {
+        AutotuneEntry e{};
+        e.mode = PlanExecMode::SinglePass;
+        e.variant_id = out_cand.variant_id;
+        e.log_n1 = 0;
+        e.pass0_wg = 0;
+        e.l2_chunk_bytes = 0;
+        AutotuneCache::put(cache_path_, key, e);
+    }
+    return true;
+}
 
-    void configure_plan(size_t max_bs) {
-        // 1. Hardware capability & numerical safety guards
+template <int Sign>
+void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::setup_multistage(size_t max_bs) {
+    exec_mode_ = PlanExecMode::MultiStageGlobal;
+    variant_name_ = format_multistage_name(logN_);
+    const size_t fft_bytes = N_ * sizeof(ComplexT);
+    const size_t l2_bytes = (launch_cfg_.l2_chunk_bytes > 0)
+        ? launch_cfg_.l2_chunk_bytes
+        : dev_cfg_.compute_l2_chunk_bytes(
+              fft_bytes,
+              size_t{16},
+              is_compute_heavy_,
+              launch_cfg_.l2_budget_num,
+              launch_cfg_.l2_budget_den,
+              launch_cfg_.min_waves_per_cu);
+    chunk_bs_ = std::min(max_bs, std::max<size_t>(1, l2_bytes / fft_bytes));
+    if (chunk_bs_ == 0) chunk_bs_ = 1;
+    const size_t reg_wg_cap = SYCL_FFT_WIDE ? 256 : 512;
+    pass0_wg_size_ = (launch_cfg_.pass0_wg_size > 0)
+        ? dev_cfg_.clamp_pow2_wg(N_, launch_cfg_.pass0_wg_size, reg_wg_cap)
+        : dev_cfg_.default_wg_size(N_, std::min<size_t>(256, reg_wg_cap));
+    // Multi-stage executes strictly in-place on output buffer -> zero scratch needed.
+    scratch_elems_ = 0;
+    scratch_ = nullptr;
+}
+
+template <int Sign>
+void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::configure_plan(size_t max_bs) {
+    // 1. Hardware capability & numerical safety guards
 #if SYCL_FFT_IS_DOUBLE
-        if (!dev_cfg_.has_fp64) {
-            throw std::runtime_error(
-                "FP64 FFT requested on device without sycl::aspect::fp64 (" +
-                dev_cfg_.device_name + "); use DifFftPlandf (double-float) instead");
-        }
+    if (!dev_cfg_.has_fp64) {
+        throw std::runtime_error(
+            "FP64 FFT requested on device without sycl::aspect::fp64 (" +
+            dev_cfg_.device_name + "); use DifFftPlandf (double-float) instead");
+    }
 #endif
 #if SYCL_FFT_IS_DF
-        if (!launch_cfg_.skip_df_kat) {
-            const auto kat = probe_df_kat(q_, dev_cfg_);
-            if (!kat.df_kat_passed) {
-                throw std::runtime_error(
-                    "Double-Float Known-Answer Test failed on " + dev_cfg_.device_name +
-                    ": " + kat.df_kat_error);
-            }
+    if (!launch_cfg_.skip_df_kat) {
+        const auto kat = probe_df_kat(q_, dev_cfg_);
+        if (!kat.df_kat_passed) {
+            throw std::runtime_error(
+                "Double-Float Known-Answer Test failed on " + dev_cfg_.device_name +
+                ": " + kat.df_kat_error);
         }
+    }
 #endif
 #if SYCL_FFT_IS_HALF
-        if (!launch_cfg_.skip_fp16_kat) {
-            const auto kat = probe_fp16_kat(q_, dev_cfg_);
-            if (!kat.fp16_kat_passed) {
-                throw std::runtime_error(
-                    "FP16 Known-Answer Test failed on " + dev_cfg_.device_name +
-                    ": " + kat.fp16_kat_error);
-            }
+    if (!launch_cfg_.skip_fp16_kat) {
+        const auto kat = probe_fp16_kat(q_, dev_cfg_);
+        if (!kat.fp16_kat_passed) {
+            throw std::runtime_error(
+                "FP16 Known-Answer Test failed on " + dev_cfg_.device_name +
+                ": " + kat.fp16_kat_error);
         }
+    }
 #endif
 
-        // 2. Always-on cached hardware probes (sub-group topology & FP64:FP32 ratio)
-        const auto sg_probe = probe_subgroup_topology(q_, dev_cfg_);
-        effective_sg_size_ = sg_probe.effective_sg_size;
-        sg_linear_ok_ = sg_probe.sg_linear_ok && sg_probe.sg_xor_ok;
-        sg_tile_sync_ok_ = sg_probe.sg_linear_ok;
+    // 2. Always-on cached hardware probes (sub-group topology & FP64:FP32 ratio)
+    const auto sg_probe = probe_subgroup_topology(q_, dev_cfg_);
+    effective_sg_size_ = sg_probe.effective_sg_size;
+    sg_linear_ok_ = sg_probe.sg_linear_ok && sg_probe.sg_xor_ok;
+    sg_tile_sync_ok_ = sg_probe.sg_linear_ok;
 
 #if SYCL_FFT_IS_DOUBLE
-        if (launch_cfg_.fp64_compute_heavy_override >= 0) {
-            is_compute_heavy_ = (launch_cfg_.fp64_compute_heavy_override != 0);
-        } else {
-            const auto fp64_probe = probe_fp64_ratio(q_, dev_cfg_);
-            fp64_to_fp32_ratio_ = fp64_probe.fp64_to_fp32_ratio;
-            is_compute_heavy_ = fp64_probe.fp64_compute_heavy;
-        }
+    if (launch_cfg_.fp64_compute_heavy_override >= 0) {
+        is_compute_heavy_ = (launch_cfg_.fp64_compute_heavy_override != 0);
+    } else {
+        const auto fp64_probe = probe_fp64_ratio(q_, dev_cfg_);
+        fp64_to_fp32_ratio_ = fp64_probe.fp64_to_fp32_ratio;
+        is_compute_heavy_ = fp64_probe.fp64_compute_heavy;
+    }
 #else
-        is_compute_heavy_ = (launch_cfg_.fp64_compute_heavy_override == 1);
+    is_compute_heavy_ = (launch_cfg_.fp64_compute_heavy_override == 1);
 #endif
 
-        cache_path_ = AutotuneCache::resolve_cache_path(launch_cfg_.cache_path);
-        bitrev_wg_size_ = (launch_cfg_.bitrev_wg_size > 0)
-            ? dev_cfg_.clamp_pow2_wg(N_, launch_cfg_.bitrev_wg_size)
-            : dev_cfg_.default_wg_size(N_, 256);
-        // BitRevPlan is constructed lazily via ensure_bitrev_plan() so raw-FFT / NuFFT-1
-        // callers never pay bit-reversal planning or LUT-state allocation overhead.
+    cache_path_ = AutotuneCache::resolve_cache_path(launch_cfg_.cache_path);
+    bitrev_wg_size_ = (launch_cfg_.bitrev_wg_size > 0)
+        ? dev_cfg_.clamp_pow2_wg(N_, launch_cfg_.bitrev_wg_size)
+        : dev_cfg_.default_wg_size(N_, 256);
+    // BitRevPlan is constructed lazily via ensure_bitrev_plan() so raw-FFT / NuFFT-1
+    // callers never pay bit-reversal planning or LUT-state allocation overhead.
 
-        // 3. Refuse smem-transpose kernels when !has_native_local_mem (or forced multistage)
-        if (launch_cfg_.force_multistage ||
-            (!dev_cfg_.has_native_local_mem && !launch_cfg_.allow_emulated_local_mem)) {
-            if (!launch_cfg_.allow_multistage_fallback) {
-                throw std::runtime_error(
-                    "Device lacks native local memory (" + dev_cfg_.device_name +
-                    ") and multi-stage global fallback is disabled");
-            }
-            setup_multistage(max_bs);
-            return;
+    // 3. Refuse smem-transpose kernels when !has_native_local_mem (or forced multistage)
+    if (launch_cfg_.force_multistage ||
+        (!dev_cfg_.has_native_local_mem && !launch_cfg_.allow_emulated_local_mem)) {
+        if (!launch_cfg_.allow_multistage_fallback) {
+            throw std::runtime_error(
+                "Device lacks native local memory (" + dev_cfg_.device_name +
+                ") and multi-stage global fallback is disabled");
         }
+        setup_multistage(max_bs);
+        return;
+    }
 
-        // Derive single-pass ceiling from descriptor tables
-        int max_single = 9;
-        for (int n = 10; n <= 14; ++n) {
-            if (!collect_candidates(n, false).empty()) max_single = n;
-        }
-        two_pass_min_logN_ = (launch_cfg_.two_pass_min_logN > 0)
-            ? launch_cfg_.two_pass_min_logN
-            : (max_single + 1);
+    // Derive single-pass ceiling from descriptor tables
+    int max_single = 9;
+    for (int n = 10; n <= 14; ++n) {
+        if (!collect_candidates(n, false).empty()) max_single = n;
+    }
+    two_pass_min_logN_ = (launch_cfg_.two_pass_min_logN > 0)
+        ? launch_cfg_.two_pass_min_logN
+        : (max_single + 1);
 
-        const bool can_try_single = (logN_ < two_pass_min_logN_) &&
-                                    !collect_candidates(logN_, true).empty();
-        const bool can_use_cache = (launch_cfg_.autotune == AutotuneMode::Auto) &&
-                                   !launch_cfg_.has_plan_overrides();
-        const bool force_tune = (launch_cfg_.autotune == AutotuneMode::Force);
-        const std::string plan_key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, logN_);
+    const bool can_try_single = (logN_ < two_pass_min_logN_) &&
+                                !collect_candidates(logN_, true).empty();
+    const bool can_use_cache = (launch_cfg_.autotune == AutotuneMode::Auto) &&
+                               !launch_cfg_.has_plan_overrides();
+    const bool force_tune = (launch_cfg_.autotune == AutotuneMode::Force);
+    const std::string plan_key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, logN_);
 
-        // 4. Fast path: check persistent disk autotune cache for this logN
-        if (can_use_cache) {
-            AutotuneEntry cached{};
-            if (AutotuneCache::get(cache_path_, plan_key, cached)) {
-                if (cached.mode == PlanExecMode::SinglePass && can_try_single) {
-                    const auto valid = collect_candidates(logN_, true);
-                    if (find_by_id(valid, cached.variant_id, single_pass_cand_)) {
-                        exec_mode_ = PlanExecMode::SinglePass;
+    // 4. Fast path: check persistent disk autotune cache for this logN
+    if (can_use_cache) {
+        AutotuneEntry cached{};
+        if (AutotuneCache::get(cache_path_, plan_key, cached)) {
+            if (cached.mode == PlanExecMode::SinglePass && can_try_single) {
+                const auto valid = collect_candidates(logN_, true);
+                if (find_by_id(valid, cached.variant_id, single_pass_cand_)) {
+                    exec_mode_ = PlanExecMode::SinglePass;
+                    variant_name_ = single_pass_cand_.variant_id;
+                    cache_hit_ = true;
+                    return;
+                }
+            } else if (cached.mode == PlanExecMode::TwoPass &&
+                       cached.log_n1 >= 3 && cached.log_n1 <= 5) {
+                const int n2 = logN_ - cached.log_n1;
+                if (n2 >= 10 && n2 <= 13) {
+                    const auto valid2 = collect_candidates(n2, false);
+                    if (find_by_id(valid2, cached.variant_id, single_pass_cand_)) {
+                        exec_mode_ = PlanExecMode::TwoPass;
+                        log_n1_ = cached.log_n1;
+                        log_n2_ = n2;
                         variant_name_ = single_pass_cand_.variant_id;
+                        const size_t n2_sz = size_t{1} << log_n2_;
+                        pass0_wg_size_ = dev_cfg_.clamp_pow2_wg(
+                            n2_sz, cached.pass0_wg > 0 ? cached.pass0_wg : 256);
+                        const size_t fft_bytes = N_ * sizeof(ComplexT);
+                        const size_t l2_bytes = cached.l2_chunk_bytes > 0
+                            ? cached.l2_chunk_bytes
+                            : dev_cfg_.compute_l2_chunk_bytes(
+                                  fft_bytes, size_t{1} << log_n1_, is_compute_heavy_,
+                                  launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
+                                  launch_cfg_.min_waves_per_cu);
+                        chunk_bs_ = std::min(max_bs, std::max<size_t>(1, l2_bytes / fft_bytes));
+                        if (chunk_bs_ == 0) chunk_bs_ = 1;
+                        scratch_elems_ = chunk_bs_ * N_;
+                        scratch_ = sycl::malloc_device<ComplexT>(scratch_elems_, q_);
+                        if (!scratch_) throw std::bad_alloc();
                         cache_hit_ = true;
                         return;
                     }
-                } else if (cached.mode == PlanExecMode::TwoPass &&
-                           cached.log_n1 >= 3 && cached.log_n1 <= 5) {
-                    const int n2 = logN_ - cached.log_n1;
-                    if (n2 >= 10 && n2 <= 13) {
-                        const auto valid2 = collect_candidates(n2, false);
-                        if (find_by_id(valid2, cached.variant_id, single_pass_cand_)) {
-                            exec_mode_ = PlanExecMode::TwoPass;
-                            log_n1_ = cached.log_n1;
-                            log_n2_ = n2;
-                            variant_name_ = single_pass_cand_.variant_id;
-                            const size_t n2_sz = size_t{1} << log_n2_;
-                            pass0_wg_size_ = dev_cfg_.clamp_pow2_wg(
-                                n2_sz, cached.pass0_wg > 0 ? cached.pass0_wg : 256);
-                            const size_t fft_bytes = N_ * sizeof(ComplexT);
-                            const size_t l2_bytes = cached.l2_chunk_bytes > 0
-                                ? cached.l2_chunk_bytes
-                                : dev_cfg_.compute_l2_chunk_bytes(
-                                      fft_bytes, size_t{1} << log_n1_, is_compute_heavy_,
-                                      launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
-                                      launch_cfg_.min_waves_per_cu);
-                            chunk_bs_ = std::min(max_bs, std::max<size_t>(1, l2_bytes / fft_bytes));
-                            if (chunk_bs_ == 0) chunk_bs_ = 1;
-                            scratch_elems_ = chunk_bs_ * N_;
-                            scratch_ = sycl::malloc_device<ComplexT>(scratch_elems_, q_);
-                            if (!scratch_) throw std::bad_alloc();
-                            cache_hit_ = true;
-                            return;
-                        }
-                    }
                 }
             }
         }
+    }
 
-        // 5. Try Single-Pass
-        if (can_try_single) {
-            bool sub_hit = false;
-            if (resolve_single_pass_for(logN_, true, can_use_cache, force_tune, single_pass_cand_, sub_hit)) {
-                exec_mode_ = PlanExecMode::SinglePass;
-                variant_name_ = single_pass_cand_.variant_id;
-                cache_hit_ = sub_hit;
-                return;
-            }
+    // 5. Try Single-Pass
+    if (can_try_single) {
+        bool sub_hit = false;
+        if (resolve_single_pass_for(logN_, true, can_use_cache, force_tune, single_pass_cand_, sub_hit)) {
+            exec_mode_ = PlanExecMode::SinglePass;
+            variant_name_ = single_pass_cand_.variant_id;
+            cache_hit_ = sub_hit;
+            return;
         }
+    }
 
-        // 6. Two-Pass Planning & Autotuning
-        struct SplitOption {
-            int       n1;
-            int       n2;
-            Candidate pass1_cand;
-        };
-        std::vector<SplitOption> splits;
-        auto try_add_split = [&](int n1) {
-            const int n2 = logN_ - n1;
-            if (n1 < 3 || n1 > 5 || n2 < 10 || n2 > 13) return;
-            Candidate c{};
-            bool sub_hit = false;
-            if (resolve_single_pass_for(
-                    n2, false, !launch_cfg_.has_plan_overrides(), false, c, sub_hit)) {
-                splits.push_back(SplitOption{n1, n2, c});
-            }
-        };
+    // 6. Two-Pass Planning & Autotuning
+    struct SplitOption {
+        int       n1;
+        int       n2;
+        Candidate pass1_cand;
+    };
+    std::vector<SplitOption> splits;
+    auto try_add_split = [&](int n1) {
+        const int n2 = logN_ - n1;
+        if (n1 < 3 || n1 > 5 || n2 < 10 || n2 > 13) return;
+        Candidate c{};
+        bool sub_hit = false;
+        if (resolve_single_pass_for(
+                n2, false, !launch_cfg_.has_plan_overrides(), false, c, sub_hit)) {
+            splits.push_back(SplitOption{n1, n2, c});
+        }
+    };
 
-        if (launch_cfg_.two_pass_log_n1 > 0) {
-            try_add_split(launch_cfg_.two_pass_log_n1);
-        } else {
-            int order[3] = {4, 5, 3};
+    if (launch_cfg_.two_pass_log_n1 > 0) {
+        try_add_split(launch_cfg_.two_pass_log_n1);
+    } else {
+        int order[3] = {4, 5, 3};
 #if SYCL_FFT_IS_DF
-            if (logN_ == 17) {
-                order[0] = 5; order[1] = 4; order[2] = 3;
-            }
+        if (logN_ == 17) {
+            order[0] = 5; order[1] = 4; order[2] = 3;
+        }
 #endif
+        for (int n1 : order) {
+            if (splits.size() >= 2) break;
+            if ((logN_ - n1) >= 11) try_add_split(n1);
+        }
+        if (splits.size() < 2) {
             for (int n1 : order) {
                 if (splits.size() >= 2) break;
-                if ((logN_ - n1) >= 11) try_add_split(n1);
-            }
-            if (splits.size() < 2) {
-                for (int n1 : order) {
-                    if (splits.size() >= 2) break;
-                    if ((logN_ - n1) == 10) try_add_split(n1);
-                }
+                if ((logN_ - n1) == 10) try_add_split(n1);
             }
         }
+    }
 
-        if (splits.empty()) {
-            if (launch_cfg_.allow_multistage_fallback) {
-                setup_multistage(max_bs);
-                return;
-            }
-            throw std::runtime_error(
-                "Device capabilities cannot satisfy any single-pass or 2-pass FFT split for this logN");
+    if (splits.empty()) {
+        if (launch_cfg_.allow_multistage_fallback) {
+            setup_multistage(max_bs);
+            return;
+        }
+        throw std::runtime_error(
+            "Device capabilities cannot satisfy any single-pass or 2-pass FFT split for this logN");
+    }
+
+    const size_t fft_bytes = N_ * sizeof(ComplexT);
+    int best_idx = 0;
+    size_t best_pass0_wg = 256;
+    size_t best_l2_bytes = 0;
+
+    auto default_pass0_wg_for = [&](int n1, int n2) -> size_t {
+        const size_t n2_sz = size_t{1} << n2;
+        size_t reg_wg_cap = (SYCL_FFT_WIDE && n1 >= 5) ? 256 : 512;
+        const auto p0_info = SYCL_FFT_SUFFIX(probe_pass0_stage)(q_, q_.get_device(), n1, n2);
+        if (p0_info.available && p0_info.max_wg_size > 0) {
+            reg_wg_cap = std::min(reg_wg_cap, p0_info.max_wg_size);
+        }
+        return (launch_cfg_.pass0_wg_size > 0)
+            ? dev_cfg_.clamp_pow2_wg(n2_sz, launch_cfg_.pass0_wg_size, reg_wg_cap)
+            : dev_cfg_.default_wg_size(n2_sz, std::min<size_t>(256, reg_wg_cap));
+    };
+
+    if (launch_cfg_.autotune == AutotuneMode::Off) {
+        best_idx = 0;
+        best_pass0_wg = default_pass0_wg_for(splits[0].n1, splits[0].n2);
+        best_l2_bytes = (launch_cfg_.l2_chunk_bytes > 0)
+            ? launch_cfg_.l2_chunk_bytes
+            : dev_cfg_.compute_l2_chunk_bytes(
+                  fft_bytes, size_t{1} << splits[0].n1, is_compute_heavy_,
+                  launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
+                  launch_cfg_.min_waves_per_cu);
+    } else {
+        // Autotune (split, Pass-0 WG, L2 chunk size) on a representative working set
+        size_t tune_bs = representative_tune_bs(logN_);
+        tune_bs = std::max<size_t>(4, tune_bs);
+        ComplexT* d_in = nullptr;
+        ComplexT* d_out = nullptr;
+        ComplexT* d_tmp = nullptr;
+        while (tune_bs >= 2) {
+            d_in = sycl::malloc_device<ComplexT>(tune_bs * N_, q_);
+            d_out = d_in ? sycl::malloc_device<ComplexT>(tune_bs * N_, q_) : nullptr;
+            d_tmp = d_out ? sycl::malloc_device<ComplexT>(tune_bs * N_, q_) : nullptr;
+            if (d_in && d_out && d_tmp) break;
+            if (d_in) sycl::free(d_in, q_);
+            if (d_out) sycl::free(d_out, q_);
+            if (d_tmp) sycl::free(d_tmp, q_);
+            d_in = d_out = d_tmp = nullptr;
+            tune_bs >>= 1;
         }
 
-        const size_t fft_bytes = N_ * sizeof(ComplexT);
-        int best_idx = 0;
-        size_t best_pass0_wg = 256;
-        size_t best_l2_bytes = 0;
-
-        auto default_pass0_wg_for = [&](int n1, int n2) -> size_t {
-            const size_t n2_sz = size_t{1} << n2;
-            size_t reg_wg_cap = (SYCL_FFT_WIDE && n1 >= 5) ? 256 : 512;
-            const auto p0_info = SYCL_FFT_SUFFIX(probe_pass0_stage)(q_, q_.get_device(), n1, n2);
-            if (p0_info.available && p0_info.max_wg_size > 0) {
-                reg_wg_cap = std::min(reg_wg_cap, p0_info.max_wg_size);
-            }
-            return (launch_cfg_.pass0_wg_size > 0)
-                ? dev_cfg_.clamp_pow2_wg(n2_sz, launch_cfg_.pass0_wg_size, reg_wg_cap)
-                : dev_cfg_.default_wg_size(n2_sz, std::min<size_t>(256, reg_wg_cap));
-        };
-
-        if (launch_cfg_.autotune == AutotuneMode::Off) {
+        if (!d_in || !d_out || !d_tmp) {
             best_idx = 0;
             best_pass0_wg = default_pass0_wg_for(splits[0].n1, splits[0].n2);
             best_l2_bytes = (launch_cfg_.l2_chunk_bytes > 0)
@@ -2488,210 +2532,161 @@ private:
                       launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
                       launch_cfg_.min_waves_per_cu);
         } else {
-            // Autotune (split, Pass-0 WG, L2 chunk size) on a representative working set
-            size_t tune_bs = representative_tune_bs(logN_);
-            tune_bs = std::max<size_t>(4, tune_bs);
-            ComplexT* d_in = nullptr;
-            ComplexT* d_out = nullptr;
-            ComplexT* d_tmp = nullptr;
-            while (tune_bs >= 2) {
-                d_in = sycl::malloc_device<ComplexT>(tune_bs * N_, q_);
-                d_out = d_in ? sycl::malloc_device<ComplexT>(tune_bs * N_, q_) : nullptr;
-                d_tmp = d_out ? sycl::malloc_device<ComplexT>(tune_bs * N_, q_) : nullptr;
-                if (d_in && d_out && d_tmp) break;
-                if (d_in) sycl::free(d_in, q_);
-                if (d_out) sycl::free(d_out, q_);
-                if (d_tmp) sycl::free(d_tmp, q_);
-                d_in = d_out = d_tmp = nullptr;
-                tune_bs >>= 1;
-            }
+            q_.memset(d_in, 0, tune_bs * N_ * sizeof(ComplexT)).wait();
 
-            if (!d_in || !d_out || !d_tmp) {
-                best_idx = 0;
-                best_pass0_wg = default_pass0_wg_for(splits[0].n1, splits[0].n2);
-                best_l2_bytes = (launch_cfg_.l2_chunk_bytes > 0)
-                    ? launch_cfg_.l2_chunk_bytes
-                    : dev_cfg_.compute_l2_chunk_bytes(
-                          fft_bytes, size_t{1} << splits[0].n1, is_compute_heavy_,
-                          launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
-                          launch_cfg_.min_waves_per_cu);
-            } else {
-                q_.memset(d_in, 0, tune_bs * N_ * sizeof(ComplexT)).wait();
-
-                auto time_two_pass_cfg = [&](const SplitOption& sp, size_t p0_wg, size_t c_bs, double& out_ms) -> bool {
-                    const size_t n1_sz = size_t{1} << sp.n1;
-                    auto run_once = [&]() {
-                        size_t done = 0;
-                        while (done < tune_bs) {
-                            const size_t cur = std::min(c_bs, tune_bs - done);
-                            SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
-                                q_, sp.n1, sp.n2, d_in + done * N_, d_tmp, cur, kPosSign, p0_wg);
-                            sp.pass1_cand.launch(
-                                q_, d_tmp, d_out + done * N_, cur * n1_sz, sg_tile_sync_ok_, kPosSign);
-                            done += cur;
-                        }
-                    };
-                    try {
-                        const auto w0 = std::chrono::steady_clock::now();
-                        run_once();
-                        q_.wait_and_throw();
-                        const double warm_ms =
-                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
-                        const int reps = (warm_ms > 10.0) ? 3 : 5;
-                        double samples[5] = {};
-                        for (int r = 0; r < reps; ++r) {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            run_once();
-                            q_.wait_and_throw();
-                            samples[r] = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - t0).count();
-                        }
-                        std::sort(samples, samples + reps);
-                        out_ms = samples[reps / 2];
-                        return true;
-                    } catch (...) {
-                        return false;
+            auto time_two_pass_cfg = [&](const SplitOption& sp, size_t p0_wg, size_t c_bs, double& out_ms) -> bool {
+                const size_t n1_sz = size_t{1} << sp.n1;
+                auto run_once = [&]() {
+                    size_t done = 0;
+                    while (done < tune_bs) {
+                        const size_t cur = std::min(c_bs, tune_bs - done);
+                        SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
+                            q_, sp.n1, sp.n2, d_in + done * N_, d_tmp, cur, kPosSign, p0_wg);
+                        sp.pass1_cand.launch(
+                            q_, d_tmp, d_out + done * N_, cur * n1_sz, sg_tile_sync_ok_, kPosSign);
+                        done += cur;
                     }
                 };
-
-                // Factored smart search:
-                //   Phase A: compare <=2 shortlisted splits at their analytical default Pass-0 WG.
-                //   Phase B: on the winning split only, check 1 alternate Pass-0 WG (0 new JIT).
-                //   Phase C: on the winning (split, WG), check 2 L2 chunk sizes (0 new JIT).
-                double best_ms = 1e30;
-                bool any_ok = false;
-                for (size_t si = 0; si < splits.size(); ++si) {
-                    const auto& sp = splits[si];
-                    const size_t def_wg = default_pass0_wg_for(sp.n1, sp.n2);
-                    const size_t base_l2 = (launch_cfg_.l2_chunk_bytes > 0)
-                        ? launch_cfg_.l2_chunk_bytes
-                        : dev_cfg_.compute_l2_chunk_bytes(
-                              fft_bytes, size_t{1} << sp.n1, is_compute_heavy_,
-                              launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
-                              launch_cfg_.min_waves_per_cu);
-                    const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, base_l2 / fft_bytes));
-                    double ms = 0.0;
-                    if (time_two_pass_cfg(sp, def_wg, base_cbs, ms) && (!any_ok || ms < best_ms)) {
-                        any_ok = true;
-                        best_ms = ms;
-                        best_idx = static_cast<int>(si);
-                        best_pass0_wg = def_wg;
-                        best_l2_bytes = base_l2;
+                try {
+                    const auto w0 = std::chrono::steady_clock::now();
+                    run_once();
+                    q_.wait_and_throw();
+                    const double warm_ms =
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+                    const int reps = (warm_ms > 10.0) ? 3 : 5;
+                    double samples[5] = {};
+                    for (int r = 0; r < reps; ++r) {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        run_once();
+                        q_.wait_and_throw();
+                        samples[r] = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
                     }
+                    std::sort(samples, samples + reps);
+                    out_ms = samples[reps / 2];
+                    return true;
+                } catch (...) {
+                    return false;
                 }
+            };
 
-                if (any_ok && launch_cfg_.pass0_wg_size == 0) {
-                    const auto& best_sp = splits[static_cast<size_t>(best_idx)];
-                    const size_t n2_sz = size_t{1} << best_sp.n2;
-                    const size_t alt_target = SYCL_FFT_WIDE ? size_t{128} : size_t{512};
-                    const size_t alt_wg = dev_cfg_.clamp_pow2_wg(n2_sz, alt_target);
-                    if (alt_wg != best_pass0_wg) {
-                        const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, best_l2_bytes / fft_bytes));
-                        double ms = 0.0;
-                        if (time_two_pass_cfg(best_sp, alt_wg, base_cbs, ms) && ms < best_ms) {
-                            best_ms = ms;
-                            best_pass0_wg = alt_wg;
-                        }
-                    }
-                }
-
-                if (any_ok && launch_cfg_.l2_chunk_bytes == 0) {
-                    const auto& best_sp = splits[static_cast<size_t>(best_idx)];
-                    const size_t base_l2 = best_l2_bytes;
-                    const size_t max_l2_cap = std::min(
-                        tune_bs * fft_bytes,
-                        dev_cfg_.max_mem_alloc_size > 0
-                            ? std::max(fft_bytes, dev_cfg_.max_mem_alloc_size / 4)
-                            : (tune_bs * fft_bytes));
-                    const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, base_l2 / fft_bytes));
-                    const size_t alt_bytes = std::clamp<size_t>(
-                        base_l2 * 2, fft_bytes, std::max(fft_bytes, max_l2_cap));
-                    const size_t alt_cbs = std::min(tune_bs, std::max<size_t>(1, alt_bytes / fft_bytes));
-                    if (alt_cbs != base_cbs) {
-                        double ms = 0.0;
-                        if (time_two_pass_cfg(best_sp, best_pass0_wg, alt_cbs, ms) && ms < best_ms) {
-                            best_ms = ms;
-                            best_l2_bytes = alt_cbs * fft_bytes;
-                        }
-                    }
-                }
-                sycl::free(d_tmp, q_);
-                sycl::free(d_out, q_);
-                sycl::free(d_in, q_);
-
-                if (!any_ok) {
-                    if (launch_cfg_.allow_multistage_fallback) {
-                        setup_multistage(max_bs);
-                        return;
-                    }
-                    throw std::runtime_error("All 2-pass FFT candidate launches failed on device");
+            // Factored smart search:
+            //   Phase A: compare <=2 shortlisted splits at their analytical default Pass-0 WG.
+            //   Phase B: on the winning split only, check 1 alternate Pass-0 WG (0 new JIT).
+            //   Phase C: on the winning (split, WG), check 2 L2 chunk sizes (0 new JIT).
+            double best_ms = 1e30;
+            bool any_ok = false;
+            for (size_t si = 0; si < splits.size(); ++si) {
+                const auto& sp = splits[si];
+                const size_t def_wg = default_pass0_wg_for(sp.n1, sp.n2);
+                const size_t base_l2 = (launch_cfg_.l2_chunk_bytes > 0)
+                    ? launch_cfg_.l2_chunk_bytes
+                    : dev_cfg_.compute_l2_chunk_bytes(
+                          fft_bytes, size_t{1} << sp.n1, is_compute_heavy_,
+                          launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
+                          launch_cfg_.min_waves_per_cu);
+                const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, base_l2 / fft_bytes));
+                double ms = 0.0;
+                if (time_two_pass_cfg(sp, def_wg, base_cbs, ms) && (!any_ok || ms < best_ms)) {
+                    any_ok = true;
+                    best_ms = ms;
+                    best_idx = static_cast<int>(si);
+                    best_pass0_wg = def_wg;
+                    best_l2_bytes = base_l2;
                 }
             }
-        }
 
-        const auto& chosen = splits[static_cast<size_t>(best_idx)];
-        exec_mode_ = PlanExecMode::TwoPass;
-        log_n1_ = chosen.n1;
-        log_n2_ = chosen.n2;
-        single_pass_cand_ = chosen.pass1_cand;
-        variant_name_ = single_pass_cand_.variant_id;
-        pass0_wg_size_ = best_pass0_wg;
+            if (any_ok && launch_cfg_.pass0_wg_size == 0) {
+                const auto& best_sp = splits[static_cast<size_t>(best_idx)];
+                const size_t n2_sz = size_t{1} << best_sp.n2;
+                const size_t alt_target = SYCL_FFT_WIDE ? size_t{128} : size_t{512};
+                const size_t alt_wg = dev_cfg_.clamp_pow2_wg(n2_sz, alt_target);
+                if (alt_wg != best_pass0_wg) {
+                    const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, best_l2_bytes / fft_bytes));
+                    double ms = 0.0;
+                    if (time_two_pass_cfg(best_sp, alt_wg, base_cbs, ms) && ms < best_ms) {
+                        best_ms = ms;
+                        best_pass0_wg = alt_wg;
+                    }
+                }
+            }
 
-        chunk_bs_ = std::min(max_bs, std::max<size_t>(1, best_l2_bytes / fft_bytes));
-        if (chunk_bs_ == 0) chunk_bs_ = 1;
-        scratch_elems_ = chunk_bs_ * N_;
-        scratch_ = sycl::malloc_device<ComplexT>(scratch_elems_, q_);
-        if (!scratch_) throw std::bad_alloc();
+            if (any_ok && launch_cfg_.l2_chunk_bytes == 0) {
+                const auto& best_sp = splits[static_cast<size_t>(best_idx)];
+                const size_t base_l2 = best_l2_bytes;
+                const size_t max_l2_cap = std::min(
+                    tune_bs * fft_bytes,
+                    dev_cfg_.max_mem_alloc_size > 0
+                        ? std::max(fft_bytes, dev_cfg_.max_mem_alloc_size / 4)
+                        : (tune_bs * fft_bytes));
+                const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, base_l2 / fft_bytes));
+                const size_t alt_bytes = std::clamp<size_t>(
+                    base_l2 * 2, fft_bytes, std::max(fft_bytes, max_l2_cap));
+                const size_t alt_cbs = std::min(tune_bs, std::max<size_t>(1, alt_bytes / fft_bytes));
+                if (alt_cbs != base_cbs) {
+                    double ms = 0.0;
+                    if (time_two_pass_cfg(best_sp, best_pass0_wg, alt_cbs, ms) && ms < best_ms) {
+                        best_ms = ms;
+                        best_l2_bytes = alt_cbs * fft_bytes;
+                    }
+                }
+            }
+            sycl::free(d_tmp, q_);
+            sycl::free(d_out, q_);
+            sycl::free(d_in, q_);
 
-        if (launch_cfg_.autotune != AutotuneMode::Off && !launch_cfg_.has_plan_overrides()) {
-            AutotuneEntry e{};
-            e.mode = PlanExecMode::TwoPass;
-            e.variant_id = single_pass_cand_.variant_id;
-            e.log_n1 = log_n1_;
-            e.pass0_wg = pass0_wg_size_;
-            e.l2_chunk_bytes = best_l2_bytes;
-            AutotuneCache::put(cache_path_, plan_key, e);
+            if (!any_ok) {
+                if (launch_cfg_.allow_multistage_fallback) {
+                    setup_multistage(max_bs);
+                    return;
+                }
+                throw std::runtime_error("All 2-pass FFT candidate launches failed on device");
+            }
         }
     }
 
-    BitRevPlan<ComplexT>& ensure_bitrev_plan() {
-        if (!bitrev_plan_) {
-            bitrev_plan_ = std::make_unique<BitRevPlan<ComplexT>>(
-                q_, logN_, SYCL_FFT_PREC_TAG, dev_cfg_, launch_cfg_);
-        }
-        return *bitrev_plan_;
+    const auto& chosen = splits[static_cast<size_t>(best_idx)];
+    exec_mode_ = PlanExecMode::TwoPass;
+    log_n1_ = chosen.n1;
+    log_n2_ = chosen.n2;
+    single_pass_cand_ = chosen.pass1_cand;
+    variant_name_ = single_pass_cand_.variant_id;
+    pass0_wg_size_ = best_pass0_wg;
+
+    chunk_bs_ = std::min(max_bs, std::max<size_t>(1, best_l2_bytes / fft_bytes));
+    if (chunk_bs_ == 0) chunk_bs_ = 1;
+    scratch_elems_ = chunk_bs_ * N_;
+    scratch_ = sycl::malloc_device<ComplexT>(scratch_elems_, q_);
+    if (!scratch_) throw std::bad_alloc();
+
+    if (launch_cfg_.autotune != AutotuneMode::Off && !launch_cfg_.has_plan_overrides()) {
+        AutotuneEntry e{};
+        e.mode = PlanExecMode::TwoPass;
+        e.variant_id = single_pass_cand_.variant_id;
+        e.log_n1 = log_n1_;
+        e.pass0_wg = pass0_wg_size_;
+        e.l2_chunk_bytes = best_l2_bytes;
+        AutotuneCache::put(cache_path_, plan_key, e);
     }
+}
 
-    sycl::queue&    q_;
-    int             logN_;
-    size_t          N_;
-    DeviceFftConfig dev_cfg_;
-    FftLaunchConfig launch_cfg_;
-    std::string     cache_path_;
+template <int Sign>
+BitRevPlan<SYCL_FFT_COMPLEX>& SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::ensure_bitrev_plan() {
+    if (!bitrev_plan_) {
+        bitrev_plan_ = std::make_unique<BitRevPlan<ComplexT>>(
+            q_, logN_, SYCL_FFT_PREC_TAG, dev_cfg_, launch_cfg_);
+    }
+    return *bitrev_plan_;
+}
 
-    PlanExecMode    exec_mode_ = PlanExecMode::SinglePass;
-    Candidate       single_pass_cand_{};
-    std::string     variant_name_;
-    int             two_pass_min_logN_ = 0;
-    int             log_n1_ = 0;
-    int             log_n2_ = 0;
-    size_t          pass0_wg_size_ = 256;
-    size_t          bitrev_wg_size_ = 256;
-    size_t          chunk_bs_ = 0;
-    size_t          scratch_elems_ = 0;
-    ComplexT*       scratch_ = nullptr;
-
-    size_t          effective_sg_size_ = 1;
-    bool            sg_linear_ok_ = false;
-    bool            sg_tile_sync_ok_ = false;
-    double          fp64_to_fp32_ratio_ = 0.0;
-    bool            is_compute_heavy_ = false;
-    bool            cache_hit_ = false;
-    std::unique_ptr<BitRevPlan<ComplexT>> bitrev_plan_;
-};
+// Explicit instantiations for the selected precision
+#if SYCL_FFT_ENABLE_NEG_SIGN
+template class SYCL_FFT_SUFFIX(DifFftPlan)<-1>;
+#endif
+#if SYCL_FFT_ENABLE_POS_SIGN
+template class SYCL_FFT_SUFFIX(DifFftPlan)<+1>;
+#endif
 
 #endif // !SYCL_FFT_INST_SMALL_ONLY
-
-#endif // SYCL_FFT_USE_EXTERN_TEMPLATES
 
 } // namespace sycl_fft

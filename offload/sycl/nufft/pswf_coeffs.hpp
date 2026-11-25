@@ -10,10 +10,13 @@
 
 namespace sycl_nufft {
 
+#ifndef SYCL_NUFFT_PSWF_MODE_DEFINED
+#define SYCL_NUFFT_PSWF_MODE_DEFINED 1
 enum class PswfMode : int {
     PSWF21 = 0, // sigma = 2.0,  N_out = N,     output_shift = N/2,   N_fft = bitceil(2N)
     PSWF43 = 1  // sigma = 4/3,  N_out = 3N/2,  output_shift = 3N/4,  N_fft = bitceil(2N)
 };
+#endif
 
 template <int W, int NEven, int NOdd>
 struct PswfPiecewiseTableF16 {
