@@ -123,6 +123,7 @@ struct DeviceFftConfig {
     bool is_gpu = false;
     bool has_native_local_mem = false;
     bool has_fp64 = true;
+    bool has_fp16_aspect = false;
 
     // Extended hardware identity & layout properties
     std::string device_name;
@@ -145,6 +146,7 @@ struct DeviceFftConfig {
         DeviceFftConfig cfg{};
         cfg.is_gpu = dev.is_gpu();
         cfg.has_fp64 = dev.has(sycl::aspect::fp64);
+        cfg.has_fp16_aspect = dev.has(sycl::aspect::fp16);
         cfg.device_name = sanitize_cache_token(dev.get_info<sycl::info::device::name>());
         cfg.driver_version = sanitize_cache_token(dev.get_info<sycl::info::device::driver_version>());
         cfg.backend_tag = backend_to_tag(dev);
@@ -294,12 +296,18 @@ struct FftLaunchConfig {
     int    stash_8192_override = -1;            // -1 = auto probe/autotune, 0 = false, 1 = true
     std::string variant_override;               // non-empty = pin specific single-pass variant_id
     bool   skip_df_kat = false;                 // false = enforce plan-time DF Known-Answer Test
+    std::string bitrev_variant_override;        // non-empty = pin specific bit-reversal strategy
+    bool   skip_fp16_kat = false;               // false = enforce plan-time FP16 KAT
 
     bool has_plan_overrides() const {
         return l2_chunk_bytes > 0 || pass0_wg_size > 0 || two_pass_min_logN > 0 ||
                two_pass_log_n1 > 0 || !allow_wide_kernels || force_multistage ||
                allow_emulated_local_mem || fp64_compute_heavy_override >= 0 ||
                stash_8192_override >= 0 || !variant_override.empty();
+    }
+
+    bool has_bitrev_overrides() const {
+        return bitrev_wg_size > 0 || !bitrev_variant_override.empty() || allow_emulated_local_mem;
     }
 };
 
@@ -355,6 +363,10 @@ struct DeviceProbeResult {
     bool     df_kat_probed = false;
     bool     df_kat_passed = false;
     std::string df_kat_error;
+
+    bool     fp16_kat_probed = false;
+    bool     fp16_kat_passed = false;
+    std::string fp16_kat_error;
 
     bool     fp64_probed = false;
     double   fp64_to_fp32_ratio = 0.0;
@@ -427,6 +439,39 @@ struct DfKatProbeKernel {
         out[8]  = p.hi;    out[9]  = p.lo;
         out[10] = cm_r.hi; out[11] = cm_r.lo;
         out[12] = cm_i.hi; out[13] = cm_i.lo;
+    }
+};
+
+struct Fp16KatProbeKernel {
+    const Complexh* in0;
+    const Complexh* in1;
+    Complexh* out0;
+    Complexh* out1;
+
+    void operator()(sycl::id<1>) const {
+        f16x2_t ar, ai, br, bi, wr, wi;
+        f16x2_load_pair(in0, in1, 0, true, true, ar, ai);
+        f16x2_load_pair(in0, in1, 1, true, true, br, bi);
+        f16x2_load_pair(in0, in1, 2, true, true, wr, wi);
+
+        // 0: average butterfly sum: 0.5 * (a + b)
+        const f16x2_t sr = f16x2_scale_half(f16x2_add(ar, br));
+        const f16x2_t si = f16x2_scale_half(f16x2_add(ai, bi));
+        f16x2_store_pair(out0, out1, 0, true, true, sr, si);
+
+        // 1: average butterfly diff * twiddle: (0.5 * (a - b)) * w
+        const f16x2_t dr = f16x2_scale_half(f16x2_sub(ar, br));
+        const f16x2_t di = f16x2_scale_half(f16x2_sub(ai, bi));
+        f16x2_t tr, ti;
+        f16x2_cmul(dr, di, wr, wi, tr, ti);
+        f16x2_store_pair(out0, out1, 1, true, true, tr, ti);
+
+        // 2: conditional sign flip + sqrt(1/2) rotation
+        const f16x2_t nr = f16x2_cond_neg(ar, true);
+        const f16x2_t ni = f16x2_cond_neg(ai, false);
+        f16x2_t qr, qi;
+        f16x2_cmul_sqrt1_2<false, true>(nr, ni, qr, qi);
+        f16x2_store_pair(out0, out1, 2, true, true, qr, qi);
     }
 };
 
@@ -623,6 +668,119 @@ inline DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev
     return entry;
 }
 
+inline DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
+    const std::string key = dev_cfg.identity_key();
+    {
+        std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
+        auto it = detail::probe_cache_map().find(key);
+        if (it != detail::probe_cache_map().end() && it->second.fp16_kat_probed) {
+            return it->second;
+        }
+    }
+
+    bool passed = false;
+    std::string err_msg;
+
+#if !defined(SYCL_IMPLEMENTATION_ACPP) && !defined(SYCL_IMPLEMENTATION_HIPSYCL)
+    if (!dev_cfg.has_fp16_aspect) {
+        err_msg = "device lacks sycl::aspect::fp16";
+        std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
+        auto& entry = detail::probe_cache_map()[key];
+        entry.fp16_kat_probed = true;
+        entry.fp16_kat_passed = false;
+        entry.fp16_kat_error = err_msg;
+        return entry;
+    }
+#endif
+
+    const Complexh h_in0[3] = {
+        complexh_from_doubles(1.25, -0.75),
+        complexh_from_doubles(0.375, 0.625),
+        complexh_from_doubles(0.70703125, -0.70703125)
+    };
+    const Complexh h_in1[3] = {
+        complexh_from_doubles(-0.5, 0.875),
+        complexh_from_doubles(1.125, -0.25),
+        complexh_from_doubles(0.70703125, -0.70703125)
+    };
+
+    Complexh* d_in0 = nullptr;
+    Complexh* d_in1 = nullptr;
+    Complexh* d_out0 = nullptr;
+    Complexh* d_out1 = nullptr;
+    try {
+        d_in0 = sycl::malloc_device<Complexh>(3, q);
+        d_in1 = sycl::malloc_device<Complexh>(3, q);
+        d_out0 = sycl::malloc_device<Complexh>(3, q);
+        d_out1 = sycl::malloc_device<Complexh>(3, q);
+        if (!d_in0 || !d_in1 || !d_out0 || !d_out1) {
+            err_msg = "allocation failure during FP16 KAT";
+        } else {
+            q.memcpy(d_in0, h_in0, sizeof(h_in0)).wait();
+            q.memcpy(d_in1, h_in1, sizeof(h_in1)).wait();
+            q.submit([&](sycl::handler& h) {
+                h.parallel_for(sycl::range<1>(1), detail::Fp16KatProbeKernel{d_in0, d_in1, d_out0, d_out1});
+            }).wait_and_throw();
+            Complexh h_out0[3] = {}, h_out1[3] = {};
+            q.memcpy(h_out0, d_out0, sizeof(h_out0)).wait();
+            q.memcpy(h_out1, d_out1, sizeof(h_out1)).wait();
+
+            auto check_lane = [&](const char* lane_tag, const Complexh in[3], const Complexh out[3]) -> bool {
+                long double ar, ai, br, bi, wr, wi;
+                complexh_to_long_doubles(in[0], ar, ai);
+                complexh_to_long_doubles(in[1], br, bi);
+                complexh_to_long_doubles(in[2], wr, wi);
+
+                const double exp_r[3] = {
+                    static_cast<double>(0.5L * (ar + br)),
+                    static_cast<double>(0.5L * (ar - br) * wr - 0.5L * (ai - bi) * wi),
+                    static_cast<double>(((-ar) + ai) * 0.7071067811865475244L)
+                };
+                const double exp_i[3] = {
+                    static_cast<double>(0.5L * (ai + bi)),
+                    static_cast<double>(0.5L * (ar - br) * wi + 0.5L * (ai - bi) * wr),
+                    static_cast<double>((ai - (-ar)) * 0.7071067811865475244L)
+                };
+                constexpr double kTol = 3e-3;
+                for (int i = 0; i < 3; ++i) {
+                    long double gr, gi;
+                    complexh_to_long_doubles(out[i], gr, gi);
+                    if (!std::isfinite(static_cast<double>(gr)) || !std::isfinite(static_cast<double>(gi)) ||
+                        std::fabs(static_cast<double>(gr) - exp_r[i]) > kTol ||
+                        std::fabs(static_cast<double>(gi) - exp_i[i]) > kTol) {
+                        char buf[256];
+                        std::snprintf(buf, sizeof(buf),
+                                      "FP16 KAT %s op %d mismatch (got %.5f, %.5f; exp %.5f, %.5f)",
+                                      lane_tag, i,
+                                      static_cast<double>(gr), static_cast<double>(gi),
+                                      exp_r[i], exp_i[i]);
+                        err_msg = buf;
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            if (check_lane("lane0", h_in0, h_out0) && check_lane("lane1", h_in1, h_out1)) {
+                passed = true;
+            }
+        }
+    } catch (const std::exception& ex) {
+        err_msg = std::string("kernel exception: ") + ex.what();
+    }
+    if (d_in0) sycl::free(d_in0, q);
+    if (d_in1) sycl::free(d_in1, q);
+    if (d_out0) sycl::free(d_out0, q);
+    if (d_out1) sycl::free(d_out1, q);
+
+    std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
+    auto& entry = detail::probe_cache_map()[key];
+    entry.fp16_kat_probed = true;
+    entry.fp16_kat_passed = passed;
+    entry.fp16_kat_error = err_msg;
+    return entry;
+}
+
 inline DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const std::string key = dev_cfg.identity_key();
     {
@@ -724,7 +882,7 @@ public:
     }
 
     static std::string make_key(
-        const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN) {
+        const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag = "any") {
         char vid[16];
         std::snprintf(vid, sizeof(vid), "0x%x", dev_cfg.vendor_id);
         std::ostringstream oss;
@@ -734,7 +892,7 @@ public:
             << "\t" << sanitize_cache_token(dev_cfg.driver_version)
             << "\t" << dev_cfg.backend_tag
             << "\t" << prec_tag
-            << "\tany"
+            << "\t" << (slot_tag ? slot_tag : "any")
             << "\t" << logN;
         return oss.str();
     }

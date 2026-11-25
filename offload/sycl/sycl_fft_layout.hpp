@@ -238,6 +238,119 @@ constexpr int find_min_conflict_row_stride(
 }
 
 // ============================================================================
+// Bit-Reversal Shared-Memory Bank-Conflict Models (Whole-FFT XOR & COBRA Tile)
+// ============================================================================
+namespace detail {
+
+constexpr int bit_reverse_const(int x, int bits) {
+    int r = 0;
+    for (int i = 0; i < bits; ++i) {
+        r = (r << 1) | ((x >> i) & 1);
+    }
+    return r;
+}
+
+} // namespace detail
+
+// Number of low address bits matching one conflict-free bank window for elem_bytes.
+constexpr int whole_smem_xor_k(BankModel b, int elem_bytes) {
+    if (b.banks <= 1) {
+        return 0;
+    }
+    const int banks_per_elem = (elem_bytes + b.bank_width_bytes - 1) / b.bank_width_bytes;
+    const int elem_banks = (b.banks / banks_per_elem > 0) ? (b.banks / banks_per_elem) : 1;
+    int k = 0;
+    while ((1 << (k + 1)) <= elem_banks) {
+        ++k;
+    }
+    return k;
+}
+
+// Zero-pad XOR swizzle for whole-FFT shared-memory bit-reversal.
+constexpr int whole_smem_xor_slot(int idx, int logN, int k) {
+    if (k <= 0 || logN <= k) {
+        return idx;
+    }
+    const int mask = (1 << k) - 1;
+    return idx ^ ((idx >> (logN - k)) & mask);
+}
+
+// Evaluate bank-conflict degree for whole-FFT XOR-swizzled write and bit-reversed read.
+constexpr int whole_smem_xor_conflicts(BankModel b, int elem_bytes, int logN) {
+    const int k = whole_smem_xor_k(b, elem_bytes);
+    const int N = 1 << logN;
+    const int bases[3] = {0, 32, N >> 1};
+    int worst = 1;
+    for (int bi = 0; bi < 3; ++bi) {
+        const int base = bases[bi];
+        if (base + 32 > N) continue;
+        const int dw = detail::eval_window_conflicts(b, elem_bytes, 32, [=](int lane) {
+            return whole_smem_xor_slot(base + lane, logN, k);
+        });
+        const int dr = detail::eval_window_conflicts(b, elem_bytes, 32, [=](int lane) {
+            const int r = detail::bit_reverse_const(base + lane, logN);
+            return whole_smem_xor_slot(r, logN, k);
+        });
+        if (dw > worst) worst = dw;
+        if (dr > worst) worst = dr;
+    }
+    return worst;
+}
+
+// Strided COBRA tile stride (coprime to element bank count) and evaluator.
+constexpr int cobra_tile_stride(BankModel b, int elem_bytes, int w) {
+    return find_min_conflict_stride2(b, elem_bytes, 1 << w);
+}
+
+constexpr int cobra_tile_conflicts(BankModel b, int elem_bytes, int w, int stride) {
+    const int W = 1 << w;
+    const int dw = detail::eval_window_conflicts(b, elem_bytes, W, [=](int lane) {
+        return lane;
+    });
+    const int dr = detail::eval_window_conflicts(b, elem_bytes, W, [=](int lane) {
+        const int r = detail::bit_reverse_const(lane, w);
+        return r * stride;
+    });
+    return (dw > dr) ? dw : dr;
+}
+
+// Zero-padding conflict-free XOR swizzle for W x W COBRA tiles (w = 4 or 5).
+// Conflict degree == 1 for both coalesced row writes and bit-reversed reads
+// across 4B, 8B, and 16B elements on both 32x4 and 16x4 bank models.
+constexpr int cobra_tile_xor_slot(int a, int c, int w) {
+    if (w == 4) {
+        return (a << 4) + (c ^ a ^ (a >> 3) ^ ((a >> 1) & 2));
+    }
+    if (w == 5) {
+        return (a << 5) + (c ^ a ^ (a >> 4) ^ ((a >> 2) & 2));
+    }
+    return (a << w) + c;
+}
+
+constexpr int cobra_tile_xor_conflicts(BankModel b, int elem_bytes, int w) {
+    const int W = 1 << w;
+    const int rows_per_warp = (32 >= W) ? (32 / W) : 1;
+    int worst = 1;
+    for (int row0 = 0; row0 < W; row0 += rows_per_warp) {
+        const int dw = detail::eval_window_conflicts(b, elem_bytes, 32, [=](int lane) {
+            const int a = row0 + (lane >> w);
+            const int c = lane & (W - 1);
+            return cobra_tile_xor_slot(a, c, w);
+        });
+        const int dr = detail::eval_window_conflicts(b, elem_bytes, 32, [=](int lane) {
+            const int a_out = row0 + (lane >> w);
+            const int c_out = lane & (W - 1);
+            const int a_src = detail::bit_reverse_const(c_out, w);
+            const int c_src = detail::bit_reverse_const(a_out, w);
+            return cobra_tile_xor_slot(a_src, c_src, w);
+        });
+        if (dw > worst) worst = dw;
+        if (dr > worst) worst = dr;
+    }
+    return worst;
+}
+
+// ============================================================================
 // Compile-Time Regression Suite: Verify Existing NVIDIA 32x4 & Intel 16x4 Layouts
 // ============================================================================
 namespace layout_checks {
@@ -291,6 +404,46 @@ static_assert(t2_stride_conflicts(kBank32x8, 8, 128, 8, 16,
                   find_min_conflict_row_stride(kBank32x8, 8, 128, 8, 144, 9, 16), 9) == 1,
               "Wide logN=11 on 32x8 must derive conflict-free row_stride");
 
+
+// Bit-reversal Whole-FFT XOR swizzle: 4B, 8B, 16B on 32x4 and 16x4 for logN=10..14
+static_assert(whole_smem_xor_conflicts(kBank32x4, 4, 10) == 1 &&
+              whole_smem_xor_conflicts(kBank32x4, 4, 12) == 1 &&
+              whole_smem_xor_conflicts(kBank32x4, 4, 14) == 1,
+              "Whole-FFT XOR bit-rev 4B must be conflict-free on 32x4");
+static_assert(whole_smem_xor_conflicts(kBank32x4, 8, 10) == 1 &&
+              whole_smem_xor_conflicts(kBank32x4, 8, 12) == 1 &&
+              whole_smem_xor_conflicts(kBank32x4, 8, 13) == 1,
+              "Whole-FFT XOR bit-rev 8B must be conflict-free on 32x4");
+static_assert(whole_smem_xor_conflicts(kBank32x4, 16, 10) == 1 &&
+              whole_smem_xor_conflicts(kBank32x4, 16, 11) == 1 &&
+              whole_smem_xor_conflicts(kBank32x4, 16, 12) == 1,
+              "Whole-FFT XOR bit-rev 16B must be conflict-free on 32x4");
+static_assert(whole_smem_xor_conflicts(kBank16x4, 4, 10) == 1 &&
+              whole_smem_xor_conflicts(kBank16x4, 8, 10) == 1 &&
+              whole_smem_xor_conflicts(kBank16x4, 16, 10) == 1,
+              "Whole-FFT XOR bit-rev must be conflict-free on 16x4");
+
+// Bit-reversal COBRA tile: strided (when W <= elem_banks) and zero-pad XOR (all sizes)
+static_assert(cobra_tile_conflicts(kBank32x4, 4, 4, cobra_tile_stride(kBank32x4, 4, 4)) == 1 &&
+              cobra_tile_conflicts(kBank32x4, 8, 4, cobra_tile_stride(kBank32x4, 8, 4)) == 1 &&
+              cobra_tile_conflicts(kBank32x4, 4, 5, cobra_tile_stride(kBank32x4, 4, 5)) == 1 &&
+              cobra_tile_conflicts(kBank16x4, 4, 4, cobra_tile_stride(kBank16x4, 4, 4)) == 1,
+              "COBRA strided tile must be conflict-free whenever W <= elem_banks");
+static_assert(cobra_tile_xor_conflicts(kBank32x4, 4, 4) == 1 &&
+              cobra_tile_xor_conflicts(kBank32x4, 8, 4) == 1 &&
+              cobra_tile_xor_conflicts(kBank32x4, 16, 4) == 1,
+              "COBRA zero-pad XOR tile w=4 must be conflict-free on 32x4");
+static_assert(cobra_tile_xor_conflicts(kBank32x4, 4, 5) == 1 &&
+              cobra_tile_xor_conflicts(kBank32x4, 8, 5) == 1 &&
+              cobra_tile_xor_conflicts(kBank32x4, 16, 5) == 1,
+              "COBRA zero-pad XOR tile w=5 must be conflict-free on 32x4");
+static_assert(cobra_tile_xor_conflicts(kBank16x4, 4, 4) == 1 &&
+              cobra_tile_xor_conflicts(kBank16x4, 8, 4) == 1 &&
+              cobra_tile_xor_conflicts(kBank16x4, 16, 4) == 1 &&
+              cobra_tile_xor_conflicts(kBank16x4, 4, 5) == 1 &&
+              cobra_tile_xor_conflicts(kBank16x4, 8, 5) == 1 &&
+              cobra_tile_xor_conflicts(kBank16x4, 16, 5) == 1,
+              "COBRA zero-pad XOR tile w=4,5 must be conflict-free on 16x4");
 } // namespace layout_checks
 
 } // namespace sycl_fft

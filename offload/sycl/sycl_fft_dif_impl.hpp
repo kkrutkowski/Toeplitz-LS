@@ -4,6 +4,110 @@
 
 namespace sycl_fft {
 
+#if defined(SYCL_FFT_USE_EXTERN_TEMPLATES)
+
+struct SYCL_FFT_SUFFIX(SinglePassCandidate) {
+    using ComplexT = SYCL_FFT_COMPLEX;
+    using LaunchFn = void (*)(sycl::queue&, const ComplexT*, ComplexT*, size_t, bool);
+    using ProbeFn  = KernelProbeInfo (*)(sycl::queue&, const sycl::device&);
+
+    const char*   variant_id;
+    int           logN;
+    size_t        wg_size;
+    size_t        smem_bytes;
+    size_t        req_sg;
+    int           pinned_sg;
+    bool          uses_wide_2t;
+    bool          uses_stash_8192;
+    BankModelKind bank_kind;
+    LaunchFn      launch;
+    ProbeFn       probe_bundle;
+};
+
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
+class SYCL_FFT_SUFFIX(DifFftPlan) {
+    static_assert(Sign == -1 || Sign == +1, "DifFftPlan Sign must be -1 or +1");
+    static_assert((Sign == +1 && SYCL_FFT_ENABLE_POS_SIGN) ||
+                      (Sign == -1 && SYCL_FFT_ENABLE_NEG_SIGN),
+                  "Requested DifFftPlan<Sign> is disabled at compile time (build with SIGN=pos|neg|both)");
+public:
+    using ComplexT  = SYCL_FFT_COMPLEX;
+    using SmemT     = SYCL_FFT_SMEM_T;
+    using Candidate = SYCL_FFT_SUFFIX(SinglePassCandidate);
+
+    SYCL_FFT_SUFFIX(DifFftPlan)(
+        sycl::queue& q, int logN, size_t max_bs, const FftLaunchConfig& cfg = {});
+    SYCL_FFT_SUFFIX(DifFftPlan)(
+        sycl::queue& q, int logN, size_t max_bs, size_t l2_chunk_bytes);
+    ~SYCL_FFT_SUFFIX(DifFftPlan)();
+
+    SYCL_FFT_SUFFIX(DifFftPlan)(const SYCL_FFT_SUFFIX(DifFftPlan)&) = delete;
+    SYCL_FFT_SUFFIX(DifFftPlan)& operator=(const SYCL_FFT_SUFFIX(DifFftPlan)&) = delete;
+
+    void execute_raw(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0);
+    void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0);
+    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs) { bitrev_plan_.execute(src, dst, bs); }
+    void bit_reverse(ComplexT* buf, size_t bs) { bitrev_plan_.execute_in_place(buf, bs); }
+    const char* bitrev_variant_name(bool in_place = true) { return bitrev_plan_.variant_name(in_place); }
+    bool bitrev_cache_hit(bool in_place = true) { return bitrev_plan_.cache_hit(in_place); }
+    BitRevPlan<ComplexT>& bitrev_plan() { return bitrev_plan_; }
+
+    size_t chunk_bs() const { return chunk_bs_; }
+    size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }
+    size_t pass0_wg_size() const { return pass0_wg_size_; }
+    size_t bitrev_wg_size() const { return bitrev_wg_size_; }
+    int    two_pass_min_logN() const { return two_pass_min_logN_; }
+    bool   is_two_pass() const { return exec_mode_ == PlanExecMode::TwoPass; }
+    bool   is_multistage() const { return exec_mode_ == PlanExecMode::MultiStageGlobal; }
+    PlanExecMode exec_mode() const { return exec_mode_; }
+    int    log_n1() const { return log_n1_; }
+    int    log_n2() const { return log_n2_; }
+    const char* variant_name() const { return variant_name_.c_str(); }
+    size_t effective_sg_size() const { return effective_sg_size_; }
+    double fp64_to_fp32_ratio() const { return fp64_to_fp32_ratio_; }
+    bool   is_compute_heavy() const { return is_compute_heavy_; }
+    bool   cache_hit() const { return cache_hit_; }
+    const DeviceFftConfig& device_config() const { return dev_cfg_; }
+    const FftLaunchConfig& launch_config() const { return launch_cfg_; }
+
+private:
+    sycl::queue&    q_;
+    int             logN_;
+    size_t          N_;
+    DeviceFftConfig dev_cfg_;
+    FftLaunchConfig launch_cfg_;
+    std::string     cache_path_;
+
+    PlanExecMode    exec_mode_ = PlanExecMode::SinglePass;
+    Candidate       single_pass_cand_{};
+    std::string     variant_name_;
+    int             two_pass_min_logN_ = 0;
+    int             log_n1_ = 0;
+    int             log_n2_ = 0;
+    size_t          pass0_wg_size_ = 256;
+    size_t          bitrev_wg_size_ = 256;
+    size_t          chunk_bs_ = 0;
+    size_t          scratch_elems_ = 0;
+    ComplexT*       scratch_ = nullptr;
+
+    size_t          effective_sg_size_ = 1;
+    bool            sg_linear_ok_ = false;
+    bool            sg_tile_sync_ok_ = false;
+    double          fp64_to_fp32_ratio_ = 0.0;
+    bool            is_compute_heavy_ = false;
+    bool            cache_hit_ = false;
+    BitRevPlan<ComplexT> bitrev_plan_{};
+};
+
+#if SYCL_FFT_ENABLE_NEG_SIGN
+extern template class SYCL_FFT_SUFFIX(DifFftPlan)<-1>;
+#endif
+#if SYCL_FFT_ENABLE_POS_SIGN
+extern template class SYCL_FFT_SUFFIX(DifFftPlan)<+1>;
+#endif
+
+#else // !SYCL_FFT_USE_EXTERN_TEMPLATES
+
 // ============================================================================
 // Pure Radix-2 DIF stages in registers on E = 2^LogE elements (no inter-thread
 // twiddles; exact compile-time W_32 constants with W_2, W_4, W_8 specializations).
@@ -51,8 +155,8 @@ SYCL_FFT_FORCE_INLINE void SYCL_FFT_SUFFIX(dif_radix2_reg_base)(
                 } else if constexpr (Idx32 == 12) {
                     SYCL_FFT_CMUL_SQRT1_2(true, Sign < 0, dr, di, r_re[B], r_im[B]);
                 } else {
-                    constexpr Real cr = SYCL_FFT_TWIDDLE32_RE(Sign, Idx32);
-                    constexpr Real ci = SYCL_FFT_TWIDDLE32_IM(Sign, Idx32);
+                    const Real cr = SYCL_FFT_TWIDDLE32_RE(Sign, Idx32);
+                    const Real ci = SYCL_FFT_TWIDDLE32_IM(Sign, Idx32);
                     SYCL_FFT_CMUL(dr, di, cr, ci, r_re[B], r_im[B]);
                 }
             });
@@ -81,6 +185,108 @@ SYCL_FFT_FORCE_INLINE void SYCL_FFT_SUFFIX(apply_bitrev_twiddles_with)(
 
     on_elem(std::integral_constant<int, 0>{}, r_re[0], r_im[0]);
 
+#if SYCL_FFT_IS_HALF
+    // Evaluate twiddle recurrences in scalar FP32 (eliminating FP16 squaring phase drift)
+    // and splat exact binary16 twiddles right before the 2x FP16 complex multiply.
+    auto tw_cmul = [](float ar, float ai, float br, float bi, float& or_, float& oi) SYCL_FFT_LAMBDA_INLINE {
+        or_ = sycl::fma(ar, br, -(ai * bi));
+        oi  = sycl::fma(ar, bi,   ai * br);
+    };
+    auto tw_csqr = [](float ar, float ai, float& or_, float& oi) SYCL_FFT_LAMBDA_INLINE {
+        or_ = sycl::fma(ar, ar, -(ai * ai));
+        oi  = (2.0f * ar) * ai;
+    };
+
+    float w1r, w1i;
+    if constexpr (LogE >= 4 && LogE + LogT <= 8) {
+        constexpr int Scale = 256 / (E * T);
+        const int idx = t * Scale;
+        w1r = twiddle256_ref<Sign>(idx);
+        w1i = twiddle256_imf<Sign>(idx);
+    } else if constexpr (LogE >= 3) {
+        sincos2pif_oct1<Sign>(static_cast<float>(t) * inv_m, w1r, w1i);
+    } else {
+        sincos2pif_half<Sign>(static_cast<float>(t) * inv_m, w1r, w1i);
+    }
+    float w2r, w2i, w3r, w3i, w4r, w4i;
+    tw_csqr(w1r, w1i, w2r, w2i);
+    tw_cmul(w2r, w2i, w1r, w1i, w3r, w3i);
+    tw_csqr(w2r, w2i, w4r, w4i);
+
+    if constexpr (LogE == 3) {
+        const float lo_r[4] = {1.0f, w2r, w1r, w3r};
+        const float lo_i[4] = {0.0f, w2i, w1i, w3i};
+        unroll_for<7>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 1;
+            constexpr int B = P & 1;
+            float wr, wi;
+            if constexpr (A == 0) {
+                wr = w4r; wi = w4i;
+            } else if constexpr (B == 0) {
+                wr = lo_r[A]; wi = lo_i[A];
+            } else {
+                tw_cmul(lo_r[A], lo_i[A], w4r, w4i, wr, wi);
+            }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], f16x2_splat_f(wr), f16x2_splat_f(wi), or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    } else if constexpr (LogE == 4) {
+        float w8r, w8i, w12r, w12i;
+        tw_csqr(w4r, w4i, w8r, w8i);
+        tw_cmul(w8r, w8i, w4r, w4i, w12r, w12i);
+        const float lo_r[4] = {1.0f, w2r, w1r, w3r};
+        const float lo_i[4] = {0.0f, w2i, w1i, w3i};
+        const float hi_r[4] = {1.0f, w8r, w4r, w12r};
+        const float hi_i[4] = {0.0f, w8i, w4i, w12i};
+        unroll_for<15>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 2;
+            constexpr int B = P & 3;
+            float wr, wi;
+            if constexpr (A == 0) {
+                wr = hi_r[B]; wi = hi_i[B];
+            } else if constexpr (B == 0) {
+                wr = lo_r[A]; wi = lo_i[A];
+            } else {
+                tw_cmul(lo_r[A], lo_i[A], hi_r[B], hi_i[B], wr, wi);
+            }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], f16x2_splat_f(wr), f16x2_splat_f(wi), or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    } else if constexpr (LogE == 5) {
+        float w5r, w5i, w6r, w6i, w7r, w7i;
+        float w8r, w8i, w16r, w16i, w24r, w24i;
+        tw_cmul(w4r, w4i, w1r, w1i, w5r, w5i);
+        tw_cmul(w4r, w4i, w2r, w2i, w6r, w6i);
+        tw_cmul(w4r, w4i, w3r, w3i, w7r, w7i);
+        tw_csqr(w4r, w4i, w8r, w8i);
+        tw_csqr(w8r, w8i, w16r, w16i);
+        tw_cmul(w16r, w16i, w8r, w8i, w24r, w24i);
+        const float lo_r[8] = {1.0f, w4r, w2r, w6r, w1r, w5r, w3r, w7r};
+        const float lo_i[8] = {0.0f, w4i, w2i, w6i, w1i, w5i, w3i, w7i};
+        const float hi_r[4] = {1.0f, w16r, w8r, w24r};
+        const float hi_i[4] = {0.0f, w16i, w8i, w24i};
+        unroll_for<31>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 2;
+            constexpr int B = P & 3;
+            float wr, wi;
+            if constexpr (A == 0) {
+                wr = hi_r[B]; wi = hi_i[B];
+            } else if constexpr (B == 0) {
+                wr = lo_r[A]; wi = lo_i[A];
+            } else {
+                tw_cmul(lo_r[A], lo_i[A], hi_r[B], hi_i[B], wr, wi);
+            }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], f16x2_splat_f(wr), f16x2_splat_f(wi), or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    }
+#else
     Real w1r, w1i;
     if constexpr (LogE >= 4 && LogE + LogT <= 8) {
         // Exact small-angle table lookup (W_64, W_128, W_256) -> zero trig ops!
@@ -222,6 +428,189 @@ SYCL_FFT_FORCE_INLINE void SYCL_FFT_SUFFIX(apply_bitrev_twiddles_with)(
         });
 #endif
     }
+#endif
+}
+
+// Runtime-stride twiddle helper for collapsed Pass0Functor<LogN1, true, Sign>
+// (inv_m = 1 / (N1 * N2) passed as kernel argument; LogE >= 3 guarantees t * inv_m < 1/8).
+template <int LogE, int Sign, typename OnElem>
+SYCL_FFT_FORCE_INLINE void SYCL_FFT_SUFFIX(apply_bitrev_twiddles_runtime)(
+    const SYCL_FFT_REAL (&r_re)[1 << LogE],
+    const SYCL_FFT_REAL (&r_im)[1 << LogE],
+    int t,
+    SYCL_FFT_ANGLE_T inv_m,
+    OnElem&& on_elem) {
+    using Real = SYCL_FFT_REAL;
+    static_assert(LogE >= 3 && LogE <= 5, "apply_bitrev_twiddles_runtime expects LogE in 3..5");
+
+    on_elem(std::integral_constant<int, 0>{}, r_re[0], r_im[0]);
+
+#if SYCL_FFT_IS_HALF
+    auto tw_cmul = [](float ar, float ai, float br, float bi, float& or_, float& oi) SYCL_FFT_LAMBDA_INLINE {
+        or_ = sycl::fma(ar, br, -(ai * bi));
+        oi  = sycl::fma(ar, bi,   ai * br);
+    };
+    auto tw_csqr = [](float ar, float ai, float& or_, float& oi) SYCL_FFT_LAMBDA_INLINE {
+        or_ = sycl::fma(ar, ar, -(ai * ai));
+        oi  = (2.0f * ar) * ai;
+    };
+    float w1r, w1i;
+    sincos2pif_oct1<Sign>(static_cast<float>(t) * inv_m, w1r, w1i);
+    float w2r, w2i, w3r, w3i, w4r, w4i;
+    tw_csqr(w1r, w1i, w2r, w2i);
+    tw_cmul(w2r, w2i, w1r, w1i, w3r, w3i);
+    tw_csqr(w2r, w2i, w4r, w4i);
+
+    if constexpr (LogE == 3) {
+        const float lo_r[4] = {1.0f, w2r, w1r, w3r};
+        const float lo_i[4] = {0.0f, w2i, w1i, w3i};
+        unroll_for<7>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 1, B = P & 1;
+            float wr, wi;
+            if constexpr (A == 0) { wr = w4r; wi = w4i; }
+            else if constexpr (B == 0) { wr = lo_r[A]; wi = lo_i[A]; }
+            else { tw_cmul(lo_r[A], lo_i[A], w4r, w4i, wr, wi); }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], f16x2_splat_f(wr), f16x2_splat_f(wi), or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    } else if constexpr (LogE == 4) {
+        float w8r, w8i, w12r, w12i;
+        tw_csqr(w4r, w4i, w8r, w8i);
+        tw_cmul(w8r, w8i, w4r, w4i, w12r, w12i);
+        const float lo_r[4] = {1.0f, w2r, w1r, w3r};
+        const float lo_i[4] = {0.0f, w2i, w1i, w3i};
+        const float hi_r[4] = {1.0f, w8r, w4r, w12r};
+        const float hi_i[4] = {0.0f, w8i, w4i, w12i};
+        unroll_for<15>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 2, B = P & 3;
+            float wr, wi;
+            if constexpr (A == 0) { wr = hi_r[B]; wi = hi_i[B]; }
+            else if constexpr (B == 0) { wr = lo_r[A]; wi = lo_i[A]; }
+            else { tw_cmul(lo_r[A], lo_i[A], hi_r[B], hi_i[B], wr, wi); }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], f16x2_splat_f(wr), f16x2_splat_f(wi), or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    } else if constexpr (LogE == 5) {
+        float w5r, w5i, w6r, w6i, w7r, w7i, w8r, w8i, w16r, w16i, w24r, w24i;
+        tw_cmul(w4r, w4i, w1r, w1i, w5r, w5i);
+        tw_cmul(w4r, w4i, w2r, w2i, w6r, w6i);
+        tw_cmul(w4r, w4i, w3r, w3i, w7r, w7i);
+        tw_csqr(w4r, w4i, w8r, w8i);
+        tw_csqr(w8r, w8i, w16r, w16i);
+        tw_cmul(w16r, w16i, w8r, w8i, w24r, w24i);
+        const float lo_r[8] = {1.0f, w4r, w2r, w6r, w1r, w5r, w3r, w7r};
+        const float lo_i[8] = {0.0f, w4i, w2i, w6i, w1i, w5i, w3i, w7i};
+        const float hi_r[4] = {1.0f, w16r, w8r, w24r};
+        const float hi_i[4] = {0.0f, w16i, w8i, w24i};
+        unroll_for<31>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 2, B = P & 3;
+            float wr, wi;
+            if constexpr (A == 0) { wr = hi_r[B]; wi = hi_i[B]; }
+            else if constexpr (B == 0) { wr = lo_r[A]; wi = lo_i[A]; }
+            else { tw_cmul(lo_r[A], lo_i[A], hi_r[B], hi_i[B], wr, wi); }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], f16x2_splat_f(wr), f16x2_splat_f(wi), or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    }
+#else
+    using AngleT = SYCL_FFT_ANGLE_T;
+    Real w1r, w1i;
+    SYCL_FFT_SINCOS2PI_OCT1(Sign, static_cast<AngleT>(t) * inv_m, w1r, w1i);
+    Real w2r, w2i, w3r, w3i, w4r, w4i;
+    SYCL_FFT_CSQR(w1r, w1i, w2r, w2i);
+    SYCL_FFT_CMUL(w2r, w2i, w1r, w1i, w3r, w3i);
+    SYCL_FFT_CSQR(w2r, w2i, w4r, w4i);
+
+    if constexpr (LogE == 3) {
+        const Real lo_r[4] = {SYCL_FFT_ONE, w2r, w1r, w3r};
+        const Real lo_i[4] = {SYCL_FFT_ZERO, w2i, w1i, w3i};
+        unroll_for<7>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 1, B = P & 1;
+            Real wr, wi;
+            if constexpr (A == 0) { wr = w4r; wi = w4i; }
+            else if constexpr (B == 0) { wr = lo_r[A]; wi = lo_i[A]; }
+            else { SYCL_FFT_CMUL(lo_r[A], lo_i[A], w4r, w4i, wr, wi); }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], wr, wi, or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    } else if constexpr (LogE == 4) {
+        Real w8r, w8i, w12r, w12i;
+        SYCL_FFT_CSQR(w4r, w4i, w8r, w8i);
+        SYCL_FFT_CMUL(w8r, w8i, w4r, w4i, w12r, w12i);
+        const Real lo_r[4] = {SYCL_FFT_ONE, w2r, w1r, w3r};
+        const Real lo_i[4] = {SYCL_FFT_ZERO, w2i, w1i, w3i};
+        const Real hi_r[4] = {SYCL_FFT_ONE, w8r, w4r, w12r};
+        const Real hi_i[4] = {SYCL_FFT_ZERO, w8i, w4i, w12i};
+        unroll_for<15>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 2, B = P & 3;
+            Real wr, wi;
+            if constexpr (A == 0) { wr = hi_r[B]; wi = hi_i[B]; }
+            else if constexpr (B == 0) { wr = lo_r[A]; wi = lo_i[A]; }
+            else { SYCL_FFT_CMUL(lo_r[A], lo_i[A], hi_r[B], hi_i[B], wr, wi); }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], wr, wi, or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+    } else if constexpr (LogE == 5) {
+        Real w8r, w8i, w16r, w16i, w24r, w24i;
+        SYCL_FFT_CSQR(w4r, w4i, w8r, w8i);
+        SYCL_FFT_CSQR(w8r, w8i, w16r, w16i);
+        SYCL_FFT_CMUL(w16r, w16i, w8r, w8i, w24r, w24i);
+        const Real hi_r[4] = {SYCL_FFT_ONE, w16r, w8r, w24r};
+        const Real hi_i[4] = {SYCL_FFT_ZERO, w16i, w8i, w24i};
+#if SYCL_FFT_WIDE
+        const Real base_r[4] = {SYCL_FFT_ONE, w2r, w1r, w3r};
+        const Real base_i[4] = {SYCL_FFT_ZERO, w2i, w1i, w3i};
+        unroll_for<8>([&](auto a_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int A = a_ic.value, Ahi = A >> 1, A0 = A & 1;
+            Real lor, loi;
+            if constexpr (A == 0) { lor = SYCL_FFT_ONE; loi = SYCL_FFT_ZERO; }
+            else if constexpr (Ahi == 0) { lor = w4r; loi = w4i; }
+            else if constexpr (A0 == 0) { lor = base_r[Ahi]; loi = base_i[Ahi]; }
+            else { SYCL_FFT_CMUL(base_r[Ahi], base_i[Ahi], w4r, w4i, lor, loi); }
+            unroll_for<4>([&](auto b_ic) SYCL_FFT_LAMBDA_INLINE {
+                constexpr int B = b_ic.value, P = (A << 2) | B;
+                if constexpr (P > 0) {
+                    Real wr, wi;
+                    if constexpr (A == 0) { wr = hi_r[B]; wi = hi_i[B]; }
+                    else if constexpr (B == 0) { wr = lor; wi = loi; }
+                    else { SYCL_FFT_CMUL(lor, loi, hi_r[B], hi_i[B], wr, wi); }
+                    Real or_, oi;
+                    SYCL_FFT_CMUL(r_re[P], r_im[P], wr, wi, or_, oi);
+                    on_elem(std::integral_constant<int, P>{}, or_, oi);
+                }
+            });
+        });
+#else
+        Real w5r, w5i, w6r, w6i, w7r, w7i;
+        SYCL_FFT_CMUL(w4r, w4i, w1r, w1i, w5r, w5i);
+        SYCL_FFT_CMUL(w4r, w4i, w2r, w2i, w6r, w6i);
+        SYCL_FFT_CMUL(w4r, w4i, w3r, w3i, w7r, w7i);
+        const Real lo_r[8] = {SYCL_FFT_ONE, w4r, w2r, w6r, w1r, w5r, w3r, w7r};
+        const Real lo_i[8] = {SYCL_FFT_ZERO, w4i, w2i, w6i, w1i, w5i, w3i, w7i};
+        unroll_for<31>([&](auto idx_ic) SYCL_FFT_LAMBDA_INLINE {
+            constexpr int P = idx_ic.value + 1;
+            constexpr int A = P >> 2, B = P & 3;
+            Real wr, wi;
+            if constexpr (A == 0) { wr = hi_r[B]; wi = hi_i[B]; }
+            else if constexpr (B == 0) { wr = lo_r[A]; wi = lo_i[A]; }
+            else { SYCL_FFT_CMUL(lo_r[A], lo_i[A], hi_r[B], hi_i[B], wr, wi); }
+            Real or_, oi;
+            SYCL_FFT_CMUL(r_re[P], r_im[P], wr, wi, or_, oi);
+            on_elem(std::integral_constant<int, P>{}, or_, oi);
+        });
+#endif
+    }
+#endif
 }
 
 template <int LogE, int LogT, int Sign>
@@ -423,18 +812,51 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
     bool            sg_tile_sync_ok;
     SmemH           smem;
 
+    SYCL_FFT_FORCE_INLINE static void load_elem(
+        const ComplexT* g0, const ComplexT* g1, int idx, bool valid0, bool valid1,
+        Real& re_out, Real& im_out) {
+#if SYCL_FFT_PACKED_BATCH == 2
+        f16x2_load_pair(g0, g1, idx, valid0, valid1, re_out, im_out);
+#else
+        (void)g1;
+        (void)valid1;
+        if (valid0) {
+            SYCL_FFT_LOAD_COMPLEX(g0, idx, re_out, im_out);
+        } else {
+            re_out = SYCL_FFT_ZERO;
+            im_out = SYCL_FFT_ZERO;
+        }
+#endif
+    }
+
+    SYCL_FFT_FORCE_INLINE static void store_elem(
+        ComplexT* g0, ComplexT* g1, int idx, bool valid0, bool valid1,
+        Real re_in, Real im_in) {
+#if SYCL_FFT_PACKED_BATCH == 2
+        f16x2_store_pair(g0, g1, idx, valid0, valid1, re_in, im_in);
+#else
+        (void)g1;
+        (void)valid1;
+        if (valid0) {
+            SYCL_FFT_STORE_COMPLEX(g0, idx, re_in, im_in);
+        }
+#endif
+    }
+
     SYCL_FFT_FORCE_INLINE void finish_chunk(
         const sycl::nd_item<1>& item,
         const sycl::sub_group& sg,
         Real (&c_re)[Chunk],
         Real (&c_im)[Chunk],
-        ComplexT* g_out,
+        ComplexT* g_out0,
+        ComplexT* g_out1,
         int chunk_idx,
         int smem_base,
         int t,
         int sub,
         int l,
-        bool valid) const {
+        bool valid0,
+        bool valid1) const {
         const int row_base = smem_base + sub * RowStride;
 
         // ---- Transpose 1 ----
@@ -501,10 +923,10 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
         // ---- Phase 3 & Coalesced Store ----
         if constexpr (Phase3 == Phase3Policy::SubgroupShuffle) {
             SYCL_FFT_SUFFIX(dif_radix2_subgroup)<LogW, Chunk, Sign>(sg, c_re, c_im, l);
-            if (valid) {
+            if (valid0) {
                 unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                     constexpr int M = m_ic.value;
-                    SYCL_FFT_STORE_COMPLEX(g_out, out_base + M * W, c_re[M], c_im[M]);
+                    store_elem(g_out0, g_out1, out_base + M * W, valid0, valid1, c_re[M], c_im[M]);
                 });
             }
         } else if constexpr (Phase3 == Phase3Policy::TwoTransposeXor) {
@@ -559,13 +981,13 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     smem.im[idx] = SYCL_FFT_TO_SMEM(c_im[K]);
                 });
                 SYCL_FFT_SUFFIX(sync_sub_tile)<W>(item, sg, sg_tile_sync_ok);
-                if (valid) {
+                if (valid0) {
                     unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                         constexpr int M = m_ic.value;
                         const int idx = row_base + M * W + (l ^ M);
                         const Real vr = SYCL_FFT_FROM_SMEM(smem.re[idx]);
                         const Real vi = SYCL_FFT_FROM_SMEM(smem.im[idx]);
-                        SYCL_FFT_STORE_COMPLEX(g_out, out_base + M * W, vr, vi);
+                        store_elem(g_out0, g_out1, out_base + M * W, valid0, valid1, vr, vi);
                     });
                 }
             } else {
@@ -589,10 +1011,10 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     constexpr int M = m_ic.value;
                     c_im[M] = SYCL_FFT_FROM_SMEM(smem.buf[row_base + M * W + (l ^ M)]);
                 });
-                if (valid) {
+                if (valid0) {
                     unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                         constexpr int M = m_ic.value;
-                        SYCL_FFT_STORE_COMPLEX(g_out, out_base + M * W, c_re[M], c_im[M]);
+                        store_elem(g_out0, g_out1, out_base + M * W, valid0, valid1, c_re[M], c_im[M]);
                     });
                 }
             }
@@ -668,13 +1090,13 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     });
                 });
                 SYCL_FFT_SUFFIX(sync_sub_tile)<W>(item, sg, sg_tile_sync_ok);
-                if (valid) {
+                if (valid0) {
                     unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                         constexpr int M = m_ic.value;
                         const int idx = row_base + M * Stride2 + l;
                         const Real vr = SYCL_FFT_FROM_SMEM(smem.re[idx]);
                         const Real vi = SYCL_FFT_FROM_SMEM(smem.im[idx]);
-                        SYCL_FFT_STORE_COMPLEX(g_out, out_base + M * W, vr, vi);
+                        store_elem(g_out0, g_out1, out_base + M * W, valid0, valid1, vr, vi);
                     });
                 }
             } else {
@@ -706,10 +1128,10 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     constexpr int M = m_ic.value;
                     c_im[M] = SYCL_FFT_FROM_SMEM(smem.buf[row_base + M * Stride2 + l]);
                 });
-                if (valid) {
+                if (valid0) {
                     unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                         constexpr int M = m_ic.value;
-                        SYCL_FFT_STORE_COMPLEX(g_out, out_base + M * W, c_re[M], c_im[M]);
+                        store_elem(g_out0, g_out1, out_base + M * W, valid0, valid1, c_re[M], c_im[M]);
                     });
                 }
             }
@@ -717,15 +1139,20 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
     }
 
     SYCL_FFT_FORCE_INLINE void run(sycl::nd_item<1> item) const {
+        constexpr size_t PB = static_cast<size_t>(SYCL_FFT_PACKED_BATCH);
         const size_t wg_id = item.get_group_linear_id();
         const int tid = static_cast<int>(item.get_local_linear_id());
         const int b_local = (B == 1) ? 0 : (tid >> LogT);
         const int t = (B == 1) ? tid : (tid & (T - 1));
-        const size_t batch = (B == 1) ? wg_id : (wg_id * B + static_cast<size_t>(b_local));
-        const bool valid = (B == 1) || (batch < bs);
+        const size_t pair_idx = (B == 1) ? wg_id : (wg_id * B + static_cast<size_t>(b_local));
+        const size_t batch0 = pair_idx * PB;
+        const bool valid0 = (B == 1 && PB == 1) || (batch0 < bs);
+        const bool valid1 = (PB == 2) && (batch0 + 1 < bs);
 
-        const ComplexT* g_in = in + batch * N;
-        ComplexT* g_out = out + batch * N;
+        const ComplexT* g_in0 = in + batch0 * N;
+        const ComplexT* g_in1 = (PB == 2) ? (in + (batch0 + 1) * N) : g_in0;
+        ComplexT* g_out0 = out + batch0 * N;
+        ComplexT* g_out1 = (PB == 2) ? (out + (batch0 + 1) * N) : g_out0;
         const int smem_base = (B == 1) ? 0 : (b_local * FftSmem);
         const int sub = t >> LogW;
         const int l = t & (W - 1);
@@ -733,10 +1160,10 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
 
         if constexpr (LogChunks == 0) {
             Real r_re[E], r_im[E];
-            if (valid) {
+            if (valid0) {
                 unroll_for<E>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                     constexpr int M = m_ic.value;
-                    SYCL_FFT_LOAD_COMPLEX(g_in, t + M * T, r_re[M], r_im[M]);
+                    load_elem(g_in0, g_in1, t + M * T, valid0, valid1, r_re[M], r_im[M]);
                 });
             } else {
                 unroll_for<E>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
@@ -746,7 +1173,7 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                 });
             }
             SYCL_FFT_SUFFIX(dif_radix2_reg)<LogE, LogT, Sign>(r_re, r_im, t);
-            finish_chunk(item, sg, r_re, r_im, g_out, 0, smem_base, t, sub, l, valid);
+            finish_chunk(item, sg, r_re, r_im, g_out0, g_out1, 0, smem_base, t, sub, l, valid0, valid1);
         } else if constexpr (StashChunk1) {
             // Stream chunk 0 (P=0..Chunk-1) into registers and stash chunk 1 (P=Chunk..E-1)
             // in thread t's already-loaded g_out slots, cutting live registers in half.
@@ -755,7 +1182,7 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                 Real r_re[E], r_im[E];
                 unroll_for<E>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                     constexpr int M = m_ic.value;
-                    SYCL_FFT_LOAD_COMPLEX(g_in, t + M * T, r_re[M], r_im[M]);
+                    load_elem(g_in0, g_in1, t + M * T, valid0, valid1, r_re[M], r_im[M]);
                 });
                 SYCL_FFT_SUFFIX(dif_radix2_reg_base)<LogE, Sign>(r_re, r_im);
                 SYCL_FFT_SUFFIX(apply_bitrev_twiddles_with)<LogE, LogT, Sign>(
@@ -765,7 +1192,7 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                             c_re[P] = vr;
                             c_im[P] = vi;
                         } else {
-                            SYCL_FFT_STORE_COMPLEX(g_out, (P * T) + t, vr, vi);
+                            store_elem(g_out0, g_out1, (P * T) + t, valid0, valid1, vr, vi);
                         }
                     });
             }
@@ -775,16 +1202,16 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     sycl::group_barrier(item.get_group());
                     unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                         constexpr int M = m_ic.value;
-                        SYCL_FFT_LOAD_COMPLEX(g_out, ((Chunk + M) * T) + t, c_re[M], c_im[M]);
+                        load_elem(g_out0, g_out1, ((Chunk + M) * T) + t, valid0, valid1, c_re[M], c_im[M]);
                     });
                 }
-                finish_chunk(item, sg, c_re, c_im, g_out, chunk_idx, smem_base, t, sub, l, true);
+                finish_chunk(item, sg, c_re, c_im, g_out0, g_out1, chunk_idx, smem_base, t, sub, l, valid0, valid1);
             }
         } else {
             Real r_re[E], r_im[E];
             unroll_for<E>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
                 constexpr int M = m_ic.value;
-                SYCL_FFT_LOAD_COMPLEX(g_in, t + M * T, r_re[M], r_im[M]);
+                load_elem(g_in0, g_in1, t + M * T, valid0, valid1, r_re[M], r_im[M]);
             });
             SYCL_FFT_SUFFIX(dif_radix2_reg)<LogE, LogT, Sign>(r_re, r_im, t);
 
@@ -794,7 +1221,7 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                 c_re[M] = r_re[M];
                 c_im[M] = r_im[M];
             });
-            finish_chunk(item, sg, c_re, c_im, g_out, 0, smem_base, t, sub, l, true);
+            finish_chunk(item, sg, c_re, c_im, g_out0, g_out1, 0, smem_base, t, sub, l, valid0, valid1);
 
             sycl::group_barrier(item.get_group());
             unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
@@ -802,7 +1229,7 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                 c_re[M] = r_re[Chunk + M];
                 c_im[M] = r_im[Chunk + M];
             });
-            finish_chunk(item, sg, c_re, c_im, g_out, 1, smem_base, t, sub, l, true);
+            finish_chunk(item, sg, c_re, c_im, g_out0, g_out1, 1, smem_base, t, sub, l, valid0, valid1);
         }
     }
 };
@@ -866,7 +1293,9 @@ struct SYCL_FFT_SUFFIX(SinglePassSpec) {
     static void launch(
         sycl::queue& q, const ComplexT* in, ComplexT* out, size_t bs, bool sg_tile_sync_ok) {
         if (bs == 0) return;
-        const size_t num_wg = (bs + static_cast<size_t>(B) - 1) / static_cast<size_t>(B);
+        constexpr size_t PB = static_cast<size_t>(SYCL_FFT_PACKED_BATCH);
+        const size_t num_pairs = (bs + PB - 1) / PB;
+        const size_t num_wg = (num_pairs + static_cast<size_t>(B) - 1) / static_cast<size_t>(B);
         q.submit([&](sycl::handler& h) {
             typename BodyT::SmemH smem(BodyT::SmemElemsPerBuf, h);
             BodyT body{in, out, bs, sg_tile_sync_ok, smem};
@@ -1114,38 +1543,58 @@ inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_sin
 //   100% in-place safe (each thread reads & writes strictly its own N1 strided slots).
 //   Supports LogN2 == 0 as the twiddle-free final stage of multi-stage fallback.
 // ============================================================================
-template <int LogN1, int LogN2, int Sign>
+template <int LogN1, bool HasTwiddles, int Sign>
 struct SYCL_FFT_SUFFIX(Pass0Functor) {
     using Real     = SYCL_FFT_REAL;
     using ComplexT = SYCL_FFT_COMPLEX;
+    using AngleT   = SYCL_FFT_ANGLE_T;
     static constexpr int N1 = 1 << LogN1;
-    static constexpr int N2 = 1 << LogN2;
-    static constexpr int N  = N1 * N2;
 
     const ComplexT* in;
     ComplexT*       tmp;
+    size_t          chunk_bs;
+    int             log_n2;
+    AngleT          inv_m;
 
     void operator()(sycl::nd_item<1> item) const SYCL_FFT_LAMBDA_INLINE {
+        constexpr size_t PB = static_cast<size_t>(SYCL_FFT_PACKED_BATCH);
+        const int n2 = HasTwiddles ? (1 << log_n2) : 1;
+        const size_t n = static_cast<size_t>(N1) << (HasTwiddles ? log_n2 : 0);
         const size_t gid = item.get_global_linear_id();
-        const size_t batch = (LogN2 == 0) ? gid : (gid >> LogN2);
-        const int j = (LogN2 == 0) ? 0 : static_cast<int>(gid & (N2 - 1));
+        const size_t pair_idx = HasTwiddles ? (gid >> log_n2) : gid;
+        const size_t batch0 = pair_idx * PB;
+        const bool valid0 = (PB == 1) || (batch0 < chunk_bs);
+        const bool valid1 = (PB == 2) && (batch0 + 1 < chunk_bs);
+        const int j = HasTwiddles ? static_cast<int>(gid & static_cast<size_t>(n2 - 1)) : 0;
 
-        const ComplexT* g_in = in + batch * N + j;
-        ComplexT* g_tmp = tmp + batch * N + j;
+        const ComplexT* g_in0 = in + batch0 * n + j;
+        const ComplexT* g_in1 = (PB == 2) ? (in + (batch0 + 1) * n + j) : g_in0;
+        ComplexT* g_tmp0 = tmp + batch0 * n + j;
+        ComplexT* g_tmp1 = (PB == 2) ? (tmp + (batch0 + 1) * n + j) : g_tmp0;
 
         Real r_re[N1], r_im[N1];
         unroll_for<N1>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
             constexpr int M = m_ic.value;
-            SYCL_FFT_LOAD_COMPLEX(g_in, M * N2, r_re[M], r_im[M]);
+#if SYCL_FFT_PACKED_BATCH == 2
+            f16x2_load_pair(g_in0, g_in1, M * n2, valid0, valid1, r_re[M], r_im[M]);
+#else
+            (void)g_in1; (void)valid0; (void)valid1;
+            SYCL_FFT_LOAD_COMPLEX(g_in0, M * n2, r_re[M], r_im[M]);
+#endif
         });
 
         SYCL_FFT_SUFFIX(dif_radix2_reg_base)<LogN1, Sign>(r_re, r_im);
 
-        if constexpr (LogN2 > 0) {
-            SYCL_FFT_SUFFIX(apply_bitrev_twiddles_with)<LogN1, LogN2, Sign>(
-                r_re, r_im, j, [&](auto p_ic, Real vr, Real vi) SYCL_FFT_LAMBDA_INLINE {
+        if constexpr (HasTwiddles) {
+            SYCL_FFT_SUFFIX(apply_bitrev_twiddles_runtime)<LogN1, Sign>(
+                r_re, r_im, j, inv_m, [&](auto p_ic, Real vr, Real vi) SYCL_FFT_LAMBDA_INLINE {
                     constexpr int P = p_ic.value;
-                    SYCL_FFT_STORE_COMPLEX(g_tmp, P * N2, vr, vi);
+#if SYCL_FFT_PACKED_BATCH == 2
+                    f16x2_store_pair(g_tmp0, g_tmp1, P * n2, valid0, valid1, vr, vi);
+#else
+                    (void)g_tmp1;
+                    SYCL_FFT_STORE_COMPLEX(g_tmp0, P * n2, vr, vi);
+#endif
                 });
         } else {
             // Store scalar lanes via volatile pointer to prevent LLVM-21 NVPTX
@@ -1154,17 +1603,30 @@ struct SYCL_FFT_SUFFIX(Pass0Functor) {
             unroll_for<N1>([&](auto p_ic) SYCL_FFT_LAMBDA_INLINE {
                 constexpr int P = p_ic.value;
 #if SYCL_FFT_IS_DF
-                volatile float* dst = reinterpret_cast<volatile float*>(g_tmp + P);
+                volatile float* dst = reinterpret_cast<volatile float*>(g_tmp0 + P);
                 dst[0] = r_re[P].hi;
                 dst[1] = r_re[P].lo;
                 dst[2] = r_im[P].hi;
                 dst[3] = r_im[P].lo;
 #elif SYCL_FFT_IS_DOUBLE
-                volatile double* dst = reinterpret_cast<volatile double*>(g_tmp + P);
+                volatile double* dst = reinterpret_cast<volatile double*>(g_tmp0 + P);
                 dst[0] = r_re[P];
                 dst[1] = r_im[P];
+#elif SYCL_FFT_IS_HALF
+                const uint32_t re_u32 = f16x2_to_u32(r_re[P]);
+                const uint32_t im_u32 = f16x2_to_u32(r_im[P]);
+                if (valid0) {
+                    volatile uint16_t* dst0 = reinterpret_cast<volatile uint16_t*>(g_tmp0 + P);
+                    dst0[0] = static_cast<uint16_t>(re_u32 & 0xFFFFu);
+                    dst0[1] = static_cast<uint16_t>(im_u32 & 0xFFFFu);
+                }
+                if (valid1) {
+                    volatile uint16_t* dst1 = reinterpret_cast<volatile uint16_t*>(g_tmp1 + P);
+                    dst1[0] = static_cast<uint16_t>(re_u32 >> 16);
+                    dst1[1] = static_cast<uint16_t>(im_u32 >> 16);
+                }
 #else
-                volatile float* dst = reinterpret_cast<volatile float*>(g_tmp + P);
+                volatile float* dst = reinterpret_cast<volatile float*>(g_tmp0 + P);
                 dst[0] = r_re[P];
                 dst[1] = r_im[P];
 #endif
@@ -1173,25 +1635,34 @@ struct SYCL_FFT_SUFFIX(Pass0Functor) {
     }
 };
 
-template <int LogN1, int LogN2, int Sign>
+template <int LogN1, bool HasTwiddles, int Sign>
 void SYCL_FFT_SUFFIX(launch_pass0_reg)(
     sycl::queue& q,
     const SYCL_FFT_COMPLEX* in,
     SYCL_FFT_COMPLEX* tmp,
+    int log_n2,
     size_t chunk_bs,
     size_t wg_size = 256) {
-    using FunctorT = SYCL_FFT_SUFFIX(Pass0Functor)<LogN1, LogN2, Sign>;
-    constexpr int N2 = 1 << LogN2;
+    using FunctorT = SYCL_FFT_SUFFIX(Pass0Functor)<LogN1, HasTwiddles, Sign>;
+    using AngleT = SYCL_FFT_ANGLE_T;
+    constexpr size_t PB = static_cast<size_t>(SYCL_FFT_PACKED_BATCH);
 
     if (chunk_bs == 0) return;
-    const size_t total_threads = chunk_bs * static_cast<size_t>(N2);
+    const size_t n2 = HasTwiddles ? (size_t{1} << log_n2) : size_t{1};
+    const size_t num_pairs = (chunk_bs + PB - 1) / PB;
+    const size_t total_threads = num_pairs * n2;
     size_t wg = 1;
     const size_t cap = std::min(std::max<size_t>(1, wg_size), total_threads);
     while ((wg << 1) <= cap) wg <<= 1;
     while (wg > 1 && (total_threads % wg) != 0) wg >>= 1;
 
+    const AngleT inv_m = HasTwiddles
+        ? (static_cast<AngleT>(1.0) / static_cast<AngleT>(size_t{1} << (LogN1 + log_n2)))
+        : static_cast<AngleT>(0.0);
     q.submit([&](sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<1>(total_threads, wg), FunctorT{in, tmp});
+        h.parallel_for(
+            sycl::nd_range<1>(total_threads, wg),
+            FunctorT{in, tmp, chunk_bs, HasTwiddles ? log_n2 : 0, inv_m});
     });
 }
 
@@ -1204,59 +1675,33 @@ inline void SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
     SYCL_FFT_COMPLEX* out,
     size_t bs,
     size_t wg_size) {
-    const int key = (log_n1 << 5) | log_n2;
-    switch (key) {
-        // LogN1 = 3
-        case (3 << 5) | 0:  SYCL_FFT_SUFFIX(launch_pass0_reg)<3, 0,  Sign>(q, in, out, bs, wg_size); break;
-        case (3 << 5) | 3:  SYCL_FFT_SUFFIX(launch_pass0_reg)<3, 3,  Sign>(q, in, out, bs, wg_size); break;
-        case (3 << 5) | 10: SYCL_FFT_SUFFIX(launch_pass0_reg)<3, 10, Sign>(q, in, out, bs, wg_size); break;
-        case (3 << 5) | 11: SYCL_FFT_SUFFIX(launch_pass0_reg)<3, 11, Sign>(q, in, out, bs, wg_size); break;
-        case (3 << 5) | 12: SYCL_FFT_SUFFIX(launch_pass0_reg)<3, 12, Sign>(q, in, out, bs, wg_size); break;
-        case (3 << 5) | 13: SYCL_FFT_SUFFIX(launch_pass0_reg)<3, 13, Sign>(q, in, out, bs, wg_size); break;
-        // LogN1 = 4
-        case (4 << 5) | 0:  SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 0,  Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 3:  SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 3,  Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 4:  SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 4,  Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 6:  SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 6,  Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 7:  SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 7,  Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 8:  SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 8,  Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 10: SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 10, Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 11: SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 11, Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 12: SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 12, Sign>(q, in, out, bs, wg_size); break;
-        case (4 << 5) | 13: SYCL_FFT_SUFFIX(launch_pass0_reg)<4, 13, Sign>(q, in, out, bs, wg_size); break;
-        // LogN1 = 5
-        case (5 << 5) | 0:  SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 0,  Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 4:  SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 4,  Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 5:  SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 5,  Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 8:  SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 8,  Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 9:  SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 9,  Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 10: SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 10, Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 11: SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 11, Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 12: SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 12, Sign>(q, in, out, bs, wg_size); break;
-        case (5 << 5) | 13: SYCL_FFT_SUFFIX(launch_pass0_reg)<5, 13, Sign>(q, in, out, bs, wg_size); break;
-        default:
-            throw std::invalid_argument("Unsupported Pass-0 stage factorization");
+    if (log_n2 == 0) {
+        switch (log_n1) {
+            case 3: SYCL_FFT_SUFFIX(launch_pass0_reg)<3, false, Sign>(q, in, out, 0, bs, wg_size); return;
+            case 4: SYCL_FFT_SUFFIX(launch_pass0_reg)<4, false, Sign>(q, in, out, 0, bs, wg_size); return;
+            case 5: SYCL_FFT_SUFFIX(launch_pass0_reg)<5, false, Sign>(q, in, out, 0, bs, wg_size); return;
+            default: break;
+        }
+    } else if (log_n2 > 0) {
+        switch (log_n1) {
+            case 3: SYCL_FFT_SUFFIX(launch_pass0_reg)<3, true, Sign>(q, in, out, log_n2, bs, wg_size); return;
+            case 4: SYCL_FFT_SUFFIX(launch_pass0_reg)<4, true, Sign>(q, in, out, log_n2, bs, wg_size); return;
+            case 5: SYCL_FFT_SUFFIX(launch_pass0_reg)<5, true, Sign>(q, in, out, log_n2, bs, wg_size); return;
+            default: break;
+        }
     }
+    throw std::invalid_argument("Unsupported Pass-0 stage factorization");
 }
 
 template <int Sign>
 inline KernelProbeInfo SYCL_FFT_SUFFIX(probe_pass0_stage)(
     sycl::queue& q, const sycl::device& dev, int log_n1, int log_n2) {
-    const int key = (log_n1 << 5) | log_n2;
-    switch (key) {
-        case (3 << 5) | 10: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<3, 10, Sign>>(q, dev);
-        case (3 << 5) | 11: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<3, 11, Sign>>(q, dev);
-        case (3 << 5) | 12: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<3, 12, Sign>>(q, dev);
-        case (3 << 5) | 13: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<3, 13, Sign>>(q, dev);
-        case (4 << 5) | 10: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<4, 10, Sign>>(q, dev);
-        case (4 << 5) | 11: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<4, 11, Sign>>(q, dev);
-        case (4 << 5) | 12: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<4, 12, Sign>>(q, dev);
-        case (4 << 5) | 13: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<4, 13, Sign>>(q, dev);
-        case (5 << 5) | 10: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<5, 10, Sign>>(q, dev);
-        case (5 << 5) | 11: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<5, 11, Sign>>(q, dev);
-        case (5 << 5) | 12: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<5, 12, Sign>>(q, dev);
-        case (5 << 5) | 13: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<5, 13, Sign>>(q, dev);
-        default:            return KernelProbeInfo{};
+    if (log_n2 <= 0) return KernelProbeInfo{};
+    switch (log_n1) {
+        case 3: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<3, true, Sign>>(q, dev);
+        case 4: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<4, true, Sign>>(q, dev);
+        case 5: return probe_kernel_bundle<SYCL_FFT_SUFFIX(Pass0Functor)<5, true, Sign>>(q, dev);
+        default: return KernelProbeInfo{};
     }
 }
 
@@ -1322,42 +1767,13 @@ inline void SYCL_FFT_SUFFIX(launch_bit_reverse)(
     int logN,
     size_t bs,
     size_t wg_size = 256) {
-    using ComplexT = SYCL_FFT_COMPLEX;
     if (bs == 0) return;
-    const size_t N = size_t{1} << logN;
-    const size_t total = N * bs;
-    size_t wg = 1;
-    const size_t cap = std::min(std::max<size_t>(1, wg_size), total);
-    while ((wg << 1) <= cap) wg <<= 1;
-    while (wg > 1 && (total % wg) != 0) wg >>= 1;
-
-    if (src == dst) {
-        q.submit([&](sycl::handler& h) {
-            h.parallel_for(sycl::nd_range<1>(total, wg), [=](sycl::nd_item<1> item) SYCL_FFT_LAMBDA_INLINE {
-                const size_t gid = item.get_global_linear_id();
-                const size_t batch = gid >> logN;
-                const uint32_t idx = static_cast<uint32_t>(gid & (N - 1));
-                const uint32_t rev = bit_reverse(idx, logN);
-                if (idx < rev) {
-                    ComplexT* base = dst + batch * N;
-                    const ComplexT a = base[idx];
-                    const ComplexT b = base[rev];
-                    base[idx] = b;
-                    base[rev] = a;
-                }
-            });
-        });
-    } else {
-        q.submit([&](sycl::handler& h) {
-            h.parallel_for(sycl::nd_range<1>(total, wg), [=](sycl::nd_item<1> item) SYCL_FFT_LAMBDA_INLINE {
-                const size_t gid = item.get_global_linear_id();
-                const size_t batch = gid >> logN;
-                const uint32_t idx = static_cast<uint32_t>(gid & (N - 1));
-                const uint32_t rev = bit_reverse(idx, logN);
-                dst[batch * N + idx] = src[batch * N + rev];
-            });
-        });
-    }
+    FftLaunchConfig cfg{};
+    cfg.autotune = AutotuneMode::Off;
+    cfg.bitrev_wg_size = wg_size;
+    BitRevPlan<SYCL_FFT_COMPLEX> plan(
+        q, logN, SYCL_FFT_PREC_TAG, DeviceFftConfig::query(q.get_device()), cfg);
+    plan.execute(src, dst, bs);
 }
 
 // ============================================================================
@@ -1369,8 +1785,12 @@ inline void SYCL_FFT_SUFFIX(launch_bit_reverse)(
 //     micro-autotuning (candidates, 2-pass splits, Pass-0 WG, L2 chunk size).
 //   - Falls back cleanly to zero-smem multi-stage global FFT on CPU/emulated-smem.
 // ============================================================================
-template <int Sign = -1>
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
 class SYCL_FFT_SUFFIX(DifFftPlan) {
+    static_assert(Sign == -1 || Sign == +1, "DifFftPlan Sign must be -1 or +1");
+    static_assert((Sign == +1 && SYCL_FFT_ENABLE_POS_SIGN) ||
+                      (Sign == -1 && SYCL_FFT_ENABLE_NEG_SIGN),
+                  "Requested DifFftPlan<Sign> is disabled at compile time (build with SIGN=pos|neg|both)");
 public:
     using ComplexT  = SYCL_FFT_COMPLEX;
     using SmemT     = SYCL_FFT_SMEM_T;
@@ -1428,9 +1848,26 @@ public:
     void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0) {
         if (bs == 0) return;
         execute_raw(in, out, bs, chunk_bs_override);
-        SYCL_FFT_SUFFIX(launch_bit_reverse)(q_, out, out, logN_, bs, bitrev_wg_size_);
+        bit_reverse(out, bs);
     }
 
+    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs) {
+        bitrev_plan_.execute(src, dst, bs);
+    }
+
+    void bit_reverse(ComplexT* buf, size_t bs) {
+        bitrev_plan_.execute_in_place(buf, bs);
+    }
+
+    const char* bitrev_variant_name(bool in_place = true) {
+        return bitrev_plan_.variant_name(in_place);
+    }
+
+    bool bitrev_cache_hit(bool in_place = true) {
+        return bitrev_plan_.cache_hit(in_place);
+    }
+
+    BitRevPlan<ComplexT>& bitrev_plan() { return bitrev_plan_; }
     size_t chunk_bs() const { return chunk_bs_; }
     size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }
     size_t pass0_wg_size() const { return pass0_wg_size_; }
@@ -1549,6 +1986,25 @@ private:
         return valid.front().cand;
     }
 
+    // Analytical shortlist: avoid JIT-compiling fallback/low-priority variants when
+    // primary hardware-matched candidates exist; test at most the top 2 contenders.
+    std::vector<FilteredCandidate> shortlist_single_pass(
+        const std::vector<FilteredCandidate>& valid) const {
+        if (valid.size() <= 2) return valid;
+        std::vector<FilteredCandidate> primary;
+#if !SYCL_FFT_WIDE
+        // When sub-group shuffles are verified, prefer SubgroupShuffle over SG=1 2-transpose fallbacks
+        if (sg_linear_ok_) {
+            for (const auto& fc : valid) {
+                if (!fc.cand.uses_wide_2t) primary.push_back(fc);
+            }
+        }
+#endif
+        const auto& pool = primary.empty() ? valid : primary;
+        const size_t limit = std::min<size_t>(pool.size(), 2);
+        return std::vector<FilteredCandidate>(pool.begin(), pool.begin() + limit);
+    }
+
     size_t representative_tune_bs(int n) const {
         const size_t fft_bytes = (size_t{1} << n) * sizeof(ComplexT);
         const size_t eff_l2 = dev_cfg_.effective_l2_bytes();
@@ -1620,18 +2076,16 @@ private:
         } catch (...) {
         }
 
+        const auto shortlisted = shortlist_single_pass(valid);
         bool found = false;
         double best_ms = 1e30;
-        for (const auto& fc : valid) {
+        for (const auto& fc : shortlisted) {
             try {
-                const auto w0 = std::chrono::steady_clock::now();
                 fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_);
                 q_.wait_and_throw();
-                const double warm_ms =
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
 
-                const int reps = (warm_ms > 10.0) ? 3 : 5;
-                double samples[5] = {};
+                constexpr int reps = 3;
+                double samples[3] = {};
                 for (int r = 0; r < reps; ++r) {
                     const auto t0 = std::chrono::steady_clock::now();
                     fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_);
@@ -1651,7 +2105,20 @@ private:
                 // Kernel failed to launch (e.g. per-kernel register WG ceiling) -> disqualify cleanly.
             }
         }
-
+        // If every shortlisted contender failed to launch, fall back to remaining valid candidates.
+        if (!found && shortlisted.size() < valid.size()) {
+            for (const auto& fc : valid) {
+                try {
+                    fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_);
+                    q_.wait_and_throw();
+                    found = true;
+                    out_winner = fc.cand;
+                    best_ms = 0.0;
+                    break;
+                } catch (...) {
+                }
+            }
+        }
         sycl::free(d_out, q_);
         sycl::free(d_in, q_);
         out_best_ms = best_ms;
@@ -1747,6 +2214,16 @@ private:
             }
         }
 #endif
+#if SYCL_FFT_IS_HALF
+        if (!launch_cfg_.skip_fp16_kat) {
+            const auto kat = probe_fp16_kat(q_, dev_cfg_);
+            if (!kat.fp16_kat_passed) {
+                throw std::runtime_error(
+                    "FP16 Known-Answer Test failed on " + dev_cfg_.device_name +
+                    ": " + kat.fp16_kat_error);
+            }
+        }
+#endif
 
         // 2. Always-on cached hardware probes (sub-group topology & FP64:FP32 ratio)
         const auto sg_probe = probe_subgroup_topology(q_, dev_cfg_);
@@ -1770,6 +2247,7 @@ private:
         bitrev_wg_size_ = (launch_cfg_.bitrev_wg_size > 0)
             ? dev_cfg_.clamp_pow2_wg(N_, launch_cfg_.bitrev_wg_size)
             : dev_cfg_.default_wg_size(N_, 256);
+        bitrev_plan_ = BitRevPlan<ComplexT>(q_, logN_, SYCL_FFT_PREC_TAG, dev_cfg_, launch_cfg_);
 
         // 3. Refuse smem-transpose kernels when !has_native_local_mem (or forced multistage)
         if (launch_cfg_.force_multistage ||
@@ -1876,17 +2354,21 @@ private:
         if (launch_cfg_.two_pass_log_n1 > 0) {
             try_add_split(launch_cfg_.two_pass_log_n1);
         } else {
-            int order[3] = {4, 3, 5};
+            int order[3] = {4, 5, 3};
 #if SYCL_FFT_IS_DF
             if (logN_ == 17) {
                 order[0] = 5; order[1] = 4; order[2] = 3;
             }
 #endif
             for (int n1 : order) {
+                if (splits.size() >= 2) break;
                 if ((logN_ - n1) >= 11) try_add_split(n1);
             }
-            for (int n1 : order) {
-                if ((logN_ - n1) == 10) try_add_split(n1);
+            if (splits.size() < 2) {
+                for (int n1 : order) {
+                    if (splits.size() >= 2) break;
+                    if ((logN_ - n1) == 10) try_add_split(n1);
+                }
             }
         }
 
@@ -1992,12 +2474,15 @@ private:
                     }
                 };
 
-                // Phase A: tune (split, Pass-0 WG) using heuristic L2 chunk size
+                // Factored smart search:
+                //   Phase A: compare <=2 shortlisted splits at their analytical default Pass-0 WG.
+                //   Phase B: on the winning split only, check 1 alternate Pass-0 WG (0 new JIT).
+                //   Phase C: on the winning (split, WG), check 2 L2 chunk sizes (0 new JIT).
                 double best_ms = 1e30;
                 bool any_ok = false;
                 for (size_t si = 0; si < splits.size(); ++si) {
                     const auto& sp = splits[si];
-                    const size_t n2_sz = size_t{1} << sp.n2;
+                    const size_t def_wg = default_pass0_wg_for(sp.n1, sp.n2);
                     const size_t base_l2 = (launch_cfg_.l2_chunk_bytes > 0)
                         ? launch_cfg_.l2_chunk_bytes
                         : dev_cfg_.compute_l2_chunk_bytes(
@@ -2005,65 +2490,51 @@ private:
                               launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
                               launch_cfg_.min_waves_per_cu);
                     const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, base_l2 / fft_bytes));
-
-                    std::vector<size_t> wg_cands;
-                    if (launch_cfg_.pass0_wg_size > 0) {
-                        wg_cands.push_back(dev_cfg_.clamp_pow2_wg(n2_sz, launch_cfg_.pass0_wg_size));
-                    } else {
-                        const auto p0_info =
-                            SYCL_FFT_SUFFIX(probe_pass0_stage)<Sign>(q_, q_.get_device(), sp.n1, sp.n2);
-                        const size_t bundle_cap = (p0_info.available && p0_info.max_wg_size > 0)
-                            ? p0_info.max_wg_size : dev_cfg_.max_work_group_size;
-                        for (size_t w : {size_t{128}, size_t{256}, size_t{512}}) {
-                            const size_t cw = dev_cfg_.clamp_pow2_wg(n2_sz, w, bundle_cap);
-                            if (std::find(wg_cands.begin(), wg_cands.end(), cw) == wg_cands.end()) {
-                                wg_cands.push_back(cw);
-                            }
-                        }
+                    double ms = 0.0;
+                    if (time_two_pass_cfg(sp, def_wg, base_cbs, ms) && (!any_ok || ms < best_ms)) {
+                        any_ok = true;
+                        best_ms = ms;
+                        best_idx = static_cast<int>(si);
+                        best_pass0_wg = def_wg;
+                        best_l2_bytes = base_l2;
                     }
+                }
 
-                    for (size_t w : wg_cands) {
+                if (any_ok && launch_cfg_.pass0_wg_size == 0) {
+                    const auto& best_sp = splits[static_cast<size_t>(best_idx)];
+                    const size_t n2_sz = size_t{1} << best_sp.n2;
+                    const size_t alt_target = SYCL_FFT_WIDE ? size_t{128} : size_t{512};
+                    const size_t alt_wg = dev_cfg_.clamp_pow2_wg(n2_sz, alt_target);
+                    if (alt_wg != best_pass0_wg) {
+                        const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, best_l2_bytes / fft_bytes));
                         double ms = 0.0;
-                        if (time_two_pass_cfg(sp, w, base_cbs, ms) && (!any_ok || ms < best_ms)) {
-                            any_ok = true;
+                        if (time_two_pass_cfg(best_sp, alt_wg, base_cbs, ms) && ms < best_ms) {
                             best_ms = ms;
-                            best_idx = static_cast<int>(si);
-                            best_pass0_wg = w;
-                            best_l2_bytes = base_l2;
+                            best_pass0_wg = alt_wg;
                         }
                     }
                 }
 
-                // Phase B: autotune L2 chunk size across {0.5x, 1x, 2x, 4x} heuristic multiples
                 if (any_ok && launch_cfg_.l2_chunk_bytes == 0) {
                     const auto& best_sp = splits[static_cast<size_t>(best_idx)];
-                    const size_t base_l2 = dev_cfg_.compute_l2_chunk_bytes(
-                        fft_bytes, size_t{1} << best_sp.n1, is_compute_heavy_,
-                        launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
-                        launch_cfg_.min_waves_per_cu);
+                    const size_t base_l2 = best_l2_bytes;
                     const size_t max_l2_cap = std::min(
                         tune_bs * fft_bytes,
                         dev_cfg_.max_mem_alloc_size > 0
                             ? std::max(fft_bytes, dev_cfg_.max_mem_alloc_size / 4)
                             : (tune_bs * fft_bytes));
-
-                    const size_t mults_num[4] = {1, 2, 4, 8};
-                    std::vector<size_t> seen_cbs;
-                    double best_l2_ms = 1e30;
-                    for (size_t mn : mults_num) {
-                        const size_t cand_bytes = std::clamp<size_t>(
-                            (base_l2 * mn) / 2, fft_bytes, std::max(fft_bytes, max_l2_cap));
-                        const size_t cbs = std::min(tune_bs, std::max<size_t>(1, cand_bytes / fft_bytes));
-                        if (std::find(seen_cbs.begin(), seen_cbs.end(), cbs) != seen_cbs.end()) continue;
-                        seen_cbs.push_back(cbs);
+                    const size_t base_cbs = std::min(tune_bs, std::max<size_t>(1, base_l2 / fft_bytes));
+                    const size_t alt_bytes = std::clamp<size_t>(
+                        base_l2 * 2, fft_bytes, std::max(fft_bytes, max_l2_cap));
+                    const size_t alt_cbs = std::min(tune_bs, std::max<size_t>(1, alt_bytes / fft_bytes));
+                    if (alt_cbs != base_cbs) {
                         double ms = 0.0;
-                        if (time_two_pass_cfg(best_sp, best_pass0_wg, cbs, ms) && ms < best_l2_ms) {
-                            best_l2_ms = ms;
-                            best_l2_bytes = cbs * fft_bytes;
+                        if (time_two_pass_cfg(best_sp, best_pass0_wg, alt_cbs, ms) && ms < best_ms) {
+                            best_ms = ms;
+                            best_l2_bytes = alt_cbs * fft_bytes;
                         }
                     }
                 }
-
                 sycl::free(d_tmp, q_);
                 sycl::free(d_out, q_);
                 sycl::free(d_in, q_);
@@ -2128,6 +2599,9 @@ private:
     double          fp64_to_fp32_ratio_ = 0.0;
     bool            is_compute_heavy_ = false;
     bool            cache_hit_ = false;
+    BitRevPlan<ComplexT> bitrev_plan_{};
 };
+
+#endif // SYCL_FFT_USE_EXTERN_TEMPLATES
 
 } // namespace sycl_fft

@@ -98,14 +98,161 @@ SYCL_FFT_FORCE_INLINE uint32_t bit_reverse(uint32_t x, int bits) {
 }
 
 // ============================================================================
-// Triple-Precision Complex & Double-Float (DF) Types
-//   FP32: Complexf  (sycl::float2,  8 B)
+// Quadruple-Precision Complex Types
+//   FP16: Complexh  (sycl::half2,    4 B, paired 2x FP16 compute via f16x2_t)
+//   FP32: Complexf  (sycl::float2,   8 B)
 //   FP64: Complex   (sycl::double2, 16 B)
 //   DF:   Complexdf ({df_t re, im}, 16 B, ~47-48 bit mantissa via 2 x fp32)
 // ============================================================================
+using Complexh = sycl::half2;
 using Complexf = sycl::float2;
 using Complex  = sycl::double2;
 
+static_assert(sizeof(Complexh) == 4 && alignof(Complexh) == 4 && std::is_trivially_copyable_v<Complexh>,
+              "Complexh must be 4-byte aligned trivially copyable pair of binary16");
+
+#if !defined(SYCL_FFT_DISABLE_NATIVE_F16X2) && defined(__clang__) && defined(__FLT16_MANT_DIG__) && \
+    (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
+#define SYCL_FFT_USE_CLANG_F16X2 1
+#else
+#define SYCL_FFT_USE_CLANG_F16X2 0
+#endif
+
+#if SYCL_FFT_USE_CLANG_F16X2
+using f16_scalar_t = _Float16;
+using f16x2_t = _Float16 __attribute__((ext_vector_type(2)));
+#else
+using f16_scalar_t = sycl::half;
+using f16x2_t = sycl::half2;
+#endif
+
+static_assert(sizeof(f16x2_t) == 4 && alignof(f16x2_t) == 4 && std::is_trivially_copyable_v<f16x2_t>,
+              "f16x2_t must be 4-byte trivially copyable for 32-bit SMEM & shuffle");
+
+SYCL_FFT_FORCE_INLINE uint32_t f16x2_to_u32(f16x2_t v) {
+    return sycl::bit_cast<uint32_t>(v);
+}
+
+SYCL_FFT_FORCE_INLINE f16x2_t u32_to_f16x2(uint32_t u) {
+    return sycl::bit_cast<f16x2_t>(u);
+}
+
+constexpr f16x2_t f16x2_make(f16_scalar_t lo, f16_scalar_t hi) {
+#if SYCL_FFT_USE_CLANG_F16X2
+    return f16x2_t{lo, hi};
+#else
+    sycl::half2 v{};
+    v.x() = lo;
+    v.y() = hi;
+    return v;
+#endif
+}
+
+constexpr f16x2_t f16x2_splat(f16_scalar_t v) {
+    return f16x2_make(v, v);
+}
+
+constexpr f16x2_t f16x2_splat_f(float v) {
+    const f16_scalar_t h = static_cast<f16_scalar_t>(v);
+    return f16x2_make(h, h);
+}
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_add(f16x2_t a, f16x2_t b) { return a + b; }
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_sub(f16x2_t a, f16x2_t b) { return a - b; }
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_neg(f16x2_t a) { return -a; }
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_mul(f16x2_t a, f16x2_t b) { return a * b; }
+
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_fma(f16x2_t a, f16x2_t b, f16x2_t c) {
+#if SYCL_FFT_USE_CLANG_F16X2
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_elementwise_fma)
+    return __builtin_elementwise_fma(a, b, c);
+#else
+    return a * b + c;
+#endif
+#else
+    return a * b + c;
+#endif
+#else
+    return sycl::fma(a, b, c);
+#endif
+}
+
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_scale_half(f16x2_t a) {
+    return a * f16x2_splat_f(0.5f);
+}
+
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_cond_neg(f16x2_t v, bool cond) {
+    const uint32_t mask = cond ? 0x80008000u : 0u;
+    return u32_to_f16x2(f16x2_to_u32(v) ^ mask);
+}
+
+SYCL_FFT_FORCE_INLINE void f16x2_cmul(
+    f16x2_t ar, f16x2_t ai, f16x2_t br, f16x2_t bi, f16x2_t& or_, f16x2_t& oi) {
+    or_ = f16x2_fma(ar, br, -(ai * bi));
+    oi  = f16x2_fma(ar, bi,   ai * br);
+}
+
+SYCL_FFT_FORCE_INLINE void f16x2_csqr(
+    f16x2_t ar, f16x2_t ai, f16x2_t& or_, f16x2_t& oi) {
+    or_ = f16x2_fma(ar, ar, -(ai * ai));
+    oi  = (f16x2_splat_f(2.0f) * ar) * ai;
+}
+
+template <bool NegRe, bool NegIm>
+SYCL_FFT_FORCE_INLINE void f16x2_cmul_sqrt1_2(
+    f16x2_t dr, f16x2_t di, f16x2_t& or_, f16x2_t& oi) {
+    const f16x2_t c = f16x2_splat_f(0.7071067811865475244f);
+    if constexpr (!NegRe && NegIm) {
+        or_ = (dr + di) * c;
+        oi  = (di - dr) * c;
+    } else if constexpr (NegRe && NegIm) {
+        or_ = (di - dr) * c;
+        oi  = -(dr + di) * c;
+    } else if constexpr (!NegRe && !NegIm) {
+        or_ = (dr - di) * c;
+        oi  = (dr + di) * c;
+    } else {
+        or_ = -(dr + di) * c;
+        oi  = (dr - di) * c;
+    }
+}
+
+// Pack 2 independent complex binary16 values (batch 0 and batch 1) into SoA f16x2_t registers:
+//   re = {g0.re, g1.re}, im = {g0.im, g1.im}.
+SYCL_FFT_FORCE_INLINE void f16x2_load_pair(
+    const Complexh* g0, const Complexh* g1, int idx, bool valid0, bool valid1,
+    f16x2_t& re_out, f16x2_t& im_out) {
+    const uint32_t u0 = valid0 ? reinterpret_cast<const uint32_t*>(g0)[idx] : 0u;
+    const uint32_t u1 = valid1 ? reinterpret_cast<const uint32_t*>(g1)[idx] : 0u;
+    const uint32_t re_u32 = (u0 & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
+    const uint32_t im_u32 = (u0 >> 16) | (u1 & 0xFFFF0000u);
+    re_out = u32_to_f16x2(re_u32);
+    im_out = u32_to_f16x2(im_u32);
+}
+
+SYCL_FFT_FORCE_INLINE void f16x2_store_pair(
+    Complexh* g0, Complexh* g1, int idx, bool valid0, bool valid1,
+    f16x2_t re_in, f16x2_t im_in) {
+    const uint32_t re_u32 = f16x2_to_u32(re_in);
+    const uint32_t im_u32 = f16x2_to_u32(im_in);
+    if (valid0) {
+        reinterpret_cast<uint32_t*>(g0)[idx] = (re_u32 & 0xFFFFu) | ((im_u32 & 0xFFFFu) << 16);
+    }
+    if (valid1) {
+        reinterpret_cast<uint32_t*>(g1)[idx] = (re_u32 >> 16) | (im_u32 & 0xFFFF0000u);
+    }
+}
+
+SYCL_FFT_FORCE_INLINE Complexh complexh_from_doubles(double r, double i) {
+    Complexh out{};
+    out.x() = static_cast<sycl::half>(static_cast<float>(r));
+    out.y() = static_cast<sycl::half>(static_cast<float>(i));
+    return out;
+}
+SYCL_FFT_FORCE_INLINE void complexh_to_long_doubles(Complexh v, long double& r, long double& i) {
+    r = static_cast<long double>(static_cast<float>(v.x()));
+    i = static_cast<long double>(static_cast<float>(v.y()));
+}
 struct alignas(8) df_t {
     float hi;
     float lo;
@@ -357,6 +504,15 @@ constexpr float twiddle32_imf(int idx32) {
 }
 
 template <int Sign>
+constexpr f16x2_t twiddle32_reh(int idx32) {
+    return f16x2_splat_f(kCos32f[idx32]);
+}
+
+template <int Sign>
+constexpr f16x2_t twiddle32_imh(int idx32) {
+    return f16x2_splat_f((Sign < 0) ? kSin32Negf[idx32] : -kSin32Negf[idx32]);
+}
+template <int Sign>
 constexpr double twiddle32_re(int idx32) {
     return kCos32[idx32];
 }
@@ -540,6 +696,25 @@ SYCL_FFT_FORCE_INLINE float sin2pif_branchless(float x) {
 
 SYCL_FFT_FORCE_INLINE float cos2pif(float x) { return cos2pif_branchless(x); }
 SYCL_FFT_FORCE_INLINE float sin2pif(float x) { return sin2pif_branchless(x); }
+
+// ============================================================================
+// FP16 Standalone Branchless Trig (evaluated in FP32, rounded to binary16 <= 0.5 ULP)
+// ============================================================================
+template <int Sign = -1>
+SYCL_FFT_FORCE_INLINE void sincos2pih_branchless(sycl::half x, sycl::half& c_out, sycl::half& s_out) {
+    float c = 0.0f, s = 0.0f;
+    sincos2pif_branchless<Sign>(static_cast<float>(x), c, s);
+    c_out = static_cast<sycl::half>(c);
+    s_out = static_cast<sycl::half>(s);
+}
+
+SYCL_FFT_FORCE_INLINE sycl::half cos2pih(sycl::half x) {
+    return static_cast<sycl::half>(cos2pif_branchless(static_cast<float>(x)));
+}
+
+SYCL_FFT_FORCE_INLINE sycl::half sin2pih(sycl::half x) {
+    return static_cast<sycl::half>(sin2pif_branchless(static_cast<float>(x)));
+}
 
 // ============================================================================
 // FP64 Branchless Polynomial Trig (raw unsuffixed, minimax on [0, 0.125])

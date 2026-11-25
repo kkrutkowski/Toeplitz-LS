@@ -2,10 +2,10 @@
 // mirroring include/nanofft_precision.h.
 //
 // Select precision before including:
-//   (default)       -> FP32:        f suffix   (Complexf, DifFftPlanf, ...)
-//   SYCL_FFT_DOUBLE -> FP64:        no suffix  (Complex,  DifFftPlan,  ...)
+//   (default)       -> FP32:        f suffix   (Complexf,  DifFftPlanf,  ...)
+//   SYCL_FFT_HALF   -> FP16 (2x):   h suffix   (Complexh,  DifFftPlanh,  ...)
+//   SYCL_FFT_DOUBLE -> FP64:        no suffix  (Complex,   DifFftPlan,   ...)
 //   SYCL_FFT_DF     -> DoubleFloat: df suffix  (Complexdf, DifFftPlandf, ...)
-
 #undef SYCL_FFT_SUFFIX
 #undef SYCL_FFT_REAL
 #undef SYCL_FFT_COMPLEX
@@ -15,6 +15,8 @@
 #undef SYCL_FFT_PREC_TAG
 #undef SYCL_FFT_IS_DOUBLE
 #undef SYCL_FFT_IS_DF
+#undef SYCL_FFT_IS_HALF
+#undef SYCL_FFT_PACKED_BATCH
 #undef SYCL_FFT_ZERO
 #undef SYCL_FFT_ONE
 #undef SYCL_FFT_SQRT1_2
@@ -50,6 +52,8 @@
 #define SYCL_FFT_PREC_TAG "df"
 #define SYCL_FFT_IS_DOUBLE 0
 #define SYCL_FFT_IS_DF 1
+#define SYCL_FFT_IS_HALF 0
+#define SYCL_FFT_PACKED_BATCH 1
 
 #define SYCL_FFT_ZERO df_make(0.0f, 0.0f)
 #define SYCL_FFT_ONE df_make(1.0f, 0.0f)
@@ -105,6 +109,8 @@
 #define SYCL_FFT_PREC_TAG "d"
 #define SYCL_FFT_IS_DOUBLE 1
 #define SYCL_FFT_IS_DF 0
+#define SYCL_FFT_IS_HALF 0
+#define SYCL_FFT_PACKED_BATCH 1
 
 #define SYCL_FFT_ZERO 0.0
 #define SYCL_FFT_ONE 1.0
@@ -177,6 +183,67 @@
 #define SYCL_FFT_SINCOS2PI_OCT1(Sign, f_exact, c, s) sincos2pi_oct1<(Sign)>((f_exact), (c), (s))
 #define SYCL_FFT_SINCOS2PI_HALF(Sign, f_exact, c, s) sincos2pi_half<(Sign)>((f_exact), (c), (s))
 
+#elif defined(SYCL_FFT_HALF)
+
+#define SYCL_FFT_SUFFIX(name) name##h
+#define SYCL_FFT_REAL f16x2_t
+#define SYCL_FFT_COMPLEX Complexh
+#define SYCL_FFT_SMEM_T uint32_t
+#define SYCL_FFT_ANGLE_T float
+#define SYCL_FFT_WIDE 0
+#define SYCL_FFT_PREC_TAG "h"
+#define SYCL_FFT_IS_DOUBLE 0
+#define SYCL_FFT_IS_DF 0
+#define SYCL_FFT_IS_HALF 1
+#define SYCL_FFT_PACKED_BATCH 2
+
+#define SYCL_FFT_ZERO f16x2_splat_f(0.0f)
+#define SYCL_FFT_ONE f16x2_splat_f(1.0f)
+#define SYCL_FFT_SQRT1_2 f16x2_splat_f(kSqrt1_2f)
+
+#define SYCL_FFT_ADD(a, b) f16x2_add((a), (b))
+#define SYCL_FFT_SUB(a, b) f16x2_sub((a), (b))
+#define SYCL_FFT_NEG(a) f16x2_neg((a))
+#define SYCL_FFT_MUL(a, b) f16x2_mul((a), (b))
+#define SYCL_FFT_SCALE_HALF(x) f16x2_scale_half((x))
+#define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi) f16x2_cmul((ar), (ai), (br), (bi), (or_), (oi))
+#define SYCL_FFT_CSQR(ar, ai, or_, oi) f16x2_csqr((ar), (ai), (or_), (oi))
+#define SYCL_FFT_CMUL_SQRT1_2(NegRe, NegIm, dr, di, or_, oi) \
+    f16x2_cmul_sqrt1_2<(NegRe), (NegIm)>((dr), (di), (or_), (oi))
+
+#define SYCL_FFT_LOAD_COMPLEX(ptr, idx, re_out, im_out)                             \
+    f16x2_load_pair((ptr), (ptr), (idx), true, false, (re_out), (im_out))
+
+#define SYCL_FFT_STORE_COMPLEX(ptr, idx, re_in, im_in)                              \
+    f16x2_store_pair((ptr), (ptr), (idx), true, false, (re_in), (im_in))
+
+#define SYCL_FFT_TO_SMEM(r) f16x2_to_u32((r))
+#define SYCL_FFT_FROM_SMEM(s) u32_to_f16x2((s))
+
+#define SYCL_FFT_SHUFFLE_XOR(sg, val, mask)                                         \
+    u32_to_f16x2(sycl::permute_group_by_xor((sg), f16x2_to_u32((val)), static_cast<uint32_t>(mask)))
+
+#define SYCL_FFT_COND_NEG(val, cond) f16x2_cond_neg((val), (cond))
+
+#define SYCL_FFT_TWIDDLE32_RE(Sign, idx) twiddle32_reh<(Sign)>((idx))
+#define SYCL_FFT_TWIDDLE32_IM(Sign, idx) twiddle32_imh<(Sign)>((idx))
+#define SYCL_FFT_TWIDDLE256_RE(Sign, idx) f16x2_splat_f(twiddle256_ref<(Sign)>((idx)))
+#define SYCL_FFT_TWIDDLE256_IM(Sign, idx) f16x2_splat_f(twiddle256_imf<(Sign)>((idx)))
+#define SYCL_FFT_SINCOS2PI_OCT1(Sign, f_exact, c, s)        \
+    do {                                                    \
+        float _cf = 0.0f, _sf = 0.0f;                       \
+        sincos2pif_oct1<(Sign)>((f_exact), _cf, _sf);       \
+        (c) = f16x2_splat_f(_cf);                           \
+        (s) = f16x2_splat_f(_sf);                           \
+    } while (0)
+#define SYCL_FFT_SINCOS2PI_HALF(Sign, f_exact, c, s)        \
+    do {                                                    \
+        float _cf = 0.0f, _sf = 0.0f;                       \
+        sincos2pif_half<(Sign)>((f_exact), _cf, _sf);       \
+        (c) = f16x2_splat_f(_cf);                           \
+        (s) = f16x2_splat_f(_sf);                           \
+    } while (0)
+
 #else // FP32 (default)
 
 #define SYCL_FFT_SUFFIX(name) name##f
@@ -188,6 +255,8 @@
 #define SYCL_FFT_PREC_TAG "f"
 #define SYCL_FFT_IS_DOUBLE 0
 #define SYCL_FFT_IS_DF 0
+#define SYCL_FFT_IS_HALF 0
+#define SYCL_FFT_PACKED_BATCH 1
 
 #define SYCL_FFT_ZERO 0.0f
 #define SYCL_FFT_ONE 1.0f
