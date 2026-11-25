@@ -212,12 +212,13 @@ struct BitRevCandidate {
 // ============================================================================
 // Strategy 1: Naive Direct Global Swap (In-Place) / Gather (Out-Of-Place)
 // ============================================================================
-template <typename RawT, bool InPlace>
+template <typename RawT>
 struct BitRevNaiveFunctor {
     const RawT* src;
     RawT* dst;
     size_t total;
     int logN;
+    bool in_place;
 
     void operator()(sycl::nd_item<1> item) const {
         const size_t gid = item.get_global_linear_id();
@@ -226,7 +227,7 @@ struct BitRevNaiveFunctor {
         const size_t batch_off = gid & ~mask;
         const uint32_t idx = static_cast<uint32_t>(gid & mask);
         const uint32_t rev = bit_reverse(idx, logN);
-        if constexpr (InPlace) {
+        if (in_place) {
             if (idx < rev) {
                 const RawT a = dst[batch_off + idx];
                 const RawT b = dst[batch_off + rev];
@@ -289,38 +290,36 @@ struct BitRevLutIdxFunctor {
 //   1 work-group per FFT. Unified for both in-place (src == dst) and out-of-place,
 //   with runtime xor_k derived from BankModel -> 4x fewer kernel instantiations.
 // ============================================================================
-template <typename RawT, int LogN, int WG>
+template <typename RawT>
 struct BitRevWholeSmemFunctor {
-    static constexpr int kN = 1 << LogN;
-    static constexpr int kE = kN / WG;
-
     const RawT* src;
     RawT* dst;
+    int logN;
+    int wg;
     int xor_k;
     sycl::local_accessor<RawT, 1> smem;
 
     void operator()(sycl::nd_item<1> item) const {
         const size_t batch = item.get_group_linear_id();
         const int tid = static_cast<int>(item.get_local_linear_id());
-        const size_t base = batch << LogN;
+        const int n = 1 << logN;
+        const size_t base = batch << logN;
         const RawT* g_src = src + base;
         RawT* g_dst = dst + base;
-        const int shift = LogN - xor_k;
+        const int shift = logN - xor_k;
         const int mask = (xor_k > 0) ? ((1 << xor_k) - 1) : 0;
 
-        #pragma unroll
-        for (int e = 0; e < kE; ++e) {
-            const int idx = e * WG + tid;
+        #pragma unroll 4
+        for (int idx = tid; idx < n; idx += wg) {
             const int slot = idx ^ ((idx >> shift) & mask);
             smem[slot] = g_src[idx];
         }
 
         sycl::group_barrier(item.get_group());
 
-        #pragma unroll
-        for (int e = 0; e < kE; ++e) {
-            const int idx = e * WG + tid;
-            const int r = static_cast<int>(bit_reverse(static_cast<uint32_t>(idx), LogN));
+        #pragma unroll 4
+        for (int idx = tid; idx < n; idx += wg) {
+            const int r = static_cast<int>(bit_reverse(static_cast<uint32_t>(idx), logN));
             const int slot = r ^ ((r >> shift) & mask);
             g_dst[idx] = smem[slot];
         }
@@ -329,13 +328,13 @@ struct BitRevWholeSmemFunctor {
 
 // ============================================================================
 // Strategy 4 & 5: Shared-Memory Tiled COBRA (Zero-Pad Conflict-Free XOR Tile)
+//   Non-layout axes (WG, InPlace, UseLut) are runtime arguments -> 6x fewer kernels.
 // ============================================================================
-template <typename RawT, int WBits, int WG, bool InPlace, bool UseLut>
+template <typename RawT, int WBits>
 struct BitRevCobraSmemFunctor {
     static constexpr int kW = 1 << WBits;
     static constexpr int kMask = kW - 1;
     static constexpr int kTileElems = kW * kW;
-    static constexpr int kE = kTileElems / WG;
 
     const RawT* src;
     RawT* dst;
@@ -343,6 +342,9 @@ struct BitRevCobraSmemFunctor {
     const uint16_t* b_lut;
     size_t work_per_batch;
     int logN;
+    int wg;
+    bool in_place;
+    bool use_lut;
     sycl::local_accessor<RawT, 1> smem;
 
     void operator()(sycl::nd_item<1> item) const {
@@ -355,8 +357,8 @@ struct BitRevCobraSmemFunctor {
 
         uint32_t b = 0;
         uint32_t b_rev = 0;
-        if constexpr (UseLut) {
-            if constexpr (InPlace) {
+        if (use_lut) {
+            if (in_place) {
                 b = static_cast<uint32_t>(b_lut[2 * b_idx]);
                 b_rev = static_cast<uint32_t>(b_lut[2 * b_idx + 1]);
             } else {
@@ -366,71 +368,61 @@ struct BitRevCobraSmemFunctor {
         } else {
             b = static_cast<uint32_t>(b_idx);
             b_rev = (m == 0) ? 0u : bit_reverse(b, m);
-            if constexpr (InPlace) {
-                if (b > b_rev) return;
-            }
+            if (in_place && b > b_rev) return;
         }
 
         const size_t base = batch << logN;
         const size_t off_b = base + (static_cast<size_t>(b) << WBits);
         const size_t off_brev = base + (static_cast<size_t>(b_rev) << WBits);
-        const RawT* g_src = InPlace ? dst : src;
+        const RawT* g_src = in_place ? dst : src;
 
-        #pragma unroll
-        for (int e = 0; e < kE; ++e) {
-            const int lin = e * WG + tid;
+        #pragma unroll 4
+        for (int lin = tid; lin < kTileElems; lin += wg) {
             const int a = lin >> WBits;
             const int c = lin & kMask;
             smem[cobra_tile_xor_slot(a, c, WBits)] =
                 g_src[off_b + (static_cast<size_t>(a) << a_shift) + c];
         }
 
-        if constexpr (InPlace) {
-            if (b != b_rev) {
-                #pragma unroll
-                for (int e = 0; e < kE; ++e) {
-                    const int lin = e * WG + tid;
-                    const int a = lin >> WBits;
-                    const int c = lin & kMask;
-                    smem[kTileElems + cobra_tile_xor_slot(a, c, WBits)] =
-                        g_src[off_brev + (static_cast<size_t>(a) << a_shift) + c];
-                }
+        if (in_place && b != b_rev) {
+            #pragma unroll 4
+            for (int lin = tid; lin < kTileElems; lin += wg) {
+                const int a = lin >> WBits;
+                const int c = lin & kMask;
+                smem[kTileElems + cobra_tile_xor_slot(a, c, WBits)] =
+                    g_src[off_brev + (static_cast<size_t>(a) << a_shift) + c];
             }
         }
 
         sycl::group_barrier(item.get_group());
 
-        #pragma unroll
-        for (int e = 0; e < kE; ++e) {
-            const int lin = e * WG + tid;
+        #pragma unroll 4
+        for (int lin = tid; lin < kTileElems; lin += wg) {
             const int a_out = lin >> WBits;
             const int c_out = lin & kMask;
-            const int a_src = UseLut
+            const int a_src = use_lut
                 ? static_cast<int>(rev_w[c_out])
                 : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
-            const int c_src = UseLut
+            const int c_src = use_lut
                 ? static_cast<int>(rev_w[a_out])
                 : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
             dst[off_brev + (static_cast<size_t>(a_out) << a_shift) + c_out] =
                 smem[cobra_tile_xor_slot(a_src, c_src, WBits)];
         }
 
-        if constexpr (InPlace) {
-            if (b != b_rev) {
-                #pragma unroll
-                for (int e = 0; e < kE; ++e) {
-                    const int lin = e * WG + tid;
-                    const int a_out = lin >> WBits;
-                    const int c_out = lin & kMask;
-                    const int a_src = UseLut
-                        ? static_cast<int>(rev_w[c_out])
-                        : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
-                    const int c_src = UseLut
-                        ? static_cast<int>(rev_w[a_out])
-                        : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
-                    dst[off_b + (static_cast<size_t>(a_out) << a_shift) + c_out] =
-                        smem[kTileElems + cobra_tile_xor_slot(a_src, c_src, WBits)];
-                }
+        if (in_place && b != b_rev) {
+            #pragma unroll 4
+            for (int lin = tid; lin < kTileElems; lin += wg) {
+                const int a_out = lin >> WBits;
+                const int c_out = lin & kMask;
+                const int a_src = use_lut
+                    ? static_cast<int>(rev_w[c_out])
+                    : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
+                const int c_src = use_lut
+                    ? static_cast<int>(rev_w[a_out])
+                    : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
+                dst[off_b + (static_cast<size_t>(a_out) << a_shift) + c_out] =
+                    smem[kTileElems + cobra_tile_xor_slot(a_src, c_src, WBits)];
             }
         }
     }
@@ -439,7 +431,7 @@ struct BitRevCobraSmemFunctor {
 // ============================================================================
 // Strategy 6: Zero-Smem Private L1-Tile Scalar COBRA (w = 4, 16x16 tiles, CPU)
 // ============================================================================
-template <typename RawT, bool InPlace>
+template <typename RawT>
 struct BitRevScalarCobraFunctor {
     static constexpr int kWBits = 4;
     static constexpr int kW = 16;
@@ -451,6 +443,7 @@ struct BitRevScalarCobraFunctor {
     size_t work_per_batch;
     size_t total_work;
     int logN;
+    bool in_place;
 
     void operator()(sycl::nd_item<1> item) const {
         const size_t gid = item.get_global_linear_id();
@@ -463,7 +456,7 @@ struct BitRevScalarCobraFunctor {
 
         uint32_t b = 0;
         uint32_t b_rev = 0;
-        if constexpr (InPlace) {
+        if (in_place) {
             b = static_cast<uint32_t>(b_lut[2 * b_idx]);
             b_rev = static_cast<uint32_t>(b_lut[2 * b_idx + 1]);
         } else {
@@ -474,8 +467,7 @@ struct BitRevScalarCobraFunctor {
         const size_t base = batch << logN;
         const size_t off_b = base + (static_cast<size_t>(b) << kWBits);
         const size_t off_brev = base + (static_cast<size_t>(b_rev) << kWBits);
-        const RawT* g_src = InPlace ? dst : src;
-
+        const RawT* g_src = in_place ? dst : src;
         RawT tileA[kW * kW];
         for (int a = 0; a < kW; ++a) {
             const RawT* row = g_src + off_b + (static_cast<size_t>(a) << a_shift);
@@ -484,8 +476,7 @@ struct BitRevScalarCobraFunctor {
             }
         }
 
-        if constexpr (InPlace) {
-            if (b != b_rev) {
+        if (in_place && b != b_rev) {
                 RawT tileB[kW * kW];
                 for (int a = 0; a < kW; ++a) {
                     const RawT* row = g_src + off_brev + (static_cast<size_t>(a) << a_shift);
@@ -504,7 +495,6 @@ struct BitRevScalarCobraFunctor {
                     }
                 }
                 return;
-            }
         }
 
         for (int a_out = 0; a_out < kW; ++a_out) {
@@ -532,7 +522,7 @@ void launch_bitrev_naive(
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-            BitRevNaiveFunctor<RawT, InPlace>{src, dst, total, logN});
+            BitRevNaiveFunctor<RawT>{src, dst, total, logN, InPlace});
     });
 }
 
@@ -584,16 +574,16 @@ void launch_bitrev_lut_idx(
     }
 }
 
-template <typename RawT, int LogN, int WG>
+template <typename RawT, int WG>
 void launch_bitrev_whole_smem(
-    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int,
+    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN,
     BitRevLutState&, size_t, int xor_k) {
     if (bs == 0) return;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<RawT, 1> smem(sycl::range<1>(size_t{1} << LogN), h);
+        sycl::local_accessor<RawT, 1> smem(sycl::range<1>(size_t{1} << logN), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(bs * WG), sycl::range<1>(WG)),
-            BitRevWholeSmemFunctor<RawT, LogN, WG>{src, dst, xor_k, smem});
+            BitRevWholeSmemFunctor<RawT>{src, dst, logN, WG, xor_k, smem});
     });
 }
 
@@ -627,8 +617,8 @@ void launch_bitrev_cobra_smem(
         sycl::local_accessor<RawT, 1> smem(sycl::range<1>(smem_elems), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(total_wg * WG), sycl::range<1>(WG)),
-            BitRevCobraSmemFunctor<RawT, WBits, WG, InPlace, UseLut>{
-                src, dst, rev_w_ptr, b_lut_ptr, work_per_batch, logN, smem});
+            BitRevCobraSmemFunctor<RawT, WBits>{
+                src, dst, rev_w_ptr, b_lut_ptr, work_per_batch, logN, WG, InPlace, UseLut, smem});
     });
 }
 
@@ -648,8 +638,8 @@ void launch_bitrev_scalar_cobra(
     q.submit([&](sycl::handler& h) {
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-            BitRevScalarCobraFunctor<RawT, InPlace>{
-                src, dst, lut.rev_w[0], b_lut_ptr, work_per_batch, total_work, logN});
+            BitRevScalarCobraFunctor<RawT>{
+                src, dst, lut.rev_w[0], b_lut_ptr, work_per_batch, total_work, logN, InPlace});
     });
 }
 
@@ -660,34 +650,11 @@ void append_whole_smem_candidates(int logN, std::vector<BitRevCandidate<RawT>>& 
         out.push_back(BitRevCandidate<RawT>{
             name, wg, smem_b, true, false, BitRevLutKind::None, fn});
     };
-    const size_t smem_b = (size_t{1} << logN) * sizeof(RawT);
-    switch (logN) {
-        case 10:
-            add("whole_smem_xor_w256", 256, smem_b, &launch_bitrev_whole_smem<RawT, 10, 256>);
-            add("whole_smem_xor_w128", 128, smem_b, &launch_bitrev_whole_smem<RawT, 10, 128>);
-            break;
-        case 11:
-            add("whole_smem_xor_w256", 256, smem_b, &launch_bitrev_whole_smem<RawT, 11, 256>);
-            add("whole_smem_xor_w128", 128, smem_b, &launch_bitrev_whole_smem<RawT, 11, 128>);
-            break;
-        case 12:
-            add("whole_smem_xor_w256", 256, smem_b, &launch_bitrev_whole_smem<RawT, 12, 256>);
-            add("whole_smem_xor_w128", 128, smem_b, &launch_bitrev_whole_smem<RawT, 12, 128>);
-            break;
-        case 13:
-            if constexpr (sizeof(RawT) <= 8) {
-                add("whole_smem_xor_w256", 256, smem_b, &launch_bitrev_whole_smem<RawT, 13, 256>);
-                add("whole_smem_xor_w128", 128, smem_b, &launch_bitrev_whole_smem<RawT, 13, 128>);
-            }
-            break;
-        case 14:
-            if constexpr (sizeof(RawT) <= 4) {
-                add("whole_smem_xor_w256", 256, smem_b, &launch_bitrev_whole_smem<RawT, 14, 256>);
-                add("whole_smem_xor_w128", 128, smem_b, &launch_bitrev_whole_smem<RawT, 14, 128>);
-            }
-            break;
-        default:
-            break;
+    const int max_whole_logN = (sizeof(RawT) <= 4) ? 14 : (sizeof(RawT) <= 8 ? 13 : 12);
+    if (logN >= 10 && logN <= max_whole_logN) {
+        const size_t smem_b = (size_t{1} << logN) * sizeof(RawT);
+        add("whole_smem_xor_w256", 256, smem_b, &launch_bitrev_whole_smem<RawT, 256>);
+        add("whole_smem_xor_w128", 128, smem_b, &launch_bitrev_whole_smem<RawT, 128>);
     }
 }
 
@@ -959,7 +926,11 @@ private:
                 add_by_name("whole_smem_xor_w128");
                 const size_t whole_bytes = (size_t{1} << logN_) * sizeof(RawT);
                 if (whole_bytes * 2 >= dev_cfg_.local_mem_size) {
-                    if (!add_by_name("cobra_w4_lut_wg256")) {
+                    if (sizeof(RawT) <= 8 && logN_ >= 12) {
+                        if (!add_by_name("cobra_w5_lut_wg256")) {
+                            add_by_name("cobra_w5_wg256");
+                        }
+                    } else if (!add_by_name("cobra_w4_lut_wg256")) {
                         add_by_name("cobra_w5_wg256");
                     }
                 }

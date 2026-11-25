@@ -1,11 +1,12 @@
 .PHONY: generic blackwell check clean
 
 ACPP        ?= acpp
-CXXFLAGS    ?= -O3 -Wall -Wextra
-# Sign convention build selector:
-#   SIGN=pos  (default): compile +1 sign only (halves compile time, HCF size, and JIT overhead)
-#   SIGN=neg           : compile -1 sign only
-#   SIGN=both          : compile both +1 and -1 signs
+CXXFLAGS    ?= -O3 -Wall -Wextra -fexcess-precision=16
+# Sign convention build selector (Sign is a runtime kernel argument, so SIGN=both
+# compiles the exact same kernel set, HCF footprint, and cold JIT cost as SIGN=pos):
+#   SIGN=pos  (default): expose +1 sign in DifFftPlan/CLI
+#   SIGN=neg           : expose -1 sign in DifFftPlan/CLI
+#   SIGN=both          : expose both +1 and -1 signs in DifFftPlan/CLI
 SIGN        ?= pos
 
 ifeq ($(SIGN),pos)

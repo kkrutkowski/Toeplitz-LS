@@ -46,7 +46,7 @@
 #define SYCL_FFT_SUFFIX(name) name##df
 #define SYCL_FFT_REAL df_t
 #define SYCL_FFT_COMPLEX Complexdf
-#define SYCL_FFT_SMEM_T sycl::float2
+#define SYCL_FFT_SMEM_T df_t
 #define SYCL_FFT_ANGLE_T float
 #define SYCL_FFT_WIDE 1
 #define SYCL_FFT_PREC_TAG "df"
@@ -66,24 +66,23 @@
 #define SYCL_FFT_SCALE_HALF(x) df_scale_pow2((x), 0.5f)
 #define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi) df_cmul_fused((ar), (ai), (br), (bi), (or_), (oi))
 #define SYCL_FFT_CSQR(ar, ai, or_, oi) df_csqr_fused((ar), (ai), (or_), (oi))
-#define SYCL_FFT_CMUL_SQRT1_2(NegRe, NegIm, dr, di, or_, oi) \
-    df_cmul_sqrt1_2<(NegRe), (NegIm)>((dr), (di), (or_), (oi))
+#define SYCL_FFT_CMUL_SQRT1_2(NegRe, pos_sign, dr, di, or_, oi) \
+    df_cmul_sqrt1_2_rt<(NegRe)>((dr), (di), (pos_sign), (or_), (oi))
 
-#define SYCL_FFT_LOAD_COMPLEX(ptr, idx, re_out, im_out)                             \
-    do {                                                                            \
-        const sycl::float4 _v4 = reinterpret_cast<const sycl::float4*>(ptr)[(idx)]; \
-        (re_out) = df_t{_v4.x(), _v4.y()};                                          \
-        (im_out) = df_t{_v4.z(), _v4.w()};                                          \
+#define SYCL_FFT_LOAD_COMPLEX(ptr, idx, re_out, im_out)     \
+    do {                                                    \
+        const Complexdf _v = (ptr)[(idx)];                  \
+        (re_out) = _v.re;                                   \
+        (im_out) = _v.im;                                   \
     } while (0)
 
-#define SYCL_FFT_STORE_COMPLEX(ptr, idx, re_in, im_in)                                            \
-    do {                                                                                          \
-        reinterpret_cast<sycl::float4*>(ptr)[(idx)] =                                             \
-            sycl::float4{(re_in).hi, (re_in).lo, (im_in).hi, (im_in).lo};                         \
+#define SYCL_FFT_STORE_COMPLEX(ptr, idx, re_in, im_in)      \
+    do {                                                    \
+        (ptr)[(idx)] = Complexdf{(re_in), (im_in)};         \
     } while (0)
 
-#define SYCL_FFT_TO_SMEM(r) sycl::float2{(r).hi, (r).lo}
-#define SYCL_FFT_FROM_SMEM(s) df_t{(s).x(), (s).y()}
+#define SYCL_FFT_TO_SMEM(r) (r)
+#define SYCL_FFT_FROM_SMEM(s) (s)
 
 #define SYCL_FFT_SHUFFLE_XOR(sg, val, mask)                                             \
     df_t{sycl::permute_group_by_xor((sg), (val).hi, static_cast<uint32_t>(mask)),       \
@@ -136,21 +135,18 @@
         (oi)  = (2.0 * _ar) * _ai;                          \
     } while (0)
 
-#define SYCL_FFT_CMUL_SQRT1_2(NegRe, NegIm, dr, di, or_, oi)    \
+#define SYCL_FFT_CMUL_SQRT1_2(NegRe, pos_sign, dr, di, or_, oi) \
     do {                                                        \
         const double _dr = (dr), _di = (di);                    \
-        if constexpr (!(NegRe) && (NegIm)) {                    \
-            (or_) = (_dr + _di) * kSqrt1_2;                     \
-            (oi)  = (_di - _dr) * kSqrt1_2;                     \
-        } else if constexpr ((NegRe) && (NegIm)) {              \
-            (or_) = (_di - _dr) * kSqrt1_2;                     \
-            (oi)  = -(_dr + _di) * kSqrt1_2;                    \
-        } else if constexpr (!(NegRe) && !(NegIm)) {            \
-            (or_) = (_dr - _di) * kSqrt1_2;                     \
-            (oi)  = (_dr + _di) * kSqrt1_2;                     \
+        const uint64_t _sb = static_cast<uint64_t>(pos_sign) << 63; \
+        const double _sdr = SYCL_FFT_BIT_CAST(double, SYCL_FFT_BIT_CAST(uint64_t, _dr) ^ _sb); \
+        const double _sdi = SYCL_FFT_BIT_CAST(double, SYCL_FFT_BIT_CAST(uint64_t, _di) ^ _sb); \
+        if constexpr (!(NegRe)) {                               \
+            (or_) = (_dr + _sdi) * kSqrt1_2;                    \
+            (oi)  = (_di - _sdr) * kSqrt1_2;                    \
         } else {                                                \
-            (or_) = -(_dr + _di) * kSqrt1_2;                    \
-            (oi)  = (_dr - _di) * kSqrt1_2;                     \
+            (or_) = (_sdi - _dr) * kSqrt1_2;                    \
+            (oi)  = -(_sdr + _di) * kSqrt1_2;                   \
         }                                                       \
     } while (0)
 
@@ -173,8 +169,8 @@
     sycl::permute_group_by_xor((sg), (val), static_cast<uint32_t>(mask))
 
 #define SYCL_FFT_COND_NEG(val, cond)                                                               \
-    sycl::bit_cast<double>(sycl::bit_cast<uint64_t>(static_cast<double>(val)) ^                    \
-                           (static_cast<uint64_t>(cond) << 63))
+    SYCL_FFT_BIT_CAST(double, SYCL_FFT_BIT_CAST(uint64_t, static_cast<double>(val)) ^              \
+                              (static_cast<uint64_t>(cond) << 63))
 
 #define SYCL_FFT_TWIDDLE32_RE(Sign, idx) twiddle32_re<(Sign)>((idx))
 #define SYCL_FFT_TWIDDLE32_IM(Sign, idx) twiddle32_im<(Sign)>((idx))
@@ -197,19 +193,42 @@
 #define SYCL_FFT_IS_HALF 1
 #define SYCL_FFT_PACKED_BATCH 2
 
-#define SYCL_FFT_ZERO f16x2_splat_f(0.0f)
-#define SYCL_FFT_ONE f16x2_splat_f(1.0f)
-#define SYCL_FFT_SQRT1_2 f16x2_splat_f(kSqrt1_2f)
+#define SYCL_FFT_ZERO kZero_f16x2
+#define SYCL_FFT_ONE kOne_f16x2
+#define SYCL_FFT_SQRT1_2 kSqrt1_2_f16x2
 
-#define SYCL_FFT_ADD(a, b) f16x2_add((a), (b))
-#define SYCL_FFT_SUB(a, b) f16x2_sub((a), (b))
-#define SYCL_FFT_NEG(a) f16x2_neg((a))
-#define SYCL_FFT_MUL(a, b) f16x2_mul((a), (b))
-#define SYCL_FFT_SCALE_HALF(x) f16x2_scale_half((x))
-#define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi) f16x2_cmul((ar), (ai), (br), (bi), (or_), (oi))
-#define SYCL_FFT_CSQR(ar, ai, or_, oi) f16x2_csqr((ar), (ai), (or_), (oi))
-#define SYCL_FFT_CMUL_SQRT1_2(NegRe, NegIm, dr, di, or_, oi) \
-    f16x2_cmul_sqrt1_2<(NegRe), (NegIm)>((dr), (di), (or_), (oi))
+#define SYCL_FFT_ADD(a, b) ((a) + (b))
+#define SYCL_FFT_SUB(a, b) ((a) - (b))
+#define SYCL_FFT_NEG(a) (-(a))
+#define SYCL_FFT_MUL(a, b) ((a) * (b))
+#define SYCL_FFT_SCALE_HALF(x) ((x) * kHalf_f16x2)
+#define SYCL_FFT_CMUL(ar, ai, br, bi, or_, oi)              \
+    do {                                                    \
+        const f16x2_t _ar = (ar), _ai = (ai);               \
+        const f16x2_t _br = (br), _bi = (bi);               \
+        (or_) = SYCL_FFT_F16X2_FMA(_ar, _br, -(_ai * _bi)); \
+        (oi)  = SYCL_FFT_F16X2_FMA(_ar, _bi,   _ai * _br);  \
+    } while (0)
+#define SYCL_FFT_CSQR(ar, ai, or_, oi)                      \
+    do {                                                    \
+        const f16x2_t _ar = (ar), _ai = (ai);               \
+        (or_) = SYCL_FFT_F16X2_FMA(_ar, _ar, -(_ai * _ai)); \
+        (oi)  = (kTwo_f16x2 * _ar) * _ai;                   \
+    } while (0)
+#define SYCL_FFT_CMUL_SQRT1_2(NegRe, pos_sign, dr, di, or_, oi) \
+    do {                                                        \
+        const f16x2_t _dr = (dr), _di = (di);                   \
+        const uint32_t _sb = (pos_sign) ? 0x80008000u : 0u;     \
+        const f16x2_t _sdr = SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, _dr) ^ _sb); \
+        const f16x2_t _sdi = SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, _di) ^ _sb); \
+        if constexpr (!(NegRe)) {                               \
+            (or_) = (_dr + _sdi) * kSqrt1_2_f16x2;              \
+            (oi)  = (_di - _sdr) * kSqrt1_2_f16x2;              \
+        } else {                                                \
+            (or_) = (_sdi - _dr) * kSqrt1_2_f16x2;              \
+            (oi)  = -(_sdr + _di) * kSqrt1_2_f16x2;             \
+        }                                                       \
+    } while (0)
 
 #define SYCL_FFT_LOAD_COMPLEX(ptr, idx, re_out, im_out)                             \
     f16x2_load_pair((ptr), (ptr), (idx), true, false, (re_out), (im_out))
@@ -217,31 +236,37 @@
 #define SYCL_FFT_STORE_COMPLEX(ptr, idx, re_in, im_in)                              \
     f16x2_store_pair((ptr), (ptr), (idx), true, false, (re_in), (im_in))
 
-#define SYCL_FFT_TO_SMEM(r) f16x2_to_u32((r))
-#define SYCL_FFT_FROM_SMEM(s) u32_to_f16x2((s))
+#define SYCL_FFT_TO_SMEM(r) SYCL_FFT_BIT_CAST(uint32_t, r)
+#define SYCL_FFT_FROM_SMEM(s) SYCL_FFT_BIT_CAST(f16x2_t, s)
 
 #define SYCL_FFT_SHUFFLE_XOR(sg, val, mask)                                         \
-    u32_to_f16x2(sycl::permute_group_by_xor((sg), f16x2_to_u32((val)), static_cast<uint32_t>(mask)))
+    SYCL_FFT_BIT_CAST(f16x2_t, sycl::permute_group_by_xor(                          \
+        (sg), SYCL_FFT_BIT_CAST(uint32_t, val), static_cast<uint32_t>(mask)))
 
-#define SYCL_FFT_COND_NEG(val, cond) f16x2_cond_neg((val), (cond))
+#define SYCL_FFT_COND_NEG(val, cond)                                                \
+    SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, val) ^ ((cond) ? 0x80008000u : 0u))
 
-#define SYCL_FFT_TWIDDLE32_RE(Sign, idx) twiddle32_reh<(Sign)>((idx))
-#define SYCL_FFT_TWIDDLE32_IM(Sign, idx) twiddle32_imh<(Sign)>((idx))
-#define SYCL_FFT_TWIDDLE256_RE(Sign, idx) f16x2_splat_f(twiddle256_ref<(Sign)>((idx)))
-#define SYCL_FFT_TWIDDLE256_IM(Sign, idx) f16x2_splat_f(twiddle256_imf<(Sign)>((idx)))
+#define SYCL_FFT_TWIDDLE32_RE(Sign, idx) kCos32h[(idx)]
+#define SYCL_FFT_TWIDDLE32_IM(Sign, idx) ((Sign) < 0 ? kSin32Negh[(idx)] : -kSin32Negh[(idx)])
+#define SYCL_FFT_TWIDDLE256_RE(Sign, idx) SYCL_FFT_F16X2_SPLAT_F(twiddle256_ref<(Sign)>((idx)))
+#define SYCL_FFT_TWIDDLE256_IM(Sign, idx) SYCL_FFT_F16X2_SPLAT_F(twiddle256_imf<(Sign)>((idx)))
 #define SYCL_FFT_SINCOS2PI_OCT1(Sign, f_exact, c, s)        \
     do {                                                    \
         float _cf = 0.0f, _sf = 0.0f;                       \
         sincos2pif_oct1<(Sign)>((f_exact), _cf, _sf);       \
-        (c) = f16x2_splat_f(_cf);                           \
-        (s) = f16x2_splat_f(_sf);                           \
+        const f16_scalar_t _ch = static_cast<f16_scalar_t>(_cf); \
+        const f16_scalar_t _sh = static_cast<f16_scalar_t>(_sf); \
+        (c) = SYCL_FFT_F16X2_SPLAT_H(_ch);                  \
+        (s) = SYCL_FFT_F16X2_SPLAT_H(_sh);                  \
     } while (0)
 #define SYCL_FFT_SINCOS2PI_HALF(Sign, f_exact, c, s)        \
     do {                                                    \
         float _cf = 0.0f, _sf = 0.0f;                       \
         sincos2pif_half<(Sign)>((f_exact), _cf, _sf);       \
-        (c) = f16x2_splat_f(_cf);                           \
-        (s) = f16x2_splat_f(_sf);                           \
+        const f16_scalar_t _ch = static_cast<f16_scalar_t>(_cf); \
+        const f16_scalar_t _sh = static_cast<f16_scalar_t>(_sf); \
+        (c) = SYCL_FFT_F16X2_SPLAT_H(_ch);                  \
+        (s) = SYCL_FFT_F16X2_SPLAT_H(_sh);                  \
     } while (0)
 
 #else // FP32 (default)
@@ -282,21 +307,18 @@
         (oi)  = (2.0f * _ar) * _ai;                         \
     } while (0)
 
-#define SYCL_FFT_CMUL_SQRT1_2(NegRe, NegIm, dr, di, or_, oi)    \
+#define SYCL_FFT_CMUL_SQRT1_2(NegRe, pos_sign, dr, di, or_, oi) \
     do {                                                        \
         const float _dr = (dr), _di = (di);                     \
-        if constexpr (!(NegRe) && (NegIm)) {                    \
-            (or_) = (_dr + _di) * kSqrt1_2f;                    \
-            (oi)  = (_di - _dr) * kSqrt1_2f;                    \
-        } else if constexpr ((NegRe) && (NegIm)) {              \
-            (or_) = (_di - _dr) * kSqrt1_2f;                    \
-            (oi)  = -(_dr + _di) * kSqrt1_2f;                   \
-        } else if constexpr (!(NegRe) && !(NegIm)) {            \
-            (or_) = (_dr - _di) * kSqrt1_2f;                    \
-            (oi)  = (_dr + _di) * kSqrt1_2f;                    \
+        const uint32_t _sb = static_cast<uint32_t>(pos_sign) << 31; \
+        const float _sdr = SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, _dr) ^ _sb); \
+        const float _sdi = SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, _di) ^ _sb); \
+        if constexpr (!(NegRe)) {                               \
+            (or_) = (_dr + _sdi) * kSqrt1_2f;                   \
+            (oi)  = (_di - _sdr) * kSqrt1_2f;                   \
         } else {                                                \
-            (or_) = -(_dr + _di) * kSqrt1_2f;                   \
-            (oi)  = (_dr - _di) * kSqrt1_2f;                    \
+            (or_) = (_sdi - _dr) * kSqrt1_2f;                   \
+            (oi)  = -(_sdr + _di) * kSqrt1_2f;                  \
         }                                                       \
     } while (0)
 
@@ -319,8 +341,8 @@
     sycl::permute_group_by_xor((sg), (val), static_cast<uint32_t>(mask))
 
 #define SYCL_FFT_COND_NEG(val, cond)                                                               \
-    sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(static_cast<float>(val)) ^                      \
-                          (static_cast<uint32_t>(cond) << 31))
+    SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, static_cast<float>(val)) ^                \
+                             (static_cast<uint32_t>(cond) << 31))
 
 #define SYCL_FFT_TWIDDLE32_RE(Sign, idx) twiddle32_ref<(Sign)>((idx))
 #define SYCL_FFT_TWIDDLE32_IM(Sign, idx) twiddle32_imf<(Sign)>((idx))

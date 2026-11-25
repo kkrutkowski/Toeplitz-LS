@@ -470,7 +470,7 @@ struct Fp16KatProbeKernel {
         const f16x2_t nr = f16x2_cond_neg(ar, true);
         const f16x2_t ni = f16x2_cond_neg(ai, false);
         f16x2_t qr, qi;
-        f16x2_cmul_sqrt1_2<false, true>(nr, ni, qr, qi);
+        f16x2_cmul_sqrt1_2_rt<false>(nr, ni, /*pos_sign=*/false, qr, qi);
         f16x2_store_pair(out0, out1, 2, true, true, qr, qi);
     }
 };
