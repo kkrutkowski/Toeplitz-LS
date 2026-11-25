@@ -1,4 +1,0 @@
-#define SYCL_FFT_USE_EXTERN_TEMPLATES 1
-#define SYCL_NUFFT_IMPLEMENTATION_TU 1
-#define SYCL_FFT_ONLY_DOUBLE 1
-#include "sycl_nufft1.hpp"

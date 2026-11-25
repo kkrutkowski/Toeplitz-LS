@@ -24,6 +24,9 @@ REASONIX.md
 /tests/build/
 /tests/build-*/
 /tests/.build/
+/offload/sycl/build/
+/offload/sycl/tests/build/
+/offload/sycl/deploy/
 /tmp/
 /lib/
 /dist/

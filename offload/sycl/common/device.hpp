@@ -1,7 +1,7 @@
 #pragma once
 
-#include "sycl_fft_layout.hpp"
-#include "sycl_fft_math.hpp"
+#include "common/layout.hpp"
+#include "common/math.hpp"
 
 #include <algorithm>
 #include <chrono>

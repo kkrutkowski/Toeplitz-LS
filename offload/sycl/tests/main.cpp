@@ -1,4 +1,4 @@
-#include "sycl_nufft1.hpp"
+#include "nufft/nufft1.hpp"
 
 #include <algorithm>
 #include <chrono>

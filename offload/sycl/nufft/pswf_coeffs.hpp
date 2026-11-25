@@ -6,7 +6,7 @@
 // and FINUFFT-adjacent Gauss-Legendre-free self-FT deconvolution constants.
 // Pipeline: Chebyshev L^2 -> Uniform L^4 -> L^8 -> L^12 -> L^16 IRLS -> Remez.
 
-#include "sycl_fft_math.hpp"
+#include "common/math.hpp"
 
 namespace sycl_nufft {
 

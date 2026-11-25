@@ -36,10 +36,10 @@
 #define SYCL_FFT_DEFAULT_SIGN (-1)
 #endif
 #endif
-#include "sycl_fft_math.hpp"
-#include "sycl_fft_layout.hpp"
-#include "sycl_fft_device.hpp"
-#include "sycl_fft_bitrev.hpp"
+#include "common/math.hpp"
+#include "common/layout.hpp"
+#include "common/device.hpp"
+#include "bitrev/bitrev.hpp"
 #include <algorithm>
 #include <memory>
 #include <new>
@@ -49,8 +49,8 @@
 #undef SYCL_FFT_DOUBLE
 #undef SYCL_FFT_DF
 #define SYCL_FFT_HALF
-#include "sycl_fft_precision.hpp"
-#include "sycl_fft_dif_impl.hpp"
+#include "common/precision.hpp"
+#include "fft/dif_impl.hpp"
 #undef SYCL_FFT_HALF
 #endif
 
@@ -58,16 +58,16 @@
 #undef SYCL_FFT_HALF
 #undef SYCL_FFT_DOUBLE
 #undef SYCL_FFT_DF
-#include "sycl_fft_precision.hpp"
-#include "sycl_fft_dif_impl.hpp"
+#include "common/precision.hpp"
+#include "fft/dif_impl.hpp"
 #endif
 
 #if !defined(SYCL_FFT_ONLY_HALF) && !defined(SYCL_FFT_ONLY_FLOAT) && !defined(SYCL_FFT_ONLY_DF)
 #undef SYCL_FFT_HALF
 #undef SYCL_FFT_DF
 #define SYCL_FFT_DOUBLE
-#include "sycl_fft_precision.hpp"
-#include "sycl_fft_dif_impl.hpp"
+#include "common/precision.hpp"
+#include "fft/dif_impl.hpp"
 #undef SYCL_FFT_DOUBLE
 #endif
 
@@ -75,8 +75,8 @@
 #undef SYCL_FFT_HALF
 #undef SYCL_FFT_DOUBLE
 #define SYCL_FFT_DF
-#include "sycl_fft_precision.hpp"
-#include "sycl_fft_dif_impl.hpp"
+#include "common/precision.hpp"
+#include "fft/dif_impl.hpp"
 #undef SYCL_FFT_DF
 #endif
 

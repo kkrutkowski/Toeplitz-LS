@@ -13,12 +13,12 @@
 //   - Primary fast path: Natural-to-bit-reversed (SlotBitReversed) transform
 
 #if !defined(SYCL_NUFFT_KERNEL_ONLY)
-#include "sycl_fft_dif.hpp"
+#include "fft/dif.hpp"
 #else
-#include "sycl_fft_math.hpp"
+#include "common/math.hpp"
 #endif
 #if !defined(SYCL_NUFFT_NO_COEFFS)
-#include "sycl_nufft_pswf_coeffs.hpp"
+#include "nufft/pswf_coeffs.hpp"
 #else
 namespace sycl_nufft {
 enum class PswfMode : int {

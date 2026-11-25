@@ -4,7 +4,7 @@
 //   3. Raw-size-deduplicated grid transpose + L2 zeroing (4B FP32, shared 8B FP64/DF, 2xFP16 pair)
 #define SYCL_NUFFT_KERNEL_ONLY 1
 #define SYCL_NUFFT_NO_COEFFS 1
-#include "sycl_nufft1.hpp"
+#include "nufft/nufft1.hpp"
 
 namespace sycl_nufft {
 namespace detail {

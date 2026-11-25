@@ -4,7 +4,7 @@
 #define SYCL_FFT_EXTERN_DEVICE 1
 #define SYCL_FFT_USE_EXTERN_TEMPLATES 1
 #define SYCL_NUFFT_PLAN_IMPLEMENTATION_TU 1
-#include "sycl_nufft1.hpp"
+#include "nufft/nufft1.hpp"
 
 #include <chrono>
 #include <limits>

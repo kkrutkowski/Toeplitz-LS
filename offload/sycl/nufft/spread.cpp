@@ -1,9 +1,20 @@
-// Multi-includable SYCL Type-1 NuFFT Spreading Kernel Module.
-// Included once per precision by sycl_nufft1_spread_{fp16,fp32,fp64,df}.cpp
-// so each precision's spreading kernels live in their own lean HCF module.
+// Decoupled SYCL Type-1 NuFFT Spreading Kernel Module.
+// Compiled once per precision with -D flags so each precision's spreading kernels
+// live in their own lean HCF module:
+//   -DSYCL_FFT_HALF | -DSYCL_FFT_FLOAT | -DSYCL_FFT_DOUBLE | -DSYCL_FFT_DF
+// Defaults to SYCL_FFT_DF (Double-Float) when no half/float/double is selected.
 // ZERO hardcoded GPU/Blackwell performance-scaling constants: all launch geometry
 // (wg_size, t_j, b_per_wg, win_elems, num_wins, grid_stride, tile_m) is supplied at
 // runtime via SpreadConfig derived from DeviceFftConfig + BankModel + AutotuneCache.
+
+#if !defined(SYCL_FFT_HALF) && !defined(SYCL_FFT_FLOAT) && \
+    !defined(SYCL_FFT_DOUBLE) && !defined(SYCL_FFT_DF)
+#  define SYCL_FFT_DF 1
+#endif
+
+#define SYCL_NUFFT_KERNEL_ONLY 1
+#include "nufft/nufft1.hpp"
+#include "common/precision.hpp"
 
 namespace sycl_nufft {
 namespace detail {
