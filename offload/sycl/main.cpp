@@ -1,4 +1,4 @@
-#include "sycl_fft_dif.hpp"
+#include "sycl_nufft1.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -72,10 +72,14 @@ void cpu_dif_radix2_ref(
 struct HalfTraits {
     using ComplexT = sycl_fft::Complexh;
     template <int Sign> using PlanT = sycl_fft::DifFftPlanh<Sign>;
+    using NufftPlanT = sycl_nufft::Nufft1Planh;
+    using XCoordT = sycl_fft::df_t;
     static constexpr const char* kName = "FP16 (2xFP16)";
     static constexpr const char* kPrecTag = "h";
     static constexpr int kDefaultLogTotal = 26;   // 256 MiB / buffer
     static constexpr double kTolRel = 1.5e-2;
+    static constexpr int kNufftWidths[2] = {4, 5};
+    static constexpr double kNufftTolRel = 1.5e-2;
 
     static ComplexT from_doubles(double r, double i) {
         return sycl_fft::complexh_from_doubles(r, i);
@@ -83,15 +87,22 @@ struct HalfTraits {
     static void to_long_doubles(const ComplexT& v, long double& r, long double& i) {
         sycl_fft::complexh_to_long_doubles(v, r, i);
     }
+    static XCoordT xcoord_from_double(double x) {
+        return sycl_fft::df_from_double(x);
+    }
 };
 
 struct FloatTraits {
     using ComplexT = sycl_fft::Complexf;
     template <int Sign> using PlanT = sycl_fft::DifFftPlanf<Sign>;
+    using NufftPlanT = sycl_nufft::Nufft1Planf;
+    using XCoordT = sycl_fft::df_t;
     static constexpr const char* kName = "FP32";
     static constexpr const char* kPrecTag = "f";
     static constexpr int kDefaultLogTotal = 25;   // 256 MiB / buffer
     static constexpr double kTolRel = 2e-5;
+    static constexpr int kNufftWidths[2] = {8, 9};
+    static constexpr double kNufftTolRel = 1.5e-5;
 
     static ComplexT from_doubles(double r, double i) {
         return ComplexT{static_cast<float>(r), static_cast<float>(i)};
@@ -100,15 +111,22 @@ struct FloatTraits {
         r = static_cast<long double>(v.x());
         i = static_cast<long double>(v.y());
     }
+    static XCoordT xcoord_from_double(double x) {
+        return sycl_fft::df_from_double(x);
+    }
 };
 
 struct DoubleTraits {
     using ComplexT = sycl_fft::Complex;
     template <int Sign> using PlanT = sycl_fft::DifFftPlan<Sign>;
+    using NufftPlanT = sycl_nufft::Nufft1Plan;
+    using XCoordT = double;
     static constexpr const char* kName = "FP64";
     static constexpr const char* kPrecTag = "d";
     static constexpr int kDefaultLogTotal = 24;   // 256 MiB / buffer
     static constexpr double kTolRel = 5e-14;
+    static constexpr int kNufftWidths[3] = {16, 17, 18};
+    static constexpr double kNufftTolRel = 2e-11;
 
     static ComplexT from_doubles(double r, double i) {
         return ComplexT{r, i};
@@ -117,15 +135,22 @@ struct DoubleTraits {
         r = static_cast<long double>(v.x());
         i = static_cast<long double>(v.y());
     }
+    static XCoordT xcoord_from_double(double x) {
+        return x;
+    }
 };
 
 struct DfTraits {
     using ComplexT = sycl_fft::Complexdf;
     template <int Sign> using PlanT = sycl_fft::DifFftPlandf<Sign>;
+    using NufftPlanT = sycl_nufft::Nufft1Plandf;
+    using XCoordT = sycl_fft::df_t;
     static constexpr const char* kName = "DF (2xFP32)";
     static constexpr const char* kPrecTag = "df";
     static constexpr int kDefaultLogTotal = 24;   // 256 MiB / buffer
     static constexpr double kTolRel = 5e-12;
+    static constexpr int kNufftWidths[3] = {14, 15, 16};
+    static constexpr double kNufftTolRel = 5e-10;
 
     static ComplexT from_doubles(double r, double i) {
         return ComplexT{sycl_fft::df_from_double(r), sycl_fft::df_from_double(i)};
@@ -133,6 +158,9 @@ struct DfTraits {
     static void to_long_doubles(const ComplexT& v, long double& r, long double& i) {
         r = static_cast<long double>(v.re.hi) + static_cast<long double>(v.re.lo);
         i = static_cast<long double>(v.im.hi) + static_cast<long double>(v.im.lo);
+    }
+    static XCoordT xcoord_from_double(double x) {
+        return sycl_fft::df_from_double(x);
     }
 };
 // Standalone verification of branchless polynomial cos2pi / sin2pi across all 4 precisions
@@ -822,6 +850,349 @@ bool run_self_tests(
     return true;
 }
 
+// ============================================================================
+// High-Precision 80-bit long double Type-1 NUDFT Reference Oracle (with Kahan summation)
+// Matches src/nufft1.c + src/nanofft.c (1 / N_fft scaled Type-1 transform, Sign = +1):
+//   F[b, k] = (1 / N_fft) * sum_{m=0}^{M-1} y[b, m] * exp(+2*pi*i * x[m] * df * q * k)
+// ============================================================================
+void cpu_nufft1_ref(
+    const std::vector<long double>& x_ld,
+    const std::vector<long double>& y_re,
+    const std::vector<long double>& y_im,
+    int M,
+    int N,
+    sycl_nufft::PswfMode mode,
+    long double df_ld,
+    int freq_factor,
+    size_t bs,
+    std::vector<long double>& out_re,
+    std::vector<long double>& out_im) {
+    constexpr long double kTwoPiLD = 6.28318530717958647692528676655900576839L;
+    const int nfft = sycl_nufft::next_pow2_int(2 * N);
+    const int nout = sycl_nufft::nufft1_nout(N, mode);
+    const long double inv_nfft = 1.0L / static_cast<long double>(nfft);
+    const long double df_q = df_ld * static_cast<long double>(freq_factor);
+
+    out_re.assign(bs * static_cast<size_t>(nout), 0.0L);
+    out_im.assign(bs * static_cast<size_t>(nout), 0.0L);
+
+    std::vector<long double> step_c(static_cast<size_t>(M));
+    std::vector<long double> step_s(static_cast<size_t>(M));
+    std::vector<long double> cur_c(static_cast<size_t>(M), 1.0L);
+    std::vector<long double> cur_s(static_cast<size_t>(M), 0.0L);
+
+    for (int m = 0; m < M; ++m) {
+        const long double ang = kTwoPiLD * (x_ld[static_cast<size_t>(m)] * df_q);
+        step_c[static_cast<size_t>(m)] = std::cos(ang);
+        step_s[static_cast<size_t>(m)] = std::sin(ang);
+    }
+
+    for (int k = 0; k < nout; ++k) {
+        if (k > 0) {
+            if ((k & 15) == 0) {
+                // Periodic exact trig refresh to eliminate recurrence drift
+                for (int m = 0; m < M; ++m) {
+                    const long double ang =
+                        kTwoPiLD * (x_ld[static_cast<size_t>(m)] * df_q * static_cast<long double>(k));
+                    cur_c[static_cast<size_t>(m)] = std::cos(ang);
+                    cur_s[static_cast<size_t>(m)] = std::sin(ang);
+                }
+            } else {
+                for (int m = 0; m < M; ++m) {
+                    const long double cc = cur_c[static_cast<size_t>(m)];
+                    const long double cs = cur_s[static_cast<size_t>(m)];
+                    const long double sc = step_c[static_cast<size_t>(m)];
+                    const long double ss = step_s[static_cast<size_t>(m)];
+                    cur_c[static_cast<size_t>(m)] = cc * sc - cs * ss;
+                    cur_s[static_cast<size_t>(m)] = cc * ss + cs * sc;
+                }
+            }
+        }
+
+        for (size_t b = 0; b < bs; ++b) {
+            long double acc_r = 0.0L, acc_i = 0.0L;
+            long double comp_r = 0.0L, comp_i = 0.0L;
+            const size_t y_base = b * static_cast<size_t>(M);
+            for (int m = 0; m < M; ++m) {
+                const long double yr = y_re[y_base + static_cast<size_t>(m)];
+                const long double yi = y_im[y_base + static_cast<size_t>(m)];
+                const long double c  = cur_c[static_cast<size_t>(m)];
+                const long double s  = cur_s[static_cast<size_t>(m)];
+                const long double tr = yr * c - yi * s;
+                const long double ti = yr * s + yi * c;
+
+                const long double dr = tr - comp_r;
+                const long double sr = acc_r + dr;
+                comp_r = (sr - acc_r) - dr;
+                acc_r = sr;
+
+                const long double di = ti - comp_i;
+                const long double si = acc_i + di;
+                comp_i = (si - acc_i) - di;
+                acc_i = si;
+            }
+            out_re[b * static_cast<size_t>(nout) + static_cast<size_t>(k)] = acc_r * inv_nfft;
+            out_im[b * static_cast<size_t>(nout) + static_cast<size_t>(k)] = acc_i * inv_nfft;
+        }
+    }
+}
+
+// Helper to convert double or df_t to double for reference setup
+inline double ic_to_double_or_df(double v) { return v; }
+inline double ic_to_double_or_df(sycl_fft::df_t v) { return sycl_fft::df_to_double(v); }
+
+template <typename Traits>
+bool run_nufft1_verification_prec(
+    sycl::queue& q,
+    const sycl_fft::FftLaunchConfig& cfg) {
+#if !SYCL_FFT_ENABLE_POS_SIGN
+    (void)q;
+    (void)cfg;
+    return true;
+#else
+    using ComplexT   = typename Traits::ComplexT;
+    using XCoordT    = typename Traits::XCoordT;
+    using NufftPlanT = typename Traits::NufftPlanT;
+
+    const int M = 256;
+    const int N = 512; // N % 4 == 0, N_fft = 1024 (log2(N_fft) = 10), N_out = 512 (PSWF21) or 768 (PSWF43)
+    const size_t bs = 5; // Odd batch size to verify FP16 f16x2_t tail handling
+    // Use a large time span [-500, 500] with non-dyadic df so x_m * df * N_fft spans thousands
+    // of cycles, exercising high-precision df_t / FP64 x-axis gridding cancellation resistance.
+    const double df_val = 0.0137;
+    const XCoordT df_xc = Traits::xcoord_from_double(df_val);
+    const long double df_ld = static_cast<long double>(ic_to_double_or_df(df_xc));
+
+    std::printf("\n=== [%s] NuFFT-1 Accuracy Verification (M=%d, N=%d, bs=%zu, x in [-500,500], df=%.4f) ===\n",
+                Traits::kName, M, N, bs, df_val);
+    std::printf("%-7s %-3s %-3s | %-12s %-12s | %-12s | %-6s\n",
+                "Mode", "w", "ff", "SlotRelL2", "SlotMaxRel", "SlotVsNatDiff", "Status");
+
+    SplitMix64 rng(20261125ULL);
+    std::vector<XCoordT> h_x(static_cast<size_t>(M));
+    std::vector<long double> h_x_ld(static_cast<size_t>(M));
+    for (int m = 0; m < M; ++m) {
+        const double raw_x = rng.next_double() * 500.0;
+        h_x[static_cast<size_t>(m)] = Traits::xcoord_from_double(raw_x);
+        if constexpr (std::is_same_v<XCoordT, double>) {
+            h_x_ld[static_cast<size_t>(m)] = static_cast<long double>(h_x[static_cast<size_t>(m)]);
+        } else {
+            h_x_ld[static_cast<size_t>(m)] =
+                static_cast<long double>(h_x[static_cast<size_t>(m)].hi) +
+                static_cast<long double>(h_x[static_cast<size_t>(m)].lo);
+        }
+    }
+
+    std::vector<ComplexT> h_y(bs * static_cast<size_t>(M));
+    std::vector<long double> h_y_re(bs * static_cast<size_t>(M));
+    std::vector<long double> h_y_im(bs * static_cast<size_t>(M));
+    for (size_t idx = 0; idx < bs * static_cast<size_t>(M); ++idx) {
+        const double r = rng.next_double();
+        const double i = rng.next_double();
+        h_y[idx] = Traits::from_doubles(r, i);
+        Traits::to_long_doubles(h_y[idx], h_y_re[idx], h_y_im[idx]);
+    }
+
+    auto* d_x = sycl::malloc_device<XCoordT>(static_cast<size_t>(M), q);
+    auto* d_y = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(M), q);
+    q.memcpy(d_x, h_x.data(), static_cast<size_t>(M) * sizeof(XCoordT));
+    q.memcpy(d_y, h_y.data(), bs * static_cast<size_t>(M) * sizeof(ComplexT));
+    q.wait();
+
+    bool all_ok = true;
+    const sycl_nufft::PswfMode modes[2] = {
+        sycl_nufft::PswfMode::PSWF21,
+        sycl_nufft::PswfMode::PSWF43
+    };
+
+    for (sycl_nufft::PswfMode mode : modes) {
+        const char* mode_str = (mode == sycl_nufft::PswfMode::PSWF43) ? "PSWF43" : "PSWF21";
+        const int nout = sycl_nufft::nufft1_nout(N, mode);
+        auto* d_out_slot = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(nout), q);
+        auto* d_out_nat  = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(nout), q);
+        std::vector<ComplexT> h_out_slot(bs * static_cast<size_t>(nout));
+        std::vector<ComplexT> h_out_unperm(bs * static_cast<size_t>(nout));
+        std::vector<ComplexT> h_out_nat(bs * static_cast<size_t>(nout));
+
+        for (int ff : {1, 2}) {
+            std::vector<long double> ref_re, ref_im;
+            cpu_nufft1_ref(h_x_ld, h_y_re, h_y_im, M, N, mode, df_ld, ff, bs, ref_re, ref_im);
+
+            for (int w : Traits::kNufftWidths) {
+                NufftPlanT plan(q, M, N, w, mode, bs, cfg);
+                plan.set_points(d_x, df_xc, ff);
+
+                // 1. Primary fast path: SlotBitReversed (natural-to-bit-reversed)
+                plan.execute(d_y, d_out_slot, bs, sycl_nufft::NufftOutOrder::SlotBitReversed);
+                // 2. Verification path: Natural order
+                plan.execute(d_y, d_out_nat, bs, sycl_nufft::NufftOutOrder::Natural);
+                q.memcpy(h_out_slot.data(), d_out_slot, bs * static_cast<size_t>(nout) * sizeof(ComplexT));
+                q.memcpy(h_out_nat.data(), d_out_nat, bs * static_cast<size_t>(nout) * sizeof(ComplexT));
+                q.wait();
+
+                // Un-permute SlotBitReversed on host for accuracy testing
+                sycl_nufft::unpermute_slots_to_natural_host(
+                    h_out_slot.data(), h_out_unperm.data(), N, mode, bs);
+
+                long double err_norm2 = 0.0L;
+                long double ref_norm2 = 0.0L;
+                long double max_err2  = 0.0L;
+                long double max_ref2  = 0.0L;
+                long double max_slot_vs_nat = 0.0L;
+
+                for (size_t idx = 0; idx < bs * static_cast<size_t>(nout); ++idx) {
+                    long double sr, si, nr, ni;
+                    Traits::to_long_doubles(h_out_unperm[idx], sr, si);
+                    Traits::to_long_doubles(h_out_nat[idx], nr, ni);
+                    const long double rr = ref_re[idx];
+                    const long double ri = ref_im[idx];
+
+                    const long double dr = sr - rr;
+                    const long double di = si - ri;
+                    const long double e2 = dr * dr + di * di;
+                    const long double r2 = rr * rr + ri * ri;
+                    err_norm2 += e2;
+                    ref_norm2 += r2;
+                    if (e2 > max_err2) max_err2 = e2;
+                    if (r2 > max_ref2) max_ref2 = r2;
+
+                    const long double sdiff = std::hypot(sr - nr, si - ni);
+                    if (sdiff > max_slot_vs_nat) max_slot_vs_nat = sdiff;
+                }
+
+                const double rel_l2  = static_cast<double>(std::sqrt(err_norm2 / ref_norm2));
+                const double max_rel = static_cast<double>(std::sqrt(max_err2 / max_ref2));
+                const bool pass = (rel_l2 <= Traits::kNufftTolRel) && (max_slot_vs_nat == 0.0L);
+                if (!pass) all_ok = false;
+
+                std::printf("%-7s %-3d %-3d | %12.3e %12.3e | %12.3e | %-6s\n",
+                            mode_str, w, ff, rel_l2, max_rel,
+                            static_cast<double>(max_slot_vs_nat),
+                            pass ? "PASS" : "FAIL");
+            }
+        }
+
+        sycl::free(d_out_slot, q);
+        sycl::free(d_out_nat, q);
+    }
+
+    sycl::free(d_x, q);
+    sycl::free(d_y, q);
+    return all_ok;
+#endif
+}
+
+// ============================================================================
+// Natural-to-Bit-Reversed (SlotBitReversed) NuFFT-1 Throughput Benchmark
+// Strictly excludes bit-reversal permutation timings from benchmarks!
+// ============================================================================
+template <typename Traits>
+void run_nufft1_benchmark_prec(
+    sycl::queue& q,
+    int M,
+    int min_logN,
+    int max_logN,
+    const sycl_fft::FftLaunchConfig& cfg,
+    int ntest) {
+#if !SYCL_FFT_ENABLE_POS_SIGN
+    (void)q; (void)M; (void)min_logN; (void)max_logN; (void)cfg; (void)ntest;
+    return;
+#else
+    using ComplexT   = typename Traits::ComplexT;
+    using XCoordT    = typename Traits::XCoordT;
+    using NufftPlanT = typename Traits::NufftPlanT;
+
+    // Practical periodogram block sizes logN in [9..11] (N = 512..2048, N_fft = 1024..4096, log2(N_fft) = 10..12)
+    const int lo_logN = std::max(9, std::min(min_logN - 1, 11));
+    const int hi_logN = std::max(lo_logN, std::min(max_logN - 1, 11));
+
+    std::printf("\n=== [%s] NuFFT-1 Natural-to-Bit-Reversed (SlotBitReversed) Throughput Benchmark (M=%d, ntest=%d, NO BitRev) ===\n",
+                Traits::kName, M, ntest);
+    std::printf("%-7s %-3s %-5s %-5s %-5s %-7s | %-9s | %-13s %-13s %-11s\n",
+                "Mode", "w", "N", "Nfft", "Nout", "Batch", "Med(ms)", "KTransforms/s", "MSamples/s", "Eff GFLOP/s");
+
+    SplitMix64 rng(99991ULL);
+    std::vector<XCoordT> h_x(static_cast<size_t>(M));
+    for (int m = 0; m < M; ++m) {
+        h_x[static_cast<size_t>(m)] = Traits::xcoord_from_double(rng.next_double() * 500.0);
+    }
+    auto* d_x = sycl::malloc_device<XCoordT>(static_cast<size_t>(M), q);
+    q.memcpy(d_x, h_x.data(), static_cast<size_t>(M) * sizeof(XCoordT));
+    q.wait();
+
+    const XCoordT df_xc = Traits::xcoord_from_double(0.0137);
+    const sycl_nufft::PswfMode modes[2] = {
+        sycl_nufft::PswfMode::PSWF21,
+        sycl_nufft::PswfMode::PSWF43
+    };
+
+    for (sycl_nufft::PswfMode mode : modes) {
+        const char* mode_str = (mode == sycl_nufft::PswfMode::PSWF43) ? "PSWF43" : "PSWF21";
+        for (int w : Traits::kNufftWidths) {
+            for (int logN = lo_logN; logN <= hi_logN; ++logN) {
+                const int N = 1 << logN;
+                const int nfft = sycl_nufft::next_pow2_int(2 * N);
+                const int log_nfft = sycl_nufft::int_log2_pow2(nfft);
+                const int nout = sycl_nufft::nufft1_nout(N, mode);
+
+                // Target ~2^21 total grid points per batch for steady GPU saturation
+                const size_t bs = std::max<size_t>(64, (size_t{1} << 21) / static_cast<size_t>(nfft));
+
+                auto* d_y   = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(M), q);
+                auto* d_out = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(nout), q);
+                q.memset(d_y, 0, bs * static_cast<size_t>(M) * sizeof(ComplexT));
+                q.wait();
+
+                NufftPlanT plan(q, M, N, w, mode, bs, cfg);
+                plan.set_points(d_x, df_xc, 1);
+                q.wait();
+
+                // Warmup runs (SlotBitReversed ONLY — no bit-reversal!)
+                for (int w_it = 0; w_it < 3; ++w_it) {
+                    plan.execute(d_y, d_out, bs, sycl_nufft::NufftOutOrder::SlotBitReversed);
+                }
+                q.wait();
+
+                std::vector<double> times_ms(static_cast<size_t>(ntest));
+                for (int t = 0; t < ntest; ++t) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    plan.execute(d_y, d_out, bs, sycl_nufft::NufftOutOrder::SlotBitReversed);
+                    q.wait();
+                    const auto t1 = std::chrono::steady_clock::now();
+                    times_ms[static_cast<size_t>(t)] =
+                        std::chrono::duration<double, std::milli>(t1 - t0).count();
+                }
+
+                std::sort(times_ms.begin(), times_ms.end());
+                const double med_ms = times_ms[static_cast<size_t>(ntest / 2)];
+                const double med_s  = med_ms * 1e-3;
+
+                const double ktransforms_s = (static_cast<double>(bs) / med_s) * 1e-3;
+                const double msamples_s    = (static_cast<double>(bs) * static_cast<double>(M) / med_s) * 1e-6;
+                // Effective algorithmic FLOPs per transform:
+                //   6 + 4*w FLOPs/point (phase shift + complex spread)
+                // + 5 * N_fft * log2(N_fft) (DIF FFT)
+                // + 2 * N_out (deconvolution complex scale)
+                const double flops_per_tx =
+                    static_cast<double>(M) * (6.0 + 4.0 * static_cast<double>(w)) +
+                    5.0 * static_cast<double>(nfft) * static_cast<double>(log_nfft) +
+                    2.0 * static_cast<double>(nout);
+                const double gflops = (static_cast<double>(bs) * flops_per_tx / med_s) * 1e-9;
+
+                std::printf("%-7s %-3d %-5d %-5d %-5d %-7zu | %9.3f | %13.2f %13.2f %11.1f\n",
+                            mode_str, w, N, nfft, nout, bs, med_ms,
+                            ktransforms_s, msamples_s, gflops);
+
+                sycl::free(d_y, q);
+                sycl::free(d_out, q);
+            }
+        }
+    }
+
+    sycl::free(d_x, q);
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -837,6 +1208,9 @@ int main(int argc, char** argv) {
     bool do_bench = true;
     bool do_bitrev_bench = true;
     bool do_bitrev_compare = false;
+    bool do_nufft = true;
+    bool nufft_only = false;
+    int nufft_M = 512;
     bool bitrev_oop = false;
     int active_sign = SYCL_FFT_DEFAULT_SIGN;
     bool verify_both_signs = false;
@@ -917,6 +1291,12 @@ int main(int argc, char** argv) {
             bitrev_oop = true;
         } else if (std::strcmp(argv[i], "--skip-bitrev-bench") == 0) {
             do_bitrev_bench = false;
+        } else if (std::strcmp(argv[i], "--nufft-only") == 0) {
+            nufft_only = true;
+        } else if (std::strcmp(argv[i], "--skip-nufft") == 0) {
+            do_nufft = false;
+        } else if (std::strcmp(argv[i], "--nufft-M") == 0 && i + 1 < argc) {
+            nufft_M = std::max(1, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--verify-both-signs") == 0 ||
                    std::strcmp(argv[i], "--verify-pos-sign") == 0 ||
                    std::strcmp(argv[i], "--verify-neg-sign") == 0) {
@@ -1018,7 +1398,7 @@ int main(int argc, char** argv) {
         compiled_signs,
         active_sign);
 
-    if (do_verify) {
+    if (do_verify && !nufft_only) {
         if (!verify_standalone_trig(q)) {
             std::cerr << "STANDALONE TRIG VERIFICATION FAILED!\n";
             return 1;
@@ -1069,8 +1449,15 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (do_verify && do_nufft) {
+        if (run_h && !run_nufft1_verification_prec<HalfTraits>(q, cfg)) return 1;
+        if (run_f && !run_nufft1_verification_prec<FloatTraits>(q, cfg)) return 1;
+        if (run_d && dev_cfg.has_fp64 && !run_nufft1_verification_prec<DoubleTraits>(q, cfg)) return 1;
+        if (run_df && !run_nufft1_verification_prec<DfTraits>(q, cfg)) return 1;
+    }
+
     std::vector<BenchRow> rows_h, rows_f, rows_d, rows_df;
-    if (do_bench) {
+    if (do_bench && !nufft_only) {
         auto bench_active_sign = [&](auto tag, int lt) -> std::vector<BenchRow> {
             using Traits = decltype(tag);
 #if SYCL_FFT_ENABLE_POS_SIGN && SYCL_FFT_ENABLE_NEG_SIGN
@@ -1120,7 +1507,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (do_bitrev_bench) {
+    if (do_bitrev_bench && !nufft_only) {
         const bool br_ip = !bitrev_oop;
         if (run_h) {
             const int lt = (log_total_override > 0) ? log_total_override : HalfTraits::kDefaultLogTotal;
@@ -1138,6 +1525,13 @@ int main(int argc, char** argv) {
             const int lt = (log_total_override > 0) ? log_total_override : DfTraits::kDefaultLogTotal;
             run_bitrev_benchmark_prec<DfTraits>(q, lt, min_logN, max_logN, cfg, ntest, br_ip, rows_df);
         }
+    }
+
+    if (do_bench && do_nufft) {
+        if (run_h) run_nufft1_benchmark_prec<HalfTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
+        if (run_f) run_nufft1_benchmark_prec<FloatTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
+        if (run_d && dev_cfg.has_fp64) run_nufft1_benchmark_prec<DoubleTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
+        if (run_df) run_nufft1_benchmark_prec<DfTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
     }
 
     if (do_bitrev_compare) {

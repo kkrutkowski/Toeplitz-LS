@@ -446,6 +446,41 @@ SYCL_FFT_DF_INLINE df_t df_sqr(df_t a) {
     return out;
 }
 
+// DF / DF division (~48-bit accuracy via 2-step Newton/remainder refinement)
+SYCL_FFT_DF_INLINE df_t df_div(df_t a, df_t b) {
+    SYCL_FFT_DF_EXACT_FP
+    const float q1 = a.hi / b.hi;
+    const df_t r1 = df_sub(a, df_mul_f(b, q1));
+    const float q2 = r1.hi / b.hi;
+    const df_t r2 = df_sub(r1, df_mul_f(b, q2));
+    const float q3 = r2.hi / b.hi;
+    df_t out;
+    df_two_sum_quick(q1, q2, out.hi, out.lo);
+    return df_add(out, df_make(q3, 0.0f));
+}
+
+SYCL_FFT_FORCE_INLINE df_t df_abs(df_t a) {
+    return (a.hi < 0.0f || (a.hi == 0.0f && a.lo < 0.0f)) ? df_neg(a) : a;
+}
+
+SYCL_FFT_DF_INLINE df_t df_floor(df_t a) {
+    SYCL_FFT_DF_EXACT_FP
+    const float f_hi = sycl::floor(a.hi);
+    const float f_lo = (f_hi == a.hi) ? sycl::floor(a.lo) : 0.0f;
+    df_t out;
+    df_two_sum(f_hi, f_lo, out.hi, out.lo);
+    return out;
+}
+
+SYCL_FFT_DF_INLINE df_t df_ceil(df_t a) {
+    SYCL_FFT_DF_EXACT_FP
+    const float c_hi = sycl::ceil(a.hi);
+    const float c_lo = (c_hi == a.hi) ? sycl::ceil(a.lo) : 0.0f;
+    df_t out;
+    df_two_sum(c_hi, c_lo, out.hi, out.lo);
+    return out;
+}
+
 // Fused DF complex multiply (38 FP32 ops vs 50 unfused):
 // Feeds un-renormalized two-product pairs directly into two_diff/two_sum + quick_two_sum.
 SYCL_FFT_DF_INLINE void df_cmul_fused(
@@ -988,11 +1023,10 @@ SYCL_FFT_FORCE_INLINE void sincos2pidf_oct1(df_t f, df_t& c_out, df_t& s_out) {
     s_out = (Sign < 0) ? df_neg(s_mag) : s_mag;
 }
 
-// General branchless df_t sincos2pi for arbitrary real df_t x
+// General branchless df_t sincos2pi for arbitrary real df_t x (even when |x| >= 2^24)
 template <int Sign = -1>
 SYCL_FFT_FORCE_INLINE void sincos2pidf_branchless(df_t x, df_t& c_out, df_t& s_out) {
-    const float k = sycl::floor(x.hi);
-    df_t f = df_sub(x, df_make(k, 0.0f));
+    df_t f = df_sub(x, df_floor(x));
     // Handle boundary where x.hi is integer and x.lo < 0 (or rounds to 1.0)
     const uint32_t lt_zero_mask = 0u - static_cast<uint32_t>(f.hi < 0.0f || (f.hi == 0.0f && f.lo < 0.0f));
     f = df_add(f, df_select(df_make(1.0f, 0.0f), df_make(0.0f, 0.0f), lt_zero_mask));

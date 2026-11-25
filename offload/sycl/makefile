@@ -1,71 +1,84 @@
-.PHONY: generic blackwell check clean
+# AdaptiveCpp (SYCL) Quadruple-Precision DIF Radix-2 FFT + NuFFT-1 Build System
+# Supports FP16 (2xFP16), FP32, FP64, and Dekker Double-Float (DF = 2xFP32)
+#
+# Usage:
+#   make -j$(nproc)             # Parallel build (Sign = +1 default, fastest compile)
+#   make SIGN=neg -j$(nproc)    # Build with Sign = -1 only
+#   make SIGN=both -j$(nproc)   # Build with both Sign = +1 and Sign = -1
+#   make run                    # Run on default SYCL device (GPU if available)
+#   make run-cpu                # Force OpenMP host CPU backend
+#   make run-gpu                # Force CUDA/HIP/Level-Zero GPU backend
 
-ACPP        ?= acpp
-CXXFLAGS    ?= -O3 -Wall -Wextra -fexcess-precision=16
-# Sign convention build selector (Sign is a runtime kernel argument, so SIGN=both
-# compiles the exact same kernel set, HCF footprint, and cold JIT cost as SIGN=pos):
-#   SIGN=pos  (default): expose +1 sign in DifFftPlan/CLI
-#   SIGN=neg           : expose -1 sign in DifFftPlan/CLI
-#   SIGN=both          : expose both +1 and -1 signs in DifFftPlan/CLI
-SIGN        ?= pos
+ACPP ?= acpp
+ACPP_TARGETS ?= generic
+SIGN ?= pos
 
 ifeq ($(SIGN),pos)
-SIGN_FLAGS  := -DSYCL_FFT_ENABLE_POS_SIGN=1 -DSYCL_FFT_ENABLE_NEG_SIGN=0
-CHECK_SIGN_ARG :=
+SIGN_FLAGS := -DSYCL_FFT_ENABLE_POS_SIGN=1 -DSYCL_FFT_ENABLE_NEG_SIGN=0 -DSYCL_FFT_DEFAULT_SIGN=1
 else ifeq ($(SIGN),neg)
-SIGN_FLAGS  := -DSYCL_FFT_ENABLE_POS_SIGN=0 -DSYCL_FFT_ENABLE_NEG_SIGN=1
-CHECK_SIGN_ARG :=
+SIGN_FLAGS := -DSYCL_FFT_ENABLE_POS_SIGN=0 -DSYCL_FFT_ENABLE_NEG_SIGN=1 -DSYCL_FFT_DEFAULT_SIGN=-1
 else ifeq ($(SIGN),both)
-SIGN_FLAGS  := -DSYCL_FFT_ENABLE_POS_SIGN=1 -DSYCL_FFT_ENABLE_NEG_SIGN=1
-CHECK_SIGN_ARG := --verify-both-signs
+SIGN_FLAGS := -DSYCL_FFT_ENABLE_POS_SIGN=1 -DSYCL_FFT_ENABLE_NEG_SIGN=1 -DSYCL_FFT_DEFAULT_SIGN=1
 else
-$(error Invalid SIGN='$(SIGN)' (expected pos, neg, or both))
+$(error Invalid SIGN='$(SIGN)'. Expected pos, neg, or both)
 endif
 
-BUILD_ROOT  := build
-BUILD_DIR   := $(BUILD_ROOT)/$(SIGN)
-HDRS        := sycl_fft_math.hpp sycl_fft_layout.hpp sycl_fft_device.hpp \
-               sycl_fft_bitrev.hpp sycl_fft_precision.hpp sycl_fft_dif_impl.hpp sycl_fft_dif.hpp
-INST_SRCS   := sycl_fft_inst_bitrev.cpp sycl_fft_inst_fp16.cpp sycl_fft_inst_fp32.cpp \
-               sycl_fft_inst_fp64.cpp sycl_fft_inst_df.cpp
-INST_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(INST_SRCS))
-MAIN_OBJ    := $(BUILD_DIR)/main.o
+CXXFLAGS ?= -O3 -std=c++20 -Wall -Wextra -fno-fast-math -ffp-contract=fast $(SIGN_FLAGS)
+ACPP_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS)
 
-# Default parallel build: compiles 6 independent TUs concurrently (each with its own small HCF module)
-generic:
-	@$(MAKE) SIGN=$(SIGN) -j$$(nproc) $(BUILD_DIR)/main_generic
-	@cp $(BUILD_DIR)/main_generic main
+TARGET := sycl_fft_bench
 
-$(BUILD_DIR):
-	@mkdir -p $(BUILD_DIR)
+FFT_HEADERS := \
+	sycl_fft_dif.hpp \
+	sycl_fft_dif_impl.hpp \
+	sycl_fft_bitrev.hpp \
+	sycl_fft_math.hpp \
+	sycl_fft_layout.hpp \
+	sycl_fft_device.hpp \
+	sycl_fft_precision.hpp
 
-$(BUILD_DIR)/main.o: main.cpp $(HDRS) | $(BUILD_DIR)
-	$(ACPP) --acpp-targets=generic $(CXXFLAGS) $(SIGN_FLAGS) -DSYCL_FFT_USE_EXTERN_TEMPLATES -c $< -o $@
+NUFFT_HEADERS := \
+	$(FFT_HEADERS) \
+	sycl_nufft_pswf_coeffs.hpp \
+	sycl_nufft1.hpp \
+	sycl_nufft1_impl.hpp
 
-$(BUILD_DIR)/%.o: %.cpp $(HDRS) | $(BUILD_DIR)
-	$(ACPP) --acpp-targets=generic $(CXXFLAGS) $(SIGN_FLAGS) -c $< -o $@
+OBJS := \
+	main.o \
+	sycl_fft_inst_bitrev.o \
+	sycl_fft_inst_fp16.o \
+	sycl_fft_inst_fp32.o \
+	sycl_fft_inst_fp64.o \
+	sycl_fft_inst_df.o \
+	sycl_nufft1_inst_fp16.o \
+	sycl_nufft1_inst_fp32.o \
+	sycl_nufft1_inst_fp64.o \
+	sycl_nufft1_inst_df.o
 
-$(BUILD_DIR)/main_generic: $(MAIN_OBJ) $(INST_OBJS)
-	$(ACPP) --acpp-targets=generic $(CXXFLAGS) $^ -o $@
+.PHONY: all clean run run-cpu run-gpu
 
-blackwell:
-	PATH="$(ACPP_CUDA_PATH)/bin:$$PATH" $(ACPP) --acpp-targets=cuda:sm_120 $(CXXFLAGS) $(SIGN_FLAGS) main.cpp -o main
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(ACPP) $(ACPP_FLAGS) $(OBJS) -o $(TARGET)
+
+main.o: main.cpp $(NUFFT_HEADERS)
+	$(ACPP) $(ACPP_FLAGS) -DSYCL_FFT_USE_EXTERN_TEMPLATES=1 -c main.cpp -o $@
+
+sycl_fft_inst_%.o: sycl_fft_inst_%.cpp $(FFT_HEADERS)
+	$(ACPP) $(ACPP_FLAGS) -c $< -o $@
+
+sycl_nufft1_inst_%.o: sycl_nufft1_inst_%.cpp $(NUFFT_HEADERS)
+	$(ACPP) $(ACPP_FLAGS) -c $< -o $@
+
+run: $(TARGET)
+	./$(TARGET)
+
+run-cpu: $(TARGET)
+	ACPP_VISIBILITY_MASK="omp" ./$(TARGET)
+
+run-gpu: $(TARGET)
+	ACPP_VISIBILITY_MASK="cuda;hip;ocl;ze" ./$(TARGET)
 
 clean:
-	rm -rf $(BUILD_ROOT) main
-check: generic
-	./main --list-devices
-	@for dev in cuda opencl omp; do \
-		if ./main --list-devices | grep -q "backend=$$dev "; then \
-			if [ "$$dev" = "opencl" ] && ! command -v llvm-spirv >/dev/null 2>&1; then \
-				echo "=== Skipping opencl (llvm-spirv not installed) ==="; \
-				continue; \
-			fi; \
-			echo "=== Testing backend: $$dev ==="; \
-			if [ "$$dev" = "cuda" ]; then \
-				./main --device $$dev --verify-only $(CHECK_SIGN_ARG) --prec all --min-logN 10 --max-logN 18 || exit 1; \
-			else \
-				./main --device $$dev --verify-only --prec all --min-logN 10 --max-logN 14 --no-autotune || exit 1; \
-			fi; \
-		fi; \
-	done
+	rm -f $(TARGET) $(OBJS)
