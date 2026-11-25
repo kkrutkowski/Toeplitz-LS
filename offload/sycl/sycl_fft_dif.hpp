@@ -9,6 +9,8 @@
 //   SYCL_FFT_ONLY_FLOAT / SYCL_FFT_ONLY_DOUBLE / SYCL_FFT_ONLY_DF
 
 #include "sycl_fft_math.hpp"
+#include "sycl_fft_layout.hpp"
+#include "sycl_fft_device.hpp"
 
 #include <algorithm>
 #include <new>
@@ -44,8 +46,9 @@
 #undef SYCL_FFT_SMEM_T
 #undef SYCL_FFT_ANGLE_T
 #undef SYCL_FFT_WIDE
-#undef SYCL_FFT_STASH_8192
-#undef SYCL_FFT_COMPUTE_HEAVY
+#undef SYCL_FFT_PREC_TAG
+#undef SYCL_FFT_IS_DOUBLE
+#undef SYCL_FFT_IS_DF
 #undef SYCL_FFT_ZERO
 #undef SYCL_FFT_ONE
 #undef SYCL_FFT_SQRT1_2

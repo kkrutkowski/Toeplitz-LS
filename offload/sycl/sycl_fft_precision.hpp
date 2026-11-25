@@ -12,8 +12,9 @@
 #undef SYCL_FFT_SMEM_T
 #undef SYCL_FFT_ANGLE_T
 #undef SYCL_FFT_WIDE
-#undef SYCL_FFT_STASH_8192
-#undef SYCL_FFT_COMPUTE_HEAVY
+#undef SYCL_FFT_PREC_TAG
+#undef SYCL_FFT_IS_DOUBLE
+#undef SYCL_FFT_IS_DF
 #undef SYCL_FFT_ZERO
 #undef SYCL_FFT_ONE
 #undef SYCL_FFT_SQRT1_2
@@ -46,8 +47,9 @@
 #define SYCL_FFT_SMEM_T sycl::float2
 #define SYCL_FFT_ANGLE_T float
 #define SYCL_FFT_WIDE 1
-#define SYCL_FFT_STASH_8192 1
-#define SYCL_FFT_COMPUTE_HEAVY 0
+#define SYCL_FFT_PREC_TAG "df"
+#define SYCL_FFT_IS_DOUBLE 0
+#define SYCL_FFT_IS_DF 1
 
 #define SYCL_FFT_ZERO df_make(0.0f, 0.0f)
 #define SYCL_FFT_ONE df_make(1.0f, 0.0f)
@@ -100,8 +102,9 @@
 #define SYCL_FFT_SMEM_T double
 #define SYCL_FFT_ANGLE_T double
 #define SYCL_FFT_WIDE 1
-#define SYCL_FFT_STASH_8192 0
-#define SYCL_FFT_COMPUTE_HEAVY 1
+#define SYCL_FFT_PREC_TAG "d"
+#define SYCL_FFT_IS_DOUBLE 1
+#define SYCL_FFT_IS_DF 0
 
 #define SYCL_FFT_ZERO 0.0
 #define SYCL_FFT_ONE 1.0
@@ -182,8 +185,9 @@
 #define SYCL_FFT_SMEM_T float
 #define SYCL_FFT_ANGLE_T float
 #define SYCL_FFT_WIDE 0
-#define SYCL_FFT_STASH_8192 0
-#define SYCL_FFT_COMPUTE_HEAVY 0
+#define SYCL_FFT_PREC_TAG "f"
+#define SYCL_FFT_IS_DOUBLE 0
+#define SYCL_FFT_IS_DF 0
 
 #define SYCL_FFT_ZERO 0.0f
 #define SYCL_FFT_ONE 1.0f

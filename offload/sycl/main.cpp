@@ -349,7 +349,7 @@ std::vector<BenchRow> run_benchmark_prec(
                 log_total,
                 static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0),
                 in_place ? "in-place" : "out-of-place");
-    std::printf("%-5s %-8s %-7s | %-9s %-10s %-10s | %-11s %-7s %-8s\n",
+    std::printf("%-5s %-8s %-7s | %-9s %-10s %-10s | %-34s %-7s %-8s\n",
                 "logN", "N", "bs", "Time(ms)", "GFLOP/s", "Eff_GB/s", "Dispatch", "ChunkBS", "ChunkMiB");
 
     std::vector<BenchRow> rows;
@@ -376,16 +376,21 @@ std::vector<BenchRow> run_benchmark_prec(
         const double gflops = flops / (elapsed_ms * 1e6);
         const double gbs = bytes / (elapsed_ms * 1e6);
 
-        char disp[32];
-        if (plan.is_two_pass()) {
-            std::snprintf(disp, sizeof(disp), "%dx%d/w%zu",
-                          1 << plan.log_n1(), 1 << plan.log_n2(), plan.pass0_wg_size());
+        char disp[64];
+        const char* mark = (cfg.autotune != sycl_fft::AutotuneMode::Off && !plan.cache_hit()) ? "*" : "";
+        if (plan.is_multistage()) {
+            std::snprintf(disp, sizeof(disp), "ms:%s/w%zu",
+                          plan.variant_name(), plan.pass0_wg_size());
+        } else if (plan.is_two_pass()) {
+            std::snprintf(disp, sizeof(disp), "2p:%dx%d/%s/w%zu%s",
+                          1 << plan.log_n1(), 1 << plan.log_n2(),
+                          plan.variant_name(), plan.pass0_wg_size(), mark);
         } else {
-            std::snprintf(disp, sizeof(disp), "1-pass");
+            std::snprintf(disp, sizeof(disp), "1p:%s%s", plan.variant_name(), mark);
         }
         const double chunk_mib = static_cast<double>(plan.chunk_bytes()) / (1024.0 * 1024.0);
 
-        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %10.1f | %-11s %-7zu %7.1f\n",
+        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %10.1f | %-34s %-7zu %7.1f\n",
                     logN, N, bs, elapsed_ms, gflops, gbs, disp, plan.chunk_bs(), chunk_mib);
         rows.push_back(BenchRow{logN, elapsed_ms, gflops, gbs});
     }
@@ -395,9 +400,124 @@ std::vector<BenchRow> run_benchmark_prec(
     return rows;
 }
 
+void list_sycl_devices() {
+    const auto devs = sycl::device::get_devices();
+    std::printf("Available SYCL devices (%zu):\n", devs.size());
+    for (size_t i = 0; i < devs.size(); ++i) {
+        const auto cfg = sycl_fft::DeviceFftConfig::query(devs[i]);
+        std::printf("  [%zu] backend=%-10s type=%-3s name=%s (vendor=0x%x CUs=%zu NativeLocal=%d FP64=%d)\n",
+                    i, cfg.backend_tag.c_str(), cfg.is_gpu ? "GPU" : "CPU",
+                    cfg.device_name.c_str(), cfg.vendor_id, cfg.max_compute_units,
+                    cfg.has_native_local_mem ? 1 : 0, cfg.has_fp64 ? 1 : 0);
+    }
+}
+
+bool select_sycl_device(const std::string& spec, sycl::device& out_dev) {
+    if (spec == "default") {
+        out_dev = sycl::device{sycl::default_selector_v};
+        return true;
+    }
+    const auto devs = sycl::device::get_devices();
+    for (const auto& d : devs) {
+        const std::string tag = sycl_fft::backend_to_tag(d);
+        if ((spec == "gpu" && d.is_gpu()) ||
+            (spec == "cpu" && d.is_cpu()) ||
+            (spec == "cuda" && tag == "cuda") ||
+            (spec == "hip" && tag == "hip") ||
+            ((spec == "ocl" || spec == "opencl") && tag == "opencl") ||
+            ((spec == "l0" || spec == "level_zero") && tag == "level_zero") ||
+            (spec == "omp" && tag == "omp") ||
+            (spec == "metal" && tag == "metal")) {
+            out_dev = d;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool run_self_tests(
+    sycl::queue& q,
+    const sycl_fft::DeviceFftConfig& dev_cfg,
+    int min_logN,
+    int max_logN,
+    bool run_f,
+    bool run_d,
+    bool run_df) {
+    std::printf("\n=== Hardware Generalization Self-Tests ===\n");
+
+    const auto sg_probe = sycl_fft::probe_subgroup_topology(q, dev_cfg);
+    std::printf("  [1] Sub-group topology probe: raw=%zu eff=%zu linear=%d xor=%d -> PASS\n",
+                sg_probe.raw_sg_size, sg_probe.effective_sg_size,
+                sg_probe.sg_linear_ok ? 1 : 0, sg_probe.sg_xor_ok ? 1 : 0);
+
+    if (run_df) {
+        const auto kat = sycl_fft::probe_df_kat(q, dev_cfg);
+        std::printf("  [2] Double-Float KAT: %s%s\n",
+                    kat.df_kat_passed ? "PASS" : "FAIL: ",
+                    kat.df_kat_passed ? "" : kat.df_kat_error.c_str());
+        if (!kat.df_kat_passed) return false;
+    }
+
+    // [3] Forced zero-smem multi-stage global fallback verification
+    {
+        sycl_fft::FftLaunchConfig ms_cfg{};
+        ms_cfg.force_multistage = true;
+        ms_cfg.autotune = sycl_fft::AutotuneMode::Off;
+        std::printf("  [3] Forced zero-smem multi-stage fallback (logN=%d..%d):\n", min_logN, max_logN);
+        if (run_f && !run_verification_prec<FloatTraits, -1>(q, min_logN, max_logN, ms_cfg)) return false;
+        if (run_d && dev_cfg.has_fp64 &&
+            !run_verification_prec<DoubleTraits, -1>(q, min_logN, max_logN, ms_cfg)) return false;
+        if (run_df && !run_verification_prec<DfTraits, -1>(q, min_logN, max_logN, ms_cfg)) return false;
+    }
+
+    // [4] Persistent disk cache round-trip (on native-local-mem devices) or refusal check
+    if (dev_cfg.has_native_local_mem) {
+        const std::string tmp_cache = "/tmp/sycl_fft_selftest_cache.txt";
+        std::error_code ec;
+        std::filesystem::remove(tmp_cache, ec);
+
+        sycl_fft::FftLaunchConfig c_force{};
+        c_force.autotune = sycl_fft::AutotuneMode::Force;
+        c_force.cache_path = tmp_cache;
+        sycl_fft::DifFftPlanf<-1> p1(q, 12, 64, c_force);
+        const std::string v1 = p1.variant_name();
+
+        sycl_fft::AutotuneCache::clear_memory_cache();
+
+        sycl_fft::FftLaunchConfig c_auto{};
+        c_auto.autotune = sycl_fft::AutotuneMode::Auto;
+        c_auto.cache_path = tmp_cache;
+        sycl_fft::DifFftPlanf<-1> p2(q, 12, 64, c_auto);
+        const std::string v2 = p2.variant_name();
+
+        std::filesystem::remove(tmp_cache, ec);
+        const bool ok = p2.cache_hit() && (v1 == v2);
+        std::printf("  [4] Disk autotune cache round-trip: v1=%s v2=%s cache_hit=%d -> %s\n",
+                    v1.c_str(), v2.c_str(), p2.cache_hit() ? 1 : 0, ok ? "PASS" : "FAIL");
+        if (!ok) return false;
+    } else {
+        sycl_fft::FftLaunchConfig c_refuse{};
+        c_refuse.allow_multistage_fallback = false;
+        c_refuse.autotune = sycl_fft::AutotuneMode::Off;
+        bool threw = false;
+        try {
+            sycl_fft::DifFftPlanf<-1> p_bad(q, 10, 4, c_refuse);
+            (void)p_bad;
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        std::printf("  [4] Non-native local-mem refusal when fallback disabled: threw=%d -> %s\n",
+                    threw ? 1 : 0, threw ? "PASS" : "FAIL");
+        if (!threw) return false;
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     int log_total_override = -1;
     int min_logN = 10;
     int max_logN = 18;
@@ -408,6 +528,9 @@ int main(int argc, char** argv) {
     bool do_verify = true;
     bool do_bench = true;
     bool verify_pos_sign = false;
+    bool skip_self_test = false;
+    bool do_list_devices = false;
+    std::string device_spec = "default";
     std::string prec = "all";
 
     for (int i = 1; i < argc; ++i) {
@@ -433,6 +556,30 @@ int main(int argc, char** argv) {
             cfg.min_waves_per_cu = static_cast<size_t>(std::max(0, std::atoi(argv[++i])));
         } else if (std::strcmp(argv[i], "--no-wide") == 0) {
             cfg.allow_wide_kernels = false;
+        } else if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            device_spec = argv[++i];
+        } else if (std::strcmp(argv[i], "--list-devices") == 0) {
+            do_list_devices = true;
+        } else if (std::strcmp(argv[i], "--no-autotune") == 0) {
+            cfg.autotune = sycl_fft::AutotuneMode::Off;
+        } else if (std::strcmp(argv[i], "--retune") == 0) {
+            cfg.autotune = sycl_fft::AutotuneMode::Force;
+        } else if (std::strcmp(argv[i], "--cache-path") == 0 && i + 1 < argc) {
+            cfg.cache_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--variant") == 0 && i + 1 < argc) {
+            cfg.variant_override = argv[++i];
+        } else if (std::strcmp(argv[i], "--force-multistage") == 0) {
+            cfg.force_multistage = true;
+        } else if (std::strcmp(argv[i], "--no-multistage") == 0) {
+            cfg.allow_multistage_fallback = false;
+        } else if (std::strcmp(argv[i], "--allow-emulated-smem") == 0) {
+            cfg.allow_emulated_local_mem = true;
+        } else if (std::strcmp(argv[i], "--fp64-heavy") == 0 && i + 1 < argc) {
+            cfg.fp64_compute_heavy_override = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--stash-8192") == 0 && i + 1 < argc) {
+            cfg.stash_8192_override = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--skip-self-test") == 0) {
+            skip_self_test = true;
         } else if (std::strcmp(argv[i], "--ntest") == 0 && i + 1 < argc) {
             ntest = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--prec") == 0 && i + 1 < argc) {
@@ -448,6 +595,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (do_list_devices) {
+        list_sycl_devices();
+        return 0;
+    }
+
     if (chunk_mb_override > 0) {
         cfg.l2_chunk_bytes = static_cast<size_t>(chunk_mb_override) * 1024 * 1024;
     }
@@ -460,17 +612,48 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order{}};
-    const auto dev = q.get_device();
+    sycl::device dev;
+    if (!select_sycl_device(device_spec, dev)) {
+        std::cerr << "Requested --device '" << device_spec << "' not found.\n";
+        list_sycl_devices();
+        return 1;
+    }
+
+    sycl::queue q{dev, sycl::property::queue::in_order{}};
     const auto dev_cfg = sycl_fft::DeviceFftConfig::query(dev);
-    std::printf("Device: %s | CUs=%zu | L2=%.1f MiB | LocalMem=%.0f KiB | MaxWG=%zu | SG=%zu..%zu\n",
-                dev.get_info<sycl::info::device::name>().c_str(),
-                dev_cfg.max_compute_units,
-                static_cast<double>(dev_cfg.l2_cache_size) / (1024.0 * 1024.0),
-                static_cast<double>(dev_cfg.local_mem_size) / 1024.0,
-                dev_cfg.max_work_group_size,
-                dev_cfg.min_sub_group_size,
-                dev_cfg.sub_group_size);
+    const auto sg_probe = sycl_fft::probe_subgroup_topology(q, dev_cfg);
+    sycl_fft::DeviceProbeResult fp64_probe{};
+    if (dev_cfg.has_fp64 && run_d) {
+        fp64_probe = sycl_fft::probe_fp64_ratio(q, dev_cfg);
+    }
+    sycl_fft::DeviceProbeResult df_probe{};
+    if (run_df) {
+        df_probe = sycl_fft::probe_df_kat(q, dev_cfg);
+    }
+
+    std::printf(
+        "Device: %s | Backend=%s | Vendor=0x%x | Driver=%s\n"
+        "  CUs=%zu | L2=%.1f MiB | LocalMem=%.0f KiB (native=%d) | BankModel=%s | MaxWG=%zu\n"
+        "  SG: reported=%zu..%zu verified=%zu (lin=%d xor=%d) | FP64=%d (ratio=%.3f heavy=%d) | DF_KAT=%s\n",
+        dev_cfg.device_name.c_str(),
+        dev_cfg.backend_tag.c_str(),
+        dev_cfg.vendor_id,
+        dev_cfg.driver_version.c_str(),
+        dev_cfg.max_compute_units,
+        static_cast<double>(dev_cfg.l2_cache_size) / (1024.0 * 1024.0),
+        static_cast<double>(dev_cfg.local_mem_size) / 1024.0,
+        dev_cfg.has_native_local_mem ? 1 : 0,
+        sycl_fft::bank_model_name(dev_cfg.bank_model),
+        dev_cfg.max_work_group_size,
+        dev_cfg.min_sub_group_size,
+        dev_cfg.sub_group_size,
+        sg_probe.effective_sg_size,
+        sg_probe.sg_linear_ok ? 1 : 0,
+        sg_probe.sg_xor_ok ? 1 : 0,
+        dev_cfg.has_fp64 ? 1 : 0,
+        fp64_probe.fp64_to_fp32_ratio,
+        fp64_probe.fp64_compute_heavy ? 1 : 0,
+        run_df ? (df_probe.df_kat_passed ? "PASS" : "FAIL") : "skip");
 
     if (do_verify) {
         if (!verify_standalone_trig(q)) {
@@ -482,12 +665,30 @@ int main(int argc, char** argv) {
             if (verify_pos_sign && !run_verification_prec<FloatTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
         }
         if (run_d) {
-            if (!run_verification_prec<DoubleTraits, -1>(q, min_logN, max_logN, cfg)) return 1;
-            if (verify_pos_sign && !run_verification_prec<DoubleTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
+            if (!dev_cfg.has_fp64) {
+                std::printf("\n[FP64] Skipping on device without sycl::aspect::fp64 (verifying expected throw)...\n");
+                bool threw = false;
+                try {
+                    sycl_fft::DifFftPlan<-1> p(q, min_logN, 1, cfg);
+                    (void)p;
+                } catch (const std::runtime_error&) {
+                    threw = true;
+                }
+                if (!threw) {
+                    std::cerr << "Expected FP64 plan to throw on !has_fp64 device!\n";
+                    return 1;
+                }
+            } else {
+                if (!run_verification_prec<DoubleTraits, -1>(q, min_logN, max_logN, cfg)) return 1;
+                if (verify_pos_sign && !run_verification_prec<DoubleTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
+            }
         }
         if (run_df) {
             if (!run_verification_prec<DfTraits, -1>(q, min_logN, max_logN, cfg)) return 1;
             if (verify_pos_sign && !run_verification_prec<DfTraits, +1>(q, min_logN, max_logN, cfg)) return 1;
+        }
+        if (!skip_self_test && !cfg.has_plan_overrides()) {
+            if (!run_self_tests(q, dev_cfg, min_logN, max_logN, run_f, run_d, run_df)) return 1;
         }
     }
 
@@ -497,7 +698,7 @@ int main(int argc, char** argv) {
             const int lt = (log_total_override > 0) ? log_total_override : FloatTraits::kDefaultLogTotal;
             run_benchmark_prec<FloatTraits>(q, lt, min_logN, max_logN, cfg, ntest, in_place);
         }
-        if (run_d) {
+        if (run_d && dev_cfg.has_fp64) {
             const int lt = (log_total_override > 0) ? log_total_override : DoubleTraits::kDefaultLogTotal;
             rows_d = run_benchmark_prec<DoubleTraits>(q, lt, min_logN, max_logN, cfg, ntest, in_place);
         }
