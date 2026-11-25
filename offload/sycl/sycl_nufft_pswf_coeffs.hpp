@@ -645,167 +645,66 @@ SYCL_FFT_FORCE_INLINE const auto& get_pswf_table_f64(PswfMode mode) {
     else { static_assert(W == 18, "Unsupported FP64 PSWF width"); return kPswfTable_fp64_w18[idx]; }
 }
 
-// Evaluate a single half-panel j in [0, (W+1)/2) at coordinate u in [-1, 1],
-// returning both panel j (w_left) and mirror panel W - 1 - j (w_right).
-template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE void eval_pswf_half_panel_f16(
-    sycl::half u,
-    int j,
-    const PswfPiecewiseTableF16<W, NEven, NOdd>& tbl,
-    sycl::half& w_left,
-    sycl::half& w_right) {
-    const sycl::half t = u * u;
-    sycl::half e_acc = static_cast<sycl::half>(tbl.even[j][NEven - 1]);
-    #pragma unroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = e_acc * t + static_cast<sycl::half>(tbl.even[j][m]);
-    }
-    if constexpr ((W & 1) != 0) {
-        if (j == (W / 2)) {
-            w_left = e_acc;
-            w_right = e_acc;
-            return;
-        }
-    }
-    sycl::half o_acc = static_cast<sycl::half>(tbl.odd[j][NOdd - 1]);
-    #pragma unroll
-    for (int m = NOdd - 2; m >= 0; --m) {
-        o_acc = o_acc * t + static_cast<sycl::half>(tbl.odd[j][m]);
-    }
-    const sycl::half uo = u * o_acc;
-    w_left  = e_acc + uo;
-    w_right = e_acc - uo;
-}
-
-template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE void eval_pswf_half_panel_f32(
-    float u,
-    int j,
-    const PswfPiecewiseTableF32<W, NEven, NOdd>& tbl,
-    float& w_left,
-    float& w_right) {
-    const float t = u * u;
-    float e_acc = tbl.even[j][NEven - 1];
-    #pragma unroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = sycl::fma(e_acc, t, tbl.even[j][m]);
-    }
-    if constexpr ((W & 1) != 0) {
-        if (j == (W / 2)) {
-            w_left = e_acc;
-            w_right = e_acc;
-            return;
-        }
-    }
-    float o_acc = tbl.odd[j][NOdd - 1];
-    #pragma unroll
-    for (int m = NOdd - 2; m >= 0; --m) {
-        o_acc = sycl::fma(o_acc, t, tbl.odd[j][m]);
-    }
-    const float uo = u * o_acc;
-    w_left  = e_acc + uo;
-    w_right = e_acc - uo;
-}
-
-template <int W, int NEven, int NOdd>
-SYCL_FFT_DF_INLINE void eval_pswf_half_panel_df(
-    sycl_fft::df_t u,
-    int j,
-    const PswfPiecewiseTableDF<W, NEven, NOdd>& tbl,
-    sycl_fft::df_t& w_left,
-    sycl_fft::df_t& w_right) {
-    using namespace sycl_fft;
-    const df_t t = df_sqr(u);
-    df_t e_acc = tbl.even[j][NEven - 1];
-    #pragma nounroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = df_add(df_mul(e_acc, t), tbl.even[j][m]);
-    }
-    if constexpr ((W & 1) != 0) {
-        if (j == (W / 2)) {
-            w_left = e_acc;
-            w_right = e_acc;
-            return;
-        }
-    }
-    df_t o_acc = tbl.odd[j][NOdd - 1];
-    #pragma nounroll
-    for (int m = NOdd - 2; m >= 0; --m) {
-        o_acc = df_add(df_mul(o_acc, t), tbl.odd[j][m]);
-    }
-    const df_t uo = df_mul(u, o_acc);
-    w_left  = df_add(e_acc, uo);
-    w_right = df_sub(e_acc, uo);
-}
-
-template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE void eval_pswf_half_panel_f64(
-    double u,
-    int j,
-    const PswfPiecewiseTableF64<W, NEven, NOdd>& tbl,
-    double& w_left,
-    double& w_right) {
-    const double t = u * u;
-    double e_acc = tbl.even[j][NEven - 1];
-    #pragma unroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = sycl::fma(e_acc, t, tbl.even[j][m]);
-    }
-    if constexpr ((W & 1) != 0) {
-        if (j == (W / 2)) {
-            w_left = e_acc;
-            w_right = e_acc;
-            return;
-        }
-    }
-    double o_acc = tbl.odd[j][NOdd - 1];
-    #pragma unroll
-    for (int m = NOdd - 2; m >= 0; --m) {
-        o_acc = sycl::fma(o_acc, t, tbl.odd[j][m]);
-    }
-    const double uo = u * o_acc;
-    w_left  = e_acc + uo;
-    w_right = e_acc - uo;
-}
-
-// Evaluate all W spreading weights in native FP16 (sycl::half) using half-panel symmetry
+// Evaluate all W spreading weights in native FP16 (packed f16x2_t) using half-panel symmetry.
+// For W in {4, 5}, n_left = W / 2 = 2, so panels j=0 and j=1 are evaluated simultaneously
+// in a single packed f16x2_t SIMD register using hardware fma.rn.f16x2 (0 cvt.f32.f16).
 template <int W, int NEven, int NOdd>
 SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f16(
-    sycl::half u,
+    sycl_fft::f16_scalar_t u,
     const PswfPiecewiseTableF16<W, NEven, NOdd>& tbl,
-    sycl::half (&w_out)[W]) {
-    const sycl::half t = u * u;
-    constexpr int n_left = W / 2;
+    sycl_fft::f16_scalar_t (&w_out)[W]) {
+    using namespace sycl_fft;
+    static_assert(W == 4 || W == 5, "FP16 PSWF width must be 4 or 5");
+    const f16x2_t u_v = SYCL_FFT_F16X2_SPLAT_H(u);
+    const f16x2_t t_v = SYCL_FFT_F16X2_FMA(u_v, u_v, kZero_f16x2);
+    const f16x2_t neg_u_v = SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, u_v) ^ 0x80008000u);
+
+    f16x2_t e_acc = f16x2_t{
+        static_cast<f16_scalar_t>(tbl.even[0][NEven - 1]),
+        static_cast<f16_scalar_t>(tbl.even[1][NEven - 1])};
     #pragma unroll
-    for (int j = 0; j < n_left; ++j) {
-        sycl::half e_acc = static_cast<sycl::half>(tbl.even[j][NEven - 1]);
-        #pragma unroll
-        for (int m = NEven - 2; m >= 0; --m) {
-            e_acc = e_acc * t + static_cast<sycl::half>(tbl.even[j][m]);
-        }
-        sycl::half o_acc = static_cast<sycl::half>(tbl.odd[j][NOdd - 1]);
-        #pragma unroll
-        for (int m = NOdd - 2; m >= 0; --m) {
-            o_acc = o_acc * t + static_cast<sycl::half>(tbl.odd[j][m]);
-        }
-        const sycl::half uo = u * o_acc;
-        w_out[j] = e_acc + uo;
-        w_out[W - 1 - j] = e_acc - uo;
+    for (int m = NEven - 2; m >= 0; --m) {
+        const f16x2_t c_e = f16x2_t{
+            static_cast<f16_scalar_t>(tbl.even[0][m]),
+            static_cast<f16_scalar_t>(tbl.even[1][m])};
+        e_acc = SYCL_FFT_F16X2_FMA(e_acc, t_v, c_e);
     }
+
+    f16x2_t o_acc = f16x2_t{
+        static_cast<f16_scalar_t>(tbl.odd[0][NOdd - 1]),
+        static_cast<f16_scalar_t>(tbl.odd[1][NOdd - 1])};
+    #pragma unroll
+    for (int m = NOdd - 2; m >= 0; --m) {
+        const f16x2_t c_o = f16x2_t{
+            static_cast<f16_scalar_t>(tbl.odd[0][m]),
+            static_cast<f16_scalar_t>(tbl.odd[1][m])};
+        o_acc = SYCL_FFT_F16X2_FMA(o_acc, t_v, c_o);
+    }
+
+    const f16x2_t w_left  = SYCL_FFT_F16X2_FMA(u_v,     o_acc, e_acc);
+    const f16x2_t w_right = SYCL_FFT_F16X2_FMA(neg_u_v, o_acc, e_acc);
+    w_out[0]     = w_left[0];
+    w_out[1]     = w_left[1];
+    w_out[W - 2] = w_right[1];
+    w_out[W - 1] = w_right[0];
+
     if constexpr ((W & 1) != 0) {
         constexpr int j_mid = W / 2;
-        sycl::half e_acc = static_cast<sycl::half>(tbl.even[j_mid][NEven - 1]);
+        const f16_scalar_t em_top = static_cast<f16_scalar_t>(tbl.even[j_mid][NEven - 1]);
+        f16x2_t em_acc = SYCL_FFT_F16X2_SPLAT_H(em_top);
         #pragma unroll
         for (int m = NEven - 2; m >= 0; --m) {
-            e_acc = e_acc * t + static_cast<sycl::half>(tbl.even[j_mid][m]);
+            const f16_scalar_t em_m = static_cast<f16_scalar_t>(tbl.even[j_mid][m]);
+            const f16x2_t c_em = SYCL_FFT_F16X2_SPLAT_H(em_m);
+            em_acc = SYCL_FFT_F16X2_FMA(em_acc, t_v, c_em);
         }
-        w_out[j_mid] = e_acc;
+        w_out[j_mid] = em_acc[0];
     }
 }
 
 // Evaluate all W spreading weights in FP32 using hardware FMA and half-panel symmetry
 template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f32(
+SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_f32(
     float u,
     const PswfPiecewiseTableF32<W, NEven, NOdd>& tbl,
     float (&w_out)[W]) {
@@ -838,9 +737,9 @@ SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f32(
     }
 }
 
-// Evaluate all W spreading weights in Dekker Double-Float (df_t) using half-panel symmetry.
-// Unrolling (j, m) makes all table accesses compile-time constants (zero .local stack loads),
-// while SYCL_FFT_DF_INLINE on df_add/df_mul prevents IR bloat.
+// Evaluate all W spreading weights in Dekker Double-Float (df_t) using half-panel symmetry
+// and mixed-precision Horner tail (high-degree terms m >= 4 with |c_m|/peak <= 1.3e-6 evaluated
+// in FP32 hardware FMA before promoting to df_t for the dominant low-degree terms).
 template <int W, int NEven, int NOdd>
 SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_df(
     sycl_fft::df_t u,
@@ -848,18 +747,49 @@ SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_df(
     sycl_fft::df_t (&w_out)[W]) {
     using namespace sycl_fft;
     const df_t t = df_sqr(u);
+    const float tf = t.hi;
     constexpr int n_left = W / 2;
+    constexpr int kEvenFloatTail = (NEven > 5) ? 4 : NEven;
+    constexpr int kOddFloatTail  = (NOdd  > 5) ? 4 : NOdd;
     #pragma unroll
     for (int j = 0; j < n_left; ++j) {
-        df_t e_acc = tbl.even[j][NEven - 1];
-        #pragma unroll
-        for (int m = NEven - 2; m >= 0; --m) {
-            e_acc = df_add(df_mul(e_acc, t), tbl.even[j][m]);
+        df_t e_acc;
+        if constexpr (kEvenFloatTail < NEven) {
+            float ef = tbl.even[j][NEven - 1].hi;
+            #pragma unroll
+            for (int m = NEven - 2; m >= kEvenFloatTail; --m) {
+                ef = sycl::fma(ef, tf, tbl.even[j][m].hi);
+            }
+            e_acc = df_make(ef, 0.0f);
+            #pragma unroll
+            for (int m = kEvenFloatTail - 1; m >= 0; --m) {
+                e_acc = df_add(df_mul(e_acc, t), tbl.even[j][m]);
+            }
+        } else {
+            e_acc = tbl.even[j][NEven - 1];
+            #pragma unroll
+            for (int m = NEven - 2; m >= 0; --m) {
+                e_acc = df_add(df_mul(e_acc, t), tbl.even[j][m]);
+            }
         }
-        df_t o_acc = tbl.odd[j][NOdd - 1];
-        #pragma unroll
-        for (int m = NOdd - 2; m >= 0; --m) {
-            o_acc = df_add(df_mul(o_acc, t), tbl.odd[j][m]);
+        df_t o_acc;
+        if constexpr (kOddFloatTail < NOdd) {
+            float of = tbl.odd[j][NOdd - 1].hi;
+            #pragma unroll
+            for (int m = NOdd - 2; m >= kOddFloatTail; --m) {
+                of = sycl::fma(of, tf, tbl.odd[j][m].hi);
+            }
+            o_acc = df_make(of, 0.0f);
+            #pragma unroll
+            for (int m = kOddFloatTail - 1; m >= 0; --m) {
+                o_acc = df_add(df_mul(o_acc, t), tbl.odd[j][m]);
+            }
+        } else {
+            o_acc = tbl.odd[j][NOdd - 1];
+            #pragma unroll
+            for (int m = NOdd - 2; m >= 0; --m) {
+                o_acc = df_add(df_mul(o_acc, t), tbl.odd[j][m]);
+            }
         }
         const df_t uo = df_mul(u, o_acc);
         w_out[j] = df_add(e_acc, uo);
@@ -867,10 +797,24 @@ SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_df(
     }
     if constexpr ((W & 1) != 0) {
         constexpr int j_mid = W / 2;
-        df_t e_acc = tbl.even[j_mid][NEven - 1];
-        #pragma unroll
-        for (int m = NEven - 2; m >= 0; --m) {
-            e_acc = df_add(df_mul(e_acc, t), tbl.even[j_mid][m]);
+        df_t e_acc;
+        if constexpr (kEvenFloatTail < NEven) {
+            float ef = tbl.even[j_mid][NEven - 1].hi;
+            #pragma unroll
+            for (int m = NEven - 2; m >= kEvenFloatTail; --m) {
+                ef = sycl::fma(ef, tf, tbl.even[j_mid][m].hi);
+            }
+            e_acc = df_make(ef, 0.0f);
+            #pragma unroll
+            for (int m = kEvenFloatTail - 1; m >= 0; --m) {
+                e_acc = df_add(df_mul(e_acc, t), tbl.even[j_mid][m]);
+            }
+        } else {
+            e_acc = tbl.even[j_mid][NEven - 1];
+            #pragma unroll
+            for (int m = NEven - 2; m >= 0; --m) {
+                e_acc = df_add(df_mul(e_acc, t), tbl.even[j_mid][m]);
+            }
         }
         w_out[j_mid] = e_acc;
     }
@@ -878,7 +822,7 @@ SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_df(
 
 // Evaluate all W spreading weights in FP64 using hardware FMA and half-panel symmetry
 template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f64(
+SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_f64(
     double u,
     const PswfPiecewiseTableF64<W, NEven, NOdd>& tbl,
     double (&w_out)[W]) {
@@ -913,10 +857,12 @@ SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f64(
 
 // FINUFFT-adjacent Gauss-Legendre-free self-FT deconvolution evaluators:
 //   deconv(k') = inv_prefac / phi(eta_{k'}),  eta_{k'} = eta_scale * |k'| / N_fft.
-// Note: FP16 evaluates the 1D scalar ratio in FP32 and rounds once to binary16
-// (cvt.rn.f16.f32) so that no FP16->FP32 promotion (cvt.f32.f16) is ever emitted.
+// Note: Arithmetic FMA blending of panel coefficients (`sycl::fma(mask_J, tbl.even[J][m], c_e)`)
+// guarantees every table entry is unconditionally referenced as a scalar register operand,
+// preventing LLVM SimplifyCFG/InstCombine from forming dynamic memory GEPs and guaranteeing
+// 0 .local stack loads/stores (ld.local = 0, st.local = 0) across all 4 precisions.
 template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE sycl::half eval_pswf_deconv_f16(
+SYCL_FFT_FORCE_INLINE sycl_fft::f16_scalar_t eval_pswf_deconv_f16(
     int abs_k_prime,
     float inv_nfft,
     const PswfPiecewiseTableF16<W, NEven, NOdd>& tbl) {
@@ -929,25 +875,37 @@ SYCL_FFT_FORCE_INLINE sycl::half eval_pswf_deconv_f16(
     if (j < 0) j = 0;
     const float u = 2.0f * (s - static_cast<float>(j)) - 1.0f;
     const float t = u * u;
-    float e_acc = tbl.even[j][NEven - 1];
+    float mask[n_half];
     #pragma unroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = sycl::fma(e_acc, t, tbl.even[j][m]);
+    for (int J = 0; J < n_half; ++J) {
+        mask[J] = (j == J) ? 1.0f : 0.0f;
+    }
+    float e_acc = 0.0f;
+    #pragma unroll
+    for (int m = NEven - 1; m >= 0; --m) {
+        float c_e = mask[0] * tbl.even[0][m];
+        #pragma unroll
+        for (int J = 1; J < n_half; ++J) {
+            c_e = sycl::fma(mask[J], tbl.even[J][m], c_e);
+        }
+        e_acc = (m == NEven - 1) ? c_e : sycl::fma(e_acc, t, c_e);
     }
     float o_acc = 0.0f;
-    if (j < n_left) {
-        o_acc = tbl.odd[j][NOdd - 1];
+    #pragma unroll
+    for (int m = NOdd - 1; m >= 0; --m) {
+        float c_o = mask[0] * tbl.odd[0][m];
         #pragma unroll
-        for (int m = NOdd - 2; m >= 0; --m) {
-            o_acc = sycl::fma(o_acc, t, tbl.odd[j][m]);
+        for (int J = 1; J < n_left; ++J) {
+            c_o = sycl::fma(mask[J], tbl.odd[J][m], c_o);
         }
+        o_acc = (m == NOdd - 1) ? c_o : sycl::fma(o_acc, t, c_o);
     }
     const float phi = sycl::fma(u, o_acc, e_acc);
-    return static_cast<sycl::half>(tbl.inv_prefac / phi);
+    return static_cast<sycl_fft::f16_scalar_t>(tbl.inv_prefac / phi);
 }
 
 template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE float eval_pswf_deconv_f32(
+SYCL_FFT_DF_INLINE float eval_pswf_deconv_f32(
     int abs_k_prime,
     float inv_nfft,
     const PswfPiecewiseTableF32<W, NEven, NOdd>& tbl) {
@@ -960,18 +918,30 @@ SYCL_FFT_FORCE_INLINE float eval_pswf_deconv_f32(
     if (j < 0) j = 0;
     const float u = 2.0f * (s - static_cast<float>(j)) - 1.0f;
     const float t = u * u;
-    float e_acc = tbl.even[j][NEven - 1];
+    float mask[n_half];
     #pragma unroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = sycl::fma(e_acc, t, tbl.even[j][m]);
+    for (int J = 0; J < n_half; ++J) {
+        mask[J] = (j == J) ? 1.0f : 0.0f;
+    }
+    float e_acc = 0.0f;
+    #pragma unroll
+    for (int m = NEven - 1; m >= 0; --m) {
+        float c_e = mask[0] * tbl.even[0][m];
+        #pragma unroll
+        for (int J = 1; J < n_half; ++J) {
+            c_e = sycl::fma(mask[J], tbl.even[J][m], c_e);
+        }
+        e_acc = (m == NEven - 1) ? c_e : sycl::fma(e_acc, t, c_e);
     }
     float o_acc = 0.0f;
-    if (j < n_left) {
-        o_acc = tbl.odd[j][NOdd - 1];
+    #pragma unroll
+    for (int m = NOdd - 1; m >= 0; --m) {
+        float c_o = mask[0] * tbl.odd[0][m];
         #pragma unroll
-        for (int m = NOdd - 2; m >= 0; --m) {
-            o_acc = sycl::fma(o_acc, t, tbl.odd[j][m]);
+        for (int J = 1; J < n_left; ++J) {
+            c_o = sycl::fma(mask[J], tbl.odd[J][m], c_o);
         }
+        o_acc = (m == NOdd - 1) ? c_o : sycl::fma(o_acc, t, c_o);
     }
     const float phi = sycl::fma(u, o_acc, e_acc);
     return tbl.inv_prefac / phi;
@@ -995,31 +965,72 @@ SYCL_FFT_DF_INLINE sycl_fft::df_t eval_pswf_deconv_df(
     const df_t s_minus_j = df_sub(s, df_make(static_cast<float>(j), 0.0f));
     const df_t u = df_sub(df_scale_pow2(s_minus_j, 2.0f), df_make(1.0f, 0.0f));
     const df_t t = df_sqr(u);
-    df_t e_acc = df_make(0.0f, 0.0f);
-    df_t o_acc = df_make(0.0f, 0.0f);
+    const float tf = t.hi;
+    float mask[n_half];
     #pragma unroll
     for (int J = 0; J < n_half; ++J) {
-        if (j == J) {
-            e_acc = tbl.even[J][NEven - 1];
+        mask[J] = (j == J) ? 1.0f : 0.0f;
+    }
+    constexpr int kEvenFloatTail = (NEven > 5) ? 5 : NEven;
+    constexpr int kOddFloatTail  = (NOdd  > 5) ? 4 : NOdd;
+    df_t e_acc = df_make(0.0f, 0.0f);
+    if constexpr (kEvenFloatTail < NEven) {
+        float ef = 0.0f;
+        #pragma unroll
+        for (int m = NEven - 1; m >= kEvenFloatTail; --m) {
+            float ce_hi = mask[0] * tbl.even[0][m].hi;
             #pragma unroll
-            for (int m = NEven - 2; m >= 0; --m) {
-                e_acc = df_add(df_mul(e_acc, t), tbl.even[J][m]);
+            for (int J = 1; J < n_half; ++J) {
+                ce_hi = sycl::fma(mask[J], tbl.even[J][m].hi, ce_hi);
             }
-            if (J < n_left) {
-                o_acc = tbl.odd[J][NOdd - 1];
-                #pragma unroll
-                for (int m = NOdd - 2; m >= 0; --m) {
-                    o_acc = df_add(df_mul(o_acc, t), tbl.odd[J][m]);
-                }
-            }
+            ef = (m == NEven - 1) ? ce_hi : sycl::fma(ef, tf, ce_hi);
         }
+        e_acc = df_make(ef, 0.0f);
+    }
+    #pragma unroll
+    for (int m = kEvenFloatTail - 1; m >= 0; --m) {
+        float ce_hi = mask[0] * tbl.even[0][m].hi;
+        float ce_lo = mask[0] * tbl.even[0][m].lo;
+        #pragma unroll
+        for (int J = 1; J < n_half; ++J) {
+            ce_hi = sycl::fma(mask[J], tbl.even[J][m].hi, ce_hi);
+            ce_lo = sycl::fma(mask[J], tbl.even[J][m].lo, ce_lo);
+        }
+        const df_t c_e = df_make(ce_hi, ce_lo);
+        e_acc = (m == NEven - 1) ? c_e : df_add(df_mul(e_acc, t), c_e);
+    }
+    df_t o_acc = df_make(0.0f, 0.0f);
+    if constexpr (kOddFloatTail < NOdd) {
+        float of = 0.0f;
+        #pragma unroll
+        for (int m = NOdd - 1; m >= kOddFloatTail; --m) {
+            float co_hi = mask[0] * tbl.odd[0][m].hi;
+            #pragma unroll
+            for (int J = 1; J < n_left; ++J) {
+                co_hi = sycl::fma(mask[J], tbl.odd[J][m].hi, co_hi);
+            }
+            of = (m == NOdd - 1) ? co_hi : sycl::fma(of, tf, co_hi);
+        }
+        o_acc = df_make(of, 0.0f);
+    }
+    #pragma unroll
+    for (int m = kOddFloatTail - 1; m >= 0; --m) {
+        float co_hi = mask[0] * tbl.odd[0][m].hi;
+        float co_lo = mask[0] * tbl.odd[0][m].lo;
+        #pragma unroll
+        for (int J = 1; J < n_left; ++J) {
+            co_hi = sycl::fma(mask[J], tbl.odd[J][m].hi, co_hi);
+            co_lo = sycl::fma(mask[J], tbl.odd[J][m].lo, co_lo);
+        }
+        const df_t c_o = df_make(co_hi, co_lo);
+        o_acc = (m == NOdd - 1) ? c_o : df_add(df_mul(o_acc, t), c_o);
     }
     const df_t phi = df_add(e_acc, df_mul(u, o_acc));
     return df_div(tbl.inv_prefac, phi);
 }
 
 template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE double eval_pswf_deconv_f64(
+SYCL_FFT_DF_INLINE double eval_pswf_deconv_f64(
     int abs_k_prime,
     double inv_nfft,
     const PswfPiecewiseTableF64<W, NEven, NOdd>& tbl) {
@@ -1032,18 +1043,30 @@ SYCL_FFT_FORCE_INLINE double eval_pswf_deconv_f64(
     if (j < 0) j = 0;
     const double u = 2.0 * (s - static_cast<double>(j)) - 1.0;
     const double t = u * u;
-    double e_acc = tbl.even[j][NEven - 1];
+    double mask[n_half];
     #pragma unroll
-    for (int m = NEven - 2; m >= 0; --m) {
-        e_acc = sycl::fma(e_acc, t, tbl.even[j][m]);
+    for (int J = 0; J < n_half; ++J) {
+        mask[J] = (j == J) ? 1.0 : 0.0;
+    }
+    double e_acc = 0.0;
+    #pragma unroll
+    for (int m = NEven - 1; m >= 0; --m) {
+        double c_e = mask[0] * tbl.even[0][m];
+        #pragma unroll
+        for (int J = 1; J < n_half; ++J) {
+            c_e = sycl::fma(mask[J], tbl.even[J][m], c_e);
+        }
+        e_acc = (m == NEven - 1) ? c_e : sycl::fma(e_acc, t, c_e);
     }
     double o_acc = 0.0;
-    if (j < n_left) {
-        o_acc = tbl.odd[j][NOdd - 1];
+    #pragma unroll
+    for (int m = NOdd - 1; m >= 0; --m) {
+        double c_o = mask[0] * tbl.odd[0][m];
         #pragma unroll
-        for (int m = NOdd - 2; m >= 0; --m) {
-            o_acc = sycl::fma(o_acc, t, tbl.odd[j][m]);
+        for (int J = 1; J < n_left; ++J) {
+            c_o = sycl::fma(mask[J], tbl.odd[J][m], c_o);
         }
+        o_acc = (m == NOdd - 1) ? c_o : sycl::fma(o_acc, t, c_o);
     }
     const double phi = sycl::fma(u, o_acc, e_acc);
     return tbl.inv_prefac / phi;

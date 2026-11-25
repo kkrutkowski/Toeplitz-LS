@@ -41,6 +41,7 @@
 #include "sycl_fft_device.hpp"
 #include "sycl_fft_bitrev.hpp"
 #include <algorithm>
+#include <memory>
 #include <new>
 #include <stdexcept>
 

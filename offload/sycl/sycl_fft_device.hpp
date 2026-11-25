@@ -353,6 +353,14 @@ inline KernelProbeInfo probe_kernel_bundle(sycl::queue& q, const sycl::device& d
 // ============================================================================
 // Always-On Process-Cached Hardware Probes (Sub-Group Topology, DF KAT, FP64 Ratio)
 // ============================================================================
+#if defined(SYCL_FFT_DEVICE_IMPLEMENTATION_TU)
+#define SYCL_FFT_DEVICE_LINKAGE
+#elif defined(SYCL_FFT_EXTERN_DEVICE) || defined(SYCL_FFT_USE_EXTERN_TEMPLATES)
+#define SYCL_FFT_DEVICE_DECL_ONLY 1
+#else
+#define SYCL_FFT_DEVICE_LINKAGE inline
+#endif
+
 struct DeviceProbeResult {
     bool     sg_probed = false;
     size_t   raw_sg_size = 1;
@@ -372,6 +380,15 @@ struct DeviceProbeResult {
     double   fp64_to_fp32_ratio = 0.0;
     bool     fp64_compute_heavy = true;
 };
+
+#if defined(SYCL_FFT_DEVICE_DECL_ONLY)
+
+DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig& dev_cfg);
+DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg);
+DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg);
+DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cfg);
+
+#else
 
 namespace detail {
 
@@ -511,7 +528,7 @@ inline std::unordered_map<std::string, DeviceProbeResult>& probe_cache_map() {
 
 } // namespace detail
 
-inline DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
+SYCL_FFT_DEVICE_LINKAGE DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const std::string key = dev_cfg.identity_key();
     {
         std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
@@ -565,7 +582,7 @@ inline DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFft
     return entry;
 }
 
-inline DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
+SYCL_FFT_DEVICE_LINKAGE DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const std::string key = dev_cfg.identity_key();
     {
         std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
@@ -668,7 +685,7 @@ inline DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev
     return entry;
 }
 
-inline DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
+SYCL_FFT_DEVICE_LINKAGE DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const std::string key = dev_cfg.identity_key();
     {
         std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
@@ -781,7 +798,7 @@ inline DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& d
     return entry;
 }
 
-inline DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
+SYCL_FFT_DEVICE_LINKAGE DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const std::string key = dev_cfg.identity_key();
     {
         std::lock_guard<std::mutex> lk(detail::probe_cache_mutex());
@@ -852,6 +869,8 @@ inline DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig&
     return entry;
 }
 
+#endif // SYCL_FFT_DEVICE_DECL_ONLY
+
 // ============================================================================
 // Persistent Disk + In-Memory Autotune Cache
 //   Keyed on (schema, compiler, device, vendor, driver, backend, prec, sign, logN).
@@ -867,171 +886,193 @@ struct AutotuneEntry {
 
 class AutotuneCache {
 public:
-    static std::string resolve_cache_path(const std::string& explicit_path) {
-        if (!explicit_path.empty()) return explicit_path;
-        if (const char* env_p = std::getenv("SYCL_FFT_CACHE_PATH"); env_p && env_p[0] != '\0') {
-            return std::string(env_p);
-        }
-        if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0] != '\0') {
-            return std::string(xdg) + "/toeplitz-ls/sycl_fft_cache_v1.txt";
-        }
-        if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
-            return std::string(home) + "/.cache/toeplitz-ls/sycl_fft_cache_v1.txt";
-        }
-        return {};
-    }
-
+    static std::string resolve_cache_path(const std::string& explicit_path);
     static std::string make_key(
-        const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag = "any") {
-        char vid[16];
-        std::snprintf(vid, sizeof(vid), "0x%x", dev_cfg.vendor_id);
-        std::ostringstream oss;
-        oss << "v1\t" << compiler_id_tag()
-            << "\t" << sanitize_cache_token(dev_cfg.device_name)
-            << "\t" << vid
-            << "\t" << sanitize_cache_token(dev_cfg.driver_version)
-            << "\t" << dev_cfg.backend_tag
-            << "\t" << prec_tag
-            << "\t" << (slot_tag ? slot_tag : "any")
-            << "\t" << logN;
-        return oss.str();
-    }
-
-    static bool get(const std::string& path, const std::string& key, AutotuneEntry& out) {
-        std::lock_guard<std::mutex> lk(cache_mutex());
-        auto& store = get_store_locked(path);
-        auto it = store.find(key);
-        if (it == store.end()) return false;
-        out = it->second;
-        return true;
-    }
-
-    static void put(const std::string& path, const std::string& key, const AutotuneEntry& val) {
-        std::lock_guard<std::mutex> lk(cache_mutex());
-        auto& store = get_store_locked(path);
-        store[key] = val;
-        if (!path.empty()) {
-            flush_locked(path, store);
-        }
-    }
-
-    static void clear_memory_cache() {
-        std::lock_guard<std::mutex> lk(cache_mutex());
-        stores().clear();
-    }
+        const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag = "any");
+    static bool get(const std::string& path, const std::string& key, AutotuneEntry& out);
+    static void put(const std::string& path, const std::string& key, const AutotuneEntry& val);
+    static void clear_memory_cache();
 
 private:
     using EntryMap = std::unordered_map<std::string, AutotuneEntry>;
 
-    static std::mutex& cache_mutex() {
-        static std::mutex m;
-        return m;
-    }
-
-    static std::unordered_map<std::string, EntryMap>& stores() {
-        static std::unordered_map<std::string, EntryMap> s;
-        return s;
-    }
-
-    static EntryMap& get_store_locked(const std::string& path) {
-        auto& all = stores();
-        auto it = all.find(path);
-        if (it != all.end()) return it->second;
-
-        EntryMap& map = all[path];
-        if (path.empty()) return map;
-
-        std::ifstream ifs(path);
-        if (!ifs.is_open()) return map;
-
-        std::string line;
-        while (std::getline(ifs, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            std::vector<std::string> cols;
-            size_t pos = 0;
-            while (pos <= line.size()) {
-                const size_t tab = line.find('\t', pos);
-                if (tab == std::string::npos) {
-                    cols.push_back(line.substr(pos));
-                    break;
-                }
-                cols.push_back(line.substr(pos, tab - pos));
-                pos = tab + 1;
-            }
-            if (cols.size() != 14 || cols[0] != "v1") continue;
-
-            std::string key = cols[0];
-            for (size_t i = 1; i < 9; ++i) {
-                key.push_back('\t');
-                key += cols[i];
-            }
-            AutotuneEntry e{};
-            if (cols[9] == "1pass") e.mode = PlanExecMode::SinglePass;
-            else if (cols[9] == "2pass") e.mode = PlanExecMode::TwoPass;
-            else if (cols[9] == "multistage") e.mode = PlanExecMode::MultiStageGlobal;
-            else continue;
-
-            e.variant_id = (cols[10] == "-") ? std::string{} : cols[10];
-            try {
-                e.log_n1 = std::stoi(cols[11]);
-                e.pass0_wg = static_cast<size_t>(std::stoull(cols[12]));
-                e.l2_chunk_bytes = static_cast<size_t>(std::stoull(cols[13]));
-            } catch (...) {
-                continue;
-            }
-            map[key] = std::move(e);
-        }
-        return map;
-    }
-
-    static const char* mode_to_str(PlanExecMode m) {
-        switch (m) {
-            case PlanExecMode::SinglePass:       return "1pass";
-            case PlanExecMode::TwoPass:          return "2pass";
-            case PlanExecMode::MultiStageGlobal: return "multistage";
-        }
-        return "1pass";
-    }
-
-    static void flush_locked(const std::string& path, const EntryMap& map) {
-        try {
-            const std::filesystem::path p(path);
-            if (p.has_parent_path()) {
-                std::error_code ec;
-                std::filesystem::create_directories(p.parent_path(), ec);
-            }
-#if !defined(_WIN32)
-            const long pid = static_cast<long>(::getpid());
-#else
-            const long pid = 0;
-#endif
-            const std::string tmp = path + ".tmp." + std::to_string(pid);
-            {
-                std::ofstream ofs(tmp, std::ios::out | std::ios::trunc);
-                if (!ofs.is_open()) return;
-                ofs << "# sycl_fft autotune cache v1\n";
-                for (const auto& kv : map) {
-                    const auto& e = kv.second;
-                    ofs << kv.first
-                        << '\t' << mode_to_str(e.mode)
-                        << '\t' << (e.variant_id.empty() ? "-" : e.variant_id)
-                        << '\t' << e.log_n1
-                        << '\t' << e.pass0_wg
-                        << '\t' << e.l2_chunk_bytes
-                        << '\n';
-                }
-                ofs.flush();
-                if (!ofs.good()) return;
-            }
-            std::error_code ec;
-            std::filesystem::rename(tmp, path, ec);
-            if (ec) {
-                std::filesystem::remove(tmp, ec);
-            }
-        } catch (...) {
-            // Silently degrade to in-memory cache on read-only filesystems.
-        }
-    }
+    static std::mutex& cache_mutex();
+    static std::unordered_map<std::string, EntryMap>& stores();
+    static EntryMap& get_store_locked(const std::string& path);
+    static const char* mode_to_str(PlanExecMode m);
+    static void flush_locked(const std::string& path, const EntryMap& map);
 };
+
+#if !defined(SYCL_FFT_DEVICE_DECL_ONLY)
+
+SYCL_FFT_DEVICE_LINKAGE std::string AutotuneCache::resolve_cache_path(const std::string& explicit_path) {
+    if (!explicit_path.empty()) return explicit_path;
+    if (const char* env_p = std::getenv("SYCL_FFT_CACHE_PATH"); env_p && env_p[0] != '\0') {
+        return std::string(env_p);
+    }
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0] != '\0') {
+        return std::string(xdg) + "/toeplitz-ls/sycl_fft_cache_v1.txt";
+    }
+    if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
+        return std::string(home) + "/.cache/toeplitz-ls/sycl_fft_cache_v1.txt";
+    }
+    return {};
+}
+
+SYCL_FFT_DEVICE_LINKAGE std::string AutotuneCache::make_key(
+    const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag) {
+    char vid[16];
+    std::snprintf(vid, sizeof(vid), "0x%x", dev_cfg.vendor_id);
+    std::ostringstream oss;
+    oss << "v1\t" << compiler_id_tag()
+        << "\t" << sanitize_cache_token(dev_cfg.device_name)
+        << "\t" << vid
+        << "\t" << sanitize_cache_token(dev_cfg.driver_version)
+        << "\t" << dev_cfg.backend_tag
+        << "\t" << prec_tag
+        << "\t" << (slot_tag ? slot_tag : "any")
+        << "\t" << logN;
+    return oss.str();
+}
+
+SYCL_FFT_DEVICE_LINKAGE bool AutotuneCache::get(
+    const std::string& path, const std::string& key, AutotuneEntry& out) {
+    std::lock_guard<std::mutex> lk(cache_mutex());
+    auto& store = get_store_locked(path);
+    auto it = store.find(key);
+    if (it == store.end()) return false;
+    out = it->second;
+    return true;
+}
+
+SYCL_FFT_DEVICE_LINKAGE void AutotuneCache::put(
+    const std::string& path, const std::string& key, const AutotuneEntry& val) {
+    std::lock_guard<std::mutex> lk(cache_mutex());
+    auto& store = get_store_locked(path);
+    store[key] = val;
+    if (!path.empty()) {
+        flush_locked(path, store);
+    }
+}
+
+SYCL_FFT_DEVICE_LINKAGE void AutotuneCache::clear_memory_cache() {
+    std::lock_guard<std::mutex> lk(cache_mutex());
+    stores().clear();
+}
+
+SYCL_FFT_DEVICE_LINKAGE std::mutex& AutotuneCache::cache_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+SYCL_FFT_DEVICE_LINKAGE std::unordered_map<std::string, AutotuneCache::EntryMap>& AutotuneCache::stores() {
+    static std::unordered_map<std::string, EntryMap> s;
+    return s;
+}
+
+SYCL_FFT_DEVICE_LINKAGE AutotuneCache::EntryMap& AutotuneCache::get_store_locked(const std::string& path) {
+    auto& all = stores();
+    auto it = all.find(path);
+    if (it != all.end()) return it->second;
+
+    EntryMap& map = all[path];
+    if (path.empty()) return map;
+
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) return map;
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::vector<std::string> cols;
+        size_t pos = 0;
+        while (pos <= line.size()) {
+            const size_t tab = line.find('\t', pos);
+            if (tab == std::string::npos) {
+                cols.push_back(line.substr(pos));
+                break;
+            }
+            cols.push_back(line.substr(pos, tab - pos));
+            pos = tab + 1;
+        }
+        if (cols.size() != 14 || cols[0] != "v1") continue;
+
+        std::string key = cols[0];
+        for (size_t i = 1; i < 9; ++i) {
+            key.push_back('\t');
+            key += cols[i];
+        }
+        AutotuneEntry e{};
+        if (cols[9] == "1pass") e.mode = PlanExecMode::SinglePass;
+        else if (cols[9] == "2pass") e.mode = PlanExecMode::TwoPass;
+        else if (cols[9] == "multistage") e.mode = PlanExecMode::MultiStageGlobal;
+        else continue;
+
+        e.variant_id = (cols[10] == "-") ? std::string{} : cols[10];
+        try {
+            e.log_n1 = std::stoi(cols[11]);
+            e.pass0_wg = static_cast<size_t>(std::stoull(cols[12]));
+            e.l2_chunk_bytes = static_cast<size_t>(std::stoull(cols[13]));
+        } catch (...) {
+            continue;
+        }
+        map[key] = std::move(e);
+    }
+    return map;
+}
+
+SYCL_FFT_DEVICE_LINKAGE const char* AutotuneCache::mode_to_str(PlanExecMode m) {
+    switch (m) {
+        case PlanExecMode::SinglePass:       return "1pass";
+        case PlanExecMode::TwoPass:          return "2pass";
+        case PlanExecMode::MultiStageGlobal: return "multistage";
+    }
+    return "1pass";
+}
+
+SYCL_FFT_DEVICE_LINKAGE void AutotuneCache::flush_locked(const std::string& path, const EntryMap& map) {
+    try {
+        const std::filesystem::path p(path);
+        if (p.has_parent_path()) {
+            std::error_code ec;
+            std::filesystem::create_directories(p.parent_path(), ec);
+        }
+#if !defined(_WIN32)
+        const long pid = static_cast<long>(::getpid());
+#else
+        const long pid = 0;
+#endif
+        const std::string tmp = path + ".tmp." + std::to_string(pid);
+        {
+            std::ofstream ofs(tmp, std::ios::out | std::ios::trunc);
+            if (!ofs.is_open()) return;
+            ofs << "# sycl_fft autotune cache v1\n";
+            for (const auto& kv : map) {
+                const auto& e = kv.second;
+                ofs << kv.first
+                    << '\t' << mode_to_str(e.mode)
+                    << '\t' << (e.variant_id.empty() ? "-" : e.variant_id)
+                    << '\t' << e.log_n1
+                    << '\t' << e.pass0_wg
+                    << '\t' << e.l2_chunk_bytes
+                    << '\n';
+            }
+            ofs.flush();
+            if (!ofs.good()) return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+        }
+    } catch (...) {
+        // Silently degrade to in-memory cache on read-only filesystems.
+    }
+}
+
+#endif // !SYCL_FFT_DEVICE_DECL_ONLY
+
+#undef SYCL_FFT_DEVICE_LINKAGE
+#undef SYCL_FFT_DEVICE_DECL_ONLY
 
 } // namespace sycl_fft

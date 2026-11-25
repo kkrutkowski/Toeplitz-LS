@@ -944,10 +944,10 @@ inline double ic_to_double_or_df(sycl_fft::df_t v) { return sycl_fft::df_to_doub
 template <typename Traits>
 bool run_nufft1_verification_prec(
     sycl::queue& q,
-    const sycl_fft::FftLaunchConfig& cfg) {
+    const sycl_nufft::Nufft1LaunchConfig& ncfg) {
 #if !SYCL_FFT_ENABLE_POS_SIGN
     (void)q;
-    (void)cfg;
+    (void)ncfg;
     return true;
 #else
     using ComplexT   = typename Traits::ComplexT;
@@ -965,8 +965,8 @@ bool run_nufft1_verification_prec(
 
     std::printf("\n=== [%s] NuFFT-1 Accuracy Verification (M=%d, N=%d, bs=%zu, x in [-500,500], df=%.4f) ===\n",
                 Traits::kName, M, N, bs, df_val);
-    std::printf("%-7s %-3s %-3s | %-12s %-12s | %-12s | %-6s\n",
-                "Mode", "w", "ff", "SlotRelL2", "SlotMaxRel", "SlotVsNatDiff", "Status");
+    std::printf("%-7s %-3s %-3s | %-12s %-12s | %-12s | %-20s %-18s | %-6s\n",
+                "Mode", "w", "ff", "SlotRelL2", "SlotMaxRel", "SlotVsNatDiff", "Spread", "Deconv", "Status");
 
     SplitMix64 rng(20261125ULL);
     std::vector<XCoordT> h_x(static_cast<size_t>(M));
@@ -1019,7 +1019,7 @@ bool run_nufft1_verification_prec(
             cpu_nufft1_ref(h_x_ld, h_y_re, h_y_im, M, N, mode, df_ld, ff, bs, ref_re, ref_im);
 
             for (int w : Traits::kNufftWidths) {
-                NufftPlanT plan(q, M, N, w, mode, bs, cfg);
+                NufftPlanT plan(q, M, N, w, mode, bs, ncfg);
                 plan.set_points(d_x, df_xc, ff);
 
                 // 1. Primary fast path: SlotBitReversed (natural-to-bit-reversed)
@@ -1065,9 +1065,11 @@ bool run_nufft1_verification_prec(
                 const bool pass = (rel_l2 <= Traits::kNufftTolRel) && (max_slot_vs_nat == 0.0L);
                 if (!pass) all_ok = false;
 
-                std::printf("%-7s %-3d %-3d | %12.3e %12.3e | %12.3e | %-6s\n",
+                std::printf("%-7s %-3d %-3d | %12.3e %12.3e | %12.3e | %-20s %-18s | %-6s\n",
                             mode_str, w, ff, rel_l2, max_rel,
                             static_cast<double>(max_slot_vs_nat),
+                            plan.spread_variant_name(),
+                            plan.deconv_variant_name(),
                             pass ? "PASS" : "FAIL");
             }
         }
@@ -1092,24 +1094,27 @@ void run_nufft1_benchmark_prec(
     int M,
     int min_logN,
     int max_logN,
-    const sycl_fft::FftLaunchConfig& cfg,
+    int nufft_max_logN,
+    const sycl_nufft::Nufft1LaunchConfig& ncfg,
     int ntest) {
 #if !SYCL_FFT_ENABLE_POS_SIGN
-    (void)q; (void)M; (void)min_logN; (void)max_logN; (void)cfg; (void)ntest;
+    (void)q; (void)M; (void)min_logN; (void)max_logN; (void)nufft_max_logN; (void)ncfg; (void)ntest;
     return;
 #else
     using ComplexT   = typename Traits::ComplexT;
     using XCoordT    = typename Traits::XCoordT;
     using NufftPlanT = typename Traits::NufftPlanT;
 
-    // Practical periodogram block sizes logN in [9..11] (N = 512..2048, N_fft = 1024..4096, log2(N_fft) = 10..12)
-    const int lo_logN = std::max(9, std::min(min_logN - 1, 11));
-    const int hi_logN = std::max(lo_logN, std::min(max_logN - 1, 11));
+    // Practical periodogram block sizes logN in [9..nufft_max_logN] (default 9..11 -> Nfft = 1024..4096)
+    const int cap_logN = std::clamp(nufft_max_logN, 9, 17);
+    const int lo_logN = std::max(9, std::min(min_logN - 1, cap_logN));
+    const int hi_logN = std::max(lo_logN, std::min(max_logN - 1, cap_logN));
 
     std::printf("\n=== [%s] NuFFT-1 Natural-to-Bit-Reversed (SlotBitReversed) Throughput Benchmark (M=%d, ntest=%d, NO BitRev) ===\n",
                 Traits::kName, M, ntest);
-    std::printf("%-7s %-3s %-5s %-5s %-5s %-7s | %-9s | %-13s %-13s %-11s\n",
-                "Mode", "w", "N", "Nfft", "Nout", "Batch", "Med(ms)", "KTransforms/s", "MSamples/s", "Eff GFLOP/s");
+    std::printf("%-7s %-3s %-5s %-6s %-6s %-7s | %-9s | %-13s %-13s %-11s | %-20s %-18s %-7s\n",
+                "Mode", "w", "N", "Nfft", "Nout", "Batch", "Med(ms)", "KTransforms/s", "MSamples/s", "Eff GFLOP/s",
+                "Spread", "Deconv", "ChunkBS");
 
     SplitMix64 rng(99991ULL);
     std::vector<XCoordT> h_x(static_cast<size_t>(M));
@@ -1143,7 +1148,7 @@ void run_nufft1_benchmark_prec(
                 q.memset(d_y, 0, bs * static_cast<size_t>(M) * sizeof(ComplexT));
                 q.wait();
 
-                NufftPlanT plan(q, M, N, w, mode, bs, cfg);
+                NufftPlanT plan(q, M, N, w, mode, bs, ncfg);
                 plan.set_points(d_x, df_xc, 1);
                 q.wait();
 
@@ -1179,9 +1184,12 @@ void run_nufft1_benchmark_prec(
                     2.0 * static_cast<double>(nout);
                 const double gflops = (static_cast<double>(bs) * flops_per_tx / med_s) * 1e-9;
 
-                std::printf("%-7s %-3d %-5d %-5d %-5d %-7zu | %9.3f | %13.2f %13.2f %11.1f\n",
+                std::printf("%-7s %-3d %-5d %-6d %-6d %-7zu | %9.3f | %13.2f %13.2f %11.1f | %-20s %-18s %-7zu\n",
                             mode_str, w, N, nfft, nout, bs, med_ms,
-                            ktransforms_s, msamples_s, gflops);
+                            ktransforms_s, msamples_s, gflops,
+                            plan.spread_variant_name(),
+                            plan.deconv_variant_name(),
+                            plan.chunk_bs());
 
                 sycl::free(d_y, q);
                 sycl::free(d_out, q);
@@ -1211,6 +1219,8 @@ int main(int argc, char** argv) {
     bool do_nufft = true;
     bool nufft_only = false;
     int nufft_M = 512;
+    int nufft_max_logN = 11;
+    sycl_nufft::Nufft1LaunchConfig nufft_cfg{};
     bool bitrev_oop = false;
     int active_sign = SYCL_FFT_DEFAULT_SIGN;
     bool verify_both_signs = false;
@@ -1297,6 +1307,14 @@ int main(int argc, char** argv) {
             do_nufft = false;
         } else if (std::strcmp(argv[i], "--nufft-M") == 0 && i + 1 < argc) {
             nufft_M = std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--nufft-max-logN") == 0 && i + 1 < argc) {
+            nufft_max_logN = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--nufft-spread") == 0 && i + 1 < argc) {
+            nufft_cfg.spread_variant_override = argv[++i];
+        } else if (std::strcmp(argv[i], "--nufft-deconv") == 0 && i + 1 < argc) {
+            nufft_cfg.deconv_variant_override = argv[++i];
+        } else if (std::strcmp(argv[i], "--force-collab-spread") == 0) {
+            nufft_cfg.force_collab_spread = true;
         } else if (std::strcmp(argv[i], "--verify-both-signs") == 0 ||
                    std::strcmp(argv[i], "--verify-pos-sign") == 0 ||
                    std::strcmp(argv[i], "--verify-neg-sign") == 0) {
@@ -1322,6 +1340,7 @@ int main(int argc, char** argv) {
     if (chunk_mb_override > 0) {
         cfg.l2_chunk_bytes = static_cast<size_t>(chunk_mb_override) * 1024 * 1024;
     }
+    nufft_cfg.fft_cfg = cfg;
 
     const bool run_h = (prec == "all" || prec == "h" || prec == "fp16");
     const bool run_f = (prec == "all" || prec == "f" || prec == "fp32");
@@ -1450,10 +1469,10 @@ int main(int argc, char** argv) {
     }
 
     if (do_verify && do_nufft) {
-        if (run_h && !run_nufft1_verification_prec<HalfTraits>(q, cfg)) return 1;
-        if (run_f && !run_nufft1_verification_prec<FloatTraits>(q, cfg)) return 1;
-        if (run_d && dev_cfg.has_fp64 && !run_nufft1_verification_prec<DoubleTraits>(q, cfg)) return 1;
-        if (run_df && !run_nufft1_verification_prec<DfTraits>(q, cfg)) return 1;
+        if (run_h && !run_nufft1_verification_prec<HalfTraits>(q, nufft_cfg)) return 1;
+        if (run_f && !run_nufft1_verification_prec<FloatTraits>(q, nufft_cfg)) return 1;
+        if (run_d && dev_cfg.has_fp64 && !run_nufft1_verification_prec<DoubleTraits>(q, nufft_cfg)) return 1;
+        if (run_df && !run_nufft1_verification_prec<DfTraits>(q, nufft_cfg)) return 1;
     }
 
     std::vector<BenchRow> rows_h, rows_f, rows_d, rows_df;
@@ -1528,10 +1547,10 @@ int main(int argc, char** argv) {
     }
 
     if (do_bench && do_nufft) {
-        if (run_h) run_nufft1_benchmark_prec<HalfTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
-        if (run_f) run_nufft1_benchmark_prec<FloatTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
-        if (run_d && dev_cfg.has_fp64) run_nufft1_benchmark_prec<DoubleTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
-        if (run_df) run_nufft1_benchmark_prec<DfTraits>(q, nufft_M, min_logN, max_logN, cfg, ntest);
+        if (run_h) run_nufft1_benchmark_prec<HalfTraits>(q, nufft_M, min_logN, max_logN, nufft_max_logN, nufft_cfg, ntest);
+        if (run_f) run_nufft1_benchmark_prec<FloatTraits>(q, nufft_M, min_logN, max_logN, nufft_max_logN, nufft_cfg, ntest);
+        if (run_d && dev_cfg.has_fp64) run_nufft1_benchmark_prec<DoubleTraits>(q, nufft_M, min_logN, max_logN, nufft_max_logN, nufft_cfg, ntest);
+        if (run_df) run_nufft1_benchmark_prec<DfTraits>(q, nufft_M, min_logN, max_logN, nufft_max_logN, nufft_cfg, ntest);
     }
 
     if (do_bitrev_compare) {

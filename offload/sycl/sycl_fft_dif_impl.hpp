@@ -46,11 +46,11 @@ public:
 
     void execute_raw(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0);
     void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0);
-    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs) { bitrev_plan_.execute(src, dst, bs); }
-    void bit_reverse(ComplexT* buf, size_t bs) { bitrev_plan_.execute_in_place(buf, bs); }
-    const char* bitrev_variant_name(bool in_place = true) { return bitrev_plan_.variant_name(in_place); }
-    bool bitrev_cache_hit(bool in_place = true) { return bitrev_plan_.cache_hit(in_place); }
-    BitRevPlan<ComplexT>& bitrev_plan() { return bitrev_plan_; }
+    void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs);
+    void bit_reverse(ComplexT* buf, size_t bs);
+    const char* bitrev_variant_name(bool in_place = true);
+    bool bitrev_cache_hit(bool in_place = true);
+    BitRevPlan<ComplexT>& bitrev_plan();
 
     size_t chunk_bs() const { return chunk_bs_; }
     size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }
@@ -71,6 +71,8 @@ public:
     const FftLaunchConfig& launch_config() const { return launch_cfg_; }
 
 private:
+    BitRevPlan<ComplexT>& ensure_bitrev_plan();
+
     sycl::queue&    q_;
     int             logN_;
     size_t          N_;
@@ -96,7 +98,7 @@ private:
     double          fp64_to_fp32_ratio_ = 0.0;
     bool            is_compute_heavy_ = false;
     bool            cache_hit_ = false;
-    BitRevPlan<ComplexT> bitrev_plan_{};
+    std::unique_ptr<BitRevPlan<ComplexT>> bitrev_plan_;
 };
 
 #if SYCL_FFT_ENABLE_NEG_SIGN
@@ -1357,7 +1359,7 @@ constexpr SYCL_FFT_SUFFIX(SinglePassCandidate) SYCL_FFT_SUFFIX(make_candidate)(c
 }
 
 template <BankModelKind BK, int ReqdSG>
-inline void SYCL_FFT_SUFFIX(append_candidates_for_bank)(
+inline void SYCL_FFT_SUFFIX(append_candidates_small_for_bank)(
     int logN, std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)>& out) {
     constexpr auto Split = StagingPolicy::Split;
     constexpr auto Seq   = StagingPolicy::Seq;
@@ -1423,32 +1425,6 @@ inline void SYCL_FFT_SUFFIX(append_candidates_for_bank)(
                         "seq_12_e4_b1_2txor"));
             }
             break;
-        case 13:
-            if constexpr (ReqdSG == 0 || ReqdSG >= 32) {
-                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
-                    SYCL_FFT_SUFFIX(SinglePassSpec)<13, 4, 0, 1, Seq, Aff, Shuf, false, BK, ReqdSG>>(
-                        "seq_13_e4_b1_sg"));
-            }
-            if constexpr (ReqdSG == 0 || ReqdSG >= 16) {
-                // Low-WG (256), 16 KiB smem, SG=16 fallback for register-limited / Intel GPUs
-                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
-                    SYCL_FFT_SUFFIX(SinglePassSpec)<13, 5, 1, 1, Seq, Aff, Shuf, false, BK, ReqdSG>>(
-                        "seq_13_e5_c2_sg"));
-            }
-            if constexpr (ReqdSG == 0) {
-                // Low-WG (256), 16 KiB smem, SG=1 (no shuffles) fallback
-                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
-                    SYCL_FFT_SUFFIX(SinglePassSpec)<13, 5, 1, 1, Seq, Aff, Xor2T, false, BK, 0>>(
-                        "seq_13_e5_c2_2txor"));
-            }
-            break;
-        case 14:
-            if constexpr (ReqdSG == 0 || ReqdSG >= 32) {
-                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
-                    SYCL_FFT_SUFFIX(SinglePassSpec)<14, 5, 1, 1, Seq, Aff, Shuf, false, BK, ReqdSG>>(
-                        "seq_14_e5_c2_sg"));
-            }
-            break;
         default:
             break;
     }
@@ -1490,6 +1466,56 @@ inline void SYCL_FFT_SUFFIX(append_candidates_for_bank)(
                         "seq_12_e4_b1_sg"));
             }
             break;
+        default:
+            break;
+    }
+#endif
+}
+
+#if !defined(SYCL_FFT_INST_SMALL_ONLY)
+template <BankModelKind BK, int ReqdSG>
+inline void SYCL_FFT_SUFFIX(append_candidates_large_for_bank)(
+    int logN, std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)>& out) {
+    constexpr auto Seq   = StagingPolicy::Seq;
+    constexpr auto Aff   = T1LayoutPolicy::Affine;
+#if !SYCL_FFT_WIDE
+    constexpr auto Shuf  = Phase3Policy::SubgroupShuffle;
+#endif
+    constexpr auto Xor2T = Phase3Policy::TwoTransposeXor;
+
+#if !SYCL_FFT_WIDE
+    switch (logN) {
+        case 13:
+            if constexpr (ReqdSG == 0 || ReqdSG >= 32) {
+                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
+                    SYCL_FFT_SUFFIX(SinglePassSpec)<13, 4, 0, 1, Seq, Aff, Shuf, false, BK, ReqdSG>>(
+                        "seq_13_e4_b1_sg"));
+            }
+            if constexpr (ReqdSG == 0 || ReqdSG >= 16) {
+                // Low-WG (256), 16 KiB smem, SG=16 fallback for register-limited / Intel GPUs
+                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
+                    SYCL_FFT_SUFFIX(SinglePassSpec)<13, 5, 1, 1, Seq, Aff, Shuf, false, BK, ReqdSG>>(
+                        "seq_13_e5_c2_sg"));
+            }
+            if constexpr (ReqdSG == 0) {
+                // Low-WG (256), 16 KiB smem, SG=1 (no shuffles) fallback
+                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
+                    SYCL_FFT_SUFFIX(SinglePassSpec)<13, 5, 1, 1, Seq, Aff, Xor2T, false, BK, 0>>(
+                        "seq_13_e5_c2_2txor"));
+            }
+            break;
+        case 14:
+            if constexpr (ReqdSG == 0 || ReqdSG >= 32) {
+                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
+                    SYCL_FFT_SUFFIX(SinglePassSpec)<14, 5, 1, 1, Seq, Aff, Shuf, false, BK, ReqdSG>>(
+                        "seq_14_e5_c2_sg"));
+            }
+            break;
+        default:
+            break;
+    }
+#else
+    switch (logN) {
         case 13:
             if constexpr (ReqdSG == 0) {
 #if SYCL_FFT_IS_DF
@@ -1515,33 +1541,78 @@ inline void SYCL_FFT_SUFFIX(append_candidates_for_bank)(
     }
 #endif
 }
+#endif // !SYCL_FFT_INST_SMALL_ONLY
 
-inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates)(
+#if defined(SYCL_FFT_INST_LARGE_ONLY)
+std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(
+    int logN, BankModelKind bank_kind);
+#else
+#if defined(SYCL_FFT_INST_SMALL_ONLY)
+std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(
+#else
+inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(
+#endif
     int logN, BankModelKind bank_kind) {
     std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> cands;
 #if defined(SYCL_FFT_ENABLE_BANK32X8)
     if (bank_kind == BankModelKind::B32x8) {
-        SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x8, 0>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x8, 0>(logN, cands);
 #if SYCL_FFT_HAS_REQD_SG_SIZE
-        SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x8, 8>(logN, cands);
-        SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x8, 16>(logN, cands);
-        SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x8, 32>(logN, cands);
-        SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x8, 64>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x8, 8>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x8, 16>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x8, 32>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x8, 64>(logN, cands);
 #endif
         return cands;
     }
 #else
     (void)bank_kind;
 #endif
-    // B32x4 derived strides are static_assert-verified conflict-degree 1 on both 32x4 and 16x4.
-    SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x4, 0>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x4, 0>(logN, cands);
 #if SYCL_FFT_HAS_REQD_SG_SIZE
-    SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x4, 8>(logN, cands);
-    SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x4, 16>(logN, cands);
-    SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x4, 32>(logN, cands);
-    SYCL_FFT_SUFFIX(append_candidates_for_bank)<BankModelKind::B32x4, 64>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x4, 8>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x4, 16>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x4, 32>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_small_for_bank)<BankModelKind::B32x4, 64>(logN, cands);
 #endif
     return cands;
+}
+#endif // SYCL_FFT_INST_LARGE_ONLY
+
+#if !defined(SYCL_FFT_INST_SMALL_ONLY)
+inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates_large)(
+    int logN, BankModelKind bank_kind) {
+    std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> cands;
+#if defined(SYCL_FFT_ENABLE_BANK32X8)
+    if (bank_kind == BankModelKind::B32x8) {
+        SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x8, 0>(logN, cands);
+#if SYCL_FFT_HAS_REQD_SG_SIZE
+        SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x8, 8>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x8, 16>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x8, 32>(logN, cands);
+        SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x8, 64>(logN, cands);
+#endif
+        return cands;
+    }
+#else
+    (void)bank_kind;
+#endif
+    SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x4, 0>(logN, cands);
+#if SYCL_FFT_HAS_REQD_SG_SIZE
+    SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x4, 8>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x4, 16>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x4, 32>(logN, cands);
+    SYCL_FFT_SUFFIX(append_candidates_large_for_bank)<BankModelKind::B32x4, 64>(logN, cands);
+#endif
+    return cands;
+}
+
+inline std::vector<SYCL_FFT_SUFFIX(SinglePassCandidate)> SYCL_FFT_SUFFIX(get_single_pass_candidates)(
+    int logN, BankModelKind bank_kind) {
+    if (logN <= 12) {
+        return SYCL_FFT_SUFFIX(get_single_pass_candidates_small)(logN, bank_kind);
+    }
+    return SYCL_FFT_SUFFIX(get_single_pass_candidates_large)(logN, bank_kind);
 }
 
 // ============================================================================
@@ -1860,22 +1931,22 @@ public:
     }
 
     void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs) {
-        bitrev_plan_.execute(src, dst, bs);
+        ensure_bitrev_plan().execute(src, dst, bs);
     }
 
     void bit_reverse(ComplexT* buf, size_t bs) {
-        bitrev_plan_.execute_in_place(buf, bs);
+        ensure_bitrev_plan().execute_in_place(buf, bs);
     }
 
     const char* bitrev_variant_name(bool in_place = true) {
-        return bitrev_plan_.variant_name(in_place);
+        return ensure_bitrev_plan().variant_name(in_place);
     }
 
     bool bitrev_cache_hit(bool in_place = true) {
-        return bitrev_plan_.cache_hit(in_place);
+        return ensure_bitrev_plan().cache_hit(in_place);
     }
 
-    BitRevPlan<ComplexT>& bitrev_plan() { return bitrev_plan_; }
+    BitRevPlan<ComplexT>& bitrev_plan() { return ensure_bitrev_plan(); }
     size_t chunk_bs() const { return chunk_bs_; }
     size_t chunk_bytes() const { return chunk_bs_ * N_ * sizeof(ComplexT); }
     size_t pass0_wg_size() const { return pass0_wg_size_; }
@@ -2255,7 +2326,8 @@ private:
         bitrev_wg_size_ = (launch_cfg_.bitrev_wg_size > 0)
             ? dev_cfg_.clamp_pow2_wg(N_, launch_cfg_.bitrev_wg_size)
             : dev_cfg_.default_wg_size(N_, 256);
-        bitrev_plan_ = BitRevPlan<ComplexT>(q_, logN_, SYCL_FFT_PREC_TAG, dev_cfg_, launch_cfg_);
+        // BitRevPlan is constructed lazily via ensure_bitrev_plan() so raw-FFT / NuFFT-1
+        // callers never pay bit-reversal planning or LUT-state allocation overhead.
 
         // 3. Refuse smem-transpose kernels when !has_native_local_mem (or forced multistage)
         if (launch_cfg_.force_multistage ||
@@ -2582,6 +2654,14 @@ private:
         }
     }
 
+    BitRevPlan<ComplexT>& ensure_bitrev_plan() {
+        if (!bitrev_plan_) {
+            bitrev_plan_ = std::make_unique<BitRevPlan<ComplexT>>(
+                q_, logN_, SYCL_FFT_PREC_TAG, dev_cfg_, launch_cfg_);
+        }
+        return *bitrev_plan_;
+    }
+
     sycl::queue&    q_;
     int             logN_;
     size_t          N_;
@@ -2607,8 +2687,10 @@ private:
     double          fp64_to_fp32_ratio_ = 0.0;
     bool            is_compute_heavy_ = false;
     bool            cache_hit_ = false;
-    BitRevPlan<ComplexT> bitrev_plan_{};
+    std::unique_ptr<BitRevPlan<ComplexT>> bitrev_plan_;
 };
+
+#endif // !SYCL_FFT_INST_SMALL_ONLY
 
 #endif // SYCL_FFT_USE_EXTERN_TEMPLATES
 

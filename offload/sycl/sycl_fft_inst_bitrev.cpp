@@ -1,4 +1,5 @@
 // Explicit instantiations for deduplicated 4B/8B/16B BitRevEngine (separate HCF module)
+#define SYCL_FFT_EXTERN_DEVICE 1
 #include "sycl_fft_bitrev.hpp"
 
 namespace sycl_fft {

@@ -9,11 +9,11 @@ using namespace sycl_fft;
 #if defined(SYCL_FFT_HALF)
 #define SYCL_NUFFT_COMPLEX_T sycl_fft::Complexh
 #define SYCL_NUFFT_REAL_T    sycl_fft::f16x2_t
-#define SYCL_NUFFT_SCALAR_T  sycl::half
+#define SYCL_NUFFT_SCALAR_T  sycl_fft::f16_scalar_t
 #define SYCL_NUFFT_XCOORD_T  sycl_fft::df_t
 #define SYCL_NUFFT_LANES     2
 #define SYCL_NUFFT_SMEM_CAP  4096
-#define SYCL_NUFFT_FMA(a, b, c) sycl_fft::f16x2_fma((a), (b), (c))
+#define SYCL_NUFFT_FMA(a, b, c) SYCL_FFT_F16X2_FMA((a), (b), (c))
 #elif defined(SYCL_FFT_DOUBLE)
 #define SYCL_NUFFT_COMPLEX_T sycl_fft::Complex
 #define SYCL_NUFFT_REAL_T    double
@@ -252,12 +252,11 @@ inline void SYCL_FFT_SUFFIX(launch_precompute_points)(
                     si = s * sycl::fma(-4.0f, s * s, 3.0f);
                 }
                 const float u_f = u_df.hi + u_df.lo;
+                const ScalarT sr_h = static_cast<ScalarT>(sr);
+                const ScalarT si_h = static_cast<ScalarT>(si);
                 d_first[m] = first;
                 d_u[m]     = static_cast<ScalarT>(u_f);
-                ComplexT sh{};
-                sh.x() = static_cast<ScalarT>(sr);
-                sh.y() = static_cast<ScalarT>(si);
-                d_shift[m] = sh;
+                d_shift[m] = SYCL_FFT_BIT_CAST(ComplexT, (sycl_fft::f16x2_t{sr_h, si_h}));
 #else
                 const float frac_f = frac_df.hi + frac_df.lo;
                 float c, s;
@@ -307,8 +306,13 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem)(
     constexpr int kLanes   = SYCL_NUFFT_LANES;
     constexpr int kSmemCap = SYCL_NUFFT_SMEM_CAP;
 
+#if defined(SYCL_FFT_DOUBLE) || defined(SYCL_FFT_DF)
     const int win_elems = std::min(nfft, kSmemCap);
     const int num_wins  = nfft / win_elems;
+#else
+    const int win_elems = nfft;
+    constexpr int num_wins = 1;
+#endif
     const int b_per_wg  = (num_wins > 1) ? 1 : std::max(1, std::min(4, kSmemCap / nfft));
     const int t_j       = kWgSize / b_per_wg; // 8, 16, or 32
     const int log2_tj   = (t_j == 8) ? 3 : ((t_j == 16) ? 4 : 5);
@@ -368,8 +372,13 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem)(
                             ScalarT w_reg[W];
 #if defined(SYCL_FFT_HALF)
                             eval_pswf_spread_weights_f16<W>(u, tbl, w_reg);
-                            const RealT sr_v = sycl_fft::f16x2_splat(sh.x());
-                            const RealT si_v = sycl_fft::f16x2_splat(sh.y());
+                            const RealT sh_v = SYCL_FFT_BIT_CAST(RealT, sh);
+                            const ScalarT sr_h = sh_v[0];
+                            const ScalarT si_h = sh_v[1];
+                            const RealT sr_v = SYCL_FFT_F16X2_SPLAT_H(sr_h);
+                            const RealT si_v = SYCL_FFT_F16X2_SPLAT_H(si_h);
+                            const RealT neg_si_v = SYCL_FFT_BIT_CAST(
+                                RealT, SYCL_FFT_BIT_CAST(uint32_t, si_v) ^ 0x80008000u);
 #elif defined(SYCL_FFT_DOUBLE)
                             eval_pswf_spread_weights_f64<W>(u, tbl, w_reg);
 #elif defined(SYCL_FFT_DF)
@@ -398,7 +407,10 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem)(
                                         b1 < chunk_bs,
                                         y_re,
                                         y_im);
-                                    sycl_fft::f16x2_cmul(y_re, y_im, sr_v, si_v, sy_re, sy_im);
+                                    sy_re = SYCL_FFT_F16X2_FMA(
+                                        y_re, sr_v, SYCL_FFT_F16X2_FMA(y_im, neg_si_v, sycl_fft::kZero_f16x2));
+                                    sy_im = SYCL_FFT_F16X2_FMA(
+                                        y_re, si_v, SYCL_FFT_F16X2_FMA(y_im, sr_v, sycl_fft::kZero_f16x2));
 #elif defined(SYCL_FFT_DF)
                                     const ComplexT y = d_y[bp * total_M_stride + static_cast<size_t>(m_idx)];
                                     sycl_fft::df_cmul_fused(y.re, y.im, sh.re, sh.im, sy_re, sy_im);
@@ -428,7 +440,7 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem)(
                                         const int idx0 = grid_base + bin0;
                                         const ScalarT w0_s = l_w[k * W + j0];
 #if defined(SYCL_FFT_HALF)
-                                        const RealT w0_v = sycl_fft::f16x2_splat(w0_s);
+                                        const RealT w0_v = SYCL_FFT_F16X2_SPLAT_H(w0_s);
 #else
                                         const RealT w0_v = w0_s;
 #endif
@@ -445,7 +457,7 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem)(
                                                 const int idx1 = grid_base + bin1;
                                                 const ScalarT w1_s = l_w[k * W + j1];
 #if defined(SYCL_FFT_HALF)
-                                                const RealT w1_v = sycl_fft::f16x2_splat(w1_s);
+                                                const RealT w1_v = SYCL_FFT_F16X2_SPLAT_H(w1_s);
 #else
                                                 const RealT w1_v = w1_s;
 #endif
@@ -604,9 +616,17 @@ inline void SYCL_FFT_SUFFIX(launch_spread_collab)(
                             RealT y_re, y_im;
                             sycl_fft::f16x2_load_pair(
                                 y_ptr0, y_ptr1, m_idx, valid0, valid1, y_re, y_im);
-                            const RealT sr_v = sycl_fft::f16x2_splat(sh.x());
-                            const RealT si_v = sycl_fft::f16x2_splat(sh.y());
-                            sycl_fft::f16x2_cmul(y_re, y_im, sr_v, si_v, sy_re, sy_im);
+                            const RealT sh_v = SYCL_FFT_BIT_CAST(RealT, sh);
+                            const ScalarT sr_h = sh_v[0];
+                            const ScalarT si_h = sh_v[1];
+                            const RealT sr_v = SYCL_FFT_F16X2_SPLAT_H(sr_h);
+                            const RealT si_v = SYCL_FFT_F16X2_SPLAT_H(si_h);
+                            const RealT neg_si_v = SYCL_FFT_BIT_CAST(
+                                RealT, SYCL_FFT_BIT_CAST(uint32_t, si_v) ^ 0x80008000u);
+                            sy_re = SYCL_FFT_F16X2_FMA(
+                                y_re, sr_v, SYCL_FFT_F16X2_FMA(y_im, neg_si_v, sycl_fft::kZero_f16x2));
+                            sy_im = SYCL_FFT_F16X2_FMA(
+                                y_re, si_v, SYCL_FFT_F16X2_FMA(y_im, sr_v, sycl_fft::kZero_f16x2));
 #elif defined(SYCL_FFT_DF)
                             const ComplexT y = y_ptr[m_idx];
                             sycl_fft::df_cmul_fused(y.re, y.im, sh.re, sh.im, sy_re, sy_im);
@@ -627,7 +647,7 @@ inline void SYCL_FFT_SUFFIX(launch_spread_collab)(
                                     static_cast<size_t>(idx) * packed_stride + my_bp;
                                 const ScalarT w_s = l_w[k * W + j];
 #if defined(SYCL_FFT_HALF)
-                                const RealT w_v = sycl_fft::f16x2_splat(w_s);
+                                const RealT w_v = SYCL_FFT_F16X2_SPLAT_H(w_s);
 #else
                                 const RealT w_v = w_s;
 #endif
@@ -793,7 +813,7 @@ inline void SYCL_FFT_SUFFIX(launch_deconv_emit)(
 
 #if defined(SYCL_FFT_HALF)
                 const ScalarT deconv_s = eval_pswf_deconv_f16<W>(abs_k_prime, inv_nfft, tbl);
-                const RealT deconv_v = sycl_fft::f16x2_splat(deconv_s);
+                const RealT deconv_v = SYCL_FFT_F16X2_SPLAT_H(deconv_s);
 #elif defined(SYCL_FFT_DOUBLE)
                 const RealT deconv_v = eval_pswf_deconv_f64<W>(abs_k_prime, inv_nfft, tbl);
 #elif defined(SYCL_FFT_DF)
