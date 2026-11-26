@@ -69,7 +69,8 @@ namespace sycl_fft {
 struct FftCompactParams {
     int         compact_mode  = 0;
     int         log_n1        = 0;       // 0 for SinglePass; log_n1 for TwoPass Pass-1 sub-FFTs
-    const void* d_slot_deconv = nullptr; // optional ScalarT[full_nout] compact-slot deconv LUT
+    const void* d_slot_deconv = nullptr; // ScalarT[full_nout] compact-slot deconv LUT (or non-null dummy)
+    bool        apply_deconv  = false;   // true iff d_slot_deconv should be loaded and multiplied
 };
 
 #define SYCL_FFT_DECLARE_DIF_PLAN(CandName, PlanName, ComplexType, SmemType)                  \
@@ -185,6 +186,7 @@ private:                                                                        
     size_t          chunk_bs_ = 0;                                                            \
     size_t          scratch_elems_ = 0;                                                       \
     ComplexT*       scratch_ = nullptr;                                                       \
+    UsmPtr<ComplexT> d_dummy_deconv_;                                                         \
                                                                                               \
     size_t          effective_sg_size_ = 1;                                                   \
     bool            sg_linear_ok_ = false;                                                    \

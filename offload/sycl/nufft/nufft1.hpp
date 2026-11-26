@@ -57,6 +57,7 @@ struct Nufft1LaunchConfig {
 // Runtime spreading execution parameters (derived dynamically from DeviceFftConfig & BankModel)
 struct SpreadConfig {
     bool use_smem            = true;
+    bool use_reg_acc         = false;
     bool use_cpu_direct      = false;
     bool use_precomp_weights = false;
     int  wg_size             = 64;
@@ -232,6 +233,35 @@ void launch_precompute_weightsdf(
     sycl::queue& q, int w, const void* d_tbl,
     const sycl_fft::df_t* d_u, sycl_fft::df_t* d_weights,
     int M, size_t wg_size);
+
+// --- Bucket-order geometry packers (once per set_points when num_wins > 1) ---
+void launch_pack_bucket_geomh(
+    sycl::queue& q, int w, int num_wins, int max_entries,
+    const int* d_bucket_off, const int* d_bucket_m,
+    const int* d_first, const sycl_fft::Complexh* d_shift, const sycl_fft::f16_scalar_t* d_weights,
+    int* d_b_first, sycl_fft::Complexh* d_b_shift, sycl_fft::f16_scalar_t* d_b_weights,
+    size_t wg_size);
+
+void launch_pack_bucket_geomf(
+    sycl::queue& q, int w, int num_wins, int max_entries,
+    const int* d_bucket_off, const int* d_bucket_m,
+    const int* d_first, const sycl_fft::Complexf* d_shift, const float* d_weights,
+    int* d_b_first, sycl_fft::Complexf* d_b_shift, float* d_b_weights,
+    size_t wg_size);
+
+void launch_pack_bucket_geom(
+    sycl::queue& q, int w, int num_wins, int max_entries,
+    const int* d_bucket_off, const int* d_bucket_m,
+    const int* d_first, const sycl_fft::Complex* d_shift, const double* d_weights,
+    int* d_b_first, sycl_fft::Complex* d_b_shift, double* d_b_weights,
+    size_t wg_size);
+
+void launch_pack_bucket_geomdf(
+    sycl::queue& q, int w, int num_wins, int max_entries,
+    const int* d_bucket_off, const int* d_bucket_m,
+    const int* d_first, const sycl_fft::Complexdf* d_shift, const sycl_fft::df_t* d_weights,
+    int* d_b_first, sycl_fft::Complexdf* d_b_shift, sycl_fft::df_t* d_b_weights,
+    size_t wg_size);
 
 // --- Decoupled spreading stage launchers (nufft/spread.cpp) ---
 void launch_spread_smem_winh(
@@ -616,6 +646,9 @@ private:
     sycl_fft::UsmPtr<int>      d_bucket_counts_;
     sycl_fft::UsmPtr<int>      d_bucket_off_;
     sycl_fft::UsmPtr<int>      d_bucket_m_;
+    sycl_fft::UsmPtr<int>      d_b_first_;
+    sycl_fft::UsmPtr<ComplexT> d_b_shift_;
+    sycl_fft::UsmPtr<ScalarT>  d_b_weights_;
     sycl_fft::UsmPtr<RealT>    d_grid_T_re_;
     sycl_fft::UsmPtr<RealT>    d_grid_T_im_;
     sycl_fft::UsmPtr<ComplexT> d_fft_buf_;

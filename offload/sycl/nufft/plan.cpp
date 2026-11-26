@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <limits>
+#include <unordered_map>
 #include <vector>
 
 namespace sycl_nufft {
@@ -62,6 +63,24 @@ void dispatch_precompute_weights(
         detail::launch_precompute_weightsdf(q, w, d_tbl, d_u, d_weights, M, wg_size);
     } else {
         detail::launch_precompute_weightsf(q, w, d_tbl, d_u, d_weights, M, wg_size);
+    }
+}
+
+template <typename Traits>
+void dispatch_pack_bucket_geom(
+    sycl::queue& q, int w, int num_wins, int max_entries,
+    const int* d_bucket_off, const int* d_bucket_m,
+    const int* d_first, const typename Traits::ComplexT* d_shift, const typename Traits::ScalarT* d_weights,
+    int* d_b_first, typename Traits::ComplexT* d_b_shift, typename Traits::ScalarT* d_b_weights,
+    size_t wg_size) {
+    if constexpr (Traits::kIsHalf) {
+        detail::launch_pack_bucket_geomh(q, w, num_wins, max_entries, d_bucket_off, d_bucket_m, d_first, d_shift, d_weights, d_b_first, d_b_shift, d_b_weights, wg_size);
+    } else if constexpr (Traits::kIsFp64) {
+        detail::launch_pack_bucket_geom(q, w, num_wins, max_entries, d_bucket_off, d_bucket_m, d_first, d_shift, d_weights, d_b_first, d_b_shift, d_b_weights, wg_size);
+    } else if constexpr (Traits::kIsDf) {
+        detail::launch_pack_bucket_geomdf(q, w, num_wins, max_entries, d_bucket_off, d_bucket_m, d_first, d_shift, d_weights, d_b_first, d_b_shift, d_b_weights, wg_size);
+    } else {
+        detail::launch_pack_bucket_geomf(q, w, num_wins, max_entries, d_bucket_off, d_bucket_m, d_first, d_shift, d_weights, d_b_first, d_b_shift, d_b_weights, wg_size);
     }
 }
 
@@ -241,7 +260,11 @@ std::vector<SpreadCandidate> build_spread_candidates(
 
     auto grid_pad_for_tj = [&](int t_j) -> int {
         if (bm.banks > 1) {
-            const int banks_per_elem = (static_cast<int>(sizeof(RealT)) + bm.bank_width_bytes - 1) / bm.bank_width_bytes;
+            // 4-byte RealT packs {re, im} into an 8-byte PairT (LDS.64/STS.64); >=8-byte RealT uses split arrays
+            const int elem_bytes = (sizeof(RealT) == 4)
+                ? static_cast<int>(2 * sizeof(RealT))
+                : static_cast<int>(sizeof(RealT));
+            const int banks_per_elem = (elem_bytes + bm.bank_width_bytes - 1) / bm.bank_width_bytes;
             const int elem_banks = std::max(1, bm.banks / std::max(1, banks_per_elem));
             if (t_j < elem_banks) {
                 return t_j;
@@ -250,11 +273,14 @@ std::vector<SpreadCandidate> build_spread_candidates(
         return 0;
     };
 
-    auto calc_smem_bytes = [&](int b_per_wg, int win_elems, int tile_m, int grid_pad) -> size_t {
+    auto calc_smem_bytes = [&](int b_per_wg, int win_elems, int tile_m, int grid_pad, bool use_reg_acc) -> size_t {
         const int grid_stride = win_elems + grid_pad;
         const int sy_stride   = b_per_wg + 1;
+        const size_t grid_b   = use_reg_acc
+            ? size_t{0}
+            : (2 * static_cast<size_t>(b_per_wg) * static_cast<size_t>(grid_stride) * sizeof(RealT));
         const size_t base =
-            2 * static_cast<size_t>(b_per_wg) * static_cast<size_t>(grid_stride) * sizeof(RealT) +
+            grid_b +
             static_cast<size_t>(tile_m) * sizeof(int) +
             2 * static_cast<size_t>(tile_m) * static_cast<size_t>(sy_stride) * sizeof(RealT);
         if (use_precomp_weights) {
@@ -290,19 +316,25 @@ std::vector<SpreadCandidate> build_spread_candidates(
                 wg_list.push_back(wg_min);
             }
 
-            auto add_smem_cand = [&](int wg_size, int win_elems) {
+            constexpr size_t kAccBytesPerQ = 2 * sizeof(RealT);
+            auto add_smem_cand = [&](int wg_size, int win_elems, bool use_reg_acc) {
                 const int b_per_wg = wg_size / t_j;
                 if (b_per_wg <= 0 || win_elems < min_win || win_elems > nfft) return;
+                if (use_reg_acc) {
+                    const int q_val = win_elems / t_j;
+                    const bool q_ok = (q_val == 4 || q_val == 8 || q_val == 16) &&
+                                      (static_cast<size_t>(q_val) * kAccBytesPerQ <= 128);
+                    if (!use_precomp_weights || win_elems < 64 || !q_ok) return;
+                }
                 int tile_m = std::min(wg_size, std::max(static_cast<int>(sg_unit), 32));
                 tile_m = pow2_clamp_int(tile_m, 16, 64);
-                while (tile_m > 16 && calc_smem_bytes(b_per_wg, win_elems, tile_m, grid_pad) > smem_limit) {
+                while (tile_m > 16 && calc_smem_bytes(b_per_wg, win_elems, tile_m, grid_pad, use_reg_acc) > smem_limit) {
                     tile_m >>= 1;
                 }
                 // Also step tile_m down to 16 if doing so strictly increases resident WGs/CU
-                // (e.g., fitting 2 WGs in 48 KiB instead of 1 WG at 25.8 KiB).
                 while (tile_m > 16) {
-                    const size_t cur_b  = calc_smem_bytes(b_per_wg, win_elems, tile_m, grid_pad);
-                    const size_t next_b = calc_smem_bytes(b_per_wg, win_elems, tile_m >> 1, grid_pad);
+                    const size_t cur_b  = calc_smem_bytes(b_per_wg, win_elems, tile_m, grid_pad, use_reg_acc);
+                    const size_t next_b = calc_smem_bytes(b_per_wg, win_elems, tile_m >> 1, grid_pad, use_reg_acc);
                     const int cur_res  = std::min(4, static_cast<int>(dev_cfg.local_mem_size / std::max<size_t>(1, cur_b)));
                     const int next_res = std::min(4, static_cast<int>(dev_cfg.local_mem_size / std::max<size_t>(1, next_b)));
                     if (next_res > cur_res) {
@@ -311,11 +343,12 @@ std::vector<SpreadCandidate> build_spread_candidates(
                         break;
                     }
                 }
-                const size_t smem_b = calc_smem_bytes(b_per_wg, win_elems, tile_m, grid_pad);
+                const size_t smem_b = calc_smem_bytes(b_per_wg, win_elems, tile_m, grid_pad, use_reg_acc);
                 if (smem_b > smem_limit) return;
 
                 std::string id =
-                    "smem_wg" + std::to_string(wg_size) + "_win" + std::to_string(win_elems);
+                    (use_reg_acc ? "reg_wg" : "smem_wg") + std::to_string(wg_size) +
+                    "_win" + std::to_string(win_elems);
                 if (t_j < w) {
                     id += "_tj" + std::to_string(t_j);
                 }
@@ -325,6 +358,7 @@ std::vector<SpreadCandidate> build_spread_candidates(
 
                 SpreadConfig sc{};
                 sc.use_smem            = true;
+                sc.use_reg_acc         = use_reg_acc;
                 sc.use_cpu_direct      = false;
                 sc.use_precomp_weights = use_precomp_weights;
                 sc.wg_size             = wg_size;
@@ -341,7 +375,8 @@ std::vector<SpreadCandidate> build_spread_candidates(
                 const int active_warps_per_cu = resident_wgs * std::max(1, wg_size / static_cast<int>(sg_unit));
                 int score = std::min(active_warps_per_cu, 16) * 20;
                 score += std::min(b_per_wg, 32) * 10;
-                if (t_j < w) score += 25; // Reward high lane utilization (prev_pow2(W))
+                if (use_reg_acc) score += 45; // Zero grid SMEM, zero grid LDS/STS, higher occupancy
+                if (t_j < w) score += 25;     // Reward high lane utilization (prev_pow2(W))
                 if (sc.num_wins == 1) score += 30;
                 else if (sc.num_wins <= 4) score += 18;
                 else score -= int_log2_pow2(sc.num_wins) * 8;
@@ -352,17 +387,28 @@ std::vector<SpreadCandidate> build_spread_candidates(
 
             for (int wg_size : wg_list) {
                 const int b_per_wg = wg_size / t_j;
+                // Hardware-generalized register-resident candidates: all Q in {4, 8, 16}
+                // within the universal 128-byte (32-reg) per-thread accumulator budget.
+                if (use_precomp_weights) {
+                    for (int q_val : {16, 8, 4}) {
+                        if (static_cast<size_t>(q_val) * kAccBytesPerQ > 128) continue;
+                        const int rwin = q_val * t_j;
+                        if (rwin >= min_win && rwin <= nfft && rwin >= 64) {
+                            add_smem_cand(wg_size, rwin, true);
+                        }
+                    }
+                }
                 int max_win = nfft;
-                while (max_win >= min_win && calc_smem_bytes(b_per_wg, max_win, 16, grid_pad) > smem_limit) {
+                while (max_win >= min_win && calc_smem_bytes(b_per_wg, max_win, 16, grid_pad, false) > smem_limit) {
                     max_win >>= 1;
                 }
                 if (max_win >= min_win) {
-                    add_smem_cand(wg_size, max_win);
+                    add_smem_cand(wg_size, max_win, false);
                     if (max_win / 2 >= min_win) {
-                        add_smem_cand(wg_size, max_win / 2);
+                        add_smem_cand(wg_size, max_win / 2, false);
                     }
-                    if (max_win / 4 >= min_win && calc_smem_bytes(b_per_wg, max_win / 2, 16, grid_pad) * 2 > dev_cfg.local_mem_size) {
-                        add_smem_cand(wg_size, max_win / 4);
+                    if (max_win / 4 >= min_win && calc_smem_bytes(b_per_wg, max_win / 2, 16, grid_pad, false) * 2 > dev_cfg.local_mem_size) {
+                        add_smem_cand(wg_size, max_win / 4, false);
                     }
                 }
             }
@@ -393,7 +439,7 @@ std::vector<SpreadCandidate> build_spread_candidates(
 
     // Collaborative batch-inner candidate (fallback / --force-collab-spread)
     {
-        const size_t reg_cap = (Traits::kIsFp64 || Traits::kIsDf) ? 128 : 256;
+        const size_t reg_cap = (sizeof(RealT) >= 8) ? 128 : 256;
         const int collab_wg = static_cast<int>(
             dev_cfg.default_wg_size(std::max<size_t>(64, sg_unit * 4), reg_cap));
         int tile_m = pow2_clamp_int(std::min(collab_wg, static_cast<int>(std::max<size_t>(32, sg_unit))), 16, 64);
@@ -526,7 +572,7 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     bool need_spread_tune = false;
     const bool allow_runtime_tune = (max_bs_ >= 32) || (autotune_mode == sycl_fft::AutotuneMode::Force);
     const int m_bin = (M_ <= 128) ? 0 : ((M_ <= 1024) ? 1 : ((M_ <= 8192) ? 2 : 3));
-    const std::string spr_slot = "nufft1_spr_w" + std::to_string(w_) + "_m" + std::to_string(m_bin);
+    const std::string spr_slot = "nufft1_spr2_w" + std::to_string(w_) + "_m" + std::to_string(m_bin);
     const std::string spr_key  = sycl_fft::AutotuneCache::make_key(
         dev_cfg, Traits::kPrecTag, log_nfft_, spr_slot.c_str());
 
@@ -640,42 +686,68 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
         }
     };
 
-    // 4. Shortlist plan-time autotuning for spreading (top 3 SMEM incl. at least one win>=128
-    //    when available; collab ONLY on CPU/non-native or forced)
+    // 4. Factored two-phase benchmark-based spreading autotuner (mirrors DifFftPlan):
+    //    Phase A: benchmark 1 representative per distinct (use_reg_acc, win_elems, t_j) family
+    //             across hardware-feasible reg & smem candidates (collab only on CPU/forced).
+    //    Phase B: on the winning family only, refine wg_size across alternate feasible WGs
+    //             (0 new kernel JITs, reuses cached window buckets for that win_elems).
     if (need_spread_tune) {
-        std::vector<size_t> shortlist;
-        bool has_wide_win = false;
-        for (size_t i = 0; i < spread_cands.size() && shortlist.size() < 2; ++i) {
-            if (spread_cands[i].cfg.use_smem) {
-                shortlist.push_back(i);
-                if (spread_cands[i].cfg.win_elems >= 128) has_wide_win = true;
+        struct FamilyKey {
+            bool use_smem;
+            bool use_reg_acc;
+            bool use_cpu_direct;
+            int  win_elems;
+            int  t_j;
+            bool operator==(const FamilyKey& o) const {
+                return use_smem == o.use_smem && use_reg_acc == o.use_reg_acc &&
+                       use_cpu_direct == o.use_cpu_direct && win_elems == o.win_elems && t_j == o.t_j;
+            }
+        };
+        auto family_of = [](const SpreadConfig& sc) -> FamilyKey {
+            return FamilyKey{sc.use_smem, sc.use_reg_acc, sc.use_cpu_direct, sc.win_elems, sc.t_j};
+        };
+
+        std::vector<size_t> phase_a;
+        std::vector<FamilyKey> seen_families;
+        auto try_add_family = [&](size_t idx) -> bool {
+            const FamilyKey fk = family_of(spread_cands[idx].cfg);
+            if (std::find(seen_families.begin(), seen_families.end(), fk) != seen_families.end()) {
+                return false;
+            }
+            seen_families.push_back(fk);
+            phase_a.push_back(idx);
+            return true;
+        };
+
+        // Pick top-scored representative from each distinct hardware-feasible family (up to 6):
+        // up to 3 register-resident families + up to 3 SMEM-grid families (guaranteed both reg & smem).
+        size_t n_reg = 0, n_smem = 0;
+        for (size_t i = 0; i < spread_cands.size() && n_reg < 3; ++i) {
+            if (spread_cands[i].cfg.use_smem && spread_cands[i].cfg.use_reg_acc) {
+                if (try_add_family(i)) ++n_reg;
             }
         }
-        if (!has_wide_win) {
-            for (size_t i = 0; i < spread_cands.size(); ++i) {
-                if (spread_cands[i].cfg.use_smem && spread_cands[i].cfg.win_elems >= 128 &&
-                    std::find(shortlist.begin(), shortlist.end(), i) == shortlist.end()) {
-                    shortlist.push_back(i);
-                    break;
-                }
+        // Guarantee at least one wide-window SMEM family (win >= 128) if available
+        for (size_t i = 0; i < spread_cands.size() && n_smem < 3; ++i) {
+            if (spread_cands[i].cfg.use_smem && !spread_cands[i].cfg.use_reg_acc &&
+                spread_cands[i].cfg.win_elems >= 128) {
+                if (try_add_family(i)) { ++n_smem; break; }
             }
         }
-        for (size_t i = 0; i < spread_cands.size() && shortlist.size() < 3; ++i) {
-            if (spread_cands[i].cfg.use_smem &&
-                std::find(shortlist.begin(), shortlist.end(), i) == shortlist.end()) {
-                shortlist.push_back(i);
+        for (size_t i = 0; i < spread_cands.size() && n_smem < 3; ++i) {
+            if (spread_cands[i].cfg.use_smem && !spread_cands[i].cfg.use_reg_acc) {
+                if (try_add_family(i)) ++n_smem;
             }
         }
-        if (!dev_cfg.has_native_local_mem || shortlist.empty() || launch_cfg_.force_collab_spread) {
+        if (!dev_cfg.has_native_local_mem || phase_a.empty() || launch_cfg_.force_collab_spread) {
             for (size_t i = 0; i < spread_cands.size(); ++i) {
                 if (!spread_cands[i].cfg.use_smem) {
-                    shortlist.push_back(i);
-                    break;
+                    if (try_add_family(i)) break;
                 }
             }
         }
 
-        if (shortlist.size() > 1) {
+        if (!phase_a.empty() && spread_cands.size() > 1) {
             const size_t tune_bs = std::min(chunk_bs_, std::max<size_t>(64, chunk_bs_));
             auto d_tune_y = sycl_fft::UsmPtr<ComplexT>::alloc_device(tune_bs * static_cast<size_t>(M_), q_);
             if (d_tune_y) {
@@ -707,36 +779,72 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                 }
                 q_.wait();
 
-                int best_idx = static_cast<int>(shortlist[0]);
-                double best_ms = std::numeric_limits<double>::max();
+                struct BucketTmp {
+                    sycl_fft::UsmPtr<int>      cnt, off, m, bf;
+                    sycl_fft::UsmPtr<ComplexT> bs;
+                    sycl_fft::UsmPtr<ScalarT>  bw;
+                };
+                std::unordered_map<int, BucketTmp> bucket_cache;
                 const ScalarT* tune_w_ptr = use_precomp_weights_ ? d_weights_.get() : nullptr;
 
-                for (size_t idx : shortlist) {
+                auto get_buckets = [&](int win_elems, int num_wins) -> const BucketTmp* {
+                    auto it = bucket_cache.find(win_elems);
+                    if (it != bucket_cache.end()) return &it->second;
+                    BucketTmp bt{};
+                    const size_t max_ent = size_t{2} * static_cast<size_t>(M_);
+                    bt.cnt = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(num_wins), q_);
+                    bt.off = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(num_wins + 1), q_);
+                    bt.m   = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
+                    if (!bt.cnt || !bt.off || !bt.m) return nullptr;
+                    detail::launch_build_window_buckets(
+                        q_, d_first_.get(), M_, nfft_, w_, win_elems, num_wins,
+                        bt.cnt.get(), bt.off.get(), bt.m.get(), precompute_wg_);
+                    if (use_precomp_weights_ && tune_w_ptr) {
+                        bt.bf = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
+                        bt.bs = sycl_fft::UsmPtr<ComplexT>::alloc_device(max_ent, q_);
+                        bt.bw = sycl_fft::UsmPtr<ScalarT>::alloc_device(max_ent * static_cast<size_t>(w_), q_);
+                        if (!bt.bf || !bt.bs || !bt.bw) return nullptr;
+                        dispatch_pack_bucket_geom<Traits>(
+                            q_, w_, num_wins, static_cast<int>(max_ent),
+                            bt.off.get(), bt.m.get(),
+                            d_first_.get(), d_shift_.get(), tune_w_ptr,
+                            bt.bf.get(), bt.bs.get(), bt.bw.get(), precompute_wg_);
+                    }
+                    auto [ins_it, _] = bucket_cache.emplace(win_elems, std::move(bt));
+                    return &ins_it->second;
+                };
+
+                auto time_cand = [&](size_t idx, double& out_ms) -> bool {
                     const auto& cand = spread_cands[idx];
                     try {
                         if (cand.cfg.use_smem) {
-                            sycl_fft::UsmPtr<int> tmp_cnt, tmp_off, tmp_m;
+                            const int* off_arg = nullptr;
+                            const int* m_arg = nullptr;
+                            const int* first_arg = d_first_.get();
+                            const ComplexT* shift_arg = d_shift_.get();
+                            const ScalarT* weight_arg = tune_w_ptr;
                             if (cand.cfg.num_wins > 1) {
-                                tmp_cnt = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(cand.cfg.num_wins), q_);
-                                tmp_off = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(cand.cfg.num_wins + 1), q_);
-                                tmp_m   = sycl_fft::UsmPtr<int>::alloc_device(size_t{2} * static_cast<size_t>(M_), q_);
-                                if (!tmp_cnt || !tmp_off || !tmp_m) continue;
-                                detail::launch_build_window_buckets(
-                                    q_, d_first_.get(), M_, nfft_, w_, cand.cfg.win_elems, cand.cfg.num_wins,
-                                    tmp_cnt.get(), tmp_off.get(), tmp_m.get(), precompute_wg_);
+                                const BucketTmp* bt = get_buckets(cand.cfg.win_elems, cand.cfg.num_wins);
+                                if (!bt) return false;
+                                off_arg = bt->off.get();
+                                m_arg   = bt->m.get();
+                                if (bt->bf && bt->bs && bt->bw) {
+                                    first_arg  = bt->bf.get();
+                                    shift_arg  = bt->bs.get();
+                                    weight_arg = bt->bw.get();
+                                }
                             }
-                            // Warmup + estimate duration for batched timing
                             dispatch_spread_smem<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
-                                tmp_off.get(), tmp_m.get(),
+                                q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
+                                off_arg, m_arg,
                                 d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
                                 mode_, cand.cfg);
                             q_.wait_and_throw();
 
                             const auto w0 = std::chrono::steady_clock::now();
                             dispatch_spread_smem<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
-                                tmp_off.get(), tmp_m.get(),
+                                q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
+                                off_arg, m_arg,
                                 d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
                                 mode_, cand.cfg);
                             q_.wait_and_throw();
@@ -750,8 +858,8 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                                 const auto t0 = std::chrono::steady_clock::now();
                                 for (int b = 0; b < batch_reps; ++b) {
                                     dispatch_spread_smem<Traits>(
-                                        q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
-                                        tmp_off.get(), tmp_m.get(),
+                                        q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
+                                        off_arg, m_arg,
                                         d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
                                         mode_, cand.cfg);
                                 }
@@ -759,12 +867,9 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                                 samples[r] = std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - t0).count() / static_cast<double>(batch_reps);
                             }
-
                             std::sort(samples, samples + 3);
-                            if (samples[1] < best_ms) {
-                                best_ms = samples[1];
-                                best_idx = static_cast<int>(idx);
-                            }
+                            out_ms = samples[1];
+                            return true;
                         } else if (cand.cfg.use_cpu_direct) {
                             dispatch_spread_cpu_direct<Traits>(
                                 q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
@@ -782,16 +887,26 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                                     std::chrono::steady_clock::now() - t0).count();
                             }
                             std::sort(samples, samples + 3);
-                            if (samples[1] < best_ms) {
-                                best_ms = samples[1];
-                                best_idx = static_cast<int>(idx);
-                            }
+                            out_ms = samples[1];
+                            return true;
                         } else {
                             auto tmp_re = sycl_fft::UsmPtr<RealT>::alloc_device(static_cast<size_t>(nfft_) * packed_stride_, q_);
                             auto tmp_im = sycl_fft::UsmPtr<RealT>::alloc_device(static_cast<size_t>(nfft_) * packed_stride_, q_);
-                            if (tmp_re && tmp_im) {
-                                q_.memset(tmp_re.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
-                                q_.memset(tmp_im.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
+                            if (!tmp_re || !tmp_im) return false;
+                            q_.memset(tmp_re.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
+                            q_.memset(tmp_im.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
+                            dispatch_spread_collab<Traits>(
+                                q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(), d_tune_y.get(),
+                                tmp_re.get(), tmp_im.get(),
+                                M_, nfft_, static_cast<size_t>(M_), tune_bs, packed_stride_, mode_, cand.cfg);
+                            dispatch_transpose_and_zero<Traits>(
+                                q_, tmp_re.get(), tmp_im.get(), d_fft_buf_.get(),
+                                nfft_, tune_bs, packed_stride_, cand.cfg);
+                            q_.wait_and_throw();
+
+                            double samples[3] = {};
+                            for (int r = 0; r < 3; ++r) {
+                                const auto t0 = std::chrono::steady_clock::now();
                                 dispatch_spread_collab<Traits>(
                                     q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(), d_tune_y.get(),
                                     tmp_re.get(), tmp_im.get(),
@@ -800,30 +915,44 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                                     q_, tmp_re.get(), tmp_im.get(), d_fft_buf_.get(),
                                     nfft_, tune_bs, packed_stride_, cand.cfg);
                                 q_.wait_and_throw();
-
-                                double samples[3] = {};
-                                for (int r = 0; r < 3; ++r) {
-                                    const auto t0 = std::chrono::steady_clock::now();
-                                    dispatch_spread_collab<Traits>(
-                                        q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(), d_tune_y.get(),
-                                        tmp_re.get(), tmp_im.get(),
-                                        M_, nfft_, static_cast<size_t>(M_), tune_bs, packed_stride_, mode_, cand.cfg);
-                                    dispatch_transpose_and_zero<Traits>(
-                                        q_, tmp_re.get(), tmp_im.get(), d_fft_buf_.get(),
-                                        nfft_, tune_bs, packed_stride_, cand.cfg);
-                                    q_.wait_and_throw();
-                                    samples[r] = std::chrono::duration<double, std::milli>(
-                                        std::chrono::steady_clock::now() - t0).count();
-                                }
-                                std::sort(samples, samples + 3);
-                                if (samples[1] < best_ms) {
-                                    best_ms = samples[1];
-                                    best_idx = static_cast<int>(idx);
-                                }
+                                samples[r] = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - t0).count();
                             }
+                            std::sort(samples, samples + 3);
+                            out_ms = samples[1];
+                            return true;
                         }
                     } catch (...) {
                         try { q_.wait(); } catch (...) {}
+                        return false;
+                    }
+                };
+
+                int best_idx = static_cast<int>(phase_a[0]);
+                double best_ms = std::numeric_limits<double>::max();
+
+                // Phase A: benchmark strategy/window/t_j families
+                for (size_t idx : phase_a) {
+                    double ms = 0.0;
+                    if (time_cand(idx, ms) && ms < best_ms) {
+                        best_ms = ms;
+                        best_idx = static_cast<int>(idx);
+                    }
+                }
+
+                // Phase B: refine wg_size within the winning family (0 new kernel JITs!)
+                if (best_ms < std::numeric_limits<double>::max() &&
+                    spread_cands[static_cast<size_t>(best_idx)].cfg.use_smem) {
+                    const FamilyKey win_fam = family_of(spread_cands[static_cast<size_t>(best_idx)].cfg);
+                    for (size_t i = 0; i < spread_cands.size(); ++i) {
+                        if (static_cast<int>(i) == best_idx) continue;
+                        if (family_of(spread_cands[i].cfg) == win_fam) {
+                            double ms = 0.0;
+                            if (time_cand(i, ms) && ms < best_ms) {
+                                best_ms = ms;
+                                best_idx = static_cast<int>(i);
+                            }
+                        }
                     }
                 }
 
@@ -990,11 +1119,23 @@ void Nufft1PlanBase<Traits>::allocate_collab_grid() {
 template <typename Traits>
 void Nufft1PlanBase<Traits>::allocate_window_buckets() {
     if (d_bucket_counts_ && d_bucket_off_ && d_bucket_m_) return;
+    const size_t max_ent = size_t{2} * static_cast<size_t>(M_);
     auto cnt = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(spread_cfg_.num_wins), q_);
     auto off = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(spread_cfg_.num_wins + 1), q_);
-    auto bm  = sycl_fft::UsmPtr<int>::alloc_device(size_t{2} * static_cast<size_t>(M_), q_);
+    auto bm  = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
     if (!cnt || !off || !bm) {
         throw std::runtime_error("Nufft1Plan: window bucket allocation failed");
+    }
+    if (use_precomp_weights_ && d_weights_) {
+        auto bf = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
+        auto bs = sycl_fft::UsmPtr<ComplexT>::alloc_device(max_ent, q_);
+        auto bw = sycl_fft::UsmPtr<ScalarT>::alloc_device(max_ent * static_cast<size_t>(w_), q_);
+        if (!bf || !bs || !bw) {
+            throw std::runtime_error("Nufft1Plan: bucket geometry allocation failed");
+        }
+        d_b_first_   = std::move(bf);
+        d_b_shift_   = std::move(bs);
+        d_b_weights_ = std::move(bw);
     }
     d_bucket_counts_ = std::move(cnt);
     d_bucket_off_    = std::move(off);
@@ -1038,6 +1179,14 @@ void Nufft1PlanBase<Traits>::set_points(
             spread_cfg_.win_elems, spread_cfg_.num_wins,
             d_bucket_counts_.get(), d_bucket_off_.get(), d_bucket_m_.get(),
             precompute_wg_);
+        if (use_precomp_weights_ && d_weights_ && d_b_first_ && d_b_shift_ && d_b_weights_) {
+            dispatch_pack_bucket_geom<Traits>(
+                q_, w_, spread_cfg_.num_wins, 2 * M_,
+                d_bucket_off_.get(), d_bucket_m_.get(),
+                d_first_.get(), d_shift_.get(), d_weights_.get(),
+                d_b_first_.get(), d_b_shift_.get(), d_b_weights_.get(),
+                precompute_wg_);
+        }
     }
 }
 
@@ -1127,8 +1276,14 @@ void Nufft1PlanBase<Traits>::execute(
 
         // 1. Hardware-generalized piecewise minimax PSWF spreading
         if (spread_cfg_.use_smem) {
+            const bool use_packed_geom =
+                (spread_cfg_.num_wins > 1) && use_precomp_weights_ &&
+                d_b_first_ && d_b_shift_ && d_b_weights_;
+            const int* first_arg        = use_packed_geom ? d_b_first_.get()   : d_first_.get();
+            const ComplexT* shift_arg   = use_packed_geom ? d_b_shift_.get()   : d_shift_.get();
+            const ScalarT* weight_arg   = use_packed_geom ? d_b_weights_.get() : w_ptr;
             dispatch_spread_smem<Traits>(
-                q_, w_, d_pswf_tbl_.get(), w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
+                q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
                 d_bucket_off_.get(), d_bucket_m_.get(),
                 cur_y, d_fft_buf_.get(), M_, nfft_, total_M_stride, cur_bs, mode_, spread_cfg_);
         } else if (spread_cfg_.use_cpu_direct) {

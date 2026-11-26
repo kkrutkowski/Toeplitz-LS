@@ -895,6 +895,7 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
     int                  compact_mode;
     int                  log_n1;
     const DeconvScalarT* d_slot_deconv;
+    bool                 apply_deconv;
     SmemH                smem;
 
     SYCL_FFT_FORCE_INLINE static void load_elem(
@@ -928,44 +929,142 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
 #endif
     }
 
-    // Fused compact-slot filtering + optional deconvolution epilogue.
-    // When compact_mode == 0 (standard raw FFT), executes a single uniform branch to store_elem.
-    SYCL_FFT_FORCE_INLINE void store_epilogue(
+    SYCL_FFT_FORCE_INLINE Real load_deconv_val(
+        const DeconvScalarT* d_dec0, const DeconvScalarT* d_dec1, int ci) const {
+#if SYCL_FFT_PACKED_BATCH == 2
+        return (log_n1 == 0)
+            ? SYCL_FFT_F16X2_SPLAT_H(d_dec0[ci])
+            : f16x2_make(d_dec0[ci], d_dec1[ci]);
+#else
+        (void)d_dec1;
+        return d_dec0[ci];
+#endif
+    }
+
+    // Hoisted branch-free compact-slot filtering + optional deconvolution epilogue.
+    // Because out_base = (sub * T + l) with T divisible by 8 and W >= 4 power of 2,
+    // slot validity (l & 3 for PSWF21; l & 7 for PSWF43 when W >= 8) is INVARIANT across
+    // all M = 0..Chunk-1, eliminating per-element branches and enabling pipelined LDG/STG.
+    template <typename GetValFn>
+    SYCL_FFT_FORCE_INLINE void emit_chunk_epilogue(
         ComplexT* g0, ComplexT* g1,
         const DeconvScalarT* d_dec0, const DeconvScalarT* d_dec1,
-        int local_slot, bool valid0, bool valid1,
-        Real re_in, Real im_in) const {
+        int out_base, int l, bool valid0, bool valid1,
+        GetValFn&& get_val) const {
+        static_assert(W >= 4, "SinglePassBody requires W >= 4");
         if (compact_mode == 0) {
-            store_elem(g0, g1, local_slot, valid0, valid1, re_in, im_in);
+            unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
+                constexpr int M = m_ic.value;
+                Real vr, vi;
+                get_val(m_ic, vr, vi);
+                store_elem(g0, g1, out_base + M * W, valid0, valid1, vr, vi);
+            });
             return;
         }
-        int ci = -1;
-        if (compact_mode == 1) {
-            const int r = local_slot & 3;
-            if (r == 0 || r == 3) {
-                ci = ((local_slot >> 2) << 1) + (r == 3 ? 1 : 0);
+        if constexpr (W >= 8) {
+            bool keep = false;
+            int ci0 = 0;
+            int ci_stride = 0;
+            if (compact_mode == 1) {
+                const int r = l & 3;
+                keep = (r == 0 || r == 3);
+                ci0 = ((out_base >> 2) << 1) + (r == 3 ? 1 : 0);
+                ci_stride = W >> 1;
+            } else {
+                const int r = l & 7;
+                keep = (r != 1 && r != 6);
+                const int off = r - (r >= 2 ? 1 : 0) - (r >= 7 ? 1 : 0);
+                ci0 = (out_base >> 3) * 6 + off;
+                ci_stride = (W >> 3) * 6;
+            }
+            if (!keep) return;
+            if (apply_deconv) {
+                unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
+                    constexpr int M = m_ic.value;
+                    const int ci = ci0 + M * ci_stride;
+                    Real vr, vi;
+                    get_val(m_ic, vr, vi);
+                    const Real dv = load_deconv_val(d_dec0, d_dec1, ci);
+                    store_elem(g0, g1, ci, valid0, valid1, SYCL_FFT_MUL(vr, dv), SYCL_FFT_MUL(vi, dv));
+                });
+            } else {
+                unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
+                    constexpr int M = m_ic.value;
+                    const int ci = ci0 + M * ci_stride;
+                    Real vr, vi;
+                    get_val(m_ic, vr, vi);
+                    store_elem(g0, g1, ci, valid0, valid1, vr, vi);
+                });
             }
         } else {
-            const int r = local_slot & 7;
-            if (r != 1 && r != 6) {
-                const int off = r - (r >= 2 ? 1 : 0) - (r >= 7 ? 1 : 0);
-                ci = (local_slot >> 3) * 6 + off;
+            // W == 4 (LogN == 10, LogE == 4)
+            if (compact_mode == 1) {
+                if (l == 0 || l == 3) {
+                    const int ci0 = ((out_base >> 2) << 1) + (l == 3 ? 1 : 0);
+                    if (apply_deconv) {
+                        unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = m_ic.value;
+                            const int ci = ci0 + M * 2;
+                            Real vr, vi;
+                            get_val(m_ic, vr, vi);
+                            const Real dv = load_deconv_val(d_dec0, d_dec1, ci);
+                            store_elem(g0, g1, ci, valid0, valid1, SYCL_FFT_MUL(vr, dv), SYCL_FFT_MUL(vi, dv));
+                        });
+                    } else {
+                        unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = m_ic.value;
+                            const int ci = ci0 + M * 2;
+                            Real vr, vi;
+                            get_val(m_ic, vr, vi);
+                            store_elem(g0, g1, ci, valid0, valid1, vr, vi);
+                        });
+                    }
+                }
+            } else {
+                const int blk0 = (out_base >> 3) * 6;
+                if (l != 1) {
+                    const int off_e = (l >= 2) ? (l - 1) : l;
+                    if (apply_deconv) {
+                        unroll_for<Chunk / 2>([&](auto k_ic) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = 2 * k_ic.value;
+                            const int ci = blk0 + k_ic.value * 6 + off_e;
+                            Real vr, vi;
+                            get_val(std::integral_constant<int, M>{}, vr, vi);
+                            const Real dv = load_deconv_val(d_dec0, d_dec1, ci);
+                            store_elem(g0, g1, ci, valid0, valid1, SYCL_FFT_MUL(vr, dv), SYCL_FFT_MUL(vi, dv));
+                        });
+                    } else {
+                        unroll_for<Chunk / 2>([&](auto k_ic) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = 2 * k_ic.value;
+                            const int ci = blk0 + k_ic.value * 6 + off_e;
+                            Real vr, vi;
+                            get_val(std::integral_constant<int, M>{}, vr, vi);
+                            store_elem(g0, g1, ci, valid0, valid1, vr, vi);
+                        });
+                    }
+                }
+                if (l != 2) {
+                    const int off_o = (l == 3) ? 5 : (l + 3);
+                    if (apply_deconv) {
+                        unroll_for<Chunk / 2>([&](auto k_ic) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = 2 * k_ic.value + 1;
+                            const int ci = blk0 + k_ic.value * 6 + off_o;
+                            Real vr, vi;
+                            get_val(std::integral_constant<int, M>{}, vr, vi);
+                            const Real dv = load_deconv_val(d_dec0, d_dec1, ci);
+                            store_elem(g0, g1, ci, valid0, valid1, SYCL_FFT_MUL(vr, dv), SYCL_FFT_MUL(vi, dv));
+                        });
+                    } else {
+                        unroll_for<Chunk / 2>([&](auto k_ic) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = 2 * k_ic.value + 1;
+                            const int ci = blk0 + k_ic.value * 6 + off_o;
+                            Real vr, vi;
+                            get_val(std::integral_constant<int, M>{}, vr, vi);
+                            store_elem(g0, g1, ci, valid0, valid1, vr, vi);
+                        });
+                    }
+                }
             }
-        }
-        if (ci >= 0) {
-            if (d_dec0 != nullptr) {
-#if SYCL_FFT_PACKED_BATCH == 2
-                const Real dv = (d_dec0 == d_dec1)
-                    ? SYCL_FFT_F16X2_SPLAT_H(d_dec0[ci])
-                    : f16x2_make(d_dec0[ci], d_dec1[ci]);
-#else
-                (void)d_dec1;
-                const Real dv = d_dec0[ci];
-#endif
-                re_in = SYCL_FFT_MUL(re_in, dv);
-                im_in = SYCL_FFT_MUL(im_in, dv);
-            }
-            store_elem(g0, g1, ci, valid0, valid1, re_in, im_in);
         }
     }
 
@@ -1052,10 +1151,12 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
         if constexpr (Phase3 == Phase3Policy::SubgroupShuffle) {
             SYCL_FFT_SUFFIX(dif_radix2_subgroup)<LogW, Chunk>(sg, c_re, c_im, l, pos_sign);
             if (valid0) {
-                unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
-                    constexpr int M = m_ic.value;
-                    store_epilogue(g_out0, g_out1, d_dec0, d_dec1, out_base + M * W, valid0, valid1, c_re[M], c_im[M]);
-                });
+                emit_chunk_epilogue(
+                    g_out0, g_out1, d_dec0, d_dec1, out_base, l, valid0, valid1,
+                    [&](auto m_ic, Real& vr, Real& vi) SYCL_FFT_LAMBDA_INLINE {
+                        vr = c_re[m_ic.value];
+                        vi = c_im[m_ic.value];
+                    });
             }
         } else if constexpr (Phase3 == Phase3Policy::TwoTransposeXor) {
             // Transpose 2 (XOR-swizzled, Chunk == W)
@@ -1110,13 +1211,14 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                 });
                 SYCL_FFT_SUFFIX(sync_sub_tile)<W>(item, sg, sg_tile_sync_ok);
                 if (valid0) {
-                    unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
-                        constexpr int M = m_ic.value;
-                        const int idx = row_base + M * W + (l ^ M);
-                        const Real vr = SYCL_FFT_FROM_SMEM(smem.re[idx]);
-                        const Real vi = SYCL_FFT_FROM_SMEM(smem.im[idx]);
-                        store_epilogue(g_out0, g_out1, d_dec0, d_dec1, out_base + M * W, valid0, valid1, vr, vi);
-                    });
+                    emit_chunk_epilogue(
+                        g_out0, g_out1, d_dec0, d_dec1, out_base, l, valid0, valid1,
+                        [&](auto m_ic, Real& vr, Real& vi) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = m_ic.value;
+                            const int idx = row_base + M * W + (l ^ M);
+                            vr = SYCL_FFT_FROM_SMEM(smem.re[idx]);
+                            vi = SYCL_FFT_FROM_SMEM(smem.im[idx]);
+                        });
                 }
             } else {
                 unroll_for<Chunk>([&](auto k_ic) SYCL_FFT_LAMBDA_INLINE {
@@ -1140,10 +1242,12 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     c_im[M] = SYCL_FFT_FROM_SMEM(smem.buf[row_base + M * W + (l ^ M)]);
                 });
                 if (valid0) {
-                    unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
-                        constexpr int M = m_ic.value;
-                        store_epilogue(g_out0, g_out1, d_dec0, d_dec1, out_base + M * W, valid0, valid1, c_re[M], c_im[M]);
-                    });
+                    emit_chunk_epilogue(
+                        g_out0, g_out1, d_dec0, d_dec1, out_base, l, valid0, valid1,
+                        [&](auto m_ic, Real& vr, Real& vi) SYCL_FFT_LAMBDA_INLINE {
+                            vr = c_re[m_ic.value];
+                            vi = c_im[m_ic.value];
+                        });
                 }
             }
         } else {
@@ -1219,13 +1323,14 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                 });
                 SYCL_FFT_SUFFIX(sync_sub_tile)<W>(item, sg, sg_tile_sync_ok);
                 if (valid0) {
-                    unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
-                        constexpr int M = m_ic.value;
-                        const int idx = row_base + M * Stride2 + l;
-                        const Real vr = SYCL_FFT_FROM_SMEM(smem.re[idx]);
-                        const Real vi = SYCL_FFT_FROM_SMEM(smem.im[idx]);
-                        store_epilogue(g_out0, g_out1, d_dec0, d_dec1, out_base + M * W, valid0, valid1, vr, vi);
-                    });
+                    emit_chunk_epilogue(
+                        g_out0, g_out1, d_dec0, d_dec1, out_base, l, valid0, valid1,
+                        [&](auto m_ic, Real& vr, Real& vi) SYCL_FFT_LAMBDA_INLINE {
+                            constexpr int M = m_ic.value;
+                            const int idx = row_base + M * Stride2 + l;
+                            vr = SYCL_FFT_FROM_SMEM(smem.re[idx]);
+                            vi = SYCL_FFT_FROM_SMEM(smem.im[idx]);
+                        });
                 }
             } else {
                 unroll_for<Groups>([&](auto g_ic) SYCL_FFT_LAMBDA_INLINE {
@@ -1257,10 +1362,12 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
                     c_im[M] = SYCL_FFT_FROM_SMEM(smem.buf[row_base + M * Stride2 + l]);
                 });
                 if (valid0) {
-                    unroll_for<Chunk>([&](auto m_ic) SYCL_FFT_LAMBDA_INLINE {
-                        constexpr int M = m_ic.value;
-                        store_epilogue(g_out0, g_out1, d_dec0, d_dec1, out_base + M * W, valid0, valid1, c_re[M], c_im[M]);
-                    });
+                    emit_chunk_epilogue(
+                        g_out0, g_out1, d_dec0, d_dec1, out_base, l, valid0, valid1,
+                        [&](auto m_ic, Real& vr, Real& vi) SYCL_FFT_LAMBDA_INLINE {
+                            vr = c_re[m_ic.value];
+                            vi = c_im[m_ic.value];
+                        });
                 }
             }
         }
@@ -1289,8 +1396,8 @@ struct SYCL_FFT_SUFFIX(SinglePassBody) {
         const ComplexT* g_in1 = valid1 ? (in + (batch0 + 1) * N) : g_in0;
         ComplexT* g_out0 = valid0 ? (out + batch0 * sub_nout) : out;
         ComplexT* g_out1 = valid1 ? (out + (batch0 + 1) * sub_nout) : g_out0;
-        const DeconvScalarT* d_dec0 = d_slot_deconv ? (d_slot_deconv + p0_0 * sub_nout) : nullptr;
-        const DeconvScalarT* d_dec1 = d_slot_deconv ? (d_slot_deconv + p0_1 * sub_nout) : nullptr;
+        const DeconvScalarT* d_dec0 = apply_deconv ? (d_slot_deconv + p0_0 * sub_nout) : d_slot_deconv;
+        const DeconvScalarT* d_dec1 = apply_deconv ? (d_slot_deconv + p0_1 * sub_nout) : d_slot_deconv;
         const int smem_base = (B == 1) ? 0 : (b_local * FftSmem);
         const int sub = t >> LogW;
         const int l = t & (W - 1);
@@ -1447,6 +1554,7 @@ struct SYCL_FFT_SUFFIX(SinglePassSpec) {
                 in, out, bs, sg_tile_sync_ok, pos_sign,
                 ep.compact_mode, ep.log_n1,
                 static_cast<const typename BodyT::DeconvScalarT*>(ep.d_slot_deconv),
+                ep.apply_deconv,
                 smem};
             h.parallel_for(
                 sycl::nd_range<1>(num_wg * kWgSize, kWgSize),
@@ -1550,15 +1658,15 @@ static void SYCL_FFT_SUFFIX(append_candidates_small_for_bank)(
 #else
     switch (logN) {
         case 10:
-            if constexpr (ReqdSG == 0 || ReqdSG >= 4) {
-                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
-                    SYCL_FFT_SUFFIX(SinglePassSpec)<10, 4, 0, 1, Split, XorT1, Shuf, false, BK, ReqdSG>>(
-                        "split_10_e4_b1_xor"));
-            }
             if constexpr (ReqdSG == 0) {
                 out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
                     SYCL_FFT_SUFFIX(SinglePassSpec)<10, 4, 0, 1, Seq, Aff, Str2T, false, BK, 0>>(
                         "seq_10_e4_b1_2tstr"));
+            }
+            if constexpr (ReqdSG == 0 || ReqdSG >= 4) {
+                out.push_back(SYCL_FFT_SUFFIX(make_candidate)<
+                    SYCL_FFT_SUFFIX(SinglePassSpec)<10, 4, 0, 1, Split, XorT1, Shuf, false, BK, ReqdSG>>(
+                        "split_10_e4_b1_xor"));
             }
             break;
         case 11:
@@ -1993,6 +2101,7 @@ SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::SYCL_FFT_SUFFIX(DifFftPlan)(
     if (logN < 10 || logN > 18) {
         throw std::invalid_argument("Supported logN range is 10..18");
     }
+    d_dummy_deconv_ = UsmPtr<ComplexT>::alloc_device(1, q_);
     configure_plan(max_bs);
 }
 
@@ -2003,12 +2112,15 @@ SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::SYCL_FFT_SUFFIX(DifFftPlan)(
 
 template <int Sign>
 SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::~SYCL_FFT_SUFFIX(DifFftPlan)() {
-    if (scratch_) {
+    if (scratch_ || d_dummy_deconv_) {
         try {
             q_.wait();
         } catch (...) {
         }
-        sycl::free(scratch_, q_);
+        if (scratch_) {
+            sycl::free(scratch_, q_);
+            scratch_ = nullptr;
+        }
     }
 }
 
@@ -2016,7 +2128,7 @@ template <int Sign>
 void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::execute_raw(
     const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override) {
     if (bs == 0) return;
-    const FftCompactParams ep_full{};
+    const FftCompactParams ep_full{0, 0, d_dummy_deconv_.get(), false};
     if (exec_mode_ == PlanExecMode::SinglePass) {
         single_pass_cand_.launch(q_, in, out, bs, sg_tile_sync_ok_, kPosSign, ep_full);
         return;
@@ -2056,8 +2168,10 @@ void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::execute_raw_compact(
     if (exec_mode_ == PlanExecMode::MultiStageGlobal) {
         throw std::runtime_error("DifFftPlan::execute_raw_compact: unsupported in MultiStageGlobal mode");
     }
+    const bool apply_dec = (d_slot_deconv != nullptr);
+    const void* dec_ptr = apply_dec ? d_slot_deconv : static_cast<const void*>(d_dummy_deconv_.get());
     if (exec_mode_ == PlanExecMode::SinglePass) {
-        const FftCompactParams ep{compact_mode, 0, d_slot_deconv};
+        const FftCompactParams ep{compact_mode, 0, dec_ptr, apply_dec};
         single_pass_cand_.launch(q_, in, out, bs, sg_tile_sync_ok_, kPosSign, ep);
         return;
     }
@@ -2067,7 +2181,7 @@ void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::execute_raw_compact(
         : chunk_bs_;
     const size_t n1 = size_t{1} << log_n1_;
     const size_t full_nout = (compact_mode == 1) ? (N_ >> 1) : ((N_ >> 2) * 3);
-    const FftCompactParams ep{compact_mode, log_n1_, d_slot_deconv};
+    const FftCompactParams ep{compact_mode, log_n1_, dec_ptr, apply_dec};
     const bool use_vol = (dev_cfg_.backend_tag == "cuda");
     size_t done = 0;
     while (done < bs) {
@@ -2222,7 +2336,7 @@ template <int Sign>
 std::vector<typename SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::FilteredCandidate>
 SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::shortlist_single_pass(
     const std::vector<FilteredCandidate>& valid) const {
-    if (valid.size() <= 2) return valid;
+    if (valid.size() <= 1) return valid;
     std::vector<FilteredCandidate> primary;
 #if !SYCL_FFT_WIDE
     // When sub-group shuffles are verified, prefer SubgroupShuffle over SG=1 2-transpose fallbacks
@@ -2230,6 +2344,12 @@ SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::shortlist_single_pass(
         for (const auto& fc : valid) {
             if (!fc.cand.uses_wide_2t) primary.push_back(fc);
         }
+    }
+#else
+    // On DF/FP64, 128-reg 2-transpose kernels consistently beat 206-218-reg SubgroupShuffle
+    // kernels when local memory suffices; skip cold-JITting the shuffle fallbacks when 2T fits.
+    for (const auto& fc : valid) {
+        if (fc.cand.uses_wide_2t) primary.push_back(fc);
     }
 #endif
     const auto& pool = primary.empty() ? valid : primary;
@@ -2262,77 +2382,78 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::tune_single_pass(
     Candidate& out_winner,
     double& out_best_ms) {
     if (valid.empty()) return false;
+    const auto shortlisted = shortlist_single_pass(valid);
     const size_t sub_n = size_t{1} << n;
     size_t tune_bs = representative_tune_bs(n);
-    ComplexT* d_in = nullptr;
-    ComplexT* d_out = nullptr;
+    UsmPtr<ComplexT> d_in, d_out;
     while (tune_bs >= 2) {
-        d_in = sycl::malloc_device<ComplexT>(tune_bs * sub_n, q_);
-        d_out = d_in ? sycl::malloc_device<ComplexT>(tune_bs * sub_n, q_) : nullptr;
+        d_in = UsmPtr<ComplexT>::alloc_device(tune_bs * sub_n, q_);
+        d_out = d_in ? UsmPtr<ComplexT>::alloc_device(tune_bs * sub_n, q_) : UsmPtr<ComplexT>{};
         if (d_in && d_out) break;
-        if (d_in) sycl::free(d_in, q_);
-        if (d_out) sycl::free(d_out, q_);
-        d_in = nullptr;
-        d_out = nullptr;
+        d_in.reset();
+        d_out.reset();
         tune_bs >>= 1;
     }
     if (!d_in || !d_out) {
-        out_winner = pick_heuristic(valid);
+        out_winner = pick_heuristic(shortlisted);
         out_best_ms = 0.0;
         return true;
     }
-    q_.memset(d_in, 0, tune_bs * sub_n * sizeof(ComplexT)).wait();
 
-    // Tune out-of-place (d_in != d_out) with a distinct non-null placeholder for d_slot_deconv
-    // (never dereferenced when compact_mode == 0) so AdaptiveCpp SSCP's pointer-alias hash
-    // matches fused Nufft1Plan::execute(SlotBitReversed) and avoids duplicate JIT compilation.
-    ComplexT* d_alias_dummy = sycl::malloc_device<ComplexT>(1, q_);
-    const FftCompactParams ep_full{0, 0, d_alias_dummy};
+    // Fill with non-zero byte pattern to avoid GPU hardware zero-page compression
+    q_.memset(d_in.get(), 0x3c, tune_bs * sub_n * sizeof(ComplexT)).wait();
+
+    // Always pass non-null d_dummy_deconv_ (with apply_deconv=false) so AdaptiveCpp SSCP's
+    // pointer-alias hash matches execute_raw, SlotBitReversed, and SlotBitReversedRaw identically.
+    const FftCompactParams ep_full{0, 0, d_dummy_deconv_.get(), false};
 
     // Single-candidate fast path: 1-shot safety launch only (no multi-rep timing loop).
-    if (valid.size() == 1) {
+    if (shortlisted.size() == 1) {
         try {
-            valid[0].cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+            shortlisted[0].cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
             q_.wait_and_throw();
-            out_winner = valid[0].cand;
+            out_winner = shortlisted[0].cand;
             out_best_ms = 0.0;
-            if (d_alias_dummy) sycl::free(d_alias_dummy, q_);
-            sycl::free(d_out, q_);
-            sycl::free(d_in, q_);
             return true;
         } catch (...) {
-            if (d_alias_dummy) sycl::free(d_alias_dummy, q_);
-            sycl::free(d_out, q_);
-            sycl::free(d_in, q_);
-            return false;
+            // Fall through to full valid list below
         }
     }
 
     // Prime GPU clocks (P8 -> P0) before comparing candidates so candidate 0 isn't penalized.
     try {
         for (int p = 0; p < 3; ++p) {
-            valid[0].cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+            shortlisted[0].cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
         }
         q_.wait_and_throw();
     } catch (...) {
     }
 
-    const auto shortlisted = shortlist_single_pass(valid);
     bool found = false;
     double best_ms = 1e30;
     for (const auto& fc : shortlisted) {
         try {
-            fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+            fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
             q_.wait_and_throw();
+
+            const auto w0 = std::chrono::steady_clock::now();
+            fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+            q_.wait_and_throw();
+            const double est_ms = std::max(
+                0.01,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            const int batch_reps = std::clamp(static_cast<int>(2.0 / est_ms) + 1, 1, 8);
 
             constexpr int reps = 3;
             double samples[3] = {};
             for (int r = 0; r < reps; ++r) {
                 const auto t0 = std::chrono::steady_clock::now();
-                fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+                for (int b = 0; b < batch_reps; ++b) {
+                    fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+                }
                 q_.wait_and_throw();
                 samples[r] = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count();
+                    std::chrono::steady_clock::now() - t0).count() / static_cast<double>(batch_reps);
             }
             std::sort(samples, samples + reps);
             const double ms = samples[reps / 2];
@@ -2350,7 +2471,7 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::tune_single_pass(
     if (!found && shortlisted.size() < valid.size()) {
         for (const auto& fc : valid) {
             try {
-                fc.cand.launch(q_, d_in, d_out, tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+                fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
                 q_.wait_and_throw();
                 found = true;
                 out_winner = fc.cand;
@@ -2360,9 +2481,6 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::tune_single_pass(
             }
         }
     }
-    if (d_alias_dummy) sycl::free(d_alias_dummy, q_);
-    sycl::free(d_out, q_);
-    sycl::free(d_in, q_);
     out_best_ms = best_ms;
     return found;
 }
@@ -2681,14 +2799,14 @@ void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::configure_plan(size_t max_bs) {
                       launch_cfg_.l2_budget_num, launch_cfg_.l2_budget_den,
                       launch_cfg_.min_waves_per_cu);
         } else {
-            q_.memset(d_in, 0, tune_bs * N_ * sizeof(ComplexT)).wait();
+            q_.memset(d_in, 0x3c, tune_bs * N_ * sizeof(ComplexT)).wait();
 
             auto time_two_pass_cfg = [&](const SplitOption& sp, size_t p0_wg, size_t c_bs, double& out_ms) -> bool {
                 const size_t n1_sz = size_t{1} << sp.n1;
                 auto run_once = [&]() {
                     size_t done = 0;
                     const bool use_vol = (dev_cfg_.backend_tag == "cuda");
-                    const FftCompactParams ep_full{};
+                    const FftCompactParams ep_full{0, 0, d_dummy_deconv_.get(), false};
                     while (done < tune_bs) {
                         const size_t cur = std::min(c_bs, tune_bs - done);
                         SYCL_FFT_SUFFIX(dispatch_pass0_stage)(
