@@ -305,6 +305,7 @@ typedef struct {
 #    define OUT_FROM_FLOAT(v) tls_f16_to_f32((v))
 #    define OUT_TO_DOUBLE(v) ((double)(v))
 #    define OUT_CAST(x) ((float)(x))
+#    define OUT_MUL(a, b) ((a) * (b))
 #    define NUFFT_PSWF_FINISH_SLOTS_OUT CHI2_PREFIX(nufft_pswf_finish_slots_f32)
 #    define NUFFT_PSWF_FINISH_SLOTS_BREADTH_OUT(plan, compact, out, blk, al, rem) \
         CHI2_PREFIX(nufft_pswf_finish_slots_breadth_f32)((plan), (const float *)(const void *)(compact), (out), (blk), (al), (rem))
@@ -318,6 +319,7 @@ typedef BREADTH_VEC OUT_BVEC;
 #    define OUT_FROM_FLOAT(v) (v)
 #    define OUT_TO_DOUBLE(v) TO_DOUBLE((v))
 #    define OUT_CAST(x) FCAST((x))
+#    define OUT_MUL(a, b) MUL((a), (b))
 #    define NUFFT_PSWF_FINISH_SLOTS_OUT NUFFT_PSWF_FINISH_SLOTS
 #    define NUFFT_PSWF_FINISH_SLOTS_BREADTH_OUT(plan, compact, out, blk, al, rem) NUFFT_PSWF_FINISH_SLOTS_BREADTH((plan), (compact), (out), (blk), (al), (rem))
 #endif
@@ -345,6 +347,12 @@ typedef BREADTH_VEC OUT_BVEC;
 #define NUFFT_PSWF_DECONV CHI2_PREFIX(nufft_pswf_deconv)
 #if defined(HALF)
 #    define NUFFT_PSWF_SET_OUTPUT_SCALE CHI2_PREFIX(nufft_pswf_set_output_scale)
+#    define NUFFT_PSWF_INIT_GEO_OPTS CHI2_PREFIX(nufft_pswf_initialize_geo_opts)
+#    define NUFFT_PSWF_IHS_DECONV CHI2_PREFIX(nufft_pswf_deconv_f32)
+#    define NUFFT_PSWF_IHS_SLOT_DECONV CHI2_PREFIX(nufft_pswf_slot_deconv_f32)
+#else
+#    define NUFFT_PSWF_IHS_DECONV NUFFT_PSWF_DECONV
+#    define NUFFT_PSWF_IHS_SLOT_DECONV NUFFT_PSWF_SLOT_DECONV
 #endif
 #define NUFFT_PSWF_INIT_OPTS CHI2_PREFIX(nufft_pswf_initialize_opts)
 #define NUFFT_PSWF_EXEC_BREADTH CHI2_PREFIX(nufft_pswf_execute_breadth)
@@ -1283,97 +1291,136 @@ static inline OUT_FLOAT ihs_wilkie_correct_power(OUT_FLOAT p, double n_eff) {
 #endif
 }
 
-/*
- * IHS forward sweep.  Unlike compute_trig_sums(), this evaluates only the
- * weighted signal transform and accumulates either |Z_k(f)|^2 or the
- * per-harmonic Wilkie-corrected NLL in place.  One NuFFT is executed per
- * harmonic.
- */
-/* Single-harmonic IHS: one NuFFT per block, frequency order throughout.  This
- * is the only path that keeps the classic layout, because deferring the bit
- * reversal cannot save a permutation when there is only one transform. */
-static int ihs_power_sweep_d1(block_ladder *ladder, int N, int block, void *plan, int backend, OUT_FLOAT *power, FLOAT *out_r, FLOAT *out_i, int normalization,
-                              OUT_FLOAT nll_scale, double n_eff) {
-    const size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
-
-    for (int idx = 0; idx < N; ++idx) power[idx] = OUT_CAST(0.0);
-
-    for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
-        const int base = (int)(block_idx * (size_t)block);
-        const int count = (base + block <= N) ? block : (N - base);
-
-        block_ladder_advance(ladder, (int)block_idx);
-        const int status = execute_nufft_block(plan, backend, ladder->srcw_r, ladder->srcw_i, out_r, out_i, 1, TLS_NUFFT_OUT_NATURAL);
-        if (status != CHI2PER_OK) return status;
-
-        if (normalization == TLS_NORM_NLL || normalization == TLS_NORM_IHS_DEFAULT) {
+/* Post-permutation / final per-block IHS normalization helper.
+ * When `post_scale != NULL`, multiplies each bin by `post_scale[k]`
+ * (pre-fused `base_scale * deconv[k]^2`) before Wilkie (d=1 NLL), Erlang
+ * (IHS_DEFAULT / NLL), or the d=1 STANDARD [0, 1) sanity check. */
+static inline void ihs_finalize_block(OUT_FLOAT *dst, int count, int degree, int normalization, OUT_FLOAT standard_scale, double n_eff,
+                                      const OUT_FLOAT *post_scale) {
+    if (normalization == TLS_NORM_STANDARD) {
+        if (post_scale) {
             for (int k = 0; k < count; ++k) {
-#if defined(HALF)
-                float re = tls_f16_to_f32(out_r[k]);
-                float im = tls_f16_to_f32(out_i[k]);
-                float z = (re * re + im * im) * nll_scale;
-                if (normalization == TLS_NORM_NLL) z = ihs_wilkie_correct_power(z, n_eff);
-                power[base + (size_t)k] += z;
-#else
-                FLOAT re = out_r[k];
-                FLOAT im = out_i[k];
-                FLOAT z = MUL(ADD(MUL(re, re), MUL(im, im)), nll_scale);
-                if (normalization == TLS_NORM_NLL) z = ihs_wilkie_correct_power(z, n_eff);
-                power[base + (size_t)k] = ADD(power[base + (size_t)k], z);
-#endif
+                OUT_FLOAT v = OUT_MUL(dst[k], post_scale[k]);
+                if (degree == 1 && (!power_is_finite(v) || OUT_TO_DOUBLE(v) >= 1.0)) v = chi2_out_nan();
+                dst[k] = v;
             }
         } else {
             for (int k = 0; k < count; ++k) {
-#if defined(HALF)
-                float re = tls_f16_to_f32(out_r[k]);
-                float im = tls_f16_to_f32(out_i[k]);
-                power[base + (size_t)k] += re * re + im * im;
-#else
-                FLOAT re = out_r[k];
-                FLOAT im = out_i[k];
-                power[base + (size_t)k] = ADD(power[base + (size_t)k], ADD(MUL(re, re), MUL(im, im)));
-#endif
+                OUT_FLOAT v = OUT_MUL(dst[k], standard_scale);
+                if (degree == 1 && (!power_is_finite(v) || OUT_TO_DOUBLE(v) >= 1.0)) v = chi2_out_nan();
+                dst[k] = v;
             }
         }
+    } else if (normalization == TLS_NORM_NLL && degree == 1) {
+        for (int k = 0; k < count; ++k) {
+            OUT_FLOAT z = post_scale ? OUT_MUL(dst[k], post_scale[k]) : dst[k];
+            if (post_scale) z = ihs_wilkie_correct_power(z, n_eff);
+            OUT_FLOAT v = ihs_correct_power(z, 1);
+            dst[k] = (OUT_TO_DOUBLE(v) >= 0.0) ? v : OUT_CAST(0.0);
+        }
+    } else {
+        for (int k = 0; k < count; ++k) {
+            OUT_FLOAT s = post_scale ? OUT_MUL(dst[k], post_scale[k]) : dst[k];
+            OUT_FLOAT v = ihs_correct_power(s, degree);
+            dst[k] = (OUT_TO_DOUBLE(v) >= 0.0) ? v : OUT_CAST(0.0);
+        }
     }
-    return CHI2PER_OK;
 }
 
-/* Multi-harmonic IHS: the running per-harmonic sum is kept in slot order and
- * permuted once per block, which saves (degree - 1) permutations per block. */
-static int ihs_power_sweep_deferred(block_ladder *ladder, int N, int block, int degree, void *plan, int backend, OUT_FLOAT *power, FLOAT *out_r, FLOAT *out_i,
-                                    int defer, int normalization, OUT_FLOAT nll_scale, double n_eff) {
+/*
+ * Depth-wise IHS sweep for all degrees d >= 1.
+ *
+ * When `defer != 0` on a PSWF backend, full blocks run in slot order
+ * (even for d = 1, where one real bit-reversal of |Z|^2 replaces two
+ * Nfft complex-component permutations).  Under TLS_IHS_DECONV_POST (default):
+ *   - STANDARD, IHS_DEFAULT, and d = 1 NLL skip NuFFT deconvolution entirely,
+ *     sum raw |Z_q|^2 in slot order, permute once, then multiply by
+ *     `scale * deconv[k]^2` in natural order before Wilkie / Erlang.
+ *   - d >= 2 NLL skips NuFFT (re, im) deconvolution via TLS_NUFFT_OUT_SLOTS_RAW
+ *     and multiplies |Z_q|^2 by precomputed `nll_scale * slot_deconv[k]^2`
+ *     before the per-harmonic nonlinear Wilkie correction, then permutes once.
+ */
+static int ihs_power_sweep_depth(block_ladder *ladder, int N, int block, int degree, void *plan, int backend, OUT_FLOAT *power, FLOAT *out_r, FLOAT *out_i,
+                                 int defer, int normalization, OUT_FLOAT standard_scale, OUT_FLOAT nll_scale, double n_eff) {
     const size_t num_blocks = ((size_t)N + (size_t)block - 1) / (size_t)block;
-    OUT_FLOAT *acc_block = (OUT_FLOAT *)checked_aligned_malloc((size_t)block, sizeof(OUT_FLOAT));
-    if (!acc_block) return CHI2PER_ERR_ALLOC;
+    const bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
+    const bool want_post = (defer && use_pswf && tls_tuning_ihs_deconv() == TLS_IHS_DECONV_POST);
+    const bool nll_multi_post = (want_post && normalization == TLS_NORM_NLL && degree > 1);
+    const bool post_after_perm = (want_post && !nll_multi_post);
 
-    for (int idx = 0; idx < N; ++idx) power[idx] = OUT_CAST(0.0);
+    OUT_FLOAT *acc_block = defer ? (OUT_FLOAT *)checked_aligned_malloc((size_t)block, sizeof(OUT_FLOAT)) : NULL;
+    OUT_FLOAT *post_scale = post_after_perm ? (OUT_FLOAT *)checked_aligned_malloc((size_t)block, sizeof(OUT_FLOAT)) : NULL;
+    OUT_FLOAT *slot_scale = nll_multi_post ? (OUT_FLOAT *)checked_aligned_malloc((size_t)block, sizeof(OUT_FLOAT)) : NULL;
+    if ((defer && !acc_block) || (post_after_perm && !post_scale) || (nll_multi_post && !slot_scale)) {
+        nanofft_aligned_free(acc_block);
+        nanofft_aligned_free(post_scale);
+        nanofft_aligned_free(slot_scale);
+        return CHI2PER_ERR_ALLOC;
+    }
+
+    if (post_after_perm) {
+        const OUT_FLOAT *deconv = NUFFT_PSWF_IHS_DECONV((const PSWF_PLAN_T *)plan);
+        const OUT_FLOAT base_scale = (normalization == TLS_NORM_STANDARD) ? standard_scale : nll_scale;
+        for (int k = 0; k < block; ++k) {
+            const OUT_FLOAT d = deconv[k];
+            post_scale[k] = OUT_MUL(base_scale, OUT_MUL(d, d));
+        }
+    } else if (nll_multi_post) {
+        const OUT_FLOAT *sdec = NUFFT_PSWF_IHS_SLOT_DECONV((PSWF_PLAN_T *)plan);
+        for (int k = 0; k < block; ++k) {
+            const OUT_FLOAT d = sdec[k];
+            slot_scale[k] = OUT_MUL(nll_scale, OUT_MUL(d, d));
+        }
+    }
 
     for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
         const int base = (int)(block_idx * (size_t)block);
         const int count = (base + block <= N) ? block : (N - base);
         const int slot_block = (defer && count == block) ? 1 : 0;
-#if !defined(HALF)
-        const int raw_slots = (slot_block && normalization != TLS_NORM_NLL) ? 1 : 0;
-        const int mode = raw_slots ? TLS_NUFFT_OUT_SLOTS_RAW : (slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL);
-#else
-        const int mode = slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL;
-#endif
+        const bool block_post_perm = (slot_block && post_after_perm);
+        const bool block_nll_multi = (slot_block && nll_multi_post);
+        const int mode = (block_post_perm || block_nll_multi) ? TLS_NUFFT_OUT_SLOTS_RAW : (slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL);
 
         block_ladder_advance(ladder, (int)block_idx);
-        if (slot_block) {
-            for (int k = 0; k < count; ++k) acc_block[k] = OUT_CAST(0.0);
-        }
+        OUT_FLOAT *acc = slot_block ? acc_block : (power + base);
+        for (int k = 0; k < count; ++k) acc[k] = OUT_CAST(0.0);
 
         for (int q = 1; q <= degree; ++q) {
             const size_t src_off = (size_t)(q - 1) * (size_t)ladder->levels * (size_t)ladder->M;
             const int status = execute_nufft_block(plan, backend, ladder->srcw_r + src_off, ladder->srcw_i + src_off, out_r, out_i, q, mode);
             if (status != CHI2PER_OK) {
                 nanofft_aligned_free(acc_block);
+                nanofft_aligned_free(post_scale);
+                nanofft_aligned_free(slot_scale);
                 return status;
             }
-            OUT_FLOAT *acc = slot_block ? acc_block : power + base;
-            if (normalization == TLS_NORM_NLL || normalization == TLS_NORM_IHS_DEFAULT) {
+            if (block_post_perm || normalization == TLS_NORM_STANDARD) {
+                for (int k = 0; k < count; ++k) {
+#if defined(HALF)
+                    float re = tls_f16_to_f32(out_r[k]);
+                    float im = tls_f16_to_f32(out_i[k]);
+                    acc[k] += re * re + im * im;
+#else
+                    FLOAT re = out_r[k];
+                    FLOAT im = out_i[k];
+                    acc[k] = ADD(acc[k], ADD(MUL(re, re), MUL(im, im)));
+#endif
+                }
+            } else if (block_nll_multi) {
+                for (int k = 0; k < count; ++k) {
+#if defined(HALF)
+                    float re = tls_f16_to_f32(out_r[k]);
+                    float im = tls_f16_to_f32(out_i[k]);
+                    float z = (re * re + im * im) * slot_scale[k];
+                    acc[k] += ihs_wilkie_correct_power(z, n_eff);
+#else
+                    FLOAT re = out_r[k];
+                    FLOAT im = out_i[k];
+                    FLOAT z = MUL(ADD(MUL(re, re), MUL(im, im)), slot_scale[k]);
+                    acc[k] = ADD(acc[k], ihs_wilkie_correct_power(z, n_eff));
+#endif
+                }
+            } else {
                 for (int k = 0; k < count; ++k) {
 #if defined(HALF)
                     float re = tls_f16_to_f32(out_r[k]);
@@ -1389,60 +1436,56 @@ static int ihs_power_sweep_deferred(block_ladder *ladder, int N, int block, int 
                     acc[k] = ADD(acc[k], z);
 #endif
                 }
-            } else {
-                for (int k = 0; k < count; ++k) {
-#if defined(HALF)
-                    float re = tls_f16_to_f32(out_r[k]);
-                    float im = tls_f16_to_f32(out_i[k]);
-                    acc[k] += re * re + im * im;
-#else
-                    FLOAT re = out_r[k];
-                    FLOAT im = out_i[k];
-                    acc[k] = ADD(acc[k], ADD(MUL(re, re), MUL(im, im)));
-#endif
-                }
             }
         }
 
-        if (slot_block) {
-            NUFFT_PSWF_FINISH_SLOTS_OUT((PSWF_PLAN_T *)plan, acc_block, power + base, count);
-#if !defined(HALF)
-            if (raw_slots) {
-                const FLOAT *deconv = NUFFT_PSWF_DECONV((const PSWF_PLAN_T *)plan);
-                for (int k = 0; k < count; ++k) {
-                    FLOAT d = deconv[k];
-                    power[base + k] = MUL(power[base + k], MUL(d, d));
-                }
-            }
-#endif
-        }
+        if (slot_block) NUFFT_PSWF_FINISH_SLOTS_OUT((PSWF_PLAN_T *)plan, acc_block, power + base, count);
+        ihs_finalize_block(power + base, count, degree, normalization, standard_scale, n_eff, block_post_perm ? post_scale : NULL);
     }
 
     nanofft_aligned_free(acc_block);
+    nanofft_aligned_free(post_scale);
+    nanofft_aligned_free(slot_scale);
     return CHI2PER_OK;
 }
 
 static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, double f0, int N, int block, int degree, void *plan, int backend, OUT_FLOAT *power,
-                                   int defer, int normalization, OUT_FLOAT nll_scale, double n_eff) {
+                                   int defer, int normalization, OUT_FLOAT standard_scale, OUT_FLOAT nll_scale, double n_eff) {
     const size_t num_blocks = ((size_t)N + (size_t)block - 1u) / (size_t)block;
     const bool use_pswf = (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21);
-    const int slot_block = (degree > 1 && defer && use_pswf) ? 1 : 0;
-#if !defined(HALF)
-    const int raw_slots = (slot_block && normalization != TLS_NORM_NLL) ? 1 : 0;
-    const int mode = raw_slots ? TLS_NUFFT_OUT_SLOTS_RAW : (slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL);
-    const FLOAT *deconv = raw_slots ? NUFFT_PSWF_DECONV((const PSWF_PLAN_T *)plan) : NULL;
-#else
-    const int mode = slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL;
-#endif
+    const int slot_block = (defer && use_pswf) ? 1 : 0;
+    const bool want_post = (slot_block && tls_tuning_ihs_deconv() == TLS_IHS_DECONV_POST);
+    const bool nll_multi_post = (want_post && normalization == TLS_NORM_NLL && degree > 1);
+    const bool post_after_perm = (want_post && !nll_multi_post);
+    const int mode = want_post ? TLS_NUFFT_OUT_SLOTS_RAW : (slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL);
 
     BREADTH_VEC *out_r = (BREADTH_VEC *)checked_aligned_malloc((size_t)block, sizeof(BREADTH_VEC));
     BREADTH_VEC *out_i = (BREADTH_VEC *)checked_aligned_malloc((size_t)block, sizeof(BREADTH_VEC));
     OUT_BVEC *acc_b = (OUT_BVEC *)checked_aligned_malloc((size_t)block, sizeof(OUT_BVEC));
-    if (!out_r || !out_i || !acc_b) {
+    OUT_FLOAT *post_scale = post_after_perm ? (OUT_FLOAT *)checked_aligned_malloc((size_t)block, sizeof(OUT_FLOAT)) : NULL;
+    OUT_FLOAT *slot_scale = nll_multi_post ? (OUT_FLOAT *)checked_aligned_malloc((size_t)block, sizeof(OUT_FLOAT)) : NULL;
+    if (!out_r || !out_i || !acc_b || (post_after_perm && !post_scale) || (nll_multi_post && !slot_scale)) {
         nanofft_aligned_free(out_r);
         nanofft_aligned_free(out_i);
         nanofft_aligned_free(acc_b);
+        nanofft_aligned_free(post_scale);
+        nanofft_aligned_free(slot_scale);
         return CHI2PER_ERR_ALLOC;
+    }
+
+    if (post_after_perm) {
+        const OUT_FLOAT *deconv = NUFFT_PSWF_IHS_DECONV((const PSWF_PLAN_T *)plan);
+        const OUT_FLOAT base_scale = (normalization == TLS_NORM_STANDARD) ? standard_scale : nll_scale;
+        for (int k = 0; k < block; ++k) {
+            const OUT_FLOAT d = deconv[k];
+            post_scale[k] = OUT_MUL(base_scale, OUT_MUL(d, d));
+        }
+    } else if (nll_multi_post) {
+        const OUT_FLOAT *sdec = NUFFT_PSWF_IHS_SLOT_DECONV((PSWF_PLAN_T *)plan);
+        for (int k = 0; k < block; ++k) {
+            const OUT_FLOAT d = sdec[k];
+            slot_scale[k] = OUT_MUL(nll_scale, OUT_MUL(d, d));
+        }
     }
 
 #if !defined(HALF)
@@ -1463,7 +1506,25 @@ static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, doub
             if (status != CHI2PER_OK) goto done;
 
 #if defined(HALF)
-            if (normalization == TLS_NORM_NLL) {
+            if (post_after_perm || normalization == TLS_NORM_STANDARD) {
+                for (int k = 0; k < block; ++k) {
+                    for (int l = 0; l < active_lanes; ++l) {
+                        float re = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_r[k], l));
+                        float im = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_i[k], l));
+                        acc_b[k].elems[l] += re * re + im * im;
+                    }
+                }
+            } else if (nll_multi_post) {
+                for (int k = 0; k < block; ++k) {
+                    const float sk = slot_scale[k];
+                    for (int l = 0; l < active_lanes; ++l) {
+                        float re = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_r[k], l));
+                        float im = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_i[k], l));
+                        float z = ihs_wilkie_correct_power((re * re + im * im) * sk, n_eff);
+                        acc_b[k].elems[l] += z;
+                    }
+                }
+            } else if (normalization == TLS_NORM_NLL) {
                 for (int k = 0; k < block; ++k) {
                     for (int l = 0; l < active_lanes; ++l) {
                         float re = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_r[k], l));
@@ -1472,7 +1533,7 @@ static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, doub
                         acc_b[k].elems[l] += z;
                     }
                 }
-            } else if (normalization == TLS_NORM_IHS_DEFAULT) {
+            } else {
                 for (int k = 0; k < block; ++k) {
                     for (int l = 0; l < active_lanes; ++l) {
                         float re = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_r[k], l));
@@ -1480,17 +1541,28 @@ static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, doub
                         acc_b[k].elems[l] += (re * re + im * im) * nll_scale;
                     }
                 }
-            } else {
-                for (int k = 0; k < block; ++k) {
-                    for (int l = 0; l < active_lanes; ++l) {
-                        float re = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_r[k], l));
-                        float im = tls_f16_to_f32(BVEC_STORE_GET_LANE(out_i[k], l));
-                        acc_b[k].elems[l] += re * re + im * im;
-                    }
-                }
             }
 #else
-            if (normalization == TLS_NORM_NLL) {
+            if (post_after_perm || normalization == TLS_NORM_STANDARD) {
+                for (int k = 0; k < block; ++k) {
+                    const BREADTH_COMPUTE_VEC re = LOAD_BVEC(&out_r[k]);
+                    const BREADTH_COMPUTE_VEC im = LOAD_BVEC(&out_i[k]);
+                    const BREADTH_COMPUTE_VEC p2 = BREADTH_ADD(BREADTH_MUL(re, re), BREADTH_MUL(im, im));
+                    STORE_BVEC(&acc_b[k], BREADTH_ADD(LOAD_BVEC(&acc_b[k]), p2));
+                }
+            } else if (nll_multi_post) {
+                for (int k = 0; k < block; ++k) {
+                    const BREADTH_COMPUTE_VEC re = LOAD_BVEC(&out_r[k]);
+                    const BREADTH_COMPUTE_VEC im = LOAD_BVEC(&out_i[k]);
+                    const BREADTH_COMPUTE_VEC zv = BREADTH_MUL_S(BREADTH_ADD(BREADTH_MUL(re, re), BREADTH_MUL(im, im)), slot_scale[k]);
+                    BREADTH_COMPUTE_VEC acc = LOAD_BVEC(&acc_b[k]);
+                    for (int l = 0; l < active_lanes; ++l) {
+                        FLOAT z = ihs_wilkie_correct_power(BREADTH_GET_LANE(zv, l), n_eff);
+                        BREADTH_SET_LANE(acc, l, ADD(BREADTH_GET_LANE(acc, l), z));
+                    }
+                    STORE_BVEC(&acc_b[k], acc);
+                }
+            } else if (normalization == TLS_NORM_NLL) {
                 for (int k = 0; k < block; ++k) {
                     const BREADTH_COMPUTE_VEC re = LOAD_BVEC(&out_r[k]);
                     const BREADTH_COMPUTE_VEC im = LOAD_BVEC(&out_i[k]);
@@ -1502,19 +1574,12 @@ static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, doub
                     }
                     STORE_BVEC(&acc_b[k], acc);
                 }
-            } else if (normalization == TLS_NORM_IHS_DEFAULT) {
+            } else {
                 for (int k = 0; k < block; ++k) {
                     const BREADTH_COMPUTE_VEC re = LOAD_BVEC(&out_r[k]);
                     const BREADTH_COMPUTE_VEC im = LOAD_BVEC(&out_i[k]);
                     const BREADTH_COMPUTE_VEC zv = BREADTH_MUL(BREADTH_ADD(BREADTH_MUL(re, re), BREADTH_MUL(im, im)), v_nll_scale);
                     STORE_BVEC(&acc_b[k], BREADTH_ADD(LOAD_BVEC(&acc_b[k]), zv));
-                }
-            } else {
-                for (int k = 0; k < block; ++k) {
-                    const BREADTH_COMPUTE_VEC re = LOAD_BVEC(&out_r[k]);
-                    const BREADTH_COMPUTE_VEC im = LOAD_BVEC(&out_i[k]);
-                    const BREADTH_COMPUTE_VEC p2 = BREADTH_ADD(BREADTH_MUL(re, re), BREADTH_MUL(im, im));
-                    STORE_BVEC(&acc_b[k], BREADTH_ADD(LOAD_BVEC(&acc_b[k]), p2));
                 }
             }
 #endif
@@ -1522,20 +1587,6 @@ static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, doub
 
         if (slot_block) {
             NUFFT_PSWF_FINISH_SLOTS_BREADTH_OUT((PSWF_PLAN_T *)plan, acc_b, power + base, block, active_lanes, total_remaining);
-#if !defined(HALF)
-            if (raw_slots && deconv) {
-                for (int v = 0; v < active_lanes; ++v) {
-                    const int rem = total_remaining - v * block;
-                    if (rem <= 0) break;
-                    const int count_v = (rem < block) ? rem : block;
-                    OUT_FLOAT *dst = power + base + (size_t)v * (size_t)block;
-                    for (int k = 0; k < count_v; ++k) {
-                        FLOAT d = deconv[k];
-                        dst[k] = MUL(dst[k], MUL(d, d));
-                    }
-                }
-            }
-#endif
         } else {
             for (int v = 0; v < active_lanes; ++v) {
                 const int rem = total_remaining - v * block;
@@ -1545,12 +1596,22 @@ static int ihs_power_sweep_breadth(const NUFFT_INPUT_T *x, const FLOAT *wy, doub
                 for (int k = 0; k < count_v; ++k) dst[k] = OUT_BVEC_GET_LANE(acc_b[k], v);
             }
         }
+
+        for (int v = 0; v < active_lanes; ++v) {
+            const int rem = total_remaining - v * block;
+            if (rem <= 0) break;
+            const int count_v = (rem < block) ? rem : block;
+            ihs_finalize_block(power + base + (size_t)v * (size_t)block, count_v, degree, normalization, standard_scale, n_eff,
+                               post_after_perm ? post_scale : NULL);
+        }
     }
 
 done:
     nanofft_aligned_free(out_r);
     nanofft_aligned_free(out_i);
     nanofft_aligned_free(acc_b);
+    nanofft_aligned_free(post_scale);
+    nanofft_aligned_free(slot_scale);
     return status;
 }
 
@@ -2007,7 +2068,8 @@ static int solve_periodogram_svd_vec(const FLOAT *Sw, const FLOAT *Cw, const FLO
 static int solve_periodogram_vec(const FLOAT *Sw, const FLOAT *Cw, const FLOAT *Syw, const FLOAT *Cyw, int N, int degree, int solver, FLOAT chi2_ref,
                                  int normalization, int M, const cybenko_model_t *cyb, OUT_FLOAT b, const FLOAT *dot_scale, OUT_FLOAT *power, OUT_FLOAT *cond,
                                  toep_workspace *ws) {
-    if (solver == CHI2PER_SOLVER_LDLT) return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, dot_scale, power, cond);
+    if (solver == CHI2PER_SOLVER_LDLT)
+        return solve_periodogram_ldlt_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, dot_scale, power, cond);
     if (solver == CHI2PER_SOLVER_SVD) return solve_periodogram_svd_vec(Sw, Cw, Syw, Cyw, N, degree, chi2_ref, normalization, M, cyb, b, dot_scale, power, cond);
 
     const int norder = 2 * degree + 1;
@@ -2502,7 +2564,7 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
     }
 
     const double row_scale_d = (double)nfft / ws_d;
-    const bool merge_row_scale = use_pswf && (row_scale_d < 32768.0);
+    const bool merge_row_scale = use_pswf && (row_scale_d < 32768.0) && (tls_tuning_ihs_deconv() == TLS_IHS_DECONV_POST);
 
     if (backend == CHI2PER_BACKEND_PSWF43) {
         plan = NUFFT_PSWF_INIT_OPTS(M, plan_block, NUFFT_W43, df, max_factor, "43", spread_mode, vec_mode);
@@ -2680,9 +2742,10 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
         const FLOAT *slot_phi = NULL;
         const FLOAT *slot_dec = NULL;
 #else
-        const int mode = slot_block ? TLS_NUFFT_OUT_SLOTS_RAW : TLS_NUFFT_OUT_NATURAL;
-        const FLOAT *slot_phi = slot_block ? NUFFT_PSWF_SLOT_PHI_HAT((PSWF_PLAN_T *)plan) : NULL;
-        const FLOAT *slot_dec = slot_block ? NUFFT_PSWF_SLOT_DECONV((PSWF_PLAN_T *)plan) : NULL;
+        const bool raw_slots = (slot_block && tls_tuning_ihs_deconv() == TLS_IHS_DECONV_POST);
+        const int mode = raw_slots ? TLS_NUFFT_OUT_SLOTS_RAW : (slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL);
+        const FLOAT *slot_phi = raw_slots ? NUFFT_PSWF_SLOT_PHI_HAT((PSWF_PLAN_T *)plan) : NULL;
+        const FLOAT *slot_dec = raw_slots ? NUFFT_PSWF_SLOT_DECONV((PSWF_PLAN_T *)plan) : NULL;
 #endif
         const BREADTH_COMPUTE_VEC v_ws = BREADTH_SPLAT(ws_fft);
         const BREADTH_COMPUTE_VEC v_yws = BREADTH_SPLAT(yws_fft);
@@ -2805,9 +2868,10 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
         const FLOAT *slot_phi = NULL;
         const FLOAT *slot_dec = NULL;
 #else
-        const int mode = slot_block ? TLS_NUFFT_OUT_SLOTS_RAW : TLS_NUFFT_OUT_NATURAL;
-        const FLOAT *slot_phi = slot_block ? NUFFT_PSWF_SLOT_PHI_HAT((PSWF_PLAN_T *)plan) : NULL;
-        const FLOAT *slot_dec = slot_block ? NUFFT_PSWF_SLOT_DECONV((PSWF_PLAN_T *)plan) : NULL;
+        const bool raw_slots = (slot_block && tls_tuning_ihs_deconv() == TLS_IHS_DECONV_POST);
+        const int mode = raw_slots ? TLS_NUFFT_OUT_SLOTS_RAW : (slot_block ? TLS_NUFFT_OUT_SLOTS : TLS_NUFFT_OUT_NATURAL);
+        const FLOAT *slot_phi = raw_slots ? NUFFT_PSWF_SLOT_PHI_HAT((PSWF_PLAN_T *)plan) : NULL;
+        const FLOAT *slot_dec = raw_slots ? NUFFT_PSWF_SLOT_DECONV((PSWF_PLAN_T *)plan) : NULL;
 #endif
 
         block_ladder_advance(&ladder, (int)block_idx);
@@ -2875,8 +2939,8 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
 
         int block_status;
         if (degree == 1) {
-            block_status = gls_impl(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, ws_fft, yws_fft, chi2_ref, normalization, M, &cyb, b, slot_dec, power_block,
-                                    cond_block);
+            block_status =
+                gls_impl(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, ws_fft, yws_fft, chi2_ref, normalization, M, &cyb, b, slot_dec, power_block, cond_block);
         } else {
             block_status = solve_periodogram_vec(rows.Sw, rows.Cw, rows.Syw, rows.Cyw, count, degree, solver, chi2_ref, normalization, M, &cyb, b, slot_dec,
                                                  power_block, cond_block, &workspace);
@@ -3256,14 +3320,22 @@ int CHI2_PREFIX(ihs_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
 #endif
 
     if (backend == CHI2PER_BACKEND_PSWF43) {
+#if defined(HALF)
+        plan = NUFFT_PSWF_INIT_GEO_OPTS(M, plan_block, NUFFT_W43, df, degree, "43", spread_mode, vec_mode);
+#else
         plan = NUFFT_PSWF_INIT_OPTS(M, plan_block, NUFFT_W43, df, degree, "43", spread_mode, vec_mode);
+#endif
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
         }
         NUFFT_PSWF_PRE((PSWF_PLAN_T *)plan, x);
     } else if (backend == CHI2PER_BACKEND_PSWF21) {
+#if defined(HALF)
+        plan = NUFFT_PSWF_INIT_GEO_OPTS(M, plan_block, NUFFT_W21, df, degree, "21", spread_mode, vec_mode);
+#else
         plan = NUFFT_PSWF_INIT_OPTS(M, plan_block, NUFFT_W21, df, degree, "21", spread_mode, vec_mode);
+#endif
         if (!plan) {
             status = CHI2PER_ERR_ALLOC;
             goto cleanup;
@@ -3278,18 +3350,14 @@ int CHI2_PREFIX(ihs_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         NUFFT_LRA_PRE((LRA_PLAN_T *)plan, x, M, block, NUFFT_RANK);
     }
 
+    const int defer = (tls_tuning_defer() != 0 && use_pswf && NUFFT_PSWF_SLOTS_AVAILABLE((PSWF_PLAN_T *)plan)) ? 1 : 0;
     if (use_breadth) {
-        const int defer = (tls_tuning_defer() != 0 && use_pswf && NUFFT_PSWF_SLOTS_AVAILABLE((PSWF_PLAN_T *)plan)) ? 1 : 0;
-        status = ihs_power_sweep_breadth(x, wy, f0, N, block, degree, plan, backend, power, defer, normalization, nll_scale, norm_neff_d);
+        status = ihs_power_sweep_breadth(x, wy, f0, N, block, degree, plan, backend, power, defer, normalization, standard_scale, nll_scale, norm_neff_d);
     } else {
         status = block_ladder_init(&ladder, x, wy, NULL, M, degree, 0, block, ladder_levels, backend, f0, df);
         if (status == CHI2PER_OK) {
-            if (degree == 1) {
-                status = ihs_power_sweep_d1(&ladder, N, block, plan, backend, power, out_r, out_i, normalization, nll_scale, norm_neff_d);
-            } else {
-                const int defer = (tls_tuning_defer() != 0 && use_pswf && NUFFT_PSWF_SLOTS_AVAILABLE((PSWF_PLAN_T *)plan)) ? 1 : 0;
-                status = ihs_power_sweep_deferred(&ladder, N, block, degree, plan, backend, power, out_r, out_i, defer, normalization, nll_scale, norm_neff_d);
-            }
+            status = ihs_power_sweep_depth(&ladder, N, block, degree, plan, backend, power, out_r, out_i, defer, normalization, standard_scale, nll_scale,
+                                           norm_neff_d);
         }
     }
 
@@ -3299,21 +3367,6 @@ int CHI2_PREFIX(ihs_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOAT *dy
         } else {
             tls_tuning_report_work_bytes(
                 (unsigned long long)((size_t)degree * (size_t)ladder_levels * (size_t)M * 4u * sizeof(FLOAT) + (size_t)2 * (size_t)block * sizeof(FLOAT)));
-        }
-        if (normalization == TLS_NORM_STANDARD) {
-            for (int idx = 0; idx < N; ++idx) {
-#if defined(HALF)
-                power[idx] *= standard_scale;
-#else
-                power[idx] = MUL(power[idx], standard_scale);
-#endif
-                if (degree == 1 && (!power_is_finite(power[idx]) || OUT_TO_DOUBLE(power[idx]) >= 1.0)) power[idx] = chi2_out_nan();
-            }
-        } else {
-            for (int idx = 0; idx < N; ++idx) {
-                power[idx] = ihs_correct_power(power[idx], degree);
-                if (!(OUT_TO_DOUBLE(power[idx]) >= 0.0)) power[idx] = OUT_CAST(0.0);
-            }
         }
     }
 

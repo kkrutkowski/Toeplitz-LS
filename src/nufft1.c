@@ -102,10 +102,12 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #        define NANOFFT_EXECUTE nanoffth_nat_execute
 #        define NANOFFT_EXECUTE_RAW nanoffth_nat_execute_raw
 #        define NANOFFT_PERMUTE_1D nanoffth_nat_permute_1d
+#        define NANOFFT_PERMUTE_1D_F32 nanoffth_nat_permute_1d_f32
 #        define NANOFFT_MAKE_PLAN_BREADTH nanoffth_nat_make_plan_breadth
 #        define NANOFFT_EXECUTE_BREADTH nanoffth_nat_execute_breadth
 #        define NANOFFT_EXECUTE_RAW_BREADTH nanoffth_nat_execute_raw_breadth
 #        define NANOFFT_PERMUTE_1D_BREADTH nanoffth_nat_permute_1d_breadth
+#        define NANOFFT_PERMUTE_1D_BREADTH_F32 nanoffth_nat_permute_1d_breadth_f32
 #        define NANOFFT_DESTROY_PLAN nanoffth_nat_destroy_plan
 #    else
 #        define PFX(name) tlsh_nufft_##name
@@ -114,10 +116,12 @@ static void get_lra_params(const nufft_input_t *x, int Mpoints, int Nfft, int *T
 #        define NANOFFT_EXECUTE nanoffth_execute
 #        define NANOFFT_EXECUTE_RAW nanoffth_execute_raw
 #        define NANOFFT_PERMUTE_1D nanoffth_permute_1d
+#        define NANOFFT_PERMUTE_1D_F32 nanoffth_permute_1d_f32
 #        define NANOFFT_MAKE_PLAN_BREADTH nanoffth_make_plan_breadth
 #        define NANOFFT_EXECUTE_BREADTH nanoffth_execute_breadth
 #        define NANOFFT_EXECUTE_RAW_BREADTH nanoffth_execute_raw_breadth
 #        define NANOFFT_PERMUTE_1D_BREADTH nanoffth_permute_1d_breadth
+#        define NANOFFT_PERMUTE_1D_BREADTH_F32 nanoffth_permute_1d_breadth_f32
 #        define NANOFFT_DESTROY_PLAN nanoffth_destroy_plan
 #    endif
 #    define LRA_BESSEL_TERMS 4
@@ -1062,6 +1066,12 @@ struct PFX(pswf_plan) {
     BREADTH_VEC *bperm_scratch;
 #if defined(HALF)
     double output_scale;
+    int use_geo_scale;
+    double kernel_scale_d;
+    float *deconv_f32;
+    float *slot_deconv_compact_f32;
+    float *perm_scratch_f32;
+    float *bperm_scratch_f32;
 #else
     FLOAT kernel_scale;
     FLOAT *phi_hat;
@@ -1135,7 +1145,8 @@ static inline int PFX(pswf_kernel_scale_exp)(int w, bool mode43, bool is_ppoly) 
 static inline FLOAT PFX(pswf_log_scale)(int e) { return MUL(FCAST(e), FCONST(0.69314718055994529, 2.3190468138462996e-17)); }
 #endif
 
-static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
+#if defined(HALF)
+static inline FLOAT PFX(pswf0_impl)(FLOAT z, int w, bool mode43, bool apply_exp_scale) {
     int safe_w = w;
     if (safe_w < 1) safe_w = 1;
     if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
@@ -1144,46 +1155,34 @@ static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
     const FLOAT *coeffs = NULL;
     int deg = 0;
     FLOAT c = FCAST(0.0);
-#if defined(HALF)
-    const FLOAT log_scale = PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false));
-#endif
+    const FLOAT log_scale = apply_exp_scale ? PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false)) : FCAST(0.0);
 
     if (PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c)) {
         FLOAT poly = coeffs[deg];
         for (int i = deg - 1; i >= 0; --i) poly = M_FMA(poly, Z, coeffs[i]);
 
-#if defined(HALF)
         return MUL(M_EXP(ADD(log_scale, MUL(MUL(NEG(c), Z), FCAST(0.5)))), poly);
-#else
-        return MUL(M_EXP(MUL(MUL(NEG(c), Z), FCAST(0.5))), poly);
-#endif
     } else {
         FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
         FLOAT inner = SUB(FCAST(1.0), Z);
         if (TO_DOUBLE(inner) < 0.0) inner = FCAST(0.0);
 
-#if defined(HALF)
         return M_EXP(ADD(log_scale, MUL(beta, SUB(M_SQRT(inner), FCAST(1.0)))));
-#else
-        return M_EXP(MUL(beta, SUB(M_SQRT(inner), FCAST(1.0))));
-#endif
     }
 }
 
-static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict__ out_arr, int n, int w, bool mode43) {
+static void PFX(pswf0_batch_impl)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict__ out_arr, int n, int w, bool mode43, bool apply_exp_scale) {
     int safe_w = w;
     if (safe_w < 1) safe_w = 1;
     if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
 
-#if INTERNAL_VEC_LEN > 1
+#    if INTERNAL_VEC_LEN > 1
     const FLOAT *coeffs = NULL;
     int deg = 0;
     FLOAT c = FCAST(0.0);
     bool has_lut = PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c);
-#    if defined(HALF)
-    const FLOAT log_scale = PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false));
+    const FLOAT log_scale = apply_exp_scale ? PFX(pswf_log_scale)(PFX(pswf_kernel_scale_exp)(safe_w, mode43, false)) : FCAST(0.0);
     const INTERNAL_VEC v_log_scale = IVEC_SPLAT(log_scale);
-#    endif
 
     int n_vec = n - (n % INTERNAL_VEC_LEN);
 
@@ -1197,11 +1196,7 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
             INTERNAL_VEC v_poly = IVEC_SPLAT(coeffs[deg]);
             for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), IVEC_SPLAT(coeffs[j]));
 
-#    if defined(HALF)
             INTERNAL_VEC v_result = MUL(M_EXP(ADD(v_log_scale, MUL(v_Z, v_neg_c_half))), v_poly);
-#    else
-            INTERNAL_VEC v_result = MUL(M_EXP(MUL(v_Z, v_neg_c_half)), v_poly);
-#    endif
             STORE_VEC(&out_arr[i], v_result);
         }
     } else {
@@ -1218,20 +1213,96 @@ static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict_
                 if (v_inner[lane] < (IVEC_SCALAR)0.0) v_inner[lane] = (IVEC_SCALAR)0.0;
             }
 
-#    if defined(HALF)
             INTERNAL_VEC v_result = M_EXP(ADD(v_log_scale, MUL(v_beta, SUB(M_SQRT(v_inner), v_one))));
+            STORE_VEC(&out_arr[i], v_result);
+        }
+    }
+
+    for (int i = n_vec; i < n; ++i) out_arr[i] = PFX(pswf0_impl)(z_arr[i], w, mode43, apply_exp_scale);
 #    else
-            INTERNAL_VEC v_result = M_EXP(MUL(v_beta, SUB(M_SQRT(v_inner), v_one)));
+    for (int i = 0; i < n; ++i) out_arr[i] = PFX(pswf0_impl)(z_arr[i], w, mode43, apply_exp_scale);
 #    endif
+}
+
+static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict__ out_arr, int n, int w, bool mode43) {
+    PFX(pswf0_batch_impl)(z_arr, out_arr, n, w, mode43, true);
+}
+#else
+static inline FLOAT PFX(pswf0)(FLOAT z, int w, bool mode43) {
+    int safe_w = w;
+    if (safe_w < 1) safe_w = 1;
+    if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
+
+    FLOAT Z = MUL(z, z);
+    const FLOAT *coeffs = NULL;
+    int deg = 0;
+    FLOAT c = FCAST(0.0);
+
+    if (PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c)) {
+        FLOAT poly = coeffs[deg];
+        for (int i = deg - 1; i >= 0; --i) poly = M_FMA(poly, Z, coeffs[i]);
+
+        return MUL(M_EXP(MUL(MUL(NEG(c), Z), FCAST(0.5))), poly);
+    } else {
+        FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
+        FLOAT inner = SUB(FCAST(1.0), Z);
+        if (TO_DOUBLE(inner) < 0.0) inner = FCAST(0.0);
+
+        return M_EXP(MUL(beta, SUB(M_SQRT(inner), FCAST(1.0))));
+    }
+}
+
+static void PFX(pswf0_batch)(const FLOAT *__restrict__ z_arr, FLOAT *__restrict__ out_arr, int n, int w, bool mode43) {
+    int safe_w = w;
+    if (safe_w < 1) safe_w = 1;
+    if (safe_w > PSWF_MAX_W) safe_w = PSWF_MAX_W;
+
+#    if INTERNAL_VEC_LEN > 1
+    const FLOAT *coeffs = NULL;
+    int deg = 0;
+    FLOAT c = FCAST(0.0);
+    bool has_lut = PFX(pswf_lut_lookup)(safe_w, mode43, &coeffs, &deg, &c);
+
+    int n_vec = n - (n % INTERNAL_VEC_LEN);
+
+    if (has_lut) {
+        const INTERNAL_VEC v_neg_c_half = IVEC_SPLAT(NEG(MUL(c, FCAST(0.5))));
+
+        for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
+            INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
+            INTERNAL_VEC v_Z = MUL(v_z, v_z);
+
+            INTERNAL_VEC v_poly = IVEC_SPLAT(coeffs[deg]);
+            for (int j = deg - 1; j >= 0; --j) v_poly = ADD(MUL(v_poly, v_Z), IVEC_SPLAT(coeffs[j]));
+
+            INTERNAL_VEC v_result = MUL(M_EXP(MUL(v_Z, v_neg_c_half)), v_poly);
+            STORE_VEC(&out_arr[i], v_result);
+        }
+    } else {
+        FLOAT beta = FCAST((mode43 ? 1.90 : 2.30) * safe_w);
+        INTERNAL_VEC v_one = IVEC_SPLAT(FCAST(1.0));
+        INTERNAL_VEC v_beta = IVEC_SPLAT(beta);
+
+        for (int i = 0; i < n_vec; i += INTERNAL_VEC_LEN) {
+            INTERNAL_VEC v_z = LOAD_VEC(&z_arr[i]);
+            INTERNAL_VEC v_Z = MUL(v_z, v_z);
+            INTERNAL_VEC v_inner = SUB(v_one, v_Z);
+
+            for (int lane = 0; lane < INTERNAL_VEC_LEN; ++lane) {
+                if (v_inner[lane] < (IVEC_SCALAR)0.0) v_inner[lane] = (IVEC_SCALAR)0.0;
+            }
+
+            INTERNAL_VEC v_result = M_EXP(MUL(v_beta, SUB(M_SQRT(v_inner), v_one)));
             STORE_VEC(&out_arr[i], v_result);
         }
     }
 
     for (int i = n_vec; i < n; ++i) out_arr[i] = PFX(pswf0)(z_arr[i], w, mode43);
-#else
+#    else
     for (int i = 0; i < n; ++i) out_arr[i] = PFX(pswf0)(z_arr[i], w, mode43);
-#endif
+#    endif
 }
+#endif
 
 #if !defined(DOUBLE_DOUBLE)
 
@@ -1490,7 +1561,7 @@ static inline double PFX(pswf_leg_eval)(const PFX(pswf_leg_data) * data, double 
  * panels via Type-1 Chebyshev interpolation of exact Legendre psi_0^c.
  * Output layout: coeffs[k * stride + j] with k=0 highest power, k=nc-1 const,
  * nc always even in [4, PSWF_PPOLY_MAX_NC], tail lanes [w..stride-1] zeroed. */
-static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stride, FLOAT **out_coeffs) {
+static bool PFX(pswf_build_ppoly_scaled)(int w, bool mode43, bool use_geo_scale, double xi_max_d, int *out_nc, int *out_stride, FLOAT **out_coeffs) {
     if (w < 1 || w > PSWF_MAX_W) return false;
 
     double c = NANOFFT_PI * (double)w * (mode43 ? 0.625 : 0.75) - 0.05;
@@ -1565,8 +1636,39 @@ static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stri
         if (!coeffs) return false;
         memset(coeffs, 0, (size_t)nc * (size_t)stride * sizeof(FLOAT));
 #    if defined(HALF)
-        const double kernel_scale = ldexp(1.0, PFX(pswf_kernel_scale_exp)(w, mode43, true));
+        double kernel_scale = ldexp(1.0, PFX(pswf_kernel_scale_exp)(w, mode43, true));
+        if (use_geo_scale) {
+            int p_gl = mode43 ? (4 * w + 16) : (int)(1.5 * w + 2);
+            int num_gl = 2 * p_gl;
+            FLOAT *gl_x = PFX(allocate_aligned)(num_gl);
+            FLOAT *gl_w = PFX(allocate_aligned)(num_gl);
+            PFX(get_lege_roots)(num_gl, gl_x, gl_w);
+            double phi0 = 0.0, phi_edge = 0.0;
+            for (int i = 0; i < p_gl; ++i) {
+                double zd = TO_DOUBLE(gl_x[i]);
+                if (zd < -1.0) zd = -1.0;
+                if (zd > 1.0) zd = 1.0;
+                int pj = (int)floor(0.5 * (double)w * (zd + 1.0));
+                if (pj < 0) pj = 0;
+                if (pj >= w) pj = w - 1;
+                double u = (double)w * zd - (double)(2 * pj + 1 - w);
+                double pval = 0.0;
+                for (int kk = nc - 1; kk >= 0; --kk) {
+                    double cv = (kk < nc_fit) ? panel_mono[pj][kk] : 0.0;
+                    pval = pval * u + cv;
+                }
+                double pv = (double)w * TO_DOUBLE(gl_w[i]) * pval;
+                phi0 += pv;
+                phi_edge += pv * cos2pi(xi_max_d * zd);
+            }
+            nanofft_aligned_free(gl_x);
+            nanofft_aligned_free(gl_w);
+            double prod = phi0 * phi_edge;
+            kernel_scale = (prod > 0.0) ? (1.0 / sqrt(prod)) : 1.0;
+        }
 #    else
+        (void)use_geo_scale;
+        (void)xi_max_d;
         const double kernel_scale = 1.0;
 #    endif
         for (int k = 0; k < nc; ++k) {
@@ -1581,6 +1683,10 @@ static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stri
     *out_nc = nc;
     *out_stride = stride;
     return true;
+}
+
+static bool PFX(pswf_build_ppoly)(int w, bool mode43, int *out_nc, int *out_stride, FLOAT **out_coeffs) {
+    return PFX(pswf_build_ppoly_scaled)(w, mode43, false, 0.0, out_nc, out_stride, out_coeffs);
 }
 
 static inline FLOAT PFX(ppoly_eval_scalar)(FLOAT z, int w, int nc, int stride, const FLOAT *coeffs) {
@@ -1874,7 +1980,37 @@ static inline void PFX(ppoly_eval_weights)(FLOAT *NANOFFT_RESTRICT kval, const F
 
 #endif /* !defined(DOUBLE_DOUBLE) */
 
-#if !defined(HALF)
+#if defined(HALF)
+static double PFX(pswf_compute_geo_scale_d)(const struct PFX(pswf_plan) * plan) {
+    bool mode43 = (plan->upsamp[0] == '4' && plan->upsamp[1] == '3');
+    int p = mode43 ? (4 * plan->w + 16) : (int)(1.5 * plan->w + 2);
+    int num_gl_nodes = 2 * p;
+
+    FLOAT *gl_nodes = PFX(allocate_aligned)(num_gl_nodes);
+    FLOAT *gl_weights = PFX(allocate_aligned)(num_gl_nodes);
+    FLOAT *psi_vals = PFX(allocate_aligned)(num_gl_nodes);
+
+    PFX(get_lege_roots)(num_gl_nodes, gl_nodes, gl_weights);
+    PFX(pswf0_batch_impl)(gl_nodes, psi_vals, p, plan->w, mode43, false);
+
+    const double alpha_d = (double)plan->w * 0.5 / (double)plan->Nfft;
+    const double xi_max = alpha_d * (double)plan->output_shift;
+    double phi0 = 0.0;
+    double phi_edge = 0.0;
+    for (int j = 0; j < p; ++j) {
+        double pv = (double)plan->w * TO_DOUBLE(gl_weights[j]) * TO_DOUBLE(psi_vals[j]);
+        phi0 += pv;
+        phi_edge += pv * cos2pi(xi_max * TO_DOUBLE(gl_nodes[j]));
+    }
+
+    nanofft_aligned_free(psi_vals);
+    nanofft_aligned_free(gl_nodes);
+    nanofft_aligned_free(gl_weights);
+
+    double prod = phi0 * phi_edge;
+    return (prod > 0.0) ? (1.0 / sqrt(prod)) : 1.0;
+}
+#else
 /* Exact spreading-kernel scale factor S = 1 / sqrt(phi_0(0) * phi_0(xi_max))
  * so the geometric mean of the band-center and band-edge Fourier transforms
  * equals 1 identically. */
@@ -1918,7 +2054,8 @@ static FLOAT PFX(pswf_compute_geo_scale)(const struct PFX(pswf_plan) * plan) {
 }
 #endif
 
-struct PFX(pswf_plan) * PFX(pswf_initialize_opts)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode, int vec_mode) {
+static struct PFX(pswf_plan) *
+    PFX(pswf_initialize_impl)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode, int vec_mode, int use_geo_scale) {
     if (!upsamp) return NULL;
 
     bool mode21 = (upsamp[0] == '2' && upsamp[1] == '1');
@@ -1943,21 +2080,37 @@ struct PFX(pswf_plan) * PFX(pswf_initialize_opts)(int Mpoints, int N, int w, dou
 #if defined(HALF)
     plan->alpha = FCAST((double)plan->w * 0.5 / (double)plan->Nfft);
     plan->output_scale = 1.0;
+    plan->use_geo_scale = use_geo_scale ? 1 : 0;
+    plan->kernel_scale_d = 1.0;
+    const double xi_max_d = ((double)plan->w * 0.5 / (double)plan->Nfft) * (double)plan->output_shift;
 #else
+    (void)use_geo_scale;
     plan->alpha = DIV(MUL(FCAST(plan->w), FCONST(0.5)), FCAST(plan->Nfft));
+    const double xi_max_d = 0.0;
 #endif
 
 #if !defined(DOUBLE_DOUBLE)
     if (spread_mode == TLS_SPREAD_PIECEWISE) {
-        if (PFX(pswf_build_ppoly)(w, mode43, &plan->ppoly_nc, &plan->ppoly_stride, &plan->ppoly_coeffs)) {
+        if (PFX(pswf_build_ppoly_scaled)(w, mode43, use_geo_scale != 0, xi_max_d, &plan->ppoly_nc, &plan->ppoly_stride, &plan->ppoly_coeffs)) {
             plan->use_ppoly = 1;
         }
     }
 #else
     (void)spread_mode;
+    (void)xi_max_d;
 #endif
 
-#if !defined(HALF)
+#if defined(HALF)
+    if (plan->use_geo_scale) {
+        if (!plan->use_ppoly) plan->kernel_scale_d = PFX(pswf_compute_geo_scale_d)(plan);
+        size_t f32_bytes = (((size_t)plan->Nout * sizeof(float)) + 63u) & ~(size_t)63u;
+        if (f32_bytes < 64u) f32_bytes = 64u;
+        plan->deconv_f32 = (float *)nanofft_aligned_alloc(64, f32_bytes);
+        plan->slot_deconv_compact_f32 = (float *)nanofft_aligned_alloc(64, f32_bytes);
+        if (plan->deconv_f32) memset(plan->deconv_f32, 0, f32_bytes);
+        if (plan->slot_deconv_compact_f32) memset(plan->slot_deconv_compact_f32, 0, f32_bytes);
+    }
+#else
     plan->kernel_scale = PFX(pswf_compute_geo_scale)(plan);
     if (plan->use_ppoly && plan->ppoly_coeffs) {
         size_t ncoeffs = (size_t)plan->ppoly_nc * (size_t)plan->ppoly_stride;
@@ -2026,6 +2179,17 @@ struct PFX(pswf_plan) * PFX(pswf_initialize_opts)(int Mpoints, int N, int w, dou
     plan->perm_scratch = PFX(allocate_aligned)((size_t)plan->slots);
     return plan;
 }
+
+struct PFX(pswf_plan) * PFX(pswf_initialize_opts)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode, int vec_mode) {
+    return PFX(pswf_initialize_impl)(Mpoints, N, w, df, freq_factor, upsamp, spread_mode, vec_mode, 0);
+}
+
+#if defined(HALF)
+struct PFX(pswf_plan) *
+    PFX(pswf_initialize_geo_opts)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode, int vec_mode) {
+    return PFX(pswf_initialize_impl)(Mpoints, N, w, df, freq_factor, upsamp, spread_mode, vec_mode, 1);
+}
+#endif
 
 struct PFX(pswf_plan) * PFX(pswf_initialize_mode)(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode) {
     return PFX(pswf_initialize_opts)(Mpoints, N, w, df, freq_factor, upsamp, spread_mode, TLS_VEC_DEPTH);
@@ -2100,7 +2264,20 @@ static void PFX(pswf_build_slot_tables)(struct PFX(pswf_plan) * plan) {
     plan->period = period;
     plan->nvalid = nvalid;
 
-#if !defined(HALF)
+#if defined(HALF)
+    if (plan->deconv_f32 && plan->slot_deconv_compact_f32) {
+        int s = 0;
+        for (int base = 0; base < nfft; base += period) {
+            for (int k = 0; k < nvalid; ++k) {
+                const int p = base + (int)plan->slot_offsets[k];
+                const int bin = (int)nanofft_reverse_bits((uint32_t)p, log_nfft);
+                const int out_idx = (bin >= first_bin) ? (bin - first_bin) : (bin + plan->output_shift);
+                plan->slot_deconv_compact_f32[s] = plan->deconv_f32[out_idx];
+                ++s;
+            }
+        }
+    }
+#else
     if (plan->phi_hat && plan->slot_phi_hat_compact && plan->slot_deconv_compact) {
         int s = 0;
         for (int base = 0; base < nfft; base += period) {
@@ -2132,8 +2309,15 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
     if (plan->use_ppoly) {
         for (int j = 0; j < p; ++j) precomp_vals[j] = PFX(ppoly_eval_scalar)(gl_nodes[j], plan->w, plan->ppoly_nc, plan->ppoly_stride, plan->ppoly_coeffs);
     } else {
+#    if defined(HALF)
+        if (plan->use_geo_scale) {
+            PFX(pswf0_batch_impl)(gl_nodes, precomp_vals, p, plan->w, mode43, false);
+            for (int j = 0; j < p; ++j) precomp_vals[j] = FCAST(TO_DOUBLE(precomp_vals[j]) * plan->kernel_scale_d);
+        } else {
+            PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w, mode43);
+        }
+#    else
         PFX(pswf0_batch)(gl_nodes, precomp_vals, p, plan->w, mode43);
-#    if !defined(HALF)
         for (int j = 0; j < p; ++j) precomp_vals[j] = MUL(precomp_vals[j], plan->kernel_scale);
 #    endif
     }
@@ -2155,7 +2339,9 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
             for (int j = 0; j < p; ++j) {
                 phi_hat_half += TO_DOUBLE(precomp_vals[j]) * cos2pi(xi_k * TO_DOUBLE(gl_nodes[j]));
             }
-            plan->deconv[k] = FCAST(out_scale / phi_hat_half);
+            const double d_val = out_scale / phi_hat_half;
+            plan->deconv[k] = FCAST(d_val);
+            if (plan->deconv_f32) plan->deconv_f32[k] = (float)d_val;
         }
     }
 #else
@@ -2293,12 +2479,22 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
                         double dist = (double)idx - x_n;
                         z_buf[l] = FCAST((2.0 * dist) / (double)plan->w);
                     }
+#    if defined(HALF)
+                    if (plan->use_geo_scale) {
+                        PFX(pswf0_batch_impl)(z_buf, kval_buf, plan->w, plan->w, mode43, false);
+                        current_first_idx[m] = PFX(positive_mod_int)(m_left, plan->Nfft);
+                        size_t w_base = (size_t)m * (size_t)plan->w;
+                        for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)l] = FCAST(TO_DOUBLE(kval_buf[l]) * plan->kernel_scale_d);
+                    } else {
+                        PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
+                        current_first_idx[m] = PFX(positive_mod_int)(m_left, plan->Nfft);
+                        size_t w_base = (size_t)m * (size_t)plan->w;
+                        for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)l] = kval_buf[l];
+                    }
+#    else
                     PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
                     current_first_idx[m] = PFX(positive_mod_int)(m_left, plan->Nfft);
                     size_t w_base = (size_t)m * (size_t)plan->w;
-#    if defined(HALF)
-                    for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)l] = kval_buf[l];
-#    else
                     for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)l] = MUL(kval_buf[l], plan->kernel_scale);
 #    endif
                 }
@@ -2374,7 +2570,15 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
                     z_buf[l] = FCAST((2.0 * dist) / (double)plan->w);
                 }
 
+#    if defined(HALF)
+                if (plan->use_geo_scale) {
+                    PFX(pswf0_batch_impl)(z_buf, kval_buf, plan->w, plan->w, mode43, false);
+                } else {
+                    PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
+                }
+#    else
                 PFX(pswf0_batch)(z_buf, kval_buf, plan->w, plan->w, mode43);
+#    endif
 
                 int first = PFX(positive_mod_int)(m_left, plan->Nfft);
                 int base = first - (first % INTERNAL_VEC_LEN);
@@ -2383,7 +2587,12 @@ void PFX(pswf_precompute)(struct PFX(pswf_plan) * plan, const nufft_input_t *x) 
                 current_spread_base_idx[m] = base;
                 for (int l = 0; l < plan->spread_stride; ++l) current_spread_weight[w_base + (size_t)l] = FCAST(0.0);
 #    if defined(HALF)
-                for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)(lane_offset + l)] = kval_buf[l];
+                if (plan->use_geo_scale) {
+                    for (int l = 0; l < plan->w; ++l)
+                        current_spread_weight[w_base + (size_t)(lane_offset + l)] = FCAST(TO_DOUBLE(kval_buf[l]) * plan->kernel_scale_d);
+                } else {
+                    for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)(lane_offset + l)] = kval_buf[l];
+                }
 #    else
                 for (int l = 0; l < plan->w; ++l) current_spread_weight[w_base + (size_t)(lane_offset + l)] = MUL(kval_buf[l], plan->kernel_scale);
 #    endif
@@ -2511,52 +2720,70 @@ void PFX(pswf_finish_slots_breadth)(struct PFX(pswf_plan) * plan, const BREADTH_
 }
 
 #if defined(HALF)
-static inline uint32_t PFX(log2_u32)(uint32_t n) {
-    uint32_t bits = 0u;
-    while (n > 1u) {
-        n >>= 1u;
-        ++bits;
-    }
-    return bits;
-}
-
 void PFX(pswf_finish_slots_f32)(struct PFX(pswf_plan) * plan, const float *compact, float *out, int count) {
     if (!plan || !compact || !out || count <= 0 || plan->period <= 0) return;
-    const uint32_t log_nfft = PFX(log2_u32)((uint32_t)plan->Nfft);
-    const int split = plan->output_shift;
-    const int first_bin = plan->Nfft - split;
+
+    if (!plan->perm_scratch_f32) {
+        size_t bytes = (((size_t)plan->slots * sizeof(float)) + 63u) & ~(size_t)63u;
+        if (bytes < 64u) bytes = 64u;
+        plan->perm_scratch_f32 = (float *)nanofft_aligned_alloc(64, bytes);
+        if (!plan->perm_scratch_f32) return;
+        memset(plan->perm_scratch_f32, 0, bytes);
+    }
+
+    float *padded = plan->perm_scratch_f32;
     int s = 0;
     for (int base = 0; base < plan->slots; base += plan->period) {
-        for (int k = 0; k < plan->nvalid; ++k) {
-            const uint32_t slot_pos = (uint32_t)(base + (int)plan->slot_offsets[k]);
-            const int bin = (int)nanofft_reverse_bits(slot_pos, log_nfft);
-            const int out_idx = (bin >= first_bin) ? (bin - first_bin) : (bin + split);
-            if (out_idx >= 0 && out_idx < count) out[out_idx] = compact[s];
-            ++s;
-        }
+        for (int k = 0; k < plan->nvalid; ++k) padded[base + (int)plan->slot_offsets[k]] = compact[s++];
     }
+
+    NANOFFT_PERMUTE_1D_F32(plan->nanofft_p, padded);
+
+    const int ncopy = (count < plan->Nout) ? count : plan->Nout;
+    const int split = plan->output_shift;
+    const int first_bin = plan->Nfft - split;
+    const int first = (split < ncopy) ? split : ncopy;
+    if (first > 0) memcpy(out, padded + first_bin, (size_t)first * sizeof(float));
+    if (ncopy > first) memcpy(out + first, padded, (size_t)(ncopy - first) * sizeof(float));
+    if (count > ncopy) memset(out + ncopy, 0, (size_t)(count - ncopy) * sizeof(float));
 }
 
 void PFX(pswf_finish_slots_breadth_f32)(struct PFX(pswf_plan) * plan, const float *compact, float *out, int block, int active_lanes, int total_remaining) {
     if (!plan || !plan->is_breadth || !compact || !out || active_lanes <= 0 || total_remaining <= 0 || plan->period <= 0) return;
-    const uint32_t log_nfft = PFX(log2_u32)((uint32_t)plan->Nfft);
-    const int split = plan->output_shift;
-    const int first_bin = plan->Nfft - split;
+
+    const size_t stride = (size_t)BREADTH_VEC_LEN;
+    if (!plan->bperm_scratch_f32) {
+        size_t bytes = (((size_t)plan->slots * stride * sizeof(float)) + 63u) & ~(size_t)63u;
+        if (bytes < 64u) bytes = 64u;
+        plan->bperm_scratch_f32 = (float *)nanofft_aligned_alloc(64, bytes);
+        if (!plan->bperm_scratch_f32) return;
+        memset(plan->bperm_scratch_f32, 0, bytes);
+    }
+
+    float *padded = plan->bperm_scratch_f32;
     int s = 0;
     for (int base = 0; base < plan->slots; base += plan->period) {
         for (int k = 0; k < plan->nvalid; ++k) {
-            const uint32_t slot_pos = (uint32_t)(base + (int)plan->slot_offsets[k]);
-            const int bin = (int)nanofft_reverse_bits(slot_pos, log_nfft);
-            const int out_idx = (bin >= first_bin) ? (bin - first_bin) : (bin + split);
-            const float *src = compact + (size_t)s * (size_t)BREADTH_VEC_LEN;
-            if (out_idx >= 0 && out_idx < block) {
-                for (int v = 0; v < active_lanes; ++v) {
-                    const int rem = total_remaining - v * block;
-                    if (out_idx < rem) out[(size_t)v * (size_t)block + (size_t)out_idx] = src[v];
-                }
-            }
+            const int pos = base + (int)plan->slot_offsets[k];
+            memcpy(padded + (size_t)pos * stride, compact + (size_t)s * stride, stride * sizeof(float));
             ++s;
         }
+    }
+
+    NANOFFT_PERMUTE_1D_BREADTH_F32(plan->nanofft_p, padded);
+
+    const int split = plan->output_shift;
+    const int first_bin = plan->Nfft - split;
+    for (int v = 0; v < active_lanes; ++v) {
+        const int rem = total_remaining - v * block;
+        if (rem <= 0) break;
+        const int count_v = (rem < block) ? rem : block;
+        const int ncopy = (count_v < plan->Nout) ? count_v : plan->Nout;
+        const int first = (split < ncopy) ? split : ncopy;
+        float *dst = out + (size_t)v * (size_t)block;
+        for (int k = 0; k < first; ++k) dst[k] = padded[(size_t)(first_bin + k) * stride + (size_t)v];
+        for (int k = first; k < ncopy; ++k) dst[k] = padded[(size_t)(k - split) * stride + (size_t)v];
+        if (count_v > ncopy) memset(dst + ncopy, 0, (size_t)(count_v - ncopy) * sizeof(float));
     }
 }
 #endif
@@ -2599,6 +2826,13 @@ const FLOAT *PFX(pswf_deconv)(const struct PFX(pswf_plan) * plan) { return plan 
 #if defined(HALF)
 void PFX(pswf_set_output_scale)(struct PFX(pswf_plan) * plan, double scale) {
     if (plan) plan->output_scale = scale;
+}
+
+const float *PFX(pswf_deconv_f32)(const struct PFX(pswf_plan) * plan) { return plan ? plan->deconv_f32 : NULL; }
+
+const float *PFX(pswf_slot_deconv_f32)(struct PFX(pswf_plan) * plan) {
+    PFX(pswf_ensure_slot_tables)(plan);
+    return (plan && plan->period > 0 && plan->nvalid > 0) ? plan->slot_deconv_compact_f32 : NULL;
 }
 #endif
 
@@ -2855,7 +3089,12 @@ void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     nanofft_aligned_free(plan->fft_real);
     nanofft_aligned_free(plan->fft_imag);
     nanofft_aligned_free(plan->slot_deconv);
-#if !defined(HALF)
+#if defined(HALF)
+    nanofft_aligned_free(plan->deconv_f32);
+    nanofft_aligned_free(plan->slot_deconv_compact_f32);
+    nanofft_aligned_free(plan->perm_scratch_f32);
+    nanofft_aligned_free(plan->bperm_scratch_f32);
+#else
     nanofft_aligned_free(plan->phi_hat);
     nanofft_aligned_free(plan->slot_phi_hat_compact);
     nanofft_aligned_free(plan->slot_deconv_compact);

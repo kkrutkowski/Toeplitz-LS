@@ -73,6 +73,12 @@ typedef struct {
     uint32_t j;
 } rev_pair;
 
+#if defined(HALF)
+typedef struct {
+    float elems[BREADTH_VEC_LEN];
+} nanofft_bvec_f32;
+#endif
+
 struct PLAN_T {
     uint32_t N;
     int is_breadth; /* 0 = depth-wise scalar/SIMD plan, 1 = breadth-wise vector-wide plan */
@@ -88,6 +94,11 @@ struct PLAN_T {
     int permute;     /* effective bit-reversal strategy for this plan */
     rev_pair *pairs; /* lazily built swap-pair list, NULL until first use */
     uint32_t npairs;
+#if defined(HALF)
+    int permute_f32;              /* effective bit-reversal strategy for 4B float outputs */
+    float *cobra_buffer_f32;      /* lazily allocated two float tiles: A at 0, B at BLOCK_ELEMS */
+    nanofft_bvec_f32 *bcobra_f32; /* lazily allocated two float breadth tiles */
+#endif
 };
 
 /* =========================================================================
@@ -152,12 +163,33 @@ NANOFFT_UNUSED static inline BREADTH_COMPUTE_VEC half_bvec(BREADTH_COMPUTE_VEC x
 #define COBRAVO_IDX_LEN (COBRAVO_W4_LEN + COBRAVO_W5_LEN + COBRAVO_W6_LEN)
 
 /* Gather-emitted tiles for float/double; double-double (16B) and half (2B)
- * keep the scalar in-tile swap (no matching x86 gather width). */
+ * keep the scalar in-tile swap (no matching x86 gather width). Under HALF,
+ * the deferred 1D float permutation (permute_1d_f32) still uses 32-bit gathers. */
 #if !defined(DOUBLE_DOUBLE) && !defined(HALF) && (defined(__AVX512F__) || defined(__AVX2__))
 #    define COBRAVO_GATHER 1
 #    include <immintrin.h>
 #else
 #    define COBRAVO_GATHER 0
+#endif
+
+#if defined(HALF) && (defined(__AVX512F__) || defined(__AVX2__))
+#    define COBRAVO_F32_GATHER 1
+#    include <immintrin.h>
+#else
+#    define COBRAVO_F32_GATHER 0
+#endif
+
+#if defined(HALF)
+#    define PAIRS_MAX_LOG_F32 13u
+#    if VEC_BYTES >= 64
+#        define BCOBRA_F32_MAX_W 3u
+#        define BPAIRS_MAX_LOG_F32 10u
+#    else
+#        define BCOBRA_F32_MAX_W 4u
+#        define BPAIRS_MAX_LOG_F32 11u
+#    endif
+#    define BCOBRA_F32_BLOCK_WIDTH (1u << BCOBRA_F32_MAX_W)
+#    define BCOBRA_F32_BLOCK_ELEMS (BCOBRA_F32_BLOCK_WIDTH * BCOBRA_F32_BLOCK_WIDTH)
 #endif
 
 /* Breadth-wise COBRAVO sizing: keep 4 staging tiles (A/B x real/imag) in L1.
@@ -293,7 +325,7 @@ static inline void pair_shuffle_1d(FLOAT *values, const rev_pair *pairs, uint32_
  * is loaded and stored with row-sized memcpy / vector moves.
  * ------------------------------------------------------------------------- */
 
-#if COBRAVO_GATHER
+#if COBRAVO_GATHER || COBRAVO_F32_GATHER
 /* In-tile reversal indices of every supported tile width, packed back to back.
  * Pure data derived from the fixed bit reversal, built by a constructor so no
  * transform can observe a half-initialised table. */
@@ -694,6 +726,240 @@ static inline void bit_reverse_permutation_1d_breadth(BREADTH_VEC *values, uint3
     }
     cobravo_shuffle_1d_breadth(values, order, plan->bcobra_real, plan->bcobra_real + BCOBRA_BLOCK_ELEMS, plan->cobravo);
 }
+
+#if defined(HALF)
+/* -------------------------------------------------------------------------
+ * 1D float (4-byte) bit-reverse permutation for HALF deferred periodogram
+ * outputs (uses COBRAVO with 32-bit AVX2/AVX-512 gathers for depth and
+ * vector-wide tile emit for breadth).
+ * ------------------------------------------------------------------------- */
+
+static inline void table_shuffle_1d_f32(float *values, uint32_t log_n) {
+    for (uint32_t i = 0; i < (1u << log_n); ++i) {
+        const uint32_t j = reverse_bits(i, log_n);
+        if (j > i) {
+            const float t = values[i];
+            values[i] = values[j];
+            values[j] = t;
+        }
+    }
+}
+
+static inline void pair_shuffle_1d_f32(float *values, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const float t = values[i];
+        values[i] = values[j];
+        values[j] = t;
+    }
+}
+
+static inline void cobravo_load_tile_f32(const float *src, uint32_t b_shifted, uint32_t shift_top, uint32_t w, float *dst) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + (size_t)a * width, src + ((size_t)a << shift_top) + b_shifted, (size_t)width * sizeof(float));
+}
+
+static inline void cobravo_store_tile_f32(const float *src, float *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + ((size_t)a << shift_top) + b_shifted, src + (size_t)a * width, (size_t)width * sizeof(float));
+}
+
+#    if COBRAVO_F32_GATHER
+static inline void cobravo_emit_tile_gather_f32(const float *src, float *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    const uint32_t row_mask = (1u << w) - 1u;
+    const int *idx = cobravo_idx_table(w);
+#        if defined(__AVX512F__)
+    for (uint32_t v = 0; v < tile; v += 16u) {
+        const __m512i ix = _mm512_load_si512((const void *)(idx + v));
+        const __m512 x = _mm512_i32gather_ps(ix, src, 4);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm512_storeu_ps(dst + off, x);
+    }
+#        else
+    for (uint32_t v = 0; v < tile; v += 8u) {
+        const __m256i ix = _mm256_load_si256((const __m256i *)(const void *)(idx + v));
+        const __m256 x = _mm256_i32gather_ps(src, ix, 4);
+        const uint32_t off = ((v >> w) << shift_top) | b_shifted | (v & row_mask);
+        _mm256_storeu_ps(dst + off, x);
+    }
+#        endif
+}
+#    endif /* COBRAVO_F32_GATHER */
+
+static inline void cobravo_reverse_tile_f32(float *tile_values, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    for (uint32_t i = 0; i < tile; ++i) {
+        const uint32_t j = reverse_bits(i, 2u * w);
+        if (j > i) {
+            const float t = tile_values[i];
+            tile_values[i] = tile_values[j];
+            tile_values[j] = t;
+        }
+    }
+}
+
+static inline void cobravo_emit_tile_f32(float *src, float *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w, int vectorized) {
+#    if COBRAVO_F32_GATHER
+    if (vectorized && w >= 4u) {
+        cobravo_emit_tile_gather_f32(src, dst, b_shifted, shift_top, w);
+        return;
+    }
+#    else
+    (void)vectorized;
+#    endif
+    cobravo_reverse_tile_f32(src, w);
+    cobravo_store_tile_f32(src, dst, b_shifted, shift_top, w);
+}
+
+static inline void cobravo_shuffle_1d_f32(float *values, uint32_t log_n, float *bufA, float *bufB, int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > (uint32_t)LOG_BLOCK_WIDTH) w = (uint32_t)LOG_BLOCK_WIDTH;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile_f32(values, b_shifted, shift_top, w, bufA);
+        if (b != b_rev) cobravo_load_tile_f32(values, b_rev_shifted, shift_top, w, bufB);
+
+        cobravo_emit_tile_f32(bufA, values, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) cobravo_emit_tile_f32(bufB, values, b_shifted, shift_top, w, vectorized);
+    }
+}
+
+static inline void bit_reverse_permutation_1d_f32(float *values, uint32_t N, PLAN_T *plan) {
+    const uint32_t order = intlog2(N);
+    if (plan->permute_f32 == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute_f32 == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle_1d_f32(values, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute_f32 == TLS_PERMUTE_COBRAVO) {
+        if (plan->cobra_buffer_f32 == NULL) {
+            const size_t cobra_size = 2u * BLOCK_ELEMS * sizeof(float);
+            plan->cobra_buffer_f32 = (float *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(cobra_size));
+        }
+        if (plan->cobra_buffer_f32 != NULL) {
+            cobravo_shuffle_1d_f32(values, order, plan->cobra_buffer_f32, plan->cobra_buffer_f32 + BLOCK_ELEMS, plan->cobravo);
+            return;
+        }
+    }
+    table_shuffle_1d_f32(values, order);
+}
+
+static inline void table_shuffle_1d_breadth_f32(nanofft_bvec_f32 *values, uint32_t log_n) {
+    const uint32_t n = 1u << log_n;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t j = reverse_bits(i, log_n);
+        if (j > i) {
+            const nanofft_bvec_f32 t = values[i];
+            values[i] = values[j];
+            values[j] = t;
+        }
+    }
+}
+
+static inline void pair_shuffle_1d_breadth_f32(nanofft_bvec_f32 *values, const rev_pair *pairs, uint32_t npairs) {
+    for (uint32_t k = 0; k < npairs; ++k) {
+        const uint32_t i = pairs[k].i;
+        const uint32_t j = pairs[k].j;
+        const nanofft_bvec_f32 t = values[i];
+        values[i] = values[j];
+        values[j] = t;
+    }
+}
+
+static inline void cobravo_load_tile_breadth_f32(const nanofft_bvec_f32 *src, uint32_t b_shifted, uint32_t shift_top, uint32_t w, nanofft_bvec_f32 *dst) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + (size_t)a * width, src + ((size_t)a << shift_top) + b_shifted, (size_t)width * sizeof(nanofft_bvec_f32));
+}
+
+static inline void cobravo_store_tile_breadth_f32(const nanofft_bvec_f32 *src, nanofft_bvec_f32 *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w) {
+    const uint32_t width = 1u << w;
+    for (uint32_t a = 0; a < width; ++a) memcpy(dst + ((size_t)a << shift_top) + b_shifted, src + (size_t)a * width, (size_t)width * sizeof(nanofft_bvec_f32));
+}
+
+static inline void cobravo_reverse_tile_breadth_f32(nanofft_bvec_f32 *tile_values, uint32_t w) {
+    const uint32_t tile = 1u << (2u * w);
+    for (uint32_t i = 0; i < tile; ++i) {
+        const uint32_t j = reverse_bits(i, 2u * w);
+        if (j > i) {
+            const nanofft_bvec_f32 t = tile_values[i];
+            tile_values[i] = tile_values[j];
+            tile_values[j] = t;
+        }
+    }
+}
+
+static inline void cobravo_emit_tile_breadth_f32(nanofft_bvec_f32 *src, nanofft_bvec_f32 *dst, uint32_t b_shifted, uint32_t shift_top, uint32_t w,
+                                                 int vectorized) {
+    if (vectorized) {
+        const uint32_t width = 1u << w;
+        const uint16_t *idx = bcobra_idx_table(w);
+        for (uint32_t a = 0; a < width; ++a) {
+            nanofft_bvec_f32 *row = dst + ((size_t)a << shift_top) + b_shifted;
+            const uint16_t *idx_row = idx + (size_t)a * width;
+            for (uint32_t c = 0; c < width; ++c) row[c] = src[idx_row[c]];
+        }
+        return;
+    }
+    cobravo_reverse_tile_breadth_f32(src, w);
+    cobravo_store_tile_breadth_f32(src, dst, b_shifted, shift_top, w);
+}
+
+static inline void cobravo_shuffle_1d_breadth_f32(nanofft_bvec_f32 *values, uint32_t log_n, nanofft_bvec_f32 *bufA, nanofft_bvec_f32 *bufB, int vectorized) {
+    uint32_t w = log_n >> 1;
+    if (w > BCOBRA_F32_MAX_W) w = BCOBRA_F32_MAX_W;
+    const uint32_t width = 1u << w;
+    const uint32_t num_b_bits = log_n - 2u * w;
+    const uint32_t b_size = 1u << num_b_bits;
+    const uint32_t shift_top = num_b_bits + w;
+
+    for (uint32_t b = 0; b < b_size; ++b) {
+        const uint32_t b_rev = reverse_bits(b, num_b_bits);
+        if (b > b_rev) continue;
+
+        const uint32_t b_shifted = b * width;
+        const uint32_t b_rev_shifted = b_rev * width;
+
+        cobravo_load_tile_breadth_f32(values, b_shifted, shift_top, w, bufA);
+        if (b != b_rev) cobravo_load_tile_breadth_f32(values, b_rev_shifted, shift_top, w, bufB);
+
+        cobravo_emit_tile_breadth_f32(bufA, values, b_rev_shifted, shift_top, w, vectorized);
+        if (b != b_rev) cobravo_emit_tile_breadth_f32(bufB, values, b_shifted, shift_top, w, vectorized);
+    }
+}
+
+static inline void bit_reverse_permutation_1d_breadth_f32(float *values, uint32_t N, PLAN_T *plan) {
+    nanofft_bvec_f32 *bvals = (nanofft_bvec_f32 *)(void *)values;
+    const uint32_t order = intlog2(N);
+    if (plan->permute_f32 == TLS_PERMUTE_PAIRS && plan->pairs == NULL) ensure_pairs(plan);
+    if (plan->permute_f32 == TLS_PERMUTE_PAIRS && plan->pairs != NULL) {
+        pair_shuffle_1d_breadth_f32(bvals, plan->pairs, plan->npairs);
+        return;
+    }
+    if (plan->permute_f32 == TLS_PERMUTE_COBRAVO) {
+        if (plan->bcobra_f32 == NULL) {
+            const size_t bcobra_size = 2u * BCOBRA_F32_BLOCK_ELEMS * sizeof(nanofft_bvec_f32);
+            plan->bcobra_f32 = (nanofft_bvec_f32 *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(bcobra_size));
+        }
+        if (plan->bcobra_f32 != NULL) {
+            cobravo_shuffle_1d_breadth_f32(bvals, order, plan->bcobra_f32, plan->bcobra_f32 + BCOBRA_F32_BLOCK_ELEMS, plan->cobravo);
+            return;
+        }
+    }
+    table_shuffle_1d_breadth_f32(bvals, order);
+}
+#endif /* defined(HALF) */
 
 /* =========================================================================
  * Intra-vector butterfly pass
@@ -1491,6 +1757,20 @@ PLAN_T *PREFIX(make_plan)(uint32_t N) {
     plan->cobra_buffer_imag = (FLOAT *)nanofft_aligned_alloc(NANOFFT_ALIGN, align_up(cobra_size));
     plan->bcobra_real = NULL;
     plan->bcobra_imag = NULL;
+#if defined(HALF)
+    {
+        const uint32_t order = intlog2(N);
+        int mode = tls_tuning_permute();
+        if (mode == TLS_PERMUTE_AUTO) {
+            mode = (order < PAIRS_MIN_LOG) ? TLS_PERMUTE_TABLE : ((order <= PAIRS_MAX_LOG_F32) ? TLS_PERMUTE_PAIRS : TLS_PERMUTE_COBRAVO);
+        }
+        if (mode == TLS_PERMUTE_PAIRS && order > PAIRS_MAX_LOG_F32 + 3u) mode = TLS_PERMUTE_COBRAVO;
+        if (mode == TLS_PERMUTE_COBRAVO && order < COBRAVO_MIN_LOG) mode = TLS_PERMUTE_TABLE;
+        plan->permute_f32 = mode;
+    }
+    plan->cobra_buffer_f32 = NULL;
+    plan->bcobra_f32 = NULL;
+#endif
 
     return plan;
 }
@@ -1537,6 +1817,20 @@ PLAN_T *PREFIX(make_plan_breadth)(uint32_t N) {
         plan->bcobra_real = NULL;
         plan->bcobra_imag = NULL;
     }
+#if defined(HALF)
+    {
+        const uint32_t order = intlog2(N);
+        int mode = tls_tuning_permute();
+        if (mode == TLS_PERMUTE_AUTO) {
+            mode = (order < BPAIRS_MIN_LOG) ? TLS_PERMUTE_TABLE : ((order <= BPAIRS_MAX_LOG_F32) ? TLS_PERMUTE_PAIRS : TLS_PERMUTE_COBRAVO);
+        }
+        if (mode == TLS_PERMUTE_PAIRS && order > BPAIRS_MAX_LOG_F32 + 6u) mode = TLS_PERMUTE_COBRAVO;
+        if (mode == TLS_PERMUTE_COBRAVO && order < BCOBRA_MIN_LOG) mode = TLS_PERMUTE_TABLE;
+        plan->permute_f32 = mode;
+    }
+    plan->cobra_buffer_f32 = NULL;
+    plan->bcobra_f32 = NULL;
+#endif
 
     return plan;
 }
@@ -1549,6 +1843,10 @@ void PREFIX(destroy_plan)(PLAN_T *plan) {
         nanofft_aligned_free(plan->cobra_buffer_imag);
         nanofft_aligned_free(plan->bcobra_real);
         nanofft_aligned_free(plan->bcobra_imag);
+#if defined(HALF)
+        nanofft_aligned_free(plan->cobra_buffer_f32);
+        nanofft_aligned_free(plan->bcobra_f32);
+#endif
         nanofft_aligned_free(plan->pairs);
         nanofft_aligned_free(plan);
     }
@@ -1561,6 +1859,10 @@ void PREFIX(execute_raw)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
 void PREFIX(permute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) { bit_reverse_permutation(real_signal, imag_signal, plan->N, plan); }
 
 void PREFIX(permute_1d)(PLAN_T *plan, FLOAT *values) { bit_reverse_permutation_1d(values, plan->N, plan); }
+
+#if defined(HALF)
+void PREFIX(permute_1d_f32)(PLAN_T *plan, float *values) { bit_reverse_permutation_1d_f32(values, plan->N, plan); }
+#endif
 
 void PREFIX(execute)(PLAN_T *plan, FLOAT *real_signal, FLOAT *imag_signal) {
     PREFIX(execute_raw)(plan, real_signal, imag_signal);
@@ -1576,6 +1878,10 @@ void PREFIX(permute_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC
 }
 
 void PREFIX(permute_1d_breadth)(PLAN_T *plan, BREADTH_VEC *values) { bit_reverse_permutation_1d_breadth(values, plan->N, plan); }
+
+#if defined(HALF)
+void PREFIX(permute_1d_breadth_f32)(PLAN_T *plan, float *values) { bit_reverse_permutation_1d_breadth_f32(values, plan->N, plan); }
+#endif
 
 void PREFIX(execute_breadth)(PLAN_T *plan, BREADTH_VEC *real_signal, BREADTH_VEC *imag_signal) {
     PREFIX(execute_raw_breadth)(plan, real_signal, imag_signal);

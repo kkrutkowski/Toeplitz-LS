@@ -61,7 +61,7 @@ TEST_HALF_DISPATCH_FLAG := -DTLS_HALF_HAS_NATIVE_EMBED
 else
 TEST_HALF_DISPATCH_FLAG :=
 endif
-TARGETS := $(BUILD)/check_nanofft $(BUILD)/check_vecmath $(BUILD)/check_periodogram $(BUILD)/dump_periodogram $(BUILD)/bench_fft $(BUILD)/bench_permute $(BUILD)/bench_fuse $(BUILD)/bench_periodogram $(BUILD)/bench_public $(BUILD)/bench_spread $(BUILD)/bench_vectorize
+TARGETS := $(BUILD)/check_nanofft $(BUILD)/check_vecmath $(BUILD)/check_periodogram $(BUILD)/dump_periodogram $(BUILD)/bench_fft $(BUILD)/bench_permute $(BUILD)/bench_fuse $(BUILD)/bench_periodogram $(BUILD)/bench_ihs $(BUILD)/bench_public $(BUILD)/bench_spread $(BUILD)/bench_vectorize
 
 .PHONY: all check bench bench_permute permute bench_fuse fuse tune clean
 .DELETE_ON_ERROR:
@@ -156,6 +156,9 @@ $(BUILD)/bench_permute: bench_permute.c $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
 
 $(BUILD)/bench_periodogram: bench_periodogram.c $(OBJS)
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
+
+$(BUILD)/bench_ihs: bench_ihs.c $(OBJS)
 	$(CC) $(CFLAGS) $(FUSE_CFLAGS) $(INC) $< $(OBJS) -o $@ $(LDLIBS)
 
 $(BUILD)/bench_public: bench_public.c $(OBJS)

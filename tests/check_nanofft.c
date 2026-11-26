@@ -1047,6 +1047,69 @@ static void check_breadth_half(void) {
     }
 }
 
+static void check_half_permute_f32(void) {
+    const uint32_t depth_sizes[] = {64u, 256u, 1024u, 16384u, 65536u};
+    const int pmodes[5] = {TLS_PERMUTE_AUTO, TLS_PERMUTE_TABLE, TLS_PERMUTE_PAIRS, TLS_PERMUTE_COBRAVO, TLS_PERMUTE_COBRAVO};
+    const int pcob[5] = {1, 1, 1, 1, 0};
+
+    for (size_t s = 0; s < sizeof(depth_sizes) / sizeof(depth_sizes[0]); ++s) {
+        const uint32_t n = depth_sizes[s];
+        uint32_t log_n = 0u;
+        while ((1u << log_n) < n) ++log_n;
+        float *v = (float *)test_alloc((size_t)n * sizeof(float));
+        for (int p = 0; p < 5; ++p) {
+            tls_tuning_set_permute(pmodes[p]);
+            tls_tuning_set_cobravo(pcob[p]);
+            nanoffth_plan *plan = nanoffth_make_plan(n);
+            for (uint32_t k = 0; k < n; ++k) v[k] = (float)k;
+            nanoffth_permute_1d_f32(plan, v);
+            int ok = 1;
+            for (uint32_t k = 0; k < n; ++k) {
+                if (v[k] != (float)reverse_bits_ref(k, log_n)) {
+                    ok = 0;
+                    break;
+                }
+            }
+            CHECK(ok, "half permute_1d_f32 mismatch at n=%u p=%d", n, p);
+            nanoffth_destroy_plan(plan);
+        }
+        free(v);
+    }
+
+    const uint32_t breadth_sizes[] = {64u, 256u, 1024u, 4096u, 16384u};
+    for (size_t s = 0; s < sizeof(breadth_sizes) / sizeof(breadth_sizes[0]); ++s) {
+        const uint32_t n = breadth_sizes[s];
+        uint32_t log_n = 0u;
+        while ((1u << log_n) < n) ++log_n;
+        float *v = (float *)test_alloc((size_t)n * (size_t)VECH_LEN * sizeof(float));
+        for (int p = 0; p < 5; ++p) {
+            tls_tuning_set_permute(pmodes[p]);
+            tls_tuning_set_cobravo(pcob[p]);
+            nanoffth_plan *plan = nanoffth_make_plan_breadth(n);
+            for (uint32_t k = 0; k < n; ++k) {
+                for (int l = 0; l < VECH_LEN; ++l) v[(size_t)k * (size_t)VECH_LEN + (size_t)l] = (float)(k * (uint32_t)VECH_LEN + (uint32_t)l);
+            }
+            nanoffth_permute_1d_breadth_f32(plan, v);
+            int ok = 1;
+            for (uint32_t k = 0; k < n && ok; ++k) {
+                const uint32_t want_k = reverse_bits_ref(k, log_n);
+                for (int l = 0; l < VECH_LEN; ++l) {
+                    const float want = (float)(want_k * (uint32_t)VECH_LEN + (uint32_t)l);
+                    if (v[(size_t)k * (size_t)VECH_LEN + (size_t)l] != want) {
+                        ok = 0;
+                        break;
+                    }
+                }
+            }
+            CHECK(ok, "half permute_1d_breadth_f32 mismatch at n=%u p=%d", n, p);
+            nanoffth_destroy_plan(plan);
+        }
+        free(v);
+    }
+    tls_tuning_set_permute(TLS_PERMUTE_AUTO);
+    tls_tuning_set_cobravo(TLS_TUNING_COBRAVO_DEFAULT);
+}
+
 int main(void) {
     printf("check_nanofft: permutation\n");
     check_permutation();
@@ -1073,6 +1136,8 @@ int main(void) {
     check_fft_half();
     printf("check_nanofft: breadth half FFT & permute\n");
     check_breadth_half();
+    printf("check_nanofft: half 1D f32 COBRAVO permute\n");
+    check_half_permute_f32();
 
     if (failures) {
         printf("check_nanofft: %d failure(s)\n", failures);

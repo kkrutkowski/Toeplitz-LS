@@ -19,6 +19,7 @@ static int tuning_fft_bfuse = TLS_TUNING_FFT_FUSE_DEFAULT;
 static int tuning_fft_order = TLS_FFT_ORDER_END;
 static int tuning_cobravo = TLS_TUNING_COBRAVO_DEFAULT;
 static int tuning_defer = TLS_TUNING_DEFER_DEFAULT;
+static int tuning_ihs_deconv = TLS_IHS_DECONV_POST;
 static int tuning_permute = TLS_PERMUTE_AUTO;
 static int tuning_spread = TLS_SPREAD_AUTO;
 static int tuning_vectorize = TLS_VEC_AUTO;
@@ -51,6 +52,10 @@ void tls_tuning_set_cobravo(int on) { tuning_cobravo = on ? 1 : 0; }
 int tls_tuning_defer(void) { return tuning_defer; }
 
 void tls_tuning_set_defer(int on) { tuning_defer = on ? 1 : 0; }
+
+int tls_tuning_ihs_deconv(void) { return tuning_ihs_deconv; }
+
+void tls_tuning_set_ihs_deconv(int mode) { tuning_ihs_deconv = (mode == TLS_IHS_DECONV_PRE) ? TLS_IHS_DECONV_PRE : TLS_IHS_DECONV_POST; }
 
 int tls_tuning_permute(void) { return tuning_permute; }
 

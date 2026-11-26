@@ -245,13 +245,20 @@ static void run_ihs_case(const char *name, int M, int N, int degree, int backend
     }
 
     tls_tuning_set_defer(0);
+    tls_tuning_set_ihs_deconv(TLS_IHS_DECONV_POST);
     int s0 = tlsf_ihs(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, norm, p0);
     tls_tuning_set_defer(1);
+    tls_tuning_set_ihs_deconv(TLS_IHS_DECONV_POST);
     int s1 = tlsf_ihs(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, norm, p1);
+    float *p_pre = (float *)test_alloc((size_t)N * sizeof(float));
+    tls_tuning_set_ihs_deconv(TLS_IHS_DECONV_PRE);
+    int s2 = tlsf_ihs(t, fy, dy, M, 0.001, 0.0005, N, degree, backend, norm, p_pre);
+    tls_tuning_set_ihs_deconv(TLS_IHS_DECONV_POST);
 
-    CHECK(s0 == s1, "%s: IHS status %d vs %d", name, s0, s1);
+    CHECK(s0 == s1 && s0 == s2, "%s: IHS status %d vs %d vs %d", name, s0, s1, s2);
     if (s0 >= 0) {
-        CHECK(same_values(p0, p1, N, 1e-6, 1e-9), "%s: IHS power changed when deferring", name);
+        CHECK(same_values(p0, p1, N, 1e-6, 1e-9), "%s: IHS power changed when deferring (post-deconv)", name);
+        CHECK(same_values(p0, p_pre, N, 1e-6, 1e-9), "%s: IHS power changed when deferring (pre-deconv)", name);
         for (int i = 0; i < N; ++i) {
             const float v = p1[i];
             CHECK(isfinite(v) && v >= 0.0f, "%s: IHS power[%d]=%.9g is not finite/non-negative", name, i, (double)v);
@@ -260,6 +267,7 @@ static void run_ihs_case(const char *name, int M, int N, int degree, int backend
     }
     if (dump_mode) dump_line("ihs", name, N, degree, backend, 0, norm, p1, N, s0 < 0 ? s0 : 0, 0);
 
+    free(p_pre);
     free(t);
     free(y);
     free(fy);
@@ -720,19 +728,42 @@ static void run_half_precision_suite(void) {
         }
     }
 
-    /* IHS across backends, normalizations, depth/breadth, float/double inputs */
+    /* IHS across degrees (d=1 and d=3), backends, normalizations, spreads, depth/breadth, defer, float/double inputs */
     const int ihs_norms[3] = {TLS_NORM_IHS_RAW, TLS_NORM_IHS_DEFAULT, TLS_NORM_NLL};
     const int ihs_backends[3] = {TLS_BACKEND_PSWF43, TLS_BACKEND_PSWF21, TLS_BACKEND_LRA};
-    for (int bi = 0; bi < 3; ++bi) {
-        for (int ni = 0; ni < 3; ++ni) {
-            for (int defer = 0; defer <= 1; ++defer) {
-                tls_tuning_set_defer(defer);
-                int s0 = tlsh_ihs_opts(t, yf, dyf, M, 0.001, 0.0005, N, 3, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, ph0);
-                int s1 = tlsh_ihs_opts(t, yf, dyf, M, 0.001, 0.0005, N, 3, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_BREADTH, ph1);
-                int sd = tlsh_ihs_opts_d(t, yd, dyd, M, 0.001, 0.0005, N, 3, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, phd);
-                CHECK(s0 == 0 && s1 == 0 && sd == 0, "ihs half be=%d nm=%d defer=%d status %d %d %d", ihs_backends[bi], ihs_norms[ni], defer, s0, s1, sd);
-                CHECK(same_values(ph0, ph1, N, 2e-2, 2e-2), "ihs half depth vs breadth be=%d nm=%d defer=%d", ihs_backends[bi], ihs_norms[ni], defer);
-                CHECK(same_values(ph0, phd, N, 1e-2, 1e-2), "ihs half float vs double be=%d nm=%d defer=%d", ihs_backends[bi], ihs_norms[ni], defer);
+    const int ihs_degs[2] = {1, 3};
+    for (int di = 0; di < 2; ++di) {
+        const int deg = ihs_degs[di];
+        for (int bi = 0; bi < 3; ++bi) {
+            const int spread_max = (ihs_backends[bi] == TLS_BACKEND_LRA) ? 1 : 2;
+            const int spreads[2] = {TLS_SPREAD_MINMAX, TLS_SPREAD_PIECEWISE};
+            for (int ni = 0; ni < 3; ++ni) {
+                int s_ref = tls_ihs_opts(t, yd, dyd, M, 0.001, 0.0005, N, deg, ihs_backends[bi], ihs_norms[ni], TLS_SPREAD_MINMAX, TLS_VEC_DEPTH, pref);
+                CHECK(s_ref == 0, "ihs half ref d=%d be=%d nm=%d status %d", deg, ihs_backends[bi], ihs_norms[ni], s_ref);
+                for (int si = 0; si < spread_max; ++si) {
+                    for (int defer = 0; defer <= 1; ++defer) {
+                        tls_tuning_set_defer(defer);
+                        int s0 = tlsh_ihs_opts(t, yf, dyf, M, 0.001, 0.0005, N, deg, ihs_backends[bi], ihs_norms[ni], spreads[si], TLS_VEC_DEPTH, ph0);
+                        int s1 = tlsh_ihs_opts(t, yf, dyf, M, 0.001, 0.0005, N, deg, ihs_backends[bi], ihs_norms[ni], spreads[si], TLS_VEC_BREADTH, ph1);
+                        int sd = tlsh_ihs_opts_d(t, yd, dyd, M, 0.001, 0.0005, N, deg, ihs_backends[bi], ihs_norms[ni], spreads[si], TLS_VEC_DEPTH, phd);
+                        CHECK(s0 == 0 && s1 == 0 && sd == 0, "ihs half d=%d be=%d nm=%d sp=%d defer=%d status %d %d %d", deg, ihs_backends[bi], ihs_norms[ni],
+                              spreads[si], defer, s0, s1, sd);
+                        CHECK(same_values(ph0, ph1, N, 2e-2, 2e-2), "ihs half depth vs breadth d=%d be=%d nm=%d sp=%d defer=%d", deg, ihs_backends[bi],
+                              ihs_norms[ni], spreads[si], defer);
+                        CHECK(same_values(ph0, phd, N, 1e-2, 1e-2), "ihs half float vs double d=%d be=%d nm=%d sp=%d defer=%d", deg, ihs_backends[bi],
+                              ihs_norms[ni], spreads[si], defer);
+                        if (ihs_norms[ni] == TLS_NORM_IHS_RAW && defer == 1) {
+                            double max_diff = 0.0;
+                            for (int k = 0; k < N; ++k) {
+                                if (!f32_is_nan_bits(ph0[k]) && !f64_is_nan_bits(pref[k])) {
+                                    double d = fabs((double)ph0[k] - pref[k]);
+                                    if (d > max_diff) max_diff = d;
+                                }
+                            }
+                            CHECK(max_diff < 2.5e-2, "ihs half vs FP64 d=%d be=%d sp=%d max |dP|=%.3e", deg, ihs_backends[bi], spreads[si], max_diff);
+                        }
+                    }
+                }
             }
         }
     }
@@ -819,8 +850,11 @@ int main(int argc, char **argv) {
     run_double_case("gls_d1", 400, 512, 1, 1, TLS_SOLVER_LEVINSON, TLS_NORM_STANDARD);
     run_double_case("d3", 600, 900, 3, 1, TLS_SOLVER_LEVINSON, TLS_NORM_NLL);
 
-    printf("check_periodogram: IHS (d = 1 stays natural, d >= 2 defers)\n");
+    printf("check_periodogram: IHS (all d >= 1 defer with post-permutation deconv)\n");
     run_ihs_case("ihs_d1", 400, 512, 1, 1, TLS_NORM_STANDARD);
+    run_ihs_case("ihs_d1_default", 400, 512, 1, 1, TLS_NORM_IHS_DEFAULT);
+    run_ihs_case("ihs_d1_nll", 400, 512, 1, 1, TLS_NORM_NLL);
+    run_ihs_case("ihs_d1_pswf21", 400, 512, 1, 2, TLS_NORM_STANDARD);
     run_ihs_case("ihs_d3_raw", 400, 512, 3, 1, TLS_NORM_IHS_RAW);
     run_ihs_case("ihs_d3_default", 400, 512, 3, 1, TLS_NORM_IHS_DEFAULT);
     run_ihs_case("ihs_d3_nll", 400, 512, 3, 1, TLS_NORM_NLL);

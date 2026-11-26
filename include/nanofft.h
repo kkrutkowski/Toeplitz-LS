@@ -778,11 +778,13 @@ TLS_API void nanoffth_execute(nanoffth_plan *plan, tls_f16_t *real_signal, tls_f
 TLS_API void nanoffth_execute_raw(nanoffth_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
 TLS_API void nanoffth_permute(nanoffth_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
 TLS_API void nanoffth_permute_1d(nanoffth_plan *plan, tls_f16_t *values);
+TLS_API void nanoffth_permute_1d_f32(nanoffth_plan *plan, float *values);
 TLS_API nanoffth_plan *nanoffth_make_plan_breadth(uint32_t N);
 TLS_API void nanoffth_execute_breadth(nanoffth_plan *plan, VECH *real_signal, VECH *imag_signal);
 TLS_API void nanoffth_execute_raw_breadth(nanoffth_plan *plan, VECH *real_signal, VECH *imag_signal);
 TLS_API void nanoffth_permute_breadth(nanoffth_plan *plan, VECH *real_signal, VECH *imag_signal);
 TLS_API void nanoffth_permute_1d_breadth(nanoffth_plan *plan, VECH *values);
+TLS_API void nanoffth_permute_1d_breadth_f32(nanoffth_plan *plan, float *values);
 
 #ifdef HALF_NATIVE_EMBED
 typedef struct nanoffth_nat_plan nanoffth_nat_plan;
@@ -794,11 +796,13 @@ void nanoffth_nat_execute(nanoffth_nat_plan *plan, tls_f16_t *real_signal, tls_f
 void nanoffth_nat_execute_raw(nanoffth_nat_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
 void nanoffth_nat_permute(nanoffth_nat_plan *plan, tls_f16_t *real_signal, tls_f16_t *imag_signal);
 void nanoffth_nat_permute_1d(nanoffth_nat_plan *plan, tls_f16_t *values);
+void nanoffth_nat_permute_1d_f32(nanoffth_nat_plan *plan, float *values);
 nanoffth_nat_plan *nanoffth_nat_make_plan_breadth(uint32_t N);
 void nanoffth_nat_execute_breadth(nanoffth_nat_plan *plan, VECH *real_signal, VECH *imag_signal);
 void nanoffth_nat_execute_raw_breadth(nanoffth_nat_plan *plan, VECH *real_signal, VECH *imag_signal);
 void nanoffth_nat_permute_breadth(nanoffth_nat_plan *plan, VECH *real_signal, VECH *imag_signal);
 void nanoffth_nat_permute_1d_breadth(nanoffth_nat_plan *plan, VECH *values);
+void nanoffth_nat_permute_1d_breadth_f32(nanoffth_nat_plan *plan, float *values);
 #endif
 typedef struct nanofftf_plan nanofftf_plan;
 TLS_API nanofftf_plan *nanofftf_make_plan(uint32_t N);

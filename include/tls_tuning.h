@@ -55,6 +55,16 @@ TLS_API void tls_tuning_set_cobravo(int on);
 TLS_API int tls_tuning_defer(void);
 TLS_API void tls_tuning_set_defer(int on);
 
+/* IHS deconvolution placement when deferred bit reversal is active:
+ *   TLS_IHS_DECONV_POST (0) = default: raw slots, deconv after sum & permute
+ *   TLS_IHS_DECONV_PRE  (1) = deconv during slot emit (for benchmarking) */
+enum {
+    TLS_IHS_DECONV_POST = 0,
+    TLS_IHS_DECONV_PRE = 1,
+};
+TLS_API int tls_tuning_ihs_deconv(void);
+TLS_API void tls_tuning_set_ihs_deconv(int mode);
+
 /* Bit-reversal strategy: 0 = automatic (the measured crossover), 1 = scalar
  * table shuffle, 2 = precomputed swap pairs, 3 = Cobravo tiled reversal.
  * Exposed so the benchmark harness can interleave strategies in one process. */

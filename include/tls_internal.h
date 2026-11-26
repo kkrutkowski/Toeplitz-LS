@@ -18,9 +18,9 @@ extern "C" {
 
 /* How a PSWF NuFFT hands one block back to the caller. */
 enum {
-    TLS_NUFFT_OUT_NATURAL = 0,   /* frequency order, Nout entries (classic contract) */
-    TLS_NUFFT_OUT_SLOTS = 1,     /* kept FFT positions only, Nout entries, deconvolved */
-    TLS_NUFFT_OUT_SLOTS_RAW = 2  /* kept FFT positions only, Nout entries, un-deconvolved */
+    TLS_NUFFT_OUT_NATURAL = 0,  /* frequency order, Nout entries (classic contract) */
+    TLS_NUFFT_OUT_SLOTS = 1,    /* kept FFT positions only, Nout entries, deconvolved */
+    TLS_NUFFT_OUT_SLOTS_RAW = 2 /* kept FFT positions only, Nout entries, un-deconvolved */
 };
 
 /*
@@ -66,11 +66,19 @@ TLS_API int tlsh_nufft_pswf_bench_ppoly_gen(int w, const char upsamp[2], int rep
 int tlsh_nat_nufft_pswf_bench_ppoly_gen(int w, const char upsamp[2], int reps);
 #endif
 
+TLS_API tlsh_nufft_pswf_plan *tlsh_nufft_pswf_initialize_geo_opts(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode,
+                                                                  int vec_mode);
+TLS_API const float *tlsh_nufft_pswf_deconv_f32(const tlsh_nufft_pswf_plan *plan);
+TLS_API const float *tlsh_nufft_pswf_slot_deconv_f32(tlsh_nufft_pswf_plan *plan);
 TLS_API void tlsh_nufft_pswf_set_output_scale(tlsh_nufft_pswf_plan *plan, double scale);
 TLS_API void tlsh_nufft_pswf_finish_slots_f32(tlsh_nufft_pswf_plan *plan, const float *compact, float *out, int count);
 TLS_API void tlsh_nufft_pswf_finish_slots_breadth_f32(tlsh_nufft_pswf_plan *plan, const float *compact, float *out, int block, int active_lanes,
                                                       int total_remaining);
 #ifdef HALF_NATIVE_EMBED
+tlsh_nat_nufft_pswf_plan *tlsh_nat_nufft_pswf_initialize_geo_opts(int Mpoints, int N, int w, double df, int freq_factor, const char upsamp[2], int spread_mode,
+                                                                  int vec_mode);
+const float *tlsh_nat_nufft_pswf_deconv_f32(const tlsh_nat_nufft_pswf_plan *plan);
+const float *tlsh_nat_nufft_pswf_slot_deconv_f32(tlsh_nat_nufft_pswf_plan *plan);
 void tlsh_nat_nufft_pswf_set_output_scale(tlsh_nat_nufft_pswf_plan *plan, double scale);
 void tlsh_nat_nufft_pswf_finish_slots_f32(tlsh_nat_nufft_pswf_plan *plan, const float *compact, float *out, int count);
 void tlsh_nat_nufft_pswf_finish_slots_breadth_f32(tlsh_nat_nufft_pswf_plan *plan, const float *compact, float *out, int block, int active_lanes,
