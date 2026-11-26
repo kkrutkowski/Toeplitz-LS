@@ -8,6 +8,7 @@
 //
 // All FFT kernels and DifFftPlan implementations live in fft/dif.cpp (compiled per
 // precision and small/large split into isolated HCF modules).
+// All DifFftPlan constructors require an in-order sycl::queue (enforced at runtime).
 //
 // Sign convention compile-time controls (default: +1 only):
 //   SYCL_FFT_ENABLE_POS_SIGN (0 or 1, default 1)
@@ -61,10 +62,21 @@ namespace sycl_fft {
 #define SYCL_FFT_EXTERN_DECL_POS(PlanName)
 #endif
 
+// Optional fused compact-slot filtering + deconvolution epilogue for SinglePass / TwoPass DIF FFTs.
+//   compact_mode == 0: full N-element DIF slot output (standard FFT)
+//   compact_mode == 1: PSWF21 kept slots (s % 4 in {0, 3}, compact stride N/2)
+//   compact_mode == 2: PSWF43 kept slots (s % 8 in {0, 2, 3, 4, 5, 7}, compact stride 3N/4)
+struct FftCompactParams {
+    int         compact_mode  = 0;
+    int         log_n1        = 0;       // 0 for SinglePass; log_n1 for TwoPass Pass-1 sub-FFTs
+    const void* d_slot_deconv = nullptr; // optional ScalarT[full_nout] compact-slot deconv LUT
+};
+
 #define SYCL_FFT_DECLARE_DIF_PLAN(CandName, PlanName, ComplexType, SmemType)                  \
 struct CandName {                                                                             \
     using ComplexT = ComplexType;                                                             \
-    using LaunchFn = void (*)(sycl::queue&, const ComplexT*, ComplexT*, size_t, bool, bool);  \
+    using LaunchFn = void (*)(sycl::queue&, const ComplexT*, ComplexT*, size_t, bool, bool,   \
+                              const FftCompactParams&);                                       \
     using ProbeFn  = KernelProbeInfo (*)(sycl::queue&, const sycl::device&);                  \
                                                                                               \
     const char*   variant_id;                                                                 \
@@ -100,6 +112,10 @@ public:                                                                         
     PlanName& operator=(const PlanName&) = delete;                                            \
                                                                                               \
     void execute_raw(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0); \
+    /* Fused compact-slot + optional deconvolution epilogue (SinglePass & TwoPass). */        \
+    /* Note: `in` (full length bs*N) may be overwritten as scratch when StashChunk1 runs. */  \
+    void execute_raw_compact(ComplexT* in, ComplexT* out, size_t bs, int compact_mode,        \
+                             const void* d_slot_deconv = nullptr, size_t chunk_bs_override = 0); \
     void execute(const ComplexT* in, ComplexT* out, size_t bs, size_t chunk_bs_override = 0); \
     void bit_reverse(const ComplexT* src, ComplexT* dst, size_t bs);                          \
     void bit_reverse(ComplexT* buf, size_t bs);                                               \

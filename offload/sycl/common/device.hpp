@@ -200,4 +200,62 @@ public:
     static void clear_memory_cache();
 };
 
+// Move-only RAII wrapper for SYCL USM device allocations.
+template <typename T>
+class UsmPtr {
+public:
+    UsmPtr() = default;
+    UsmPtr(T* ptr, sycl::queue* q) noexcept : ptr_(ptr), q_(q) {}
+    ~UsmPtr() { reset(); }
+
+    UsmPtr(const UsmPtr&) = delete;
+    UsmPtr& operator=(const UsmPtr&) = delete;
+
+    UsmPtr(UsmPtr&& other) noexcept : ptr_(other.ptr_), q_(other.q_) {
+        other.ptr_ = nullptr;
+        other.q_ = nullptr;
+    }
+
+    UsmPtr& operator=(UsmPtr&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = other.ptr_;
+            q_ = other.q_;
+            other.ptr_ = nullptr;
+            other.q_ = nullptr;
+        }
+        return *this;
+    }
+
+    static UsmPtr alloc_device(size_t count, sycl::queue& q) {
+        if (count == 0) return UsmPtr{};
+        return UsmPtr(sycl::malloc_device<T>(count, q), &q);
+    }
+
+    void reset(T* ptr = nullptr, sycl::queue* q = nullptr) noexcept {
+        if (ptr_ && q_) {
+            try {
+                sycl::free(ptr_, *q_);
+            } catch (...) {
+            }
+        }
+        ptr_ = ptr;
+        q_ = q;
+    }
+
+    T* release() noexcept {
+        T* p = ptr_;
+        ptr_ = nullptr;
+        q_ = nullptr;
+        return p;
+    }
+
+    T* get() const noexcept { return ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+private:
+    T* ptr_ = nullptr;
+    sycl::queue* q_ = nullptr;
+};
+
 } // namespace sycl_fft

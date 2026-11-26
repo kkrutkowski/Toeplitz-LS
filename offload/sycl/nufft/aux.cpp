@@ -19,6 +19,7 @@ void launch_precompute_points_df_x(
     int w,
     int output_shift,
     bool mode43,
+    bool pos_sign,
     int* d_first,
     ScalarT* d_u,
     ComplexT* d_shift,
@@ -71,6 +72,7 @@ void launch_precompute_points_df_x(
                         sr = df_mul(c, df_sub(df_scale_pow2(c2, 4.0f), df_make(3.0f, 0.0f)));
                         si = df_mul(s, df_sub(df_make(3.0f, 0.0f), df_scale_pow2(s2, 4.0f)));
                     }
+                    if (!pos_sign) si = df_neg(si);
                     d_u[m]     = u_df;
                     d_shift[m] = Complexdf{sr, si};
                 } else if constexpr (IsHalf) {
@@ -82,11 +84,12 @@ void launch_precompute_points_df_x(
                         sr = c * sycl::fma(4.0f, c * c, -3.0f);
                         si = s * sycl::fma(-4.0f, s * s, 3.0f);
                     }
+                    if (!pos_sign) si = -si;
                     const float u_f = u_df.hi + u_df.lo;
                     const f16_scalar_t sr_h = static_cast<f16_scalar_t>(sr);
                     const f16_scalar_t si_h = static_cast<f16_scalar_t>(si);
                     d_u[m]     = static_cast<f16_scalar_t>(u_f);
-                    d_shift[m] = SYCL_FFT_BIT_CAST(Complexh, (f16x2_t{sr_h, si_h}));
+                    d_shift[m] = SYCL_FFT_BIT_CAST(Complexh, f16x2_make(sr_h, si_h));
                 } else {
                     const float frac_f = frac_df.hi + frac_df.lo;
                     float c, s;
@@ -96,6 +99,7 @@ void launch_precompute_points_df_x(
                         sr = c * sycl::fma(4.0f, c * c, -3.0f);
                         si = s * sycl::fma(-4.0f, s * s, 3.0f);
                     }
+                    if (!pos_sign) si = -si;
                     d_u[m]     = u_df.hi + u_df.lo;
                     d_shift[m] = Complexf(sr, si);
                 }
@@ -170,34 +174,34 @@ void launch_transpose_and_zero_raw(
 
 void launch_precompute_pointsh(
     sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, sycl_fft::f16_scalar_t* d_u, sycl_fft::Complexh* d_shift,
     size_t wg_size) {
     launch_precompute_points_df_x<sycl_fft::f16_scalar_t, sycl_fft::Complexh, true, false>(
-        q, d_x, df_scaled, M, nfft, w, output_shift, mode43, d_first, d_u, d_shift, wg_size);
+        q, d_x, df_scaled, M, nfft, w, output_shift, mode43, pos_sign, d_first, d_u, d_shift, wg_size);
 }
 
 void launch_precompute_pointsf(
     sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, float* d_u, sycl_fft::Complexf* d_shift,
     size_t wg_size) {
     launch_precompute_points_df_x<float, sycl_fft::Complexf, false, false>(
-        q, d_x, df_scaled, M, nfft, w, output_shift, mode43, d_first, d_u, d_shift, wg_size);
+        q, d_x, df_scaled, M, nfft, w, output_shift, mode43, pos_sign, d_first, d_u, d_shift, wg_size);
 }
 
 void launch_precompute_pointsdf(
     sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, sycl_fft::df_t* d_u, sycl_fft::Complexdf* d_shift,
     size_t wg_size) {
     launch_precompute_points_df_x<sycl_fft::df_t, sycl_fft::Complexdf, false, true>(
-        q, d_x, df_scaled, M, nfft, w, output_shift, mode43, d_first, d_u, d_shift, wg_size);
+        q, d_x, df_scaled, M, nfft, w, output_shift, mode43, pos_sign, d_first, d_u, d_shift, wg_size);
 }
 
 void launch_precompute_points(
     sycl::queue& q, const double* d_x, double df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, double* d_u, sycl_fft::Complex* d_shift,
     size_t wg_size) {
     const size_t wg = std::max<size_t>(1, wg_size);
@@ -232,6 +236,7 @@ void launch_precompute_points(
                     sr = c * sycl::fma(4.0, c * c, -3.0);
                     si = s * sycl::fma(-4.0, s * s, 3.0);
                 }
+                if (!pos_sign) si = -si;
 
                 d_first[m] = first;
                 d_u[m]     = u;
@@ -275,21 +280,42 @@ void launch_build_window_buckets(
             });
     });
 
-    // Pass 2: Exclusive prefix sum over num_wins (single work-item, num_wins is small <= 1024)
-    q.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(
-            sycl::range<1>(1),
-            [=](sycl::id<1>) {
-                int sum = 0;
-                for (int wi = 0; wi < num_wins; ++wi) {
-                    const int cnt = d_bucket_counts[wi];
-                    d_bucket_off[wi] = sum;
-                    d_bucket_counts[wi] = sum; // reuse as atomic write cursor for Pass 3
-                    sum += cnt;
-                }
-                d_bucket_off[num_wins] = sum;
-            });
-    });
+    // Pass 2: Exclusive prefix sum over num_wins (parallel single-WG scan when num_wins <= 256)
+    if (num_wins <= 256) {
+        const size_t scan_wg = static_cast<size_t>(next_pow2_int(num_wins));
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(scan_wg, scan_wg),
+                [=](sycl::nd_item<1> item) {
+                    const int wi = static_cast<int>(item.get_local_linear_id());
+                    const int val = (wi < num_wins) ? d_bucket_counts[wi] : 0;
+                    const int pref = sycl::exclusive_scan_over_group(
+                        item.get_group(), val, sycl::plus<int>());
+                    if (wi < num_wins) {
+                        d_bucket_off[wi] = pref;
+                        d_bucket_counts[wi] = pref; // reuse as atomic write cursor for Pass 3
+                    }
+                    if (wi == num_wins - 1) {
+                        d_bucket_off[num_wins] = pref + val;
+                    }
+                });
+        });
+    } else {
+        q.submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::range<1>(1),
+                [=](sycl::id<1>) {
+                    int sum = 0;
+                    for (int wi = 0; wi < num_wins; ++wi) {
+                        const int cnt = d_bucket_counts[wi];
+                        d_bucket_off[wi] = sum;
+                        d_bucket_counts[wi] = sum;
+                        sum += cnt;
+                    }
+                    d_bucket_off[num_wins] = sum;
+                });
+        });
+    }
 
     // Pass 3: Scatter original point indices into contiguous per-window buckets
     q.submit([&](sycl::handler& cgh) {
@@ -308,6 +334,56 @@ void launch_build_window_buckets(
                     const int p1 = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
                                                     sycl::access::address_space::global_space>(d_bucket_counts[w1]).fetch_add(1);
                     d_bucket_m[p1] = m;
+                }
+            });
+    });
+
+    // Pass 4: Sort point indices within each window (for cnt <= 512) in local memory
+    // so spreading Phase 1b loads d_y[bp * M + m] in monotonic coalesced order.
+    constexpr int kMaxSort = 512;
+    const size_t sort_wg = std::min<size_t>(std::max<size_t>(64, wg), size_t{256});
+    q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> l_idx(sycl::range<1>(static_cast<size_t>(kMaxSort)), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(num_wins) * sort_wg, sort_wg),
+            [=](sycl::nd_item<1> item) {
+                const auto grp = item.get_group();
+                const int win = static_cast<int>(item.get_group_linear_id());
+                const int tid = static_cast<int>(item.get_local_linear_id());
+                const int wg_n = static_cast<int>(sort_wg);
+                const int off = d_bucket_off[win];
+                const int cnt = d_bucket_off[win + 1] - off;
+                if (cnt <= 1 || cnt > kMaxSort) return;
+
+                int p2 = 1;
+                while (p2 < cnt) p2 <<= 1;
+
+                constexpr int kSentinel = 0x7fffffff;
+                for (int i = tid; i < p2; i += wg_n) {
+                    l_idx[i] = (i < cnt) ? d_bucket_m[off + i] : kSentinel;
+                }
+                sycl::group_barrier(grp);
+
+                for (int k = 2; k <= p2; k <<= 1) {
+                    for (int j = k >> 1; j > 0; j >>= 1) {
+                        for (int i = tid; i < p2; i += wg_n) {
+                            const int ixj = i ^ j;
+                            if (ixj > i) {
+                                const int a = l_idx[i];
+                                const int b = l_idx[ixj];
+                                const bool asc = ((i & k) == 0);
+                                if ((asc && a > b) || (!asc && a < b)) {
+                                    l_idx[i] = b;
+                                    l_idx[ixj] = a;
+                                }
+                            }
+                        }
+                        sycl::group_barrier(grp);
+                    }
+                }
+
+                for (int i = tid; i < cnt; i += wg_n) {
+                    d_bucket_m[off + i] = l_idx[i];
                 }
             });
     });
@@ -377,14 +453,12 @@ void launch_transpose_and_zero_f16pair(
                     const sycl_fft::f16x2_t ti = l_im[ly * stride + lx];
                     const size_t b0 = 2 * bp_out;
                     const size_t b1 = 2 * bp_out + 1;
+                    const bool v0 = (b0 < chunk_bs);
+                    const bool v1 = (b1 < chunk_bs);
+                    sycl_fft::Complexh* dst0 = d_fft_buf + b0 * static_cast<size_t>(nfft);
+                    sycl_fft::Complexh* dst1 = v1 ? (d_fft_buf + b1 * static_cast<size_t>(nfft)) : dst0;
                     sycl_fft::f16x2_store_pair(
-                        d_fft_buf + b0 * static_cast<size_t>(nfft),
-                        d_fft_buf + b1 * static_cast<size_t>(nfft),
-                        static_cast<int>(n_out),
-                        b0 < chunk_bs,
-                        b1 < chunk_bs,
-                        tr,
-                        ti);
+                        dst0, dst1, static_cast<int>(n_out), v0, v1, tr, ti);
                 }
             });
     });

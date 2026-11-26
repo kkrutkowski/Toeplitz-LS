@@ -15,6 +15,7 @@
 #   make clean                  # Remove build artifacts
 
 ACPP ?= acpp
+CXX ?= clang++
 ACPP_TARGETS ?= generic
 SIGN ?= pos
 
@@ -29,11 +30,12 @@ $(error Invalid SIGN='$(SIGN)'. Expected pos, neg, or both)
 endif
 
 CXXFLAGS ?= -O3 -std=c++20 -Wall -Wextra -fno-fast-math -ffp-contract=fast $(SIGN_FLAGS)
-PICFLAGS := -fPIC -fvisibility=hidden
+PICFLAGS := -fPIC -fvisibility=hidden -fvisibility-inlines-hidden
 INCLUDES := -I.
+VERSION_SCRIPT := tls_sycl.map
 
 ACPP_COMPILE_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS) $(PICFLAGS) $(INCLUDES)
-ACPP_LINK_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS)
+ACPP_LINK_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS) -Wl,--version-script=$(VERSION_SCRIPT)
 
 BUILD_DIR ?= build
 OBJDIR ?= $(BUILD_DIR)/obj
@@ -87,13 +89,13 @@ all: $(TARGET_SO)
 
 objs: $(CORE_OBJS)
 
-$(TARGET_SO): $(LIB_OBJS)
+$(TARGET_SO): $(LIB_OBJS) $(VERSION_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_LINK_FLAGS) -shared $(LIB_OBJS) -o $@
 
 $(OBJDIR)/impl.o: impl.cpp
 	@mkdir -p $(dir $@)
-	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(PICFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR)/common/device.o: common/device.cpp $(COMMON_HEADERS)
 	@mkdir -p $(dir $@)

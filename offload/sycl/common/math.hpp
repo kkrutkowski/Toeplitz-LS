@@ -50,7 +50,8 @@ SYCL_FFT_FORCE_INLINE constexpr Dst sycl_fft_bit_cast(const Src& src) noexcept {
     _Pragma("clang fp reassociate(off)") \
     _Pragma("clang fp contract(off)")
 #else
-#define SYCL_FFT_DF_EXACT_FP
+#define SYCL_FFT_DF_EXACT_FP \
+    _Pragma("STDC FP_CONTRACT OFF")
 #endif
 
 #if defined(__ACPP_ENABLE_CUDA_TARGET__)
@@ -161,7 +162,13 @@ SYCL_FFT_FORCE_INLINE constexpr f16x2_t u32_to_f16x2(uint32_t u) {
     return SYCL_FFT_BIT_CAST(f16x2_t, u);
 }
 
-SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_make(f16_scalar_t lo, f16_scalar_t hi) {
+#if SYCL_FFT_USE_CLANG_F16X2
+#define SYCL_FFT_F16X2_CONSTEXPR constexpr
+#else
+#define SYCL_FFT_F16X2_CONSTEXPR
+#endif
+
+SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_make(f16_scalar_t lo, f16_scalar_t hi) {
 #if SYCL_FFT_USE_CLANG_F16X2
     return f16x2_t{lo, hi};
 #else
@@ -172,11 +179,27 @@ SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_make(f16_scalar_t lo, f16_scalar_t
 #endif
 }
 
-SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_splat(f16_scalar_t v) {
+SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16_scalar_t f16x2_lo(f16x2_t v) {
+#if SYCL_FFT_USE_CLANG_F16X2
+    return v[0];
+#else
+    return v.x();
+#endif
+}
+
+SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16_scalar_t f16x2_hi(f16x2_t v) {
+#if SYCL_FFT_USE_CLANG_F16X2
+    return v[1];
+#else
+    return v.y();
+#endif
+}
+
+SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_splat(f16_scalar_t v) {
     return f16x2_make(v, v);
 }
 
-SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_splat_f(float v) {
+SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_splat_f(float v) {
     const f16_scalar_t h = static_cast<f16_scalar_t>(v);
     return f16x2_make(h, h);
 }
@@ -200,11 +223,41 @@ SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_splat_f(float v) {
 #define SYCL_FFT_F16X2_FMA(a, b, c) sycl::fma((a), (b), (c))
 #endif
 
-constexpr f16x2_t kZero_f16x2    = f16x2_splat_f(0.0f);
-constexpr f16x2_t kOne_f16x2     = f16x2_splat_f(1.0f);
-constexpr f16x2_t kHalf_f16x2    = f16x2_splat_f(0.5f);
-constexpr f16x2_t kTwo_f16x2     = f16x2_splat_f(2.0f);
-constexpr f16x2_t kSqrt1_2_f16x2 = f16x2_splat_f(0.7071067811865475244f);
+constexpr uint16_t f32_to_f16_bits_const(float f) noexcept {
+    const uint32_t u = SYCL_FFT_BIT_CAST(uint32_t, f);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const uint32_t exp  = (u >> 23) & 0xFFu;
+    const uint32_t mant = u & 0x007FFFFFu;
+    if (exp == 0u) return static_cast<uint16_t>(sign);
+    if (exp == 255u) return static_cast<uint16_t>(sign | 0x7C00u | (mant ? 0x0200u : 0u));
+    const int e = static_cast<int>(exp) - 127 + 15;
+    if (e >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    if (e <= 0) {
+        if (e < -10) return static_cast<uint16_t>(sign);
+        const uint32_t m = mant | 0x00800000u;
+        const int shift = 14 - e;
+        const uint32_t round_bit = uint32_t{1} << (shift - 1);
+        const uint32_t rem = m & ((uint32_t{1} << shift) - 1u);
+        uint32_t h = m >> shift;
+        if (rem > round_bit || (rem == round_bit && (h & 1u))) ++h;
+        return static_cast<uint16_t>(sign | h);
+    }
+    const uint32_t rem = mant & 0x1FFFu;
+    uint32_t h = (static_cast<uint32_t>(e) << 10) | (mant >> 13);
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
+    return static_cast<uint16_t>(sign | h);
+}
+
+SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_splat_const(float v) noexcept {
+    const uint32_t b = static_cast<uint32_t>(f32_to_f16_bits_const(v));
+    return u32_to_f16x2(b | (b << 16));
+}
+
+constexpr f16x2_t kZero_f16x2    = f16x2_splat_const(0.0f);
+constexpr f16x2_t kOne_f16x2     = f16x2_splat_const(1.0f);
+constexpr f16x2_t kHalf_f16x2    = f16x2_splat_const(0.5f);
+constexpr f16x2_t kTwo_f16x2     = f16x2_splat_const(2.0f);
+constexpr f16x2_t kSqrt1_2_f16x2 = f16x2_splat_const(0.7071067811865475244f);
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_add(f16x2_t a, f16x2_t b) { return a + b; }
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_sub(f16x2_t a, f16x2_t b) { return a - b; }
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_neg(f16x2_t a) { return -a; }
@@ -273,8 +326,8 @@ SYCL_FFT_FORCE_INLINE void f16x2_cmul_sqrt1_2(
 SYCL_FFT_FORCE_INLINE void f16x2_load_pair(
     const Complexh* g0, const Complexh* g1, int idx, bool valid0, bool valid1,
     f16x2_t& re_out, f16x2_t& im_out) {
-    const uint32_t u0 = valid0 ? reinterpret_cast<const uint32_t*>(g0)[idx] : 0u;
-    const uint32_t u1 = valid1 ? reinterpret_cast<const uint32_t*>(g1)[idx] : 0u;
+    const uint32_t u0 = valid0 ? sycl_fft_bit_cast<uint32_t>(g0[idx]) : 0u;
+    const uint32_t u1 = valid1 ? sycl_fft_bit_cast<uint32_t>(g1[idx]) : 0u;
     const uint32_t re_u32 = (u0 & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
     const uint32_t im_u32 = (u0 >> 16) | (u1 & 0xFFFF0000u);
     re_out = SYCL_FFT_BIT_CAST(f16x2_t, re_u32);
@@ -287,10 +340,10 @@ SYCL_FFT_FORCE_INLINE void f16x2_store_pair(
     const uint32_t re_u32 = SYCL_FFT_BIT_CAST(uint32_t, re_in);
     const uint32_t im_u32 = SYCL_FFT_BIT_CAST(uint32_t, im_in);
     if (valid0) {
-        reinterpret_cast<uint32_t*>(g0)[idx] = (re_u32 & 0xFFFFu) | ((im_u32 & 0xFFFFu) << 16);
+        g0[idx] = sycl_fft_bit_cast<Complexh>((re_u32 & 0xFFFFu) | ((im_u32 & 0xFFFFu) << 16));
     }
     if (valid1) {
-        reinterpret_cast<uint32_t*>(g1)[idx] = (re_u32 >> 16) | (im_u32 & 0xFFFF0000u);
+        g1[idx] = sycl_fft_bit_cast<Complexh>((re_u32 >> 16) | (im_u32 & 0xFFFF0000u));
     }
 }
 

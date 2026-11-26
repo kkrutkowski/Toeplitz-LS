@@ -662,34 +662,34 @@ SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f16(
     const f16x2_t t_v = SYCL_FFT_F16X2_FMA(u_v, u_v, kZero_f16x2);
     const f16x2_t neg_u_v = SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, u_v) ^ 0x80008000u);
 
-    f16x2_t e_acc = f16x2_t{
+    f16x2_t e_acc = f16x2_make(
         static_cast<f16_scalar_t>(tbl.even[0][NEven - 1]),
-        static_cast<f16_scalar_t>(tbl.even[1][NEven - 1])};
+        static_cast<f16_scalar_t>(tbl.even[1][NEven - 1]));
     #pragma unroll
     for (int m = NEven - 2; m >= 0; --m) {
-        const f16x2_t c_e = f16x2_t{
+        const f16x2_t c_e = f16x2_make(
             static_cast<f16_scalar_t>(tbl.even[0][m]),
-            static_cast<f16_scalar_t>(tbl.even[1][m])};
+            static_cast<f16_scalar_t>(tbl.even[1][m]));
         e_acc = SYCL_FFT_F16X2_FMA(e_acc, t_v, c_e);
     }
 
-    f16x2_t o_acc = f16x2_t{
+    f16x2_t o_acc = f16x2_make(
         static_cast<f16_scalar_t>(tbl.odd[0][NOdd - 1]),
-        static_cast<f16_scalar_t>(tbl.odd[1][NOdd - 1])};
+        static_cast<f16_scalar_t>(tbl.odd[1][NOdd - 1]));
     #pragma unroll
     for (int m = NOdd - 2; m >= 0; --m) {
-        const f16x2_t c_o = f16x2_t{
+        const f16x2_t c_o = f16x2_make(
             static_cast<f16_scalar_t>(tbl.odd[0][m]),
-            static_cast<f16_scalar_t>(tbl.odd[1][m])};
+            static_cast<f16_scalar_t>(tbl.odd[1][m]));
         o_acc = SYCL_FFT_F16X2_FMA(o_acc, t_v, c_o);
     }
 
     const f16x2_t w_left  = SYCL_FFT_F16X2_FMA(u_v,     o_acc, e_acc);
     const f16x2_t w_right = SYCL_FFT_F16X2_FMA(neg_u_v, o_acc, e_acc);
-    w_out[0]     = w_left[0];
-    w_out[1]     = w_left[1];
-    w_out[W - 2] = w_right[1];
-    w_out[W - 1] = w_right[0];
+    w_out[0]     = f16x2_lo(w_left);
+    w_out[1]     = f16x2_hi(w_left);
+    w_out[W - 2] = f16x2_hi(w_right);
+    w_out[W - 1] = f16x2_lo(w_right);
 
     if constexpr ((W & 1) != 0) {
         constexpr int j_mid = W / 2;
@@ -701,7 +701,7 @@ SYCL_FFT_FORCE_INLINE void eval_pswf_spread_weights_f16(
             const f16x2_t c_em = SYCL_FFT_F16X2_SPLAT_H(em_m);
             em_acc = SYCL_FFT_F16X2_FMA(em_acc, t_v, c_em);
         }
-        w_out[j_mid] = em_acc[0];
+        w_out[j_mid] = f16x2_lo(em_acc);
     }
 }
 
@@ -858,14 +858,94 @@ SYCL_FFT_DF_INLINE void eval_pswf_spread_weights_f64(
     }
 }
 
-// FINUFFT-adjacent Gauss-Legendre-free self-FT deconvolution evaluators:
-//   deconv(k') = inv_prefac / phi(eta_{k'}),  eta_{k'} = eta_scale * |k'| / N_fft.
+// Host helper: rescale an FP32 / DF / FP64 PSWF piecewise table in-place (on a host copy)
+// so that the continuous Fourier transform satisfies sqrt(phi_hat(0) * phi_hat(edge)) == 1
+// across the passband (eta_max = eta_scale * (mode43 ? 3/8 : 1/4)).
+// Because phi_hat(k') = prefac * psi(eta_{k'}) scales linearly with the spreading kernel
+// coefficients while prefac = lambda_0 * (w/2) is scale-invariant, rescaling even/odd
+// polynomial coefficients by r = 1 / (prefac * sqrt(psi(0) * psi(eta_max))) preserves
+// standalone deconvolved NuFFT-1 outputs with ZERO extra runtime FLOPs!
+// FP16 retains its subnormal-safe 2^e scale and does NOT call this helper.
+template <typename TableT>
+inline long double eval_pswf_table_psi_ld(const TableT& tbl, long double eta) {
+    constexpr int W = TableT::width;
+    constexpr int n_half = TableT::n_half;
+    constexpr int n_left = TableT::n_left;
+    auto to_ld = [](auto v) -> long double {
+        if constexpr (std::is_same_v<std::decay_t<decltype(v)>, sycl_fft::df_t>) {
+            return static_cast<long double>(v.hi) + static_cast<long double>(v.lo);
+        } else {
+            return static_cast<long double>(v);
+        }
+    };
+    const long double s = 0.5L * static_cast<long double>(W) * (1.0L - eta);
+    int j = static_cast<int>(std::floor(s));
+    if (j >= n_half) j = n_half - 1;
+    if (j < 0) j = 0;
+    const long double u = 2.0L * (s - static_cast<long double>(j)) - 1.0L;
+    const long double t = u * u;
+    long double e_acc = to_ld(tbl.even[j][TableT::n_even - 1]);
+    for (int m = TableT::n_even - 2; m >= 0; --m) {
+        e_acc = e_acc * t + to_ld(tbl.even[j][m]);
+    }
+    long double o_acc = 0.0L;
+    if (j < n_left) {
+        o_acc = to_ld(tbl.odd[j][TableT::n_odd - 1]);
+        for (int m = TableT::n_odd - 2; m >= 0; --m) {
+            o_acc = o_acc * t + to_ld(tbl.odd[j][m]);
+        }
+    }
+    return e_acc + u * o_acc;
+}
+
+template <typename TableT>
+inline TableT make_geo_scaled_pswf_table(const TableT& src, PswfMode mode) {
+    auto to_ld = [](auto v) -> long double {
+        if constexpr (std::is_same_v<std::decay_t<decltype(v)>, sycl_fft::df_t>) {
+            return static_cast<long double>(v.hi) + static_cast<long double>(v.lo);
+        } else {
+            return static_cast<long double>(v);
+        }
+    };
+    const long double edge_frac = (mode == PswfMode::PSWF43) ? 0.375L : 0.25L;
+    const long double eta_max = to_ld(src.eta_scale) * edge_frac;
+    const long double prefac_ld = to_ld(src.prefac);
+    const long double phi0 = prefac_ld * eval_pswf_table_psi_ld(src, 0.0L);
+    const long double phi_edge = prefac_ld * eval_pswf_table_psi_ld(src, eta_max);
+    const long double r = 1.0L / std::sqrt(phi0 * phi_edge);
+
+    TableT dst = src;
+    dst.scale_exp = 0;
+    using CoeffT = std::decay_t<decltype(dst.even[0][0])>;
+    auto from_ld = [](long double v) -> CoeffT {
+        if constexpr (std::is_same_v<CoeffT, sycl_fft::df_t>) {
+            const float hi = static_cast<float>(v);
+            const float lo = static_cast<float>(v - static_cast<long double>(hi));
+            return sycl_fft::df_make(hi, lo);
+        } else {
+            return static_cast<CoeffT>(v);
+        }
+    };
+    for (int j = 0; j < TableT::n_half; ++j) {
+        for (int m = 0; m < TableT::n_even; ++m) {
+            dst.even[j][m] = from_ld(to_ld(src.even[j][m]) * r);
+        }
+        for (int m = 0; m < TableT::n_odd; ++m) {
+            dst.odd[j][m] = from_ld(to_ld(src.odd[j][m]) * r);
+        }
+    }
+    return dst;
+}
+
+// FINUFFT-adjacent Gauss-Legendre-free self-FT evaluators (phi_hat & deconv):
+//   phi_hat(k') = prefac * phi(eta_{k'}),
+//   deconv(k')  = (output_scale * inv_prefac) / phi(eta_{k'}),  eta_{k'} = eta_scale * |k'| / N_fft.
 // Note: Arithmetic FMA blending of panel coefficients (`sycl::fma(mask_J, tbl.even[J][m], c_e)`)
 // guarantees every table entry is unconditionally referenced as a scalar register operand,
 // preventing LLVM SimplifyCFG/InstCombine from forming dynamic memory GEPs and guaranteeing
 // 0 .local stack loads/stores (ld.local = 0, st.local = 0) across all 4 precisions.
 template <int W, int NEven, int NOdd>
-SYCL_FFT_FORCE_INLINE sycl_fft::f16_scalar_t eval_pswf_deconv_f16(
+SYCL_FFT_FORCE_INLINE float eval_pswf_phi_f16_f32(
     int abs_k_prime,
     float inv_nfft,
     const PswfPiecewiseTableF16<W, NEven, NOdd>& tbl) {
@@ -903,12 +983,30 @@ SYCL_FFT_FORCE_INLINE sycl_fft::f16_scalar_t eval_pswf_deconv_f16(
         }
         o_acc = (m == NOdd - 1) ? c_o : sycl::fma(o_acc, t, c_o);
     }
-    const float phi = sycl::fma(u, o_acc, e_acc);
-    return static_cast<sycl_fft::f16_scalar_t>(tbl.inv_prefac / phi);
+    return sycl::fma(u, o_acc, e_acc);
 }
 
 template <int W, int NEven, int NOdd>
-SYCL_FFT_DF_INLINE float eval_pswf_deconv_f32(
+SYCL_FFT_FORCE_INLINE sycl_fft::f16_scalar_t eval_pswf_phi_hat_f16(
+    int abs_k_prime,
+    float inv_nfft,
+    const PswfPiecewiseTableF16<W, NEven, NOdd>& tbl) {
+    return static_cast<sycl_fft::f16_scalar_t>(
+        tbl.prefac * eval_pswf_phi_f16_f32<W>(abs_k_prime, inv_nfft, tbl));
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_FORCE_INLINE sycl_fft::f16_scalar_t eval_pswf_deconv_f16(
+    int abs_k_prime,
+    float inv_nfft,
+    const PswfPiecewiseTableF16<W, NEven, NOdd>& tbl,
+    float output_scale = 1.0f) {
+    const float phi = eval_pswf_phi_f16_f32<W>(abs_k_prime, inv_nfft, tbl);
+    return static_cast<sycl_fft::f16_scalar_t>((output_scale * tbl.inv_prefac) / phi);
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE float eval_pswf_phi_f32(
     int abs_k_prime,
     float inv_nfft,
     const PswfPiecewiseTableF32<W, NEven, NOdd>& tbl) {
@@ -946,12 +1044,27 @@ SYCL_FFT_DF_INLINE float eval_pswf_deconv_f32(
         }
         o_acc = (m == NOdd - 1) ? c_o : sycl::fma(o_acc, t, c_o);
     }
-    const float phi = sycl::fma(u, o_acc, e_acc);
-    return tbl.inv_prefac / phi;
+    return sycl::fma(u, o_acc, e_acc);
 }
 
 template <int W, int NEven, int NOdd>
-SYCL_FFT_DF_INLINE sycl_fft::df_t eval_pswf_deconv_df(
+SYCL_FFT_DF_INLINE float eval_pswf_phi_hat_f32(
+    int abs_k_prime,
+    float inv_nfft,
+    const PswfPiecewiseTableF32<W, NEven, NOdd>& tbl) {
+    return tbl.prefac * eval_pswf_phi_f32<W>(abs_k_prime, inv_nfft, tbl);
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE float eval_pswf_deconv_f32(
+    int abs_k_prime,
+    float inv_nfft,
+    const PswfPiecewiseTableF32<W, NEven, NOdd>& tbl) {
+    return tbl.inv_prefac / eval_pswf_phi_f32<W>(abs_k_prime, inv_nfft, tbl);
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE sycl_fft::df_t eval_pswf_phi_df(
     int abs_k_prime,
     float inv_nfft,
     const PswfPiecewiseTableDF<W, NEven, NOdd>& tbl) {
@@ -1028,12 +1141,27 @@ SYCL_FFT_DF_INLINE sycl_fft::df_t eval_pswf_deconv_df(
         const df_t c_o = df_make(co_hi, co_lo);
         o_acc = (m == NOdd - 1) ? c_o : df_add(df_mul(o_acc, t), c_o);
     }
-    const df_t phi = df_add(e_acc, df_mul(u, o_acc));
-    return df_div(tbl.inv_prefac, phi);
+    return df_add(e_acc, df_mul(u, o_acc));
 }
 
 template <int W, int NEven, int NOdd>
-SYCL_FFT_DF_INLINE double eval_pswf_deconv_f64(
+SYCL_FFT_DF_INLINE sycl_fft::df_t eval_pswf_phi_hat_df(
+    int abs_k_prime,
+    float inv_nfft,
+    const PswfPiecewiseTableDF<W, NEven, NOdd>& tbl) {
+    return sycl_fft::df_mul(tbl.prefac, eval_pswf_phi_df<W>(abs_k_prime, inv_nfft, tbl));
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE sycl_fft::df_t eval_pswf_deconv_df(
+    int abs_k_prime,
+    float inv_nfft,
+    const PswfPiecewiseTableDF<W, NEven, NOdd>& tbl) {
+    return sycl_fft::df_div(tbl.inv_prefac, eval_pswf_phi_df<W>(abs_k_prime, inv_nfft, tbl));
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE double eval_pswf_phi_f64(
     int abs_k_prime,
     double inv_nfft,
     const PswfPiecewiseTableF64<W, NEven, NOdd>& tbl) {
@@ -1071,8 +1199,23 @@ SYCL_FFT_DF_INLINE double eval_pswf_deconv_f64(
         }
         o_acc = (m == NOdd - 1) ? c_o : sycl::fma(o_acc, t, c_o);
     }
-    const double phi = sycl::fma(u, o_acc, e_acc);
-    return tbl.inv_prefac / phi;
+    return sycl::fma(u, o_acc, e_acc);
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE double eval_pswf_phi_hat_f64(
+    int abs_k_prime,
+    double inv_nfft,
+    const PswfPiecewiseTableF64<W, NEven, NOdd>& tbl) {
+    return tbl.prefac * eval_pswf_phi_f64<W>(abs_k_prime, inv_nfft, tbl);
+}
+
+template <int W, int NEven, int NOdd>
+SYCL_FFT_DF_INLINE double eval_pswf_deconv_f64(
+    int abs_k_prime,
+    double inv_nfft,
+    const PswfPiecewiseTableF64<W, NEven, NOdd>& tbl) {
+    return tbl.inv_prefac / eval_pswf_phi_f64<W>(abs_k_prime, inv_nfft, tbl);
 }
 } // namespace sycl_nufft
 

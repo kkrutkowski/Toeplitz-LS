@@ -42,6 +42,16 @@ struct BitRevLutState {
     BitRevLutState& operator=(const BitRevLutState&) = delete;
 
     void release() {
+        const bool any_alloc =
+            pairs16 || pairs32 || idx16 || idx32 ||
+            rev_w[0] || rev_w[1] || b_pairs[0] || b_pairs[1] ||
+            b_all_rev[0] || b_all_rev[1];
+        if (any_alloc) {
+            try {
+                q.wait();
+            } catch (...) {
+            }
+        }
         auto free_ptr = [&](auto*& p) {
             if (p) {
                 sycl::free(p, q);
@@ -693,6 +703,9 @@ BitRevEngine<RawT>::BitRevEngine(
       launch_cfg_(launch_cfg),
       xor_k_(whole_smem_xor_k(bank_model_from_kind(dev_cfg.bank_model), sizeof(RawT))),
       lut_(std::make_unique<BitRevLutState>(q_, logN)) {
+    if (!q_.is_in_order()) {
+        throw std::invalid_argument("BitRevEngine requires an in-order sycl::queue");
+    }
     cache_path_ = AutotuneCache::resolve_cache_path(launch_cfg_.cache_path);
     valid_ip_ = filter_candidates(detail::build_bitrev_candidates<RawT, true>(logN_));
     valid_oop_ = filter_candidates(detail::build_bitrev_candidates<RawT, false>(logN_));

@@ -18,6 +18,8 @@
 #include <unordered_map>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -249,30 +251,35 @@ struct SubgroupTopologyProbeKernel {
         const int t = static_cast<int>(item.get_local_linear_id());
         auto sg = item.get_sub_group();
         const uint32_t sg_sz = static_cast<uint32_t>(sg.get_max_local_range()[0]);
+        auto mark_fail = [&](int idx) {
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+                             sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(out[idx]).store(0u);
+        };
         if (t == 0) {
             out[0] = sg_sz;
         }
         const bool pow2 = (sg_sz > 0) && ((sg_sz & (sg_sz - 1u)) == 0u);
         if (!pow2 || sg.get_local_linear_id() != (static_cast<uint32_t>(t) & (sg_sz - 1u))) {
-            out[1] = 0u;
+            mark_fail(1);
         }
         const uint32_t max_h = (sg_sz < static_cast<uint32_t>(probe_wg))
             ? sg_sz : static_cast<uint32_t>(probe_wg);
         const uint32_t self = static_cast<uint32_t>(t);
         if (max_h >= 2u) {
-            if (sycl::permute_group_by_xor(sg, self, 1u) != (self ^ 1u)) out[2] = 0u;
+            if (sycl::permute_group_by_xor(sg, self, 1u) != (self ^ 1u)) mark_fail(2);
         }
         if (max_h >= 4u) {
-            if (sycl::permute_group_by_xor(sg, self, 2u) != (self ^ 2u)) out[2] = 0u;
+            if (sycl::permute_group_by_xor(sg, self, 2u) != (self ^ 2u)) mark_fail(2);
         }
         if (max_h >= 8u) {
-            if (sycl::permute_group_by_xor(sg, self, 4u) != (self ^ 4u)) out[2] = 0u;
+            if (sycl::permute_group_by_xor(sg, self, 4u) != (self ^ 4u)) mark_fail(2);
         }
         if (max_h >= 16u) {
-            if (sycl::permute_group_by_xor(sg, self, 8u) != (self ^ 8u)) out[2] = 0u;
+            if (sycl::permute_group_by_xor(sg, self, 8u) != (self ^ 8u)) mark_fail(2);
         }
         if (max_h >= 32u) {
-            if (sycl::permute_group_by_xor(sg, self, 16u) != (self ^ 16u)) out[2] = 0u;
+            if (sycl::permute_group_by_xor(sg, self, 16u) != (self ^ 16u)) mark_fail(2);
         }
     }
 };
@@ -351,7 +358,7 @@ struct FmaThroughputProbeKernel {
         const T a = static_cast<T>(1.000001);
         const T b = static_cast<T>(0.0000005);
         T x0 = seed, x1 = seed + static_cast<T>(0.1), x2 = seed + static_cast<T>(0.2), x3 = seed + static_cast<T>(0.3);
-        for (int it = 0; it < 256; ++it) {
+        for (int it = 0; it < 2048; ++it) {
             x0 = sycl::fma(x0, a, b);
             x1 = sycl::fma(x1, a, b);
             x2 = sycl::fma(x2, a, b);
@@ -412,6 +419,16 @@ DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig&
             res.sg_xor_ok = (h_out[2] != 0u);
             const bool pow2 = (res.raw_sg_size > 0) && ((res.raw_sg_size & (res.raw_sg_size - 1)) == 0);
             res.effective_sg_size = (pow2 && res.sg_linear_ok && res.sg_xor_ok) ? res.raw_sg_size : 1;
+#if !SYCL_FFT_HAS_REQD_SG_SIZE
+            // On variable-SIMD GPUs (e.g. Intel Xe/Arc/PVC supporting {8, 16, 32}),
+            // without [[sycl::reqd_sub_group_size]] the compiler may lower register-heavy
+            // FFT kernels to a narrower SIMD width than the tiny probe kernel.
+            // Clamp effective_sg_size to the device minimum so SubgroupShuffle is only
+            // selected when guaranteed safe across all register pressures.
+            if (dev_cfg.sub_group_sizes.size() > 1 && res.effective_sg_size > dev_cfg.min_sub_group_size) {
+                res.effective_sg_size = dev_cfg.min_sub_group_size;
+            }
+#endif
         }
     } catch (...) {
         if (d_out) sycl::free(d_out, q);
@@ -673,28 +690,37 @@ DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cf
             d_f32 = sycl::malloc_device<float>(num_items, q);
             d_f64 = sycl::malloc_device<double>(num_items, q);
             if (d_f32 && d_f64) {
-                auto time_f32 = [&]() {
-                    q.submit([&](sycl::handler& h) {
-                        h.parallel_for(sycl::nd_range<1>(num_items, wg),
-                                       detail::FmaThroughputProbeKernel<float>{d_f32});
-                    }).wait_and_throw();
+                auto run_f32_batch = [&](int reps) {
+                    sycl::event ev{};
+                    for (int r = 0; r < reps; ++r) {
+                        ev = q.submit([&](sycl::handler& h) {
+                            if (r > 0) h.depends_on(ev);
+                            h.parallel_for(sycl::nd_range<1>(num_items, wg),
+                                           detail::FmaThroughputProbeKernel<float>{d_f32});
+                        });
+                    }
+                    ev.wait_and_throw();
                 };
-                auto time_f64 = [&]() {
-                    q.submit([&](sycl::handler& h) {
-                        h.parallel_for(sycl::nd_range<1>(num_items, wg),
-                                       detail::FmaThroughputProbeKernel<double>{d_f64});
-                    }).wait_and_throw();
+                auto run_f64_batch = [&](int reps) {
+                    sycl::event ev{};
+                    for (int r = 0; r < reps; ++r) {
+                        ev = q.submit([&](sycl::handler& h) {
+                            if (r > 0) h.depends_on(ev);
+                            h.parallel_for(sycl::nd_range<1>(num_items, wg),
+                                           detail::FmaThroughputProbeKernel<double>{d_f64});
+                        });
+                    }
+                    ev.wait_and_throw();
                 };
                 // Warmup JIT + clocks
-                time_f32();
-                time_f64();
+                run_f32_batch(1);
+                run_f64_batch(1);
 
+                constexpr int kBatchReps = 8;
                 const auto t0 = std::chrono::steady_clock::now();
-                time_f32();
-                time_f32();
+                run_f32_batch(kBatchReps);
                 const auto t1 = std::chrono::steady_clock::now();
-                time_f64();
-                time_f64();
+                run_f64_batch(kBatchReps);
                 const auto t2 = std::chrono::steady_clock::now();
 
                 const double ns32 = std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -744,16 +770,10 @@ const char* plan_mode_to_str(PlanExecMode m) {
     return "1pass";
 }
 
-EntryMap& get_autotune_store_locked(const std::string& path) {
-    auto& all = autotune_cache_stores();
-    auto it = all.find(path);
-    if (it != all.end()) return it->second;
-
-    EntryMap& map = all[path];
-    if (path.empty()) return map;
-
+void parse_autotune_file(const std::string& path, EntryMap& map) {
+    if (path.empty()) return;
     std::ifstream ifs(path);
-    if (!ifs.is_open()) return map;
+    if (!ifs.is_open()) return;
 
     std::string line;
     while (std::getline(ifs, line)) {
@@ -792,10 +812,19 @@ EntryMap& get_autotune_store_locked(const std::string& path) {
         }
         map[key] = std::move(e);
     }
+}
+
+EntryMap& get_autotune_store_locked(const std::string& path) {
+    auto& all = autotune_cache_stores();
+    auto it = all.find(path);
+    if (it != all.end()) return it->second;
+
+    EntryMap& map = all[path];
+    parse_autotune_file(path, map);
     return map;
 }
 
-void flush_autotune_store_locked(const std::string& path, const EntryMap& map) {
+void flush_autotune_store_locked(const std::string& path, EntryMap& map) {
     try {
         const std::filesystem::path p(path);
         if (p.has_parent_path()) {
@@ -803,8 +832,31 @@ void flush_autotune_store_locked(const std::string& path, const EntryMap& map) {
             std::filesystem::create_directories(p.parent_path(), ec);
         }
 #if !defined(_WIN32)
+        const std::string lock_path = path + ".lock";
+        const int lock_fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (lock_fd >= 0) {
+            (void)::flock(lock_fd, LOCK_EX);
+        }
+        struct LockGuard {
+            int fd;
+            ~LockGuard() {
+                if (fd >= 0) {
+                    (void)::flock(fd, LOCK_UN);
+                    ::close(fd);
+                }
+            }
+        } lg{lock_fd};
+
+        // Re-read on-disk entries written by concurrent processes, then overlay our in-memory updates.
+        EntryMap merged;
+        parse_autotune_file(path, merged);
+        for (const auto& kv : map) {
+            merged[kv.first] = kv.second;
+        }
+        map = merged;
         const long pid = static_cast<long>(::getpid());
 #else
+        const EntryMap& merged = map;
         const long pid = 0;
 #endif
         const std::string tmp = path + ".tmp." + std::to_string(pid);
@@ -812,7 +864,7 @@ void flush_autotune_store_locked(const std::string& path, const EntryMap& map) {
             std::ofstream ofs(tmp, std::ios::out | std::ios::trunc);
             if (!ofs.is_open()) return;
             ofs << "# sycl_fft autotune cache v1\n";
-            for (const auto& kv : map) {
+            for (const auto& kv : merged) {
                 const auto& e = kv.second;
                 ofs << kv.first
                     << '\t' << plan_mode_to_str(e.mode)

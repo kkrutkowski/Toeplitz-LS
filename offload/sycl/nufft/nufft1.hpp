@@ -31,8 +31,9 @@ enum class PswfMode : int {
 #endif
 
 enum class NufftOutOrder : int {
-    SlotBitReversed = 0, // Primary fast path: raw DIF slot order (no bit-reversal pass)
-    Natural         = 1  // Verification path: natural frequency order k in [0, N_out)
+    SlotBitReversed    = 0, // Primary fast path: compact DIF slot order, deconvolved (fused FFT epilogue)
+    Natural            = 1, // Verification path: natural frequency order k in [0, N_out), deconvolved
+    SlotBitReversedRaw = 2  // Deferred deconvolution: compact DIF slot order WITHOUT dividing by phi_hat
 };
 
 // Hardware-generalized NuFFT-1 launch configuration (all fields auto-derived when 0/empty)
@@ -55,16 +56,18 @@ struct Nufft1LaunchConfig {
 
 // Runtime spreading execution parameters (derived dynamically from DeviceFftConfig & BankModel)
 struct SpreadConfig {
-    bool use_smem         = true;
-    int  wg_size          = 64;
-    int  t_j              = 8;
-    int  b_per_wg         = 8;
-    int  win_elems        = 1024;
-    int  num_wins         = 1;
-    int  grid_stride      = 1024;
-    int  tile_m           = 32;
-    int  transpose_tile   = 16;
-    int  transpose_stride = 17;
+    bool use_smem            = true;
+    bool use_cpu_direct      = false;
+    bool use_precomp_weights = false;
+    int  wg_size             = 64;
+    int  t_j                 = 8;
+    int  b_per_wg            = 8;
+    int  win_elems           = 1024;
+    int  num_wins            = 1;
+    int  grid_stride         = 1024;
+    int  tile_m              = 32;
+    int  transpose_tile      = 16;
+    int  transpose_stride    = 17;
 };
 
 // Runtime deconvolution execution parameters (derived dynamically from DeviceFftConfig)
@@ -155,25 +158,25 @@ namespace detail {
 // --- Auxiliary kernels (sycl_nufft1_aux.cpp) ---
 void launch_precompute_pointsh(
     sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, sycl_fft::f16_scalar_t* d_u, sycl_fft::Complexh* d_shift,
     size_t wg_size);
 
 void launch_precompute_pointsf(
     sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, float* d_u, sycl_fft::Complexf* d_shift,
     size_t wg_size);
 
 void launch_precompute_points(
     sycl::queue& q, const double* d_x, double df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, double* d_u, sycl_fft::Complex* d_shift,
     size_t wg_size);
 
 void launch_precompute_pointsdf(
     sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled,
-    int M, int nfft, int w, int output_shift, bool mode43,
+    int M, int nfft, int w, int output_shift, bool mode43, bool pos_sign,
     int* d_first, sycl_fft::df_t* d_u, sycl_fft::Complexdf* d_shift,
     size_t wg_size);
 
@@ -202,9 +205,37 @@ void launch_transpose_and_zero_f16pair(
     sycl_fft::Complexh* d_fft_buf, int nfft, size_t chunk_bs, size_t packed_stride,
     int tile, int stride);
 
-// --- Decoupled spreading stage launchers (sycl_nufft1_spread_{fp16,fp32,fp64,df}.cpp) ---
+// --- Device-resident PSWF table uploaders (avoids 1 KiB by-value kernel capture;
+//     applies exact geometric-mean-1 rescaling for FP32/FP64/DF, retains 2^e for FP16) ---
+uint8_t* upload_pswf_tableh(sycl::queue& q, int w, PswfMode mode);
+uint8_t* upload_pswf_tablef(sycl::queue& q, int w, PswfMode mode);
+uint8_t* upload_pswf_table(sycl::queue& q, int w, PswfMode mode);
+uint8_t* upload_pswf_tabledf(sycl::queue& q, int w, PswfMode mode);
+
+// --- L2-resident precomputed spreading weight evaluators (called once in set_points) ---
+void launch_precompute_weightsh(
+    sycl::queue& q, int w, const void* d_tbl,
+    const sycl_fft::f16_scalar_t* d_u, sycl_fft::f16_scalar_t* d_weights,
+    int M, size_t wg_size);
+
+void launch_precompute_weightsf(
+    sycl::queue& q, int w, const void* d_tbl,
+    const float* d_u, float* d_weights,
+    int M, size_t wg_size);
+
+void launch_precompute_weights(
+    sycl::queue& q, int w, const void* d_tbl,
+    const double* d_u, double* d_weights,
+    int M, size_t wg_size);
+
+void launch_precompute_weightsdf(
+    sycl::queue& q, int w, const void* d_tbl,
+    const sycl_fft::df_t* d_u, sycl_fft::df_t* d_weights,
+    int M, size_t wg_size);
+
+// --- Decoupled spreading stage launchers (nufft/spread.cpp) ---
 void launch_spread_smem_winh(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const sycl_fft::f16_scalar_t* d_weights,
     const int* d_first, const sycl_fft::f16_scalar_t* d_u, const sycl_fft::Complexh* d_shift,
     const int* d_bucket_off, const int* d_bucket_m,
     const sycl_fft::Complexh* d_y, sycl_fft::Complexh* d_fft_buf,
@@ -212,15 +243,21 @@ void launch_spread_smem_winh(
     PswfMode mode, const SpreadConfig& cfg);
 
 void launch_spread_collabh(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const sycl_fft::f16_scalar_t* d_weights,
     const int* d_first, const sycl_fft::f16_scalar_t* d_u, const sycl_fft::Complexh* d_shift,
     const sycl_fft::Complexh* d_y,
     sycl_fft::f16x2_t* d_grid_T_re, sycl_fft::f16x2_t* d_grid_T_im,
     int M, int nfft, size_t total_M_stride, size_t chunk_bs, size_t packed_stride,
     PswfMode mode, const SpreadConfig& cfg);
 
+void launch_spread_cpu_directh(
+    sycl::queue& q, int w, const void* d_tbl, const sycl_fft::f16_scalar_t* d_weights,
+    const int* d_first, const sycl_fft::f16_scalar_t* d_u, const sycl_fft::Complexh* d_shift,
+    const sycl_fft::Complexh* d_y, sycl_fft::Complexh* d_fft_buf,
+    int M, int nfft, size_t total_M_stride, size_t chunk_bs);
+
 void launch_spread_smem_winf(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const float* d_weights,
     const int* d_first, const float* d_u, const sycl_fft::Complexf* d_shift,
     const int* d_bucket_off, const int* d_bucket_m,
     const sycl_fft::Complexf* d_y, sycl_fft::Complexf* d_fft_buf,
@@ -228,15 +265,21 @@ void launch_spread_smem_winf(
     PswfMode mode, const SpreadConfig& cfg);
 
 void launch_spread_collabf(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const float* d_weights,
     const int* d_first, const float* d_u, const sycl_fft::Complexf* d_shift,
     const sycl_fft::Complexf* d_y,
     float* d_grid_T_re, float* d_grid_T_im,
     int M, int nfft, size_t total_M_stride, size_t chunk_bs, size_t packed_stride,
     PswfMode mode, const SpreadConfig& cfg);
 
+void launch_spread_cpu_directf(
+    sycl::queue& q, int w, const void* d_tbl, const float* d_weights,
+    const int* d_first, const float* d_u, const sycl_fft::Complexf* d_shift,
+    const sycl_fft::Complexf* d_y, sycl_fft::Complexf* d_fft_buf,
+    int M, int nfft, size_t total_M_stride, size_t chunk_bs);
+
 void launch_spread_smem_win(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const double* d_weights,
     const int* d_first, const double* d_u, const sycl_fft::Complex* d_shift,
     const int* d_bucket_off, const int* d_bucket_m,
     const sycl_fft::Complex* d_y, sycl_fft::Complex* d_fft_buf,
@@ -244,15 +287,21 @@ void launch_spread_smem_win(
     PswfMode mode, const SpreadConfig& cfg);
 
 void launch_spread_collab(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const double* d_weights,
     const int* d_first, const double* d_u, const sycl_fft::Complex* d_shift,
     const sycl_fft::Complex* d_y,
     double* d_grid_T_re, double* d_grid_T_im,
     int M, int nfft, size_t total_M_stride, size_t chunk_bs, size_t packed_stride,
     PswfMode mode, const SpreadConfig& cfg);
 
+void launch_spread_cpu_direct(
+    sycl::queue& q, int w, const void* d_tbl, const double* d_weights,
+    const int* d_first, const double* d_u, const sycl_fft::Complex* d_shift,
+    const sycl_fft::Complex* d_y, sycl_fft::Complex* d_fft_buf,
+    int M, int nfft, size_t total_M_stride, size_t chunk_bs);
+
 void launch_spread_smem_windf(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const sycl_fft::df_t* d_weights,
     const int* d_first, const sycl_fft::df_t* d_u, const sycl_fft::Complexdf* d_shift,
     const int* d_bucket_off, const int* d_bucket_m,
     const sycl_fft::Complexdf* d_y, sycl_fft::Complexdf* d_fft_buf,
@@ -260,52 +309,90 @@ void launch_spread_smem_windf(
     PswfMode mode, const SpreadConfig& cfg);
 
 void launch_spread_collabdf(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl, const sycl_fft::df_t* d_weights,
     const int* d_first, const sycl_fft::df_t* d_u, const sycl_fft::Complexdf* d_shift,
     const sycl_fft::Complexdf* d_y,
     sycl_fft::df_t* d_grid_T_re, sycl_fft::df_t* d_grid_T_im,
     int M, int nfft, size_t total_M_stride, size_t chunk_bs, size_t packed_stride,
     PswfMode mode, const SpreadConfig& cfg);
 
-// --- Decoupled GL-free deconvolution stage launchers (sycl_nufft1_deconv_{fp16,fp32,fp64,df}.cpp) ---
+void launch_spread_cpu_directdf(
+    sycl::queue& q, int w, const void* d_tbl, const sycl_fft::df_t* d_weights,
+    const int* d_first, const sycl_fft::df_t* d_u, const sycl_fft::Complexdf* d_shift,
+    const sycl_fft::Complexdf* d_y, sycl_fft::Complexdf* d_fft_buf,
+    int M, int nfft, size_t total_M_stride, size_t chunk_bs);
+
+// --- Decoupled GL-free deconvolution stage launchers & reusable LUT builders (nufft/deconv.cpp) ---
+// table_kind: 0 = slot_phi_hat (compact), 1 = slot_deconv (compact), 2 = nat_deconv (natural)
+void launch_build_deconv_tableh(
+    sycl::queue& q, int w, const void* d_tbl,
+    int nfft, int log_nfft, int nout, int output_shift,
+    PswfMode mode, int table_kind, sycl_fft::f16_scalar_t* d_out,
+    double output_scale = 1.0);
+
+void launch_build_deconv_tablef(
+    sycl::queue& q, int w, const void* d_tbl,
+    int nfft, int log_nfft, int nout, int output_shift,
+    PswfMode mode, int table_kind, float* d_out,
+    double output_scale = 1.0);
+
+void launch_build_deconv_table(
+    sycl::queue& q, int w, const void* d_tbl,
+    int nfft, int log_nfft, int nout, int output_shift,
+    PswfMode mode, int table_kind, double* d_out,
+    double output_scale = 1.0);
+
+void launch_build_deconv_tabledf(
+    sycl::queue& q, int w, const void* d_tbl,
+    int nfft, int log_nfft, int nout, int output_shift,
+    PswfMode mode, int table_kind, sycl_fft::df_t* d_out,
+    double output_scale = 1.0);
+
 void launch_deconv_emith(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl,
     const sycl_fft::Complexh* d_fft_buf, sycl_fft::Complexh* d_out,
     int nfft, int log_nfft, int nout, int output_shift,
     size_t total_nout_stride, size_t chunk_bs,
-    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg);
+    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg,
+    double output_scale = 1.0);
 
 void launch_deconv_emitf(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl,
     const sycl_fft::Complexf* d_fft_buf, sycl_fft::Complexf* d_out,
     int nfft, int log_nfft, int nout, int output_shift,
     size_t total_nout_stride, size_t chunk_bs,
-    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg);
+    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg,
+    double output_scale = 1.0);
 
 void launch_deconv_emit(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl,
     const sycl_fft::Complex* d_fft_buf, sycl_fft::Complex* d_out,
     int nfft, int log_nfft, int nout, int output_shift,
     size_t total_nout_stride, size_t chunk_bs,
-    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg);
+    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg,
+    double output_scale = 1.0);
 
 void launch_deconv_emitdf(
-    sycl::queue& q, int w,
+    sycl::queue& q, int w, const void* d_tbl,
     const sycl_fft::Complexdf* d_fft_buf, sycl_fft::Complexdf* d_out,
     int nfft, int log_nfft, int nout, int output_shift,
     size_t total_nout_stride, size_t chunk_bs,
-    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg);
+    PswfMode mode, NufftOutOrder order, const DeconvConfig& cfg,
+    double output_scale = 1.0);
 
 } // namespace detail
 
 namespace detail {
-// --- Precision tags for Nufft1PlanBase ---
+// --- Precision & sign tags for Nufft1PlanBase ---
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
 struct HalfPlanTraits {
     using ComplexT = sycl_fft::Complexh;
     using ScalarT  = sycl_fft::f16_scalar_t;
     using RealT    = sycl_fft::f16x2_t;
     using XCoordT  = sycl_fft::df_t;
-    using FftPlanT = sycl_fft::DifFftPlanh<+1>;
+    using FftPlanT = sycl_fft::DifFftPlanh<Sign>;
+    static constexpr int    kSign    = Sign;
+    static constexpr bool   kPosSign = (Sign > 0);
     static constexpr size_t kLanes   = 2;
     static constexpr bool   kIsFp64  = false;
     static constexpr bool   kIsHalf  = true;
@@ -314,12 +401,15 @@ struct HalfPlanTraits {
     static bool is_valid_width(int w) { return w == 4 || w == 5; }
 };
 
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
 struct FloatPlanTraits {
     using ComplexT = sycl_fft::Complexf;
     using ScalarT  = float;
     using RealT    = float;
     using XCoordT  = sycl_fft::df_t;
-    using FftPlanT = sycl_fft::DifFftPlanf<+1>;
+    using FftPlanT = sycl_fft::DifFftPlanf<Sign>;
+    static constexpr int    kSign    = Sign;
+    static constexpr bool   kPosSign = (Sign > 0);
     static constexpr size_t kLanes   = 1;
     static constexpr bool   kIsFp64  = false;
     static constexpr bool   kIsHalf  = false;
@@ -328,12 +418,15 @@ struct FloatPlanTraits {
     static bool is_valid_width(int w) { return w == 8 || w == 9; }
 };
 
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
 struct DoublePlanTraits {
     using ComplexT = sycl_fft::Complex;
     using ScalarT  = double;
     using RealT    = double;
     using XCoordT  = double;
-    using FftPlanT = sycl_fft::DifFftPlan<+1>;
+    using FftPlanT = sycl_fft::DifFftPlan<Sign>;
+    static constexpr int    kSign    = Sign;
+    static constexpr bool   kPosSign = (Sign > 0);
     static constexpr size_t kLanes   = 1;
     static constexpr bool   kIsFp64  = true;
     static constexpr bool   kIsHalf  = false;
@@ -342,12 +435,15 @@ struct DoublePlanTraits {
     static bool is_valid_width(int w) { return w == 16 || w == 17 || w == 18; }
 };
 
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
 struct DfPlanTraits {
     using ComplexT = sycl_fft::Complexdf;
     using ScalarT  = sycl_fft::df_t;
     using RealT    = sycl_fft::df_t;
     using XCoordT  = sycl_fft::df_t;
-    using FftPlanT = sycl_fft::DifFftPlandf<+1>;
+    using FftPlanT = sycl_fft::DifFftPlandf<Sign>;
+    static constexpr int    kSign    = Sign;
+    static constexpr bool   kPosSign = (Sign > 0);
     static constexpr size_t kLanes   = 1;
     static constexpr bool   kIsFp64  = false;
     static constexpr bool   kIsHalf  = false;
@@ -358,7 +454,8 @@ struct DfPlanTraits {
 
 } // namespace detail
 
-// Pure-host orchestrated NuFFT-1 plan (instantiated in sycl_nufft1_plan.cpp, 0 KiB HCF)
+// Pure-host orchestrated NuFFT-1 plan (instantiated in nufft/plan.cpp, 0 KiB HCF).
+// Requires an in-order sycl::queue and power-of-2 N in [512, 131072] (enforced upfront).
 template <typename Traits>
 class Nufft1PlanBase {
 public:
@@ -367,6 +464,8 @@ public:
     using RealT    = typename Traits::RealT;
     using XCoordT  = typename Traits::XCoordT;
     using FftPlanT = typename Traits::FftPlanT;
+    static constexpr int  kSign    = Traits::kSign;
+    static constexpr bool kPosSign = Traits::kPosSign;
 
     Nufft1PlanBase(
         sycl::queue& q,
@@ -416,6 +515,20 @@ public:
         execute(d_y, d_out, bs, order);
     }
 
+    // Optional multiplicative output scale folded into deconvolution (for FP16, folded in FP32
+    // prior to the single FP16 cast to absorb Toeplitz row_scale without an extra rounding pass).
+    void set_output_scale(double scale);
+    double output_scale() const { return output_scale_; }
+
+    // Lazy read-only device LUTs (length nout_) for deferred deconvolution and multi-NuFFT
+    // index-wise combination with a single final bit-reversal pass:
+    //   d_slot_phi_hat(): phi_hat(k'_i) in compact SlotBitReversed order
+    //   d_slot_deconv():  output_scale / phi_hat(k'_i) in compact SlotBitReversed order
+    //   d_deconv():       output_scale / phi_hat(k') in Natural frequency order
+    const ScalarT* d_slot_phi_hat();
+    const ScalarT* d_slot_deconv();
+    const ScalarT* d_deconv();
+
     int M() const { return M_; }
     int N() const { return N_; }
     int w() const { return w_; }
@@ -437,6 +550,26 @@ public:
     const DeconvConfig& deconv_config() const { return deconv_cfg_; }
 
 private:
+    static int validate_and_log_nfft(sycl::queue& q, int M, int N, int w, PswfMode mode) {
+        if (!q.is_in_order()) {
+            throw std::invalid_argument("Nufft1Plan: requires an in-order sycl::queue");
+        }
+        if (M <= 0) {
+            throw std::invalid_argument("Nufft1Plan: M must be positive");
+        }
+        if (N < 512 || N > (1 << 17) || (N & (N - 1)) != 0) {
+            throw std::invalid_argument(
+                "Nufft1Plan: N must be a power of 2 in [512, 131072]");
+        }
+        if (mode == PswfMode::PSWF43 && (N % 4) != 0) {
+            throw std::invalid_argument("Nufft1Plan: PSWF43 requires N divisible by 4");
+        }
+        if (!Traits::is_valid_width(w)) {
+            throw std::invalid_argument("Nufft1Plan: unsupported kernel width w for this precision");
+        }
+        return int_log2_pow2(2 * N);
+    }
+
     static Nufft1LaunchConfig make_default_cfg(const sycl_fft::FftLaunchConfig& fft_cfg) {
         Nufft1LaunchConfig c{};
         c.fft_cfg = fft_cfg;
@@ -451,8 +584,8 @@ private:
     int                N_;
     int                w_;
     PswfMode           mode_;
-    int                nfft_;
     int                log_nfft_;
+    int                nfft_;
     int                nout_;
     int                output_shift_;
     size_t             max_bs_;
@@ -466,29 +599,53 @@ private:
     DeconvConfig       deconv_cfg_{};
     std::string        spread_variant_name_;
     std::string        deconv_variant_name_;
-    bool               spread_cache_hit_ = false;
-    bool               deconv_cache_hit_ = false;
-    size_t             precompute_wg_    = 64;
+    bool               spread_cache_hit_    = false;
+    bool               deconv_cache_hit_    = false;
+    bool               use_precomp_weights_ = false;
+    size_t             precompute_wg_       = 64;
+    double             output_scale_        = 1.0;
 
-    int*               d_first_          = nullptr;
-    ScalarT*           d_u_              = nullptr;
-    ComplexT*          d_shift_          = nullptr;
-    int*               d_bucket_counts_  = nullptr;
-    int*               d_bucket_off_     = nullptr;
-    int*               d_bucket_m_       = nullptr;
-    RealT*             d_grid_T_re_      = nullptr;
-    RealT*             d_grid_T_im_      = nullptr;
-    ComplexT*          d_fft_buf_        = nullptr;
+    sycl_fft::UsmPtr<uint8_t>  d_pswf_tbl_;
+    sycl_fft::UsmPtr<ScalarT>  d_weights_;
+    sycl_fft::UsmPtr<ScalarT>  d_slot_phi_hat_;
+    sycl_fft::UsmPtr<ScalarT>  d_slot_deconv_;
+    sycl_fft::UsmPtr<ScalarT>  d_nat_deconv_;
+    sycl_fft::UsmPtr<int>      d_first_;
+    sycl_fft::UsmPtr<ScalarT>  d_u_;
+    sycl_fft::UsmPtr<ComplexT> d_shift_;
+    sycl_fft::UsmPtr<int>      d_bucket_counts_;
+    sycl_fft::UsmPtr<int>      d_bucket_off_;
+    sycl_fft::UsmPtr<int>      d_bucket_m_;
+    sycl_fft::UsmPtr<RealT>    d_grid_T_re_;
+    sycl_fft::UsmPtr<RealT>    d_grid_T_im_;
+    sycl_fft::UsmPtr<ComplexT> d_fft_buf_;
 };
 
-extern template class Nufft1PlanBase<detail::HalfPlanTraits>;
-extern template class Nufft1PlanBase<detail::FloatPlanTraits>;
-extern template class Nufft1PlanBase<detail::DoublePlanTraits>;
-extern template class Nufft1PlanBase<detail::DfPlanTraits>;
+#if SYCL_FFT_ENABLE_POS_SIGN
+extern template class Nufft1PlanBase<detail::HalfPlanTraits<+1>>;
+extern template class Nufft1PlanBase<detail::FloatPlanTraits<+1>>;
+extern template class Nufft1PlanBase<detail::DoublePlanTraits<+1>>;
+extern template class Nufft1PlanBase<detail::DfPlanTraits<+1>>;
+#endif
+#if SYCL_FFT_ENABLE_NEG_SIGN
+extern template class Nufft1PlanBase<detail::HalfPlanTraits<-1>>;
+extern template class Nufft1PlanBase<detail::FloatPlanTraits<-1>>;
+extern template class Nufft1PlanBase<detail::DoublePlanTraits<-1>>;
+extern template class Nufft1PlanBase<detail::DfPlanTraits<-1>>;
+#endif
 
-using Nufft1Planh  = Nufft1PlanBase<detail::HalfPlanTraits>;
-using Nufft1Planf  = Nufft1PlanBase<detail::FloatPlanTraits>;
-using Nufft1Plan   = Nufft1PlanBase<detail::DoublePlanTraits>;
-using Nufft1Plandf = Nufft1PlanBase<detail::DfPlanTraits>;
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
+using Nufft1PlanhSign  = Nufft1PlanBase<detail::HalfPlanTraits<Sign>>;
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
+using Nufft1PlanfSign  = Nufft1PlanBase<detail::FloatPlanTraits<Sign>>;
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
+using Nufft1PlanSign   = Nufft1PlanBase<detail::DoublePlanTraits<Sign>>;
+template <int Sign = SYCL_FFT_DEFAULT_SIGN>
+using Nufft1PlandfSign = Nufft1PlanBase<detail::DfPlanTraits<Sign>>;
+
+using Nufft1Planh  = Nufft1PlanhSign<SYCL_FFT_DEFAULT_SIGN>;
+using Nufft1Planf  = Nufft1PlanfSign<SYCL_FFT_DEFAULT_SIGN>;
+using Nufft1Plan   = Nufft1PlanSign<SYCL_FFT_DEFAULT_SIGN>;
+using Nufft1Plandf = Nufft1PlandfSign<SYCL_FFT_DEFAULT_SIGN>;
 
 } // namespace sycl_nufft

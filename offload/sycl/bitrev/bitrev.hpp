@@ -53,6 +53,7 @@ struct BitRevCandidate {
 
 // Capability-filtered, shortlist-autotuned bit-reversal engine
 // (instantiated for uint32_t, uint64_t, and sycl::uint4 in bitrev/bitrev.cpp).
+// Requires an in-order sycl::queue (enforced in constructor).
 template <typename RawT>
 class BitRevEngine {
 public:
