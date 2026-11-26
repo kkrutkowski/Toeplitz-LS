@@ -352,6 +352,16 @@ void launch_spread_cpu_directdf(
     const sycl_fft::Complexdf* d_y, sycl_fft::Complexdf* d_fft_buf,
     int M, int nfft, size_t total_M_stride, size_t chunk_bs);
 
+// SYCL 2020 kernel_bundle / private_mem_size spill & WG probe for register-resident spreading
+sycl_fft::KernelProbeInfo probe_spread_reg_kernelh(
+    sycl::queue& q, const sycl::device& dev, int w, const SpreadConfig& cfg);
+sycl_fft::KernelProbeInfo probe_spread_reg_kernelf(
+    sycl::queue& q, const sycl::device& dev, int w, const SpreadConfig& cfg);
+sycl_fft::KernelProbeInfo probe_spread_reg_kernel(
+    sycl::queue& q, const sycl::device& dev, int w, const SpreadConfig& cfg);
+sycl_fft::KernelProbeInfo probe_spread_reg_kerneldf(
+    sycl::queue& q, const sycl::device& dev, int w, const SpreadConfig& cfg);
+
 // --- Decoupled GL-free deconvolution stage launchers & reusable LUT builders (nufft/deconv.cpp) ---
 // table_kind: 0 = slot_phi_hat (compact), 1 = slot_deconv (compact), 2 = nat_deconv (natural)
 void launch_build_deconv_tableh(

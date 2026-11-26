@@ -97,9 +97,27 @@ $(OBJDIR)/impl.o: impl.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(PICFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJDIR)/common/device.o: common/device.cpp $(COMMON_HEADERS)
+KERNEL_HASH_INPUTS := \
+	common/math.hpp \
+	common/layout.hpp \
+	common/device.hpp \
+	common/precision.hpp \
+	bitrev/bitrev.hpp \
+	bitrev/bitrev.cpp \
+	fft/dif.hpp \
+	fft/dif.cpp \
+	nufft/pswf_coeffs.hpp \
+	nufft/nufft1.hpp \
+	nufft/aux.cpp \
+	nufft/spread.cpp \
+	nufft/deconv.cpp \
+	nufft/plan.cpp
+
+KERNEL_CODE_HASH := $(shell (command -v sha256sum >/dev/null 2>&1 && sha256sum $(KERNEL_HASH_INPUTS) | sha256sum | cut -c1-16) || (command -v shasum >/dev/null 2>&1 && shasum -a 256 $(KERNEL_HASH_INPUTS) | shasum -a 256 | cut -c1-16) || echo "unknown")
+
+$(OBJDIR)/common/device.o: common/device.cpp $(COMMON_HEADERS) $(KERNEL_HASH_INPUTS)
 	@mkdir -p $(dir $@)
-	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
+	$(ACPP) $(ACPP_COMPILE_FLAGS) -DSYCL_FFT_KERNEL_HASH=\"$(KERNEL_CODE_HASH)\" -c $< -o $@
 
 $(OBJDIR)/bitrev/bitrev.o: bitrev/bitrev.cpp $(COMMON_HEADERS) bitrev/bitrev.hpp
 	@mkdir -p $(dir $@)

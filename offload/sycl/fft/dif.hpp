@@ -160,7 +160,9 @@ private:                                                                        
         const std::vector<FilteredCandidate>& valid) const;                                   \
     size_t representative_tune_bs(int n) const;                                               \
     bool tune_single_pass(int n, const std::vector<FilteredCandidate>& valid,                 \
-                          Candidate& out_winner, double& out_best_ms);                        \
+                          Candidate& out_winner, double& out_best_ms,                         \
+                          double* out_margin_pct = nullptr,                                   \
+                          std::string* out_runner_up = nullptr);                              \
     bool resolve_single_pass_for(int n, bool apply_variant_override, bool allow_cache,        \
                                  bool force_tune, Candidate& out_cand, bool& out_cache_hit,   \
                                  double* out_ms = nullptr);                                   \

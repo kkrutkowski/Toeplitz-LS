@@ -441,12 +441,74 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem_win_precomp_impl)(
 }
 
 // ============================================================================
-// 2a-reg. Register-Resident Windowed Spreading (hardware-generalized Q in {4, 8, 16}
-//         subject to universal accumulator register budget Q * 2 * sizeof(RealT) <= 128 B)
-//     - ZERO grid SMEM (acc_re[Q], acc_im[Q] live 100% in thread registers, 0 .local spills!)
+// 2a-reg. Register-Resident Windowed Spreading (widened Q in {2, 4, 8, 16, 32},
+//         no hardcoded register-file byte cap: spill probe + Phase A measurement decide)
+//     - ZERO grid SMEM (acc_re[Q], acc_im[Q] promoted to scalar thread registers via
+//       compile-time binary-search constant-index helpers)
 //     - ZERO grid SMEM zeroing, ZERO initial barrier, ZERO grid LDS/STS in inner loop
-//     - 3x-4x higher SM occupancy & direct coalesced register-to-global writeback
+//     - Direct coalesced register-to-global writeback
 // ============================================================================
+template <int W, int Q, bool MultiPass>
+struct SYCL_FFT_SUFFIX(SpreadRegKernelTag) {};
+
+#if defined(SYCL_FFT_DF)
+template <int Lo, int Hi>
+SYCL_FFT_FORCE_INLINE void reg_acc_df_get(
+    int q_idx,
+    const sycl_fft::df_t* acc_re,
+    const sycl_fft::df_t* acc_im,
+    sycl_fft::df_t& cr,
+    sycl_fft::df_t& ci) {
+    if constexpr (Hi - Lo == 1) {
+        cr = acc_re[Lo];
+        ci = acc_im[Lo];
+    } else {
+        constexpr int Mid = (Lo + Hi) / 2;
+        if (q_idx < Mid) {
+            reg_acc_df_get<Lo, Mid>(q_idx, acc_re, acc_im, cr, ci);
+        } else {
+            reg_acc_df_get<Mid, Hi>(q_idx, acc_re, acc_im, cr, ci);
+        }
+    }
+}
+
+template <int Lo, int Hi>
+SYCL_FFT_FORCE_INLINE void reg_acc_df_set(
+    int q_idx,
+    sycl_fft::df_t* acc_re,
+    sycl_fft::df_t* acc_im,
+    sycl_fft::df_t cr,
+    sycl_fft::df_t ci) {
+    if constexpr (Hi - Lo == 1) {
+        acc_re[Lo] = cr;
+        acc_im[Lo] = ci;
+    } else {
+        constexpr int Mid = (Lo + Hi) / 2;
+        if (q_idx < Mid) {
+            reg_acc_df_set<Lo, Mid>(q_idx, acc_re, acc_im, cr, ci);
+        } else {
+            reg_acc_df_set<Mid, Hi>(q_idx, acc_re, acc_im, cr, ci);
+        }
+    }
+}
+#else
+template <int Lo, int Hi, typename RealT>
+SYCL_FFT_FORCE_INLINE void reg_acc_fma_range(
+    int q_idx, RealT* acc_re, RealT* acc_im, RealT sy_re, RealT sy_im, RealT wv) {
+    if constexpr (Hi - Lo == 1) {
+        acc_re[Lo] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[Lo]);
+        acc_im[Lo] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[Lo]);
+    } else {
+        constexpr int Mid = (Lo + Hi) / 2;
+        if (q_idx < Mid) {
+            reg_acc_fma_range<Lo, Mid>(q_idx, acc_re, acc_im, sy_re, sy_im, wv);
+        } else {
+            reg_acc_fma_range<Mid, Hi>(q_idx, acc_re, acc_im, sy_re, sy_im, wv);
+        }
+    }
+}
+#endif
+
 template <int W, int Q, bool MultiPass>
 inline void SYCL_FFT_SUFFIX(launch_spread_smem_win_reg_impl)(
     sycl::queue& q,
@@ -498,7 +560,7 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem_win_reg_impl)(
         sycl::local_accessor<int, 1>     l_first(sycl::range<1>(static_cast<size_t>(tile_m)), cgh);
         sycl::local_accessor<ScalarT, 1> l_w(sycl::range<1>(static_cast<size_t>(smem_w_elems)), cgh);
 
-        cgh.parallel_for(
+        cgh.parallel_for<SYCL_FFT_SUFFIX(SpreadRegKernelTag)<W, Q, MultiPass>>(
             sycl::nd_range<1>(total_wgs * static_cast<size_t>(wg_size), static_cast<size_t>(wg_size)),
             [=](sycl::nd_item<1> item) {
                 const auto grp = item.get_group();
@@ -593,76 +655,15 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem_win_reg_impl)(
                                     const RealT wv = ws;
 #endif
 #if defined(SYCL_FFT_DF)
-                                    // Single df_mul + single df_add with constant-index switch so LLVM SROA
-                                    // promotes acc_re/acc_im 100% to scalar registers (ld.local = 0, st.local = 0).
                                     const RealT pr = sycl_fft::df_mul(sy_re, wv);
                                     const RealT pi = sycl_fft::df_mul(sy_im, wv);
-                                    RealT cr = acc_re[0], ci = acc_im[0];
-                                    switch (q_idx) {
-                                        case 0: cr = acc_re[0]; ci = acc_im[0]; break;
-                                        case 1: cr = acc_re[1]; ci = acc_im[1]; break;
-                                        case 2: cr = acc_re[2]; ci = acc_im[2]; break;
-                                        case 3: cr = acc_re[3]; ci = acc_im[3]; break;
-                                        default:
-                                            if constexpr (Q > 4) {
-                                                switch (q_idx) {
-                                                    case 4: cr = acc_re[4]; ci = acc_im[4]; break;
-                                                    case 5: cr = acc_re[5]; ci = acc_im[5]; break;
-                                                    case 6: cr = acc_re[6]; ci = acc_im[6]; break;
-                                                    default: cr = acc_re[7]; ci = acc_im[7]; break;
-                                                }
-                                            }
-                                            break;
-                                    }
+                                    RealT cr, ci;
+                                    reg_acc_df_get<0, Q>(q_idx, acc_re, acc_im, cr, ci);
                                     cr = sycl_fft::df_add(cr, pr);
                                     ci = sycl_fft::df_add(ci, pi);
-                                    switch (q_idx) {
-                                        case 0: acc_re[0] = cr; acc_im[0] = ci; break;
-                                        case 1: acc_re[1] = cr; acc_im[1] = ci; break;
-                                        case 2: acc_re[2] = cr; acc_im[2] = ci; break;
-                                        case 3: acc_re[3] = cr; acc_im[3] = ci; break;
-                                        default:
-                                            if constexpr (Q > 4) {
-                                                switch (q_idx) {
-                                                    case 4: acc_re[4] = cr; acc_im[4] = ci; break;
-                                                    case 5: acc_re[5] = cr; acc_im[5] = ci; break;
-                                                    case 6: acc_re[6] = cr; acc_im[6] = ci; break;
-                                                    default: acc_re[7] = cr; acc_im[7] = ci; break;
-                                                }
-                                            }
-                                            break;
-                                    }
+                                    reg_acc_df_set<0, Q>(q_idx, acc_re, acc_im, cr, ci);
 #else
-                                    switch (q_idx) {
-                                        case 0: acc_re[0] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[0]); acc_im[0] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[0]); break;
-                                        case 1: acc_re[1] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[1]); acc_im[1] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[1]); break;
-                                        case 2: acc_re[2] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[2]); acc_im[2] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[2]); break;
-                                        case 3: acc_re[3] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[3]); acc_im[3] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[3]); break;
-                                        default:
-                                            if constexpr (Q > 4) {
-                                                switch (q_idx) {
-                                                    case 4: acc_re[4] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[4]); acc_im[4] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[4]); break;
-                                                    case 5: acc_re[5] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[5]); acc_im[5] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[5]); break;
-                                                    case 6: acc_re[6] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[6]); acc_im[6] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[6]); break;
-                                                    case 7: acc_re[7] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[7]); acc_im[7] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[7]); break;
-                                                    default:
-                                                        if constexpr (Q > 8) {
-                                                            switch (q_idx) {
-                                                                case 8:  acc_re[8]  = SYCL_NUFFT_FMA(sy_re, wv, acc_re[8]);  acc_im[8]  = SYCL_NUFFT_FMA(sy_im, wv, acc_im[8]);  break;
-                                                                case 9:  acc_re[9]  = SYCL_NUFFT_FMA(sy_re, wv, acc_re[9]);  acc_im[9]  = SYCL_NUFFT_FMA(sy_im, wv, acc_im[9]);  break;
-                                                                case 10: acc_re[10] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[10]); acc_im[10] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[10]); break;
-                                                                case 11: acc_re[11] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[11]); acc_im[11] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[11]); break;
-                                                                case 12: acc_re[12] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[12]); acc_im[12] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[12]); break;
-                                                                case 13: acc_re[13] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[13]); acc_im[13] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[13]); break;
-                                                                case 14: acc_re[14] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[14]); acc_im[14] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[14]); break;
-                                                                default: acc_re[15] = SYCL_NUFFT_FMA(sy_re, wv, acc_re[15]); acc_im[15] = SYCL_NUFFT_FMA(sy_im, wv, acc_im[15]); break;
-                                                            }
-                                                        }
-                                                        break;
-                                                }
-                                            }
-                                            break;
-                                    }
+                                    reg_acc_fma_range<0, Q>(q_idx, acc_re, acc_im, sy_re, sy_im, wv);
 #endif
                                 }
                             };
@@ -941,7 +942,6 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem_win_dispatch_w)(
     size_t chunk_bs,
     const SpreadConfig& cfg) {
     constexpr bool kCanMultiPass = (W == 5 || W == 9 || W == 17 || W == 18);
-    constexpr size_t kAccBytesPerQ = 2 * sizeof(SYCL_NUFFT_REAL_T);
     if (d_weights) {
         if (cfg.use_reg_acc) {
             const int q_val = cfg.win_elems / cfg.t_j;
@@ -959,15 +959,13 @@ inline void SYCL_FFT_SUFFIX(launch_spread_smem_win_dispatch_w)(
                     q, d_weights, d_first, d_shift, d_bucket_off, d_bucket_m,
                     d_y, d_fft_buf, M, nfft, total_M_stride, chunk_bs, cfg);
             };
-            if constexpr (4 * kAccBytesPerQ <= 128) {
-                if (q_val == 4) { launch_reg_q(std::integral_constant<int, 4>{}); return; }
+            if constexpr (W > 16) {
+                if (q_val == 2) { launch_reg_q(std::integral_constant<int, 2>{}); return; }
             }
-            if constexpr (8 * kAccBytesPerQ <= 128) {
-                if (q_val == 8) { launch_reg_q(std::integral_constant<int, 8>{}); return; }
-            }
-            if constexpr (16 * kAccBytesPerQ <= 128) {
-                if (q_val == 16) { launch_reg_q(std::integral_constant<int, 16>{}); return; }
-            }
+            if (q_val == 4)  { launch_reg_q(std::integral_constant<int, 4>{});  return; }
+            if (q_val == 8)  { launch_reg_q(std::integral_constant<int, 8>{});  return; }
+            if (q_val == 16) { launch_reg_q(std::integral_constant<int, 16>{}); return; }
+            if (q_val == 32) { launch_reg_q(std::integral_constant<int, 32>{}); return; }
         }
         if constexpr (kCanMultiPass) {
             if (cfg.t_j < W) {
@@ -1502,6 +1500,50 @@ void SYCL_FFT_SUFFIX(launch_spread_cpu_direct)(
         SYCL_FFT_SUFFIX(launch_spread_cpu_direct_impl)<9>(
             q, d_tbl, d_weights, d_first, d_u, d_shift, d_y, d_fft_buf, M, nfft, total_M_stride, chunk_bs);
     }
+#endif
+}
+
+template <int W>
+inline sycl_fft::KernelProbeInfo SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)(
+    sycl::queue& q, const sycl::device& dev, const SpreadConfig& cfg) {
+    if (!cfg.use_reg_acc || cfg.t_j <= 0) return sycl_fft::KernelProbeInfo{};
+    constexpr bool kCanMultiPass = (W == 5 || W == 9 || W == 17 || W == 18);
+    const int q_val = cfg.win_elems / cfg.t_j;
+    auto probe_q = [&](auto q_ic) -> sycl_fft::KernelProbeInfo {
+        constexpr int Q = q_ic.value;
+        if constexpr (kCanMultiPass) {
+            if (cfg.t_j < W) {
+                return sycl_fft::probe_kernel_bundle<SYCL_FFT_SUFFIX(SpreadRegKernelTag)<W, Q, true>>(q, dev);
+            }
+        }
+        return sycl_fft::probe_kernel_bundle<SYCL_FFT_SUFFIX(SpreadRegKernelTag)<W, Q, false>>(q, dev);
+    };
+    if constexpr (W > 16) {
+        if (q_val == 2) return probe_q(std::integral_constant<int, 2>{});
+    }
+    if (q_val == 4)  return probe_q(std::integral_constant<int, 4>{});
+    if (q_val == 8)  return probe_q(std::integral_constant<int, 8>{});
+    if (q_val == 16) return probe_q(std::integral_constant<int, 16>{});
+    if (q_val == 32) return probe_q(std::integral_constant<int, 32>{});
+    return sycl_fft::KernelProbeInfo{};
+}
+
+sycl_fft::KernelProbeInfo SYCL_FFT_SUFFIX(probe_spread_reg_kernel)(
+    sycl::queue& q, const sycl::device& dev, int w, const SpreadConfig& cfg) {
+#if defined(SYCL_FFT_HALF)
+    if (w == 4) return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<4>(q, dev, cfg);
+    return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<5>(q, dev, cfg);
+#elif defined(SYCL_FFT_DOUBLE)
+    if (w == 16) return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<16>(q, dev, cfg);
+    if (w == 17) return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<17>(q, dev, cfg);
+    return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<18>(q, dev, cfg);
+#elif defined(SYCL_FFT_DF)
+    if (w == 14) return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<14>(q, dev, cfg);
+    if (w == 15) return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<15>(q, dev, cfg);
+    return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<16>(q, dev, cfg);
+#else
+    if (w == 8) return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<8>(q, dev, cfg);
+    return SYCL_FFT_SUFFIX(probe_spread_reg_dispatch_w)<9>(q, dev, cfg);
 #endif
 }
 

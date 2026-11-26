@@ -85,6 +85,20 @@ void dispatch_pack_bucket_geom(
 }
 
 template <typename Traits>
+sycl_fft::KernelProbeInfo dispatch_probe_spread_reg(
+    sycl::queue& q, const sycl::device& dev, int w, const SpreadConfig& cfg) {
+    if constexpr (Traits::kIsHalf) {
+        return detail::probe_spread_reg_kernelh(q, dev, w, cfg);
+    } else if constexpr (Traits::kIsFp64) {
+        return detail::probe_spread_reg_kernel(q, dev, w, cfg);
+    } else if constexpr (Traits::kIsDf) {
+        return detail::probe_spread_reg_kerneldf(q, dev, w, cfg);
+    } else {
+        return detail::probe_spread_reg_kernelf(q, dev, w, cfg);
+    }
+}
+
+template <typename Traits>
 void dispatch_spread_smem(
     sycl::queue& q, int w, const void* d_tbl, const typename Traits::ScalarT* d_weights,
     const int* d_first, const typename Traits::ScalarT* d_u, const typename Traits::ComplexT* d_shift,
@@ -316,14 +330,13 @@ std::vector<SpreadCandidate> build_spread_candidates(
                 wg_list.push_back(wg_min);
             }
 
-            constexpr size_t kAccBytesPerQ = 2 * sizeof(RealT);
             auto add_smem_cand = [&](int wg_size, int win_elems, bool use_reg_acc) {
                 const int b_per_wg = wg_size / t_j;
                 if (b_per_wg <= 0 || win_elems < min_win || win_elems > nfft) return;
                 if (use_reg_acc) {
                     const int q_val = win_elems / t_j;
-                    const bool q_ok = (q_val == 4 || q_val == 8 || q_val == 16) &&
-                                      (static_cast<size_t>(q_val) * kAccBytesPerQ <= 128);
+                    const bool q_ok = (q_val == 4 || q_val == 8 || q_val == 16 || q_val == 32) ||
+                                      (w > 16 && q_val == 2);
                     if (!use_precomp_weights || win_elems < 64 || !q_ok) return;
                 }
                 int tile_m = std::min(wg_size, std::max(static_cast<int>(sg_unit), 32));
@@ -375,7 +388,12 @@ std::vector<SpreadCandidate> build_spread_candidates(
                 const int active_warps_per_cu = resident_wgs * std::max(1, wg_size / static_cast<int>(sg_unit));
                 int score = std::min(active_warps_per_cu, 16) * 20;
                 score += std::min(b_per_wg, 32) * 10;
-                if (use_reg_acc) score += 45; // Zero grid SMEM, zero grid LDS/STS, higher occupancy
+                if (use_reg_acc) {
+                    const int q_val = win_elems / t_j;
+                    // Keep heuristic default conservative (avoid risky huge-Q when untuned);
+                    // Phase A still benchmarks all widened Q families directly.
+                    score += (q_val <= 8) ? 40 : ((q_val == 16) ? 15 : -20);
+                }
                 if (t_j < w) score += 25;     // Reward high lane utilization (prev_pow2(W))
                 if (sc.num_wins == 1) score += 30;
                 else if (sc.num_wins <= 4) score += 18;
@@ -387,11 +405,11 @@ std::vector<SpreadCandidate> build_spread_candidates(
 
             for (int wg_size : wg_list) {
                 const int b_per_wg = wg_size / t_j;
-                // Hardware-generalized register-resident candidates: all Q in {4, 8, 16}
-                // within the universal 128-byte (32-reg) per-thread accumulator budget.
+                // Widened register-resident candidates: all Q in {2, 4, 8, 16, 32} (no hardcoded byte cap;
+                // runtime private_mem_size spill probe + Phase A interleaved measurement decide).
                 if (use_precomp_weights) {
-                    for (int q_val : {16, 8, 4}) {
-                        if (static_cast<size_t>(q_val) * kAccBytesPerQ > 128) continue;
+                    for (int q_val : {32, 16, 8, 4, 2}) {
+                        if (q_val == 2 && w <= 16) continue;
                         const int rwin = q_val * t_j;
                         if (rwin >= min_win && rwin <= nfft && rwin >= 64) {
                             add_smem_cand(wg_size, rwin, true);
@@ -558,11 +576,33 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     const size_t weight_cap = std::min<size_t>(size_t{4} * 1024 * 1024, std::max<size_t>(size_t{256} * 1024, dev_cfg.effective_l2_bytes() / 4));
     use_precomp_weights_ = (weight_bytes <= weight_cap);
 
-    // 1. Build hardware-derived spreading candidates (zero hardcoded Blackwell constants)
-    const auto spread_cands = build_spread_candidates<Traits>(
+    // 1. Build hardware-derived spreading candidates & filter via SYCL 2020 private_mem_size probe (when exposed)
+    auto spread_cands = build_spread_candidates<Traits>(
         dev_cfg, eff_sg, nfft_, w_, use_precomp_weights_,
         launch_cfg_.force_collab_spread,
         launch_cfg_.fft_cfg.allow_emulated_local_mem);
+    {
+        const auto dev = q_.get_device();
+        std::vector<SpreadCandidate> filtered;
+        filtered.reserve(spread_cands.size());
+        for (const auto& c : spread_cands) {
+            if (c.cfg.use_smem && c.cfg.use_reg_acc) {
+                const auto kinfo = dispatch_probe_spread_reg<Traits>(q_, dev, w_, c.cfg);
+                if (kinfo.available) {
+                    if (kinfo.max_wg_size > 0 && static_cast<size_t>(c.cfg.wg_size) > kinfo.max_wg_size) {
+                        continue;
+                    }
+                    if (kinfo.private_mem_bytes > 0) {
+                        continue; // Reject register-accumulator variant that spills to private memory
+                    }
+                }
+            }
+            filtered.push_back(c);
+        }
+        if (!filtered.empty()) {
+            spread_cands = std::move(filtered);
+        }
+    }
     if (spread_cands.empty()) {
         throw std::runtime_error("Nufft1Plan: no valid spreading candidate for device");
     }
@@ -574,7 +614,7 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     const int m_bin = (M_ <= 128) ? 0 : ((M_ <= 1024) ? 1 : ((M_ <= 8192) ? 2 : 3));
     const std::string spr_slot = "nufft1_spr2_w" + std::to_string(w_) + "_m" + std::to_string(m_bin);
     const std::string spr_key  = sycl_fft::AutotuneCache::make_key(
-        dev_cfg, Traits::kPrecTag, log_nfft_, spr_slot.c_str());
+        dev_cfg, Traits::kPrecTag, log_nfft_, spr_slot.c_str(), Traits::kSign);
 
     if (!launch_cfg_.spread_variant_override.empty()) {
         bool found = false;
@@ -719,10 +759,10 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
             return true;
         };
 
-        // Pick top-scored representative from each distinct hardware-feasible family (up to 6):
-        // up to 3 register-resident families + up to 3 SMEM-grid families (guaranteed both reg & smem).
+        // Pick top-scored representative from each distinct hardware-feasible family:
+        // up to 4 register-resident families (covers widened Q in {2,4,8,16,32}) + up to 3 SMEM-grid families.
         size_t n_reg = 0, n_smem = 0;
-        for (size_t i = 0; i < spread_cands.size() && n_reg < 3; ++i) {
+        for (size_t i = 0; i < spread_cands.size() && n_reg < 4; ++i) {
             if (spread_cands[i].cfg.use_smem && spread_cands[i].cfg.use_reg_acc) {
                 if (try_add_family(i)) ++n_reg;
             }
@@ -810,147 +850,149 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                             d_first_.get(), d_shift_.get(), tune_w_ptr,
                             bt.bf.get(), bt.bs.get(), bt.bw.get(), precompute_wg_);
                     }
+                    q_.wait();
                     auto [ins_it, _] = bucket_cache.emplace(win_elems, std::move(bt));
                     return &ins_it->second;
                 };
 
-                auto time_cand = [&](size_t idx, double& out_ms) -> bool {
-                    const auto& cand = spread_cands[idx];
-                    try {
-                        if (cand.cfg.use_smem) {
-                            const int* off_arg = nullptr;
-                            const int* m_arg = nullptr;
-                            const int* first_arg = d_first_.get();
-                            const ComplexT* shift_arg = d_shift_.get();
-                            const ScalarT* weight_arg = tune_w_ptr;
-                            if (cand.cfg.num_wins > 1) {
-                                const BucketTmp* bt = get_buckets(cand.cfg.win_elems, cand.cfg.num_wins);
-                                if (!bt) return false;
-                                off_arg = bt->off.get();
-                                m_arg   = bt->m.get();
-                                if (bt->bf && bt->bs && bt->bw) {
-                                    first_arg  = bt->bf.get();
-                                    shift_arg  = bt->bs.get();
-                                    weight_arg = bt->bw.get();
-                                }
-                            }
-                            dispatch_spread_smem<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
-                                off_arg, m_arg,
-                                d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
-                                mode_, cand.cfg);
-                            q_.wait_and_throw();
-
-                            const auto w0 = std::chrono::steady_clock::now();
-                            dispatch_spread_smem<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
-                                off_arg, m_arg,
-                                d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
-                                mode_, cand.cfg);
-                            q_.wait_and_throw();
-                            const double est_ms = std::max(
-                                0.01,
-                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
-                            const int batch_reps = std::clamp(static_cast<int>(2.0 / est_ms) + 1, 1, 16);
-
-                            double samples[3] = {};
-                            for (int r = 0; r < 3; ++r) {
-                                const auto t0 = std::chrono::steady_clock::now();
-                                for (int b = 0; b < batch_reps; ++b) {
-                                    dispatch_spread_smem<Traits>(
-                                        q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
-                                        off_arg, m_arg,
-                                        d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
-                                        mode_, cand.cfg);
-                                }
-                                q_.wait_and_throw();
-                                samples[r] = std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - t0).count() / static_cast<double>(batch_reps);
-                            }
-                            std::sort(samples, samples + 3);
-                            out_ms = samples[1];
-                            return true;
-                        } else if (cand.cfg.use_cpu_direct) {
-                            dispatch_spread_cpu_direct<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
-                                d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs);
-                            q_.wait_and_throw();
-
-                            double samples[3] = {};
-                            for (int r = 0; r < 3; ++r) {
-                                const auto t0 = std::chrono::steady_clock::now();
-                                dispatch_spread_cpu_direct<Traits>(
-                                    q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
-                                    d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs);
-                                q_.wait_and_throw();
-                                samples[r] = std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - t0).count();
-                            }
-                            std::sort(samples, samples + 3);
-                            out_ms = samples[1];
-                            return true;
-                        } else {
-                            auto tmp_re = sycl_fft::UsmPtr<RealT>::alloc_device(static_cast<size_t>(nfft_) * packed_stride_, q_);
-                            auto tmp_im = sycl_fft::UsmPtr<RealT>::alloc_device(static_cast<size_t>(nfft_) * packed_stride_, q_);
-                            if (!tmp_re || !tmp_im) return false;
-                            q_.memset(tmp_re.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
-                            q_.memset(tmp_im.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
-                            dispatch_spread_collab<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(), d_tune_y.get(),
-                                tmp_re.get(), tmp_im.get(),
-                                M_, nfft_, static_cast<size_t>(M_), tune_bs, packed_stride_, mode_, cand.cfg);
-                            dispatch_transpose_and_zero<Traits>(
-                                q_, tmp_re.get(), tmp_im.get(), d_fft_buf_.get(),
-                                nfft_, tune_bs, packed_stride_, cand.cfg);
-                            q_.wait_and_throw();
-
-                            double samples[3] = {};
-                            for (int r = 0; r < 3; ++r) {
-                                const auto t0 = std::chrono::steady_clock::now();
-                                dispatch_spread_collab<Traits>(
-                                    q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(), d_tune_y.get(),
-                                    tmp_re.get(), tmp_im.get(),
-                                    M_, nfft_, static_cast<size_t>(M_), tune_bs, packed_stride_, mode_, cand.cfg);
-                                dispatch_transpose_and_zero<Traits>(
-                                    q_, tmp_re.get(), tmp_im.get(), d_fft_buf_.get(),
-                                    nfft_, tune_bs, packed_stride_, cand.cfg);
-                                q_.wait_and_throw();
-                                samples[r] = std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - t0).count();
-                            }
-                            std::sort(samples, samples + 3);
-                            out_ms = samples[1];
-                            return true;
-                        }
-                    } catch (...) {
-                        try { q_.wait(); } catch (...) {}
-                        return false;
-                    }
-                };
-
-                int best_idx = static_cast<int>(phase_a[0]);
-                double best_ms = std::numeric_limits<double>::max();
-
-                // Phase A: benchmark strategy/window/t_j families
+                // Pre-build window buckets & optional collab scratch BEFORE interleaved timing
+                sycl_fft::UsmPtr<RealT> collab_re, collab_im;
                 for (size_t idx : phase_a) {
-                    double ms = 0.0;
-                    if (time_cand(idx, ms) && ms < best_ms) {
-                        best_ms = ms;
-                        best_idx = static_cast<int>(idx);
+                    const auto& sc = spread_cands[idx].cfg;
+                    if (sc.use_smem && sc.num_wins > 1) {
+                        (void)get_buckets(sc.win_elems, sc.num_wins);
+                    } else if (!sc.use_smem && !sc.use_cpu_direct && !collab_re) {
+                        collab_re = sycl_fft::UsmPtr<RealT>::alloc_device(static_cast<size_t>(nfft_) * packed_stride_, q_);
+                        collab_im = sycl_fft::UsmPtr<RealT>::alloc_device(static_cast<size_t>(nfft_) * packed_stride_, q_);
+                        if (collab_re && collab_im) {
+                            q_.memset(collab_re.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
+                            q_.memset(collab_im.get(), 0, static_cast<size_t>(nfft_) * packed_stride_ * sizeof(RealT));
+                            q_.wait();
+                        }
                     }
                 }
 
-                // Phase B: refine wg_size within the winning family (0 new kernel JITs!)
-                if (best_ms < std::numeric_limits<double>::max() &&
-                    spread_cands[static_cast<size_t>(best_idx)].cfg.use_smem) {
-                    const FamilyKey win_fam = family_of(spread_cands[static_cast<size_t>(best_idx)].cfg);
-                    for (size_t i = 0; i < spread_cands.size(); ++i) {
-                        if (static_cast<int>(i) == best_idx) continue;
-                        if (family_of(spread_cands[i].cfg) == win_fam) {
-                            double ms = 0.0;
-                            if (time_cand(i, ms) && ms < best_ms) {
-                                best_ms = ms;
-                                best_idx = static_cast<int>(i);
+                auto launch_spread_cand = [&](size_t idx) -> bool {
+                    const auto& cand = spread_cands[idx];
+                    if (cand.cfg.use_smem) {
+                        const int* off_arg = nullptr;
+                        const int* m_arg = nullptr;
+                        const int* first_arg = d_first_.get();
+                        const ComplexT* shift_arg = d_shift_.get();
+                        const ScalarT* weight_arg = tune_w_ptr;
+                        if (cand.cfg.num_wins > 1) {
+                            auto it = bucket_cache.find(cand.cfg.win_elems);
+                            if (it == bucket_cache.end()) return false;
+                            const BucketTmp* bt = &it->second;
+                            off_arg = bt->off.get();
+                            m_arg   = bt->m.get();
+                            if (bt->bf && bt->bs && bt->bw) {
+                                first_arg  = bt->bf.get();
+                                shift_arg  = bt->bs.get();
+                                weight_arg = bt->bw.get();
+                            }
+                        }
+                        dispatch_spread_smem<Traits>(
+                            q_, w_, d_pswf_tbl_.get(), weight_arg, first_arg, d_u_.get(), shift_arg,
+                            off_arg, m_arg,
+                            d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs,
+                            mode_, cand.cfg);
+                        return true;
+                    } else if (cand.cfg.use_cpu_direct) {
+                        dispatch_spread_cpu_direct<Traits>(
+                            q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(),
+                            d_tune_y.get(), d_fft_buf_.get(), M_, nfft_, static_cast<size_t>(M_), tune_bs);
+                        return true;
+                    } else {
+                        if (!collab_re || !collab_im) return false;
+                        dispatch_spread_collab<Traits>(
+                            q_, w_, d_pswf_tbl_.get(), tune_w_ptr, d_first_.get(), d_u_.get(), d_shift_.get(), d_tune_y.get(),
+                            collab_re.get(), collab_im.get(),
+                            M_, nfft_, static_cast<size_t>(M_), tune_bs, packed_stride_, mode_, cand.cfg);
+                        dispatch_transpose_and_zero<Traits>(
+                            q_, collab_re.get(), collab_im.get(), d_fft_buf_.get(),
+                            nfft_, tune_bs, packed_stride_, cand.cfg);
+                        return true;
+                    }
+                };
+                auto sync_q = [&]() { q_.wait_and_throw(); };
+
+                // Phase A: interleaved (ABBA) family benchmark with conservative noise-band preference
+                // Conservatism order: SMEM-grid (!use_reg_acc) > smaller Q > smaller SMEM footprint.
+                auto more_conservative_a = [&](size_t a_pos, size_t b_pos) -> bool {
+                    const auto& ca = spread_cands[phase_a[a_pos]];
+                    const auto& cb = spread_cands[phase_a[b_pos]];
+                    if (ca.cfg.use_reg_acc != cb.cfg.use_reg_acc) {
+                        return !ca.cfg.use_reg_acc;
+                    }
+                    if (ca.cfg.use_reg_acc) {
+                        const int qa = ca.cfg.win_elems / std::max(1, ca.cfg.t_j);
+                        const int qb = cb.cfg.win_elems / std::max(1, cb.cfg.t_j);
+                        if (qa != qb) return qa < qb;
+                    }
+                    if (ca.smem_bytes != cb.smem_bytes) return ca.smem_bytes < cb.smem_bytes;
+                    return ca.score > cb.score;
+                };
+                const auto res_a = sycl_fft::run_interleaved_bench(
+                    phase_a.size(),
+                    [&](size_t pos) { return launch_spread_cand(phase_a[pos]); },
+                    sync_q,
+                    more_conservative_a,
+                    /*num_rounds=*/5,
+                    /*target_slice_ms=*/2.0,
+                    /*max_batch_reps=*/16);
+
+                int best_idx = static_cast<int>(phase_a[0]);
+                double recorded_margin_pct = 0.0;
+                std::string recorded_runner_up;
+                bool tune_ok = res_a.ok;
+
+                if (res_a.ok) {
+                    best_idx = static_cast<int>(phase_a[res_a.chosen_idx]);
+                    recorded_margin_pct = res_a.margin_pct;
+                    if (res_a.has_runner_up) {
+                        recorded_runner_up = spread_cands[phase_a[res_a.runner_up_idx]].variant_id;
+                    }
+
+                    // Phase B: interleaved (ABBA) wg_size refinement within the winning family (0 new JITs)
+                    if (spread_cands[static_cast<size_t>(best_idx)].cfg.use_smem) {
+                        const FamilyKey win_fam = family_of(spread_cands[static_cast<size_t>(best_idx)].cfg);
+                        std::vector<size_t> phase_b;
+                        phase_b.push_back(static_cast<size_t>(best_idx));
+                        for (size_t i = 0; i < spread_cands.size(); ++i) {
+                            if (static_cast<int>(i) == best_idx) continue;
+                            if (family_of(spread_cands[i].cfg) == win_fam) {
+                                phase_b.push_back(i);
+                            }
+                        }
+                        if (phase_b.size() > 1) {
+                            const int target_cons_wg = static_cast<int>(
+                                dev_cfg.default_wg_size(256, 128));
+                            auto more_conservative_b = [&](size_t a_pos, size_t b_pos) -> bool {
+                                const auto& ca = spread_cands[phase_b[a_pos]];
+                                const auto& cb = spread_cands[phase_b[b_pos]];
+                                const int da = std::abs(ca.cfg.wg_size - target_cons_wg);
+                                const int db = std::abs(cb.cfg.wg_size - target_cons_wg);
+                                if (da != db) return da < db;
+                                if (ca.smem_bytes != cb.smem_bytes) return ca.smem_bytes < cb.smem_bytes;
+                                return ca.score > cb.score;
+                            };
+                            const auto res_b = sycl_fft::run_interleaved_bench(
+                                phase_b.size(),
+                                [&](size_t pos) { return launch_spread_cand(phase_b[pos]); },
+                                sync_q,
+                                more_conservative_b,
+                                /*num_rounds=*/5,
+                                /*target_slice_ms=*/2.0,
+                                /*max_batch_reps=*/16);
+                            if (res_b.ok) {
+                                best_idx = static_cast<int>(phase_b[res_b.chosen_idx]);
+                                // Record the tighter margin between Phase A (family) and Phase B (wg)
+                                if (res_b.has_runner_up &&
+                                    (!res_a.has_runner_up || std::abs(res_b.margin_pct) < std::abs(recorded_margin_pct))) {
+                                    recorded_margin_pct = res_b.margin_pct;
+                                    recorded_runner_up = spread_cands[phase_b[res_b.runner_up_idx]].variant_id;
+                                }
                             }
                         }
                     }
@@ -960,10 +1002,12 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                 spread_cfg_ = spread_cands[static_cast<size_t>(chosen_spread)].cfg;
                 spread_variant_name_ = spread_cands[static_cast<size_t>(chosen_spread)].variant_id;
 
-                if (!launch_cfg_.has_spread_overrides() && best_ms < std::numeric_limits<double>::max()) {
+                if (!launch_cfg_.has_spread_overrides() && tune_ok) {
                     sycl_fft::AutotuneEntry ent{};
                     ent.mode = sycl_fft::PlanExecMode::SinglePass;
                     ent.variant_id = spread_variant_name_;
+                    ent.margin_pct = recorded_margin_pct;
+                    ent.runner_up_id = recorded_runner_up;
                     sycl_fft::AutotuneCache::put(cache_path, spr_key, ent);
                 }
             }
@@ -993,7 +1037,7 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     const std::string dec_slot =
         "nufft1_dec_w" + std::to_string(w_) + ((mode_ == PswfMode::PSWF43) ? "_43" : "_21");
     const std::string dec_key = sycl_fft::AutotuneCache::make_key(
-        dev_cfg, Traits::kPrecTag, log_nfft_, dec_slot.c_str());
+        dev_cfg, Traits::kPrecTag, log_nfft_, dec_slot.c_str(), Traits::kSign);
 
     if (!launch_cfg_.deconv_variant_override.empty()) {
         bool found = false;
@@ -1042,55 +1086,32 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
                 q_.memcpy(d_fft_buf_.get() + off, h_pat.data(), cnt * sizeof(ComplexT));
             }
             q_.wait();
-            int best_idx = 0;
-            double best_ms = std::numeric_limits<double>::max();
-            for (size_t i = 0; i < lim; ++i) {
-                try {
+            const auto dec_res = sycl_fft::run_interleaved_bench(
+                lim,
+                [&](size_t i) {
                     dispatch_deconv<Traits>(
                         q_, w_, d_pswf_tbl_.get(), d_fft_buf_.get(), d_tune_out.get(), nfft_, log_nfft_, nout_, output_shift_,
                         static_cast<size_t>(nout_), chunk_bs_, mode_, NufftOutOrder::SlotBitReversed,
                         deconv_cands[i].cfg, output_scale_);
-                    q_.wait_and_throw();
-
-                    const auto w0 = std::chrono::steady_clock::now();
-                    dispatch_deconv<Traits>(
-                        q_, w_, d_pswf_tbl_.get(), d_fft_buf_.get(), d_tune_out.get(), nfft_, log_nfft_, nout_, output_shift_,
-                        static_cast<size_t>(nout_), chunk_bs_, mode_, NufftOutOrder::SlotBitReversed,
-                        deconv_cands[i].cfg, output_scale_);
-                    q_.wait_and_throw();
-                    const double est_ms = std::max(
-                        0.01,
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
-                    const int batch_reps = std::clamp(static_cast<int>(2.0 / est_ms) + 1, 1, 16);
-
-                    double samples[3] = {};
-                    for (int r = 0; r < 3; ++r) {
-                        const auto t0 = std::chrono::steady_clock::now();
-                        for (int b = 0; b < batch_reps; ++b) {
-                            dispatch_deconv<Traits>(
-                                q_, w_, d_pswf_tbl_.get(), d_fft_buf_.get(), d_tune_out.get(), nfft_, log_nfft_, nout_, output_shift_,
-                                static_cast<size_t>(nout_), chunk_bs_, mode_, NufftOutOrder::SlotBitReversed,
-                                deconv_cands[i].cfg, output_scale_);
-                        }
-                        q_.wait_and_throw();
-                        samples[r] = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t0).count() / static_cast<double>(batch_reps);
+                    return true;
+                },
+                [&]() { q_.wait_and_throw(); },
+                [](size_t a, size_t b) { return a < b; },
+                /*num_rounds=*/5,
+                /*target_slice_ms=*/2.0,
+                /*max_batch_reps=*/16);
+            if (dec_res.ok) {
+                chosen_deconv = static_cast<int>(dec_res.chosen_idx);
+                if (!launch_cfg_.has_deconv_overrides()) {
+                    sycl_fft::AutotuneEntry ent{};
+                    ent.mode = sycl_fft::PlanExecMode::SinglePass;
+                    ent.variant_id = deconv_cands[static_cast<size_t>(chosen_deconv)].variant_id;
+                    ent.margin_pct = dec_res.margin_pct;
+                    if (dec_res.has_runner_up) {
+                        ent.runner_up_id = deconv_cands[dec_res.runner_up_idx].variant_id;
                     }
-                    std::sort(samples, samples + 3);
-                    if (samples[1] < best_ms) {
-                        best_ms = samples[1];
-                        best_idx = static_cast<int>(i);
-                    }
-                } catch (...) {
-                    try { q_.wait(); } catch (...) {}
+                    sycl_fft::AutotuneCache::put(cache_path, dec_key, ent);
                 }
-            }
-            chosen_deconv = best_idx;
-            if (!launch_cfg_.has_deconv_overrides() && best_ms < std::numeric_limits<double>::max()) {
-                sycl_fft::AutotuneEntry ent{};
-                ent.mode = sycl_fft::PlanExecMode::SinglePass;
-                ent.variant_id = deconv_cands[static_cast<size_t>(chosen_deconv)].variant_id;
-                sycl_fft::AutotuneCache::put(cache_path, dec_key, ent);
             }
         }
     }

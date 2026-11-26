@@ -3,7 +3,11 @@
 #include "common/layout.hpp"
 
 #include <sycl/sycl.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -37,6 +41,7 @@ enum class PlanExecMode : uint8_t {
 
 std::string sanitize_cache_token(const std::string& raw);
 std::string compiler_id_tag();
+std::string kernel_code_hash();
 std::string backend_to_tag(const sycl::device& dev);
 
 // ============================================================================
@@ -178,8 +183,10 @@ DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg)
 DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cfg);
 
 // ============================================================================
-// Persistent Disk + In-Memory Autotune Cache
-//   Keyed on (schema, compiler, device, vendor, driver, backend, prec, slot, logN).
+// Persistent Disk + In-Memory Autotune Cache (v2)
+//   Keyed on (schema, compiler+JIT, kernel_code_hash, device, vendor, cu+smem,
+//             driver, backend, prec, sign, slot, logN).
+//   Records winner/runner-up margin (%) for diagnostics & conservative fallback.
 //   Atomic temp-file rename; degrades cleanly to in-memory cache on read-only FS.
 // ============================================================================
 struct AutotuneEntry {
@@ -188,17 +195,197 @@ struct AutotuneEntry {
     int          log_n1 = 0;
     size_t       pass0_wg = 0;
     size_t       l2_chunk_bytes = 0;
+    double       margin_pct = 0.0;
+    std::string  runner_up_id;
 };
 
 class AutotuneCache {
 public:
     static std::string resolve_cache_path(const std::string& explicit_path);
     static std::string make_key(
-        const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag = "any");
+        const DeviceFftConfig& dev_cfg,
+        const char* prec_tag,
+        int logN,
+        const char* slot_tag = "any",
+        int sign = 0);
     static bool get(const std::string& path, const std::string& key, AutotuneEntry& out);
     static void put(const std::string& path, const std::string& key, const AutotuneEntry& val);
     static void clear_memory_cache();
 };
+
+// ============================================================================
+// Interleaved (ABBA/ABAB) Micro-Benchmark Helper with Empirical Noise Guard
+//   Cancels laptop GPU clock/thermal drift by running R mirrored interleaved
+//   rounds, taking per-candidate medians + IQR noise floor, and selecting the
+//   most conservative candidate among all contenders within the noise band.
+// ============================================================================
+struct InterleavedBenchResult {
+    bool   ok            = false;
+    size_t chosen_idx    = 0;
+    size_t fastest_idx   = 0;
+    size_t runner_up_idx = 0;
+    bool   has_runner_up = false;
+    double chosen_ms     = 0.0;
+    double fastest_ms    = 0.0;
+    double runner_up_ms  = 0.0;
+    double margin_pct    = 0.0; // (runner_up_ms - chosen_ms) / chosen_ms * 100 (or vs fastest if conservative fallback)
+    bool   conservative_fallback = false;
+};
+
+template <typename LaunchFn, typename SyncFn, typename ConservativeLessFn>
+inline InterleavedBenchResult run_interleaved_bench(
+    size_t num_cands,
+    LaunchFn&& launch_one,
+    SyncFn&& sync_queue,
+    ConservativeLessFn&& is_more_conservative,
+    int num_rounds = 5,
+    double target_slice_ms = 2.0,
+    int max_batch_reps = 16,
+    double min_noise_frac = 0.03,
+    double max_noise_frac = 0.08) {
+    InterleavedBenchResult res{};
+    if (num_cands == 0) return res;
+
+    const int rounds = std::max(3, (num_rounds | 1)); // odd >= 3 for exact median
+    std::vector<bool> alive(num_cands, false);
+    std::vector<int>  batch_reps(num_cands, 1);
+    std::vector<std::vector<double>> samples(num_cands);
+
+    // Stage 1: Warmup JIT + safety launch + per-candidate batch-rep calibration
+    size_t first_alive = num_cands;
+    for (size_t c = 0; c < num_cands; ++c) {
+        try {
+            if (!launch_one(c)) continue;
+            sync_queue();
+
+            const auto w0 = std::chrono::steady_clock::now();
+            if (!launch_one(c)) continue;
+            sync_queue();
+            const double est_ms = std::max(
+                0.01,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            batch_reps[c] = std::clamp(
+                static_cast<int>(target_slice_ms / est_ms) + 1, 1, std::max(1, max_batch_reps));
+            alive[c] = true;
+            samples[c].reserve(static_cast<size_t>(rounds));
+            if (first_alive == num_cands) first_alive = c;
+        } catch (...) {
+            try { sync_queue(); } catch (...) {}
+            alive[c] = false;
+        }
+    }
+    if (first_alive == num_cands) return res;
+
+    // Count surviving candidates
+    size_t alive_count = 0;
+    for (size_t c = 0; c < num_cands; ++c) {
+        if (alive[c]) ++alive_count;
+    }
+    if (alive_count == 1) {
+        res.ok = true;
+        res.chosen_idx = first_alive;
+        res.fastest_idx = first_alive;
+        res.margin_pct = 0.0;
+        return res;
+    }
+
+    // Prime GPU boost clocks (P8 -> P0) before interleaved measurement begins
+    try {
+        for (int p = 0; p < 2; ++p) {
+            (void)launch_one(first_alive);
+        }
+        sync_queue();
+    } catch (...) {
+    }
+
+    // Stage 2: Mirrored interleaved rounds (0..K-1 on even rounds, K-1..0 on odd rounds)
+    //          so monotonic clock/thermal drift cancels symmetrically across all contenders.
+    for (int r = 0; r < rounds; ++r) {
+        const bool rev = ((r & 1) != 0);
+        for (size_t step = 0; step < num_cands; ++step) {
+            const size_t c = rev ? (num_cands - 1 - step) : step;
+            if (!alive[c]) continue;
+            try {
+                const int reps = batch_reps[c];
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int b = 0; b < reps; ++b) {
+                    (void)launch_one(c);
+                }
+                sync_queue();
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count() / static_cast<double>(reps);
+                samples[c].push_back(ms);
+            } catch (...) {
+                try { sync_queue(); } catch (...) {}
+                alive[c] = false;
+            }
+        }
+    }
+
+    // Stage 3: Per-candidate median & empirical IQR spread
+    std::vector<double> med(num_cands, std::numeric_limits<double>::max());
+    std::vector<double> iqr(num_cands, 0.0);
+    size_t fastest = num_cands;
+    double fastest_ms = std::numeric_limits<double>::max();
+    for (size_t c = 0; c < num_cands; ++c) {
+        if (!alive[c] || samples[c].empty()) continue;
+        auto& s = samples[c];
+        std::sort(s.begin(), s.end());
+        med[c] = s[s.size() / 2];
+        if (s.size() >= 4) {
+            iqr[c] = s[s.size() - 2] - s[1];
+        } else if (s.size() >= 2) {
+            iqr[c] = s.back() - s.front();
+        }
+        if (med[c] < fastest_ms) {
+            fastest_ms = med[c];
+            fastest = c;
+        }
+    }
+    if (fastest == num_cands || !std::isfinite(fastest_ms)) return res;
+
+    // Runner-up (2nd fastest distinct candidate)
+    size_t runner_up = num_cands;
+    double runner_up_ms = std::numeric_limits<double>::max();
+    for (size_t c = 0; c < num_cands; ++c) {
+        if (c == fastest || !alive[c] || samples[c].empty()) continue;
+        if (med[c] < runner_up_ms) {
+            runner_up_ms = med[c];
+            runner_up = c;
+        }
+    }
+
+    // Select most conservative candidate within the empirical noise band of fastest
+    size_t chosen = fastest;
+    for (size_t c = 0; c < num_cands; ++c) {
+        if (!alive[c] || samples[c].empty() || c == chosen) continue;
+        const double emp_frac = 0.5 * (iqr[fastest] + iqr[c]) / std::max(fastest_ms, 1e-9);
+        const double noise_frac = std::clamp(std::max(min_noise_frac, emp_frac), min_noise_frac, max_noise_frac);
+        if (med[c] <= fastest_ms * (1.0 + noise_frac) && is_more_conservative(c, chosen)) {
+            chosen = c;
+        }
+    }
+
+    // Recompute runner-up relative to chosen if conservative fallback picked a different candidate
+    if (chosen != fastest) {
+        runner_up = fastest;
+        runner_up_ms = fastest_ms;
+    }
+
+    res.ok = true;
+    res.chosen_idx = chosen;
+    res.fastest_idx = fastest;
+    res.chosen_ms = med[chosen];
+    res.fastest_ms = fastest_ms;
+    res.conservative_fallback = (chosen != fastest);
+    if (runner_up != num_cands && std::isfinite(runner_up_ms)) {
+        res.has_runner_up = true;
+        res.runner_up_idx = runner_up;
+        res.runner_up_ms = runner_up_ms;
+        res.margin_pct = ((runner_up_ms - med[chosen]) / std::max(med[chosen], 1e-9)) * 100.0;
+    }
+    return res;
+}
 
 // Move-only RAII wrapper for SYCL USM device allocations.
 template <typename T>

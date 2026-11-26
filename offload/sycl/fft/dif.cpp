@@ -2380,7 +2380,9 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::tune_single_pass(
     int n,
     const std::vector<FilteredCandidate>& valid,
     Candidate& out_winner,
-    double& out_best_ms) {
+    double& out_best_ms,
+    double* out_margin_pct,
+    std::string* out_runner_up) {
     if (valid.empty()) return false;
     const auto shortlisted = shortlist_single_pass(valid);
     const size_t sub_n = size_t{1} << n;
@@ -2420,51 +2422,35 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::tune_single_pass(
         }
     }
 
-    // Prime GPU clocks (P8 -> P0) before comparing candidates so candidate 0 isn't penalized.
-    try {
-        for (int p = 0; p < 3; ++p) {
-            shortlisted[0].cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
-        }
-        q_.wait_and_throw();
-    } catch (...) {
-    }
+    auto more_conservative = [&](size_t a, size_t b) -> bool {
+        const auto& fa = shortlisted[a];
+        const auto& fb = shortlisted[b];
+        const bool a_nospill = fa.kinfo.available && fa.kinfo.private_mem_bytes == 0;
+        const bool b_nospill = fb.kinfo.available && fb.kinfo.private_mem_bytes == 0;
+        if (a_nospill != b_nospill) return a_nospill;
+        if (fa.cand.smem_bytes != fb.cand.smem_bytes) return fa.cand.smem_bytes < fb.cand.smem_bytes;
+        return a < b;
+    };
 
-    bool found = false;
-    double best_ms = 1e30;
-    for (const auto& fc : shortlisted) {
-        try {
-            fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
-            q_.wait_and_throw();
+    const auto bench = run_interleaved_bench(
+        shortlisted.size(),
+        [&](size_t c) {
+            shortlisted[c].cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
+            return true;
+        },
+        [&]() { q_.wait_and_throw(); },
+        more_conservative,
+        /*num_rounds=*/5,
+        /*target_slice_ms=*/2.0,
+        /*max_batch_reps=*/8);
 
-            const auto w0 = std::chrono::steady_clock::now();
-            fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
-            q_.wait_and_throw();
-            const double est_ms = std::max(
-                0.01,
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
-            const int batch_reps = std::clamp(static_cast<int>(2.0 / est_ms) + 1, 1, 8);
-
-            constexpr int reps = 3;
-            double samples[3] = {};
-            for (int r = 0; r < reps; ++r) {
-                const auto t0 = std::chrono::steady_clock::now();
-                for (int b = 0; b < batch_reps; ++b) {
-                    fc.cand.launch(q_, d_in.get(), d_out.get(), tune_bs, sg_tile_sync_ok_, kPosSign, ep_full);
-                }
-                q_.wait_and_throw();
-                samples[r] = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count() / static_cast<double>(batch_reps);
-            }
-            std::sort(samples, samples + reps);
-            const double ms = samples[reps / 2];
-
-            if (!found || ms < best_ms) {
-                found = true;
-                best_ms = ms;
-                out_winner = fc.cand;
-            }
-        } catch (...) {
-            // Kernel failed to launch (e.g. per-kernel register WG ceiling) -> disqualify cleanly.
+    bool found = bench.ok;
+    double best_ms = bench.chosen_ms;
+    if (bench.ok) {
+        out_winner = shortlisted[bench.chosen_idx].cand;
+        if (out_margin_pct) *out_margin_pct = bench.margin_pct;
+        if (out_runner_up && bench.has_runner_up) {
+            *out_runner_up = shortlisted[bench.runner_up_idx].cand.variant_id;
         }
     }
     // If every shortlisted contender failed to launch, fall back to remaining valid candidates.
@@ -2498,7 +2484,7 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::resolve_single_pass_for(
     const auto valid = collect_candidates(n, apply_variant_override);
     if (valid.empty()) return false;
 
-    const std::string key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, n);
+    const std::string key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, n, "fft", Sign);
     if (allow_cache && !force_tune) {
         AutotuneEntry cached{};
         if (AutotuneCache::get(cache_path_, key, cached) &&
@@ -2515,7 +2501,9 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::resolve_single_pass_for(
     }
 
     double best_ms = 0.0;
-    if (!tune_single_pass(n, valid, out_cand, best_ms)) {
+    double margin_pct = 0.0;
+    std::string runner_up;
+    if (!tune_single_pass(n, valid, out_cand, best_ms, &margin_pct, &runner_up)) {
         return false;
     }
     if (out_ms) *out_ms = best_ms;
@@ -2526,6 +2514,8 @@ bool SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::resolve_single_pass_for(
         e.log_n1 = 0;
         e.pass0_wg = 0;
         e.l2_chunk_bytes = 0;
+        e.margin_pct = margin_pct;
+        e.runner_up_id = runner_up;
         AutotuneCache::put(cache_path_, key, e);
     }
     return true;
@@ -2638,7 +2628,7 @@ void SYCL_FFT_SUFFIX(DifFftPlan)<Sign>::configure_plan(size_t max_bs) {
     const bool can_use_cache = (launch_cfg_.autotune == AutotuneMode::Auto) &&
                                !launch_cfg_.has_plan_overrides();
     const bool force_tune = (launch_cfg_.autotune == AutotuneMode::Force);
-    const std::string plan_key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, logN_);
+    const std::string plan_key = AutotuneCache::make_key(dev_cfg_, SYCL_FFT_PREC_TAG, logN_, "fft", Sign);
 
     // 4. Fast path: check persistent disk autotune cache for this logN
     if (can_use_cache) {

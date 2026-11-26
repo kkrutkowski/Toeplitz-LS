@@ -43,18 +43,52 @@ std::string sanitize_cache_token(const std::string& raw) {
 }
 
 std::string compiler_id_tag() {
+    std::string tag;
 #if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
 #if defined(ACPP_VERSION_MAJOR) && defined(ACPP_VERSION_MINOR)
-    return "acpp-" + std::to_string(ACPP_VERSION_MAJOR) + "." + std::to_string(ACPP_VERSION_MINOR);
+    tag = "acpp-" + std::to_string(ACPP_VERSION_MAJOR) + "." + std::to_string(ACPP_VERSION_MINOR);
+#if defined(ACPP_VERSION_PATCH)
+    tag += "." + std::to_string(ACPP_VERSION_PATCH);
+#endif
+#if defined(ACPP_VERSION_SUFFIX)
+    tag += ACPP_VERSION_SUFFIX;
+#endif
 #else
-    return "acpp";
+    tag = "acpp";
 #endif
 #elif defined(__INTEL_LLVM_COMPILER)
-    return "dpcpp-" + std::to_string(__INTEL_LLVM_COMPILER);
+    tag = "dpcpp-" + std::to_string(__INTEL_LLVM_COMPILER);
 #elif defined(__SYCL_COMPILER_VERSION)
-    return "sycl-" + std::to_string(__SYCL_COMPILER_VERSION);
+    tag = "sycl-" + std::to_string(__SYCL_COMPILER_VERSION);
 #else
-    return "sycl-generic";
+    tag = "sycl-generic";
+#endif
+#if defined(__clang_major__) && defined(__clang_minor__)
+    tag += "/clang-" + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__);
+#endif
+    return sanitize_cache_token(tag);
+}
+
+std::string kernel_code_hash() {
+#if defined(SYCL_FFT_KERNEL_HASH)
+    return sanitize_cache_token(SYCL_FFT_KERNEL_HASH);
+#else
+    // Fallback deterministic compile-unit fingerprint if built outside Makefile
+    uint64_t h = 14695981039346656037ULL;
+    auto mix = [&](const char* s) {
+        for (; s && *s; ++s) {
+            h ^= static_cast<unsigned char>(*s);
+            h *= 1099511628211ULL;
+        }
+    };
+    mix(__DATE__);
+    mix(__TIME__);
+#if defined(__VERSION__)
+    mix(__VERSION__);
+#endif
+    char buf[20];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return std::string(buf);
 #endif
 }
 
@@ -86,8 +120,8 @@ std::string backend_to_tag(const sycl::device& dev) {
 // DeviceFftConfig & FftLaunchConfig Methods
 // ============================================================================
 std::string DeviceFftConfig::identity_key() const {
-    char vid[16];
-    std::snprintf(vid, sizeof(vid), "0x%x", vendor_id);
+    char vid[48];
+    std::snprintf(vid, sizeof(vid), "0x%x|cu%zu_smem%zu", vendor_id, max_compute_units, local_mem_size);
     return sanitize_cache_token(device_name) + "|" +
            std::string(vid) + "|" +
            sanitize_cache_token(driver_version) + "|" +
@@ -789,27 +823,34 @@ void parse_autotune_file(const std::string& path, EntryMap& map) {
             cols.push_back(line.substr(pos, tab - pos));
             pos = tab + 1;
         }
-        if (cols.size() != 14 || cols[0] != "v1") continue;
+        // v2 schema:
+        //   cols[0..11] = key (v2, compiler_jit, code_hash, dev_name, vendor_id, cu_smem,
+        //                      driver, backend, prec, sign, slot, logN)
+        //   cols[12..18] = val (mode, variant_id, log_n1, pass0_wg, l2_chunk_bytes,
+        //                       margin_pct, runner_up_id)
+        if (cols.size() != 19 || cols[0] != "v2") continue;
 
         std::string key = cols[0];
-        for (size_t i = 1; i < 9; ++i) {
+        for (size_t i = 1; i < 12; ++i) {
             key.push_back('\t');
             key += cols[i];
         }
         AutotuneEntry e{};
-        if (cols[9] == "1pass") e.mode = PlanExecMode::SinglePass;
-        else if (cols[9] == "2pass") e.mode = PlanExecMode::TwoPass;
-        else if (cols[9] == "multistage") e.mode = PlanExecMode::MultiStageGlobal;
+        if (cols[12] == "1pass") e.mode = PlanExecMode::SinglePass;
+        else if (cols[12] == "2pass") e.mode = PlanExecMode::TwoPass;
+        else if (cols[12] == "multistage") e.mode = PlanExecMode::MultiStageGlobal;
         else continue;
 
-        e.variant_id = (cols[10] == "-") ? std::string{} : cols[10];
+        e.variant_id = (cols[13] == "-") ? std::string{} : cols[13];
         try {
-            e.log_n1 = std::stoi(cols[11]);
-            e.pass0_wg = static_cast<size_t>(std::stoull(cols[12]));
-            e.l2_chunk_bytes = static_cast<size_t>(std::stoull(cols[13]));
+            e.log_n1 = std::stoi(cols[14]);
+            e.pass0_wg = static_cast<size_t>(std::stoull(cols[15]));
+            e.l2_chunk_bytes = static_cast<size_t>(std::stoull(cols[16]));
+            e.margin_pct = std::stod(cols[17]);
         } catch (...) {
             continue;
         }
+        e.runner_up_id = (cols[18] == "-") ? std::string{} : cols[18];
         map[key] = std::move(e);
     }
 }
@@ -863,15 +904,20 @@ void flush_autotune_store_locked(const std::string& path, EntryMap& map) {
         {
             std::ofstream ofs(tmp, std::ios::out | std::ios::trunc);
             if (!ofs.is_open()) return;
-            ofs << "# sycl_fft autotune cache v1\n";
+            ofs << "# sycl_fft autotune cache v2\n";
+            ofs << "# schema\tcompiler_jit\tcode_hash\tdevice\tvendor\tcu_smem\tdriver\tbackend\tprec\tsign\tslot\tlogN\tmode\tvariant\tlog_n1\tpass0_wg\tl2_chunk\tmargin_pct\trunner_up\n";
             for (const auto& kv : merged) {
                 const auto& e = kv.second;
+                char mbuf[32];
+                std::snprintf(mbuf, sizeof(mbuf), "%.2f", e.margin_pct);
                 ofs << kv.first
                     << '\t' << plan_mode_to_str(e.mode)
                     << '\t' << (e.variant_id.empty() ? "-" : e.variant_id)
                     << '\t' << e.log_n1
                     << '\t' << e.pass0_wg
                     << '\t' << e.l2_chunk_bytes
+                    << '\t' << mbuf
+                    << '\t' << (e.runner_up_id.empty() ? "-" : e.runner_up_id)
                     << '\n';
             }
             ofs.flush();
@@ -895,25 +941,36 @@ std::string AutotuneCache::resolve_cache_path(const std::string& explicit_path) 
         return std::string(env_p);
     }
     if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0] != '\0') {
-        return std::string(xdg) + "/toeplitz-ls/sycl_fft_cache_v1.txt";
+        return std::string(xdg) + "/toeplitz-ls/sycl_fft_cache_v2.txt";
     }
     if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
-        return std::string(home) + "/.cache/toeplitz-ls/sycl_fft_cache_v1.txt";
+        return std::string(home) + "/.cache/toeplitz-ls/sycl_fft_cache_v2.txt";
     }
     return {};
 }
 
 std::string AutotuneCache::make_key(
-    const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag) {
+    const DeviceFftConfig& dev_cfg,
+    const char* prec_tag,
+    int logN,
+    const char* slot_tag,
+    int sign) {
     char vid[16];
     std::snprintf(vid, sizeof(vid), "0x%x", dev_cfg.vendor_id);
+    char cu_smem[48];
+    std::snprintf(cu_smem, sizeof(cu_smem), "cu%zu_smem%zu",
+                  dev_cfg.max_compute_units, dev_cfg.local_mem_size);
+    const char* sign_tag = (sign > 0) ? "pos" : ((sign < 0) ? "neg" : "any");
     std::ostringstream oss;
-    oss << "v1\t" << compiler_id_tag()
+    oss << "v2\t" << compiler_id_tag()
+        << "\t" << kernel_code_hash()
         << "\t" << sanitize_cache_token(dev_cfg.device_name)
         << "\t" << vid
+        << "\t" << cu_smem
         << "\t" << sanitize_cache_token(dev_cfg.driver_version)
         << "\t" << dev_cfg.backend_tag
-        << "\t" << prec_tag
+        << "\t" << (prec_tag ? prec_tag : "any")
+        << "\t" << sign_tag
         << "\t" << (slot_tag ? slot_tag : "any")
         << "\t" << logN;
     return oss.str();
