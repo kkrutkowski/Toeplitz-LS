@@ -263,6 +263,18 @@ SYCL_FFT_FORCE_INLINE f16x2_t f16x2_sub(f16x2_t a, f16x2_t b) { return a - b; }
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_neg(f16x2_t a) { return -a; }
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_mul(f16x2_t a, f16x2_t b) { return a * b; }
 
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_div(f16x2_t a, f16x2_t b) {
+    const float q0 = static_cast<float>(f16x2_lo(a)) / static_cast<float>(f16x2_lo(b));
+    const float q1 = static_cast<float>(f16x2_hi(a)) / static_cast<float>(f16x2_hi(b));
+    return f16x2_make(static_cast<f16_scalar_t>(q0), static_cast<f16_scalar_t>(q1));
+}
+
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_sqrt(f16x2_t a) {
+    const float s0 = sycl::sqrt(sycl::fmax(0.0f, static_cast<float>(f16x2_lo(a))));
+    const float s1 = sycl::sqrt(sycl::fmax(0.0f, static_cast<float>(f16x2_hi(a))));
+    return f16x2_make(static_cast<f16_scalar_t>(s0), static_cast<f16_scalar_t>(s1));
+}
+
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_fma(f16x2_t a, f16x2_t b, f16x2_t c) {
 #if SYCL_FFT_USE_CLANG_F16X2
 #if defined(__has_builtin)
@@ -389,8 +401,12 @@ SYCL_FFT_FORCE_INLINE double df_to_double(df_t a) {
     return static_cast<double>(a.hi) + static_cast<double>(a.lo);
 }
 
+// Use exact 0.0f - x rather than unary -x (xor.b32 sign flip) to avoid an NVIDIA CUDA 13
+// ptxas sm_120 codegen bug where sign-modifier folding across FMUL + FFMA in df_two_product
+// doubles the product when one operand comes directly from a bitwise sign flip.
 SYCL_FFT_FORCE_INLINE df_t df_neg(df_t a) {
-    return df_t{-a.hi, -a.lo};
+    SYCL_FFT_DF_EXACT_FP
+    return df_t{df_fsub_rn(0.0f, a.hi), df_fsub_rn(0.0f, a.lo)};
 }
 
 SYCL_FFT_FORCE_INLINE df_t df_scale_pow2(df_t a, float s) {
@@ -510,6 +526,20 @@ SYCL_FFT_DF_INLINE df_t df_div(df_t a, df_t b) {
     df_t out;
     df_two_sum_quick(q1, q2, out.hi, out.lo);
     return df_add(out, df_make(q3, 0.0f));
+}
+
+// DF square root (~47-48 bit accuracy via Karp-Markstein / Newton refinement)
+SYCL_FFT_DF_INLINE df_t df_sqrt(df_t a) {
+    SYCL_FFT_DF_EXACT_FP
+    if (a.hi <= 0.0f) return df_make(0.0f, 0.0f);
+    const float x0 = sycl::sqrt(a.hi);
+    float sq_hi, sq_lo;
+    df_two_product(x0, x0, sq_hi, sq_lo);
+    const df_t rem = df_sub(a, df_make(sq_hi, sq_lo));
+    const float dx = rem.hi / (2.0f * x0);
+    df_t out;
+    df_two_sum_quick(x0, dx, out.hi, out.lo);
+    return out;
 }
 
 SYCL_FFT_FORCE_INLINE df_t df_abs(df_t a) {

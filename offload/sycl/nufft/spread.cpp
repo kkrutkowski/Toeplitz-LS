@@ -1273,12 +1273,19 @@ static uint8_t* upload_table_impl(sycl::queue& q, const TableT& tbl) {
     return ptr;
 }
 
-uint8_t* SYCL_FFT_SUFFIX(upload_pswf_table)(sycl::queue& q, int w, PswfMode mode) {
 #if defined(SYCL_FFT_HALF)
-    // FP16 retains subnormal-safe 2^e spreading kernel scaling
+uint8_t* upload_pswf_tableh(sycl::queue& q, int w, PswfMode mode, bool geo_scale) {
+    if (geo_scale) {
+        if (w == 4) return upload_table_impl(q, make_geo_scaled_pswf_table(get_pswf_table_f16<4>(mode), mode));
+        return upload_table_impl(q, make_geo_scaled_pswf_table(get_pswf_table_f16<5>(mode), mode));
+    }
+    // FP16 default retains subnormal-safe 2^e spreading kernel scaling
     if (w == 4) return upload_table_impl(q, get_pswf_table_f16<4>(mode));
     return upload_table_impl(q, get_pswf_table_f16<5>(mode));
-#elif defined(SYCL_FFT_DOUBLE)
+}
+#else
+uint8_t* SYCL_FFT_SUFFIX(upload_pswf_table)(sycl::queue& q, int w, PswfMode mode) {
+#if defined(SYCL_FFT_DOUBLE)
     // FP64 rescales kernel to exact geometric-mean-1: sqrt(phi_hat(0) * phi_hat(edge)) == 1
     if (w == 16) return upload_table_impl(q, make_geo_scaled_pswf_table(get_pswf_table_f64<16>(mode), mode));
     if (w == 17) return upload_table_impl(q, make_geo_scaled_pswf_table(get_pswf_table_f64<17>(mode), mode));
@@ -1294,6 +1301,7 @@ uint8_t* SYCL_FFT_SUFFIX(upload_pswf_table)(sycl::queue& q, int w, PswfMode mode
     return upload_table_impl(q, make_geo_scaled_pswf_table(get_pswf_table_f32<9>(mode), mode));
 #endif
 }
+#endif
 
 void SYCL_FFT_SUFFIX(launch_precompute_weights)(
     sycl::queue& q, int w, const void* d_tbl,

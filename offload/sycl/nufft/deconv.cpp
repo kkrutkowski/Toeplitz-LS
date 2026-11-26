@@ -255,6 +255,64 @@ inline void SYCL_FFT_SUFFIX(launch_deconv_emit_impl)(
     });
 }
 
+#if defined(SYCL_FFT_HALF)
+template <int W>
+inline void launch_build_deconv_tableh_f32_impl(
+    sycl::queue& q,
+    const void* d_tbl_raw,
+    int nfft,
+    int log_nfft,
+    int nout,
+    int output_shift,
+    PswfMode mode,
+    int table_kind,
+    float* d_out,
+    double output_scale) {
+    using TableT = std::decay_t<decltype(get_pswf_table_f16<W>(PswfMode::PSWF21))>;
+    const float inv_nfft = 1.0f / static_cast<float>(nfft);
+    const float scale_f = static_cast<float>(output_scale);
+    const TableT* d_tbl = static_cast<const TableT*>(d_tbl_raw);
+    const size_t wg = 64;
+    const size_t num_wg = (static_cast<size_t>(nout) + wg - 1) / wg;
+
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_wg * wg, wg),
+            [=](sycl::nd_item<1> item) {
+                const int i = static_cast<int>(item.get_global_linear_id());
+                if (i >= nout) return;
+
+                int k_prime = 0;
+                if (table_kind == 2) {
+                    k_prime = i - output_shift;
+                } else {
+                    const int slot_p = nufft1_compact_idx_to_slot(i, mode);
+                    k_prime = nufft1_slot_to_k_prime(slot_p, log_nfft, nfft, output_shift);
+                }
+                const int abs_k_prime = (k_prime >= 0) ? k_prime : -k_prime;
+                const float phi = eval_pswf_phi_f16_f32<W>(abs_k_prime, inv_nfft, *d_tbl);
+                d_out[i] = (table_kind == 0)
+                    ? (d_tbl->prefac * phi)
+                    : ((scale_f * d_tbl->inv_prefac) / phi);
+            });
+    });
+}
+
+void launch_build_deconv_tableh_f32(
+    sycl::queue& q, int w, const void* d_tbl,
+    int nfft, int log_nfft, int nout, int output_shift,
+    PswfMode mode, int table_kind, float* d_out,
+    double output_scale) {
+    if (w == 4) {
+        launch_build_deconv_tableh_f32_impl<4>(
+            q, d_tbl, nfft, log_nfft, nout, output_shift, mode, table_kind, d_out, output_scale);
+    } else {
+        launch_build_deconv_tableh_f32_impl<5>(
+            q, d_tbl, nfft, log_nfft, nout, output_shift, mode, table_kind, d_out, output_scale);
+    }
+}
+#endif
+
 void SYCL_FFT_SUFFIX(launch_build_deconv_table)(
     sycl::queue& q, int w, const void* d_tbl,
     int nfft, int log_nfft, int nout, int output_shift,

@@ -56,6 +56,14 @@ NUFFT_BASE_HEADERS := \
 	$(FFT_HEADERS) \
 	nufft/nufft1.hpp
 
+PERIODOGRAM_HEADERS := \
+	$(NUFFT_BASE_HEADERS) \
+	linalg/levinson.hpp \
+	periodogram/subgrid.hpp \
+	periodogram/preprocess.hpp \
+	periodogram/planner.hpp \
+	periodogram/engine.hpp
+
 CORE_OBJS := \
 	$(OBJDIR)/common/device.o \
 	$(OBJDIR)/bitrev/bitrev.o \
@@ -76,7 +84,16 @@ CORE_OBJS := \
 	$(OBJDIR)/nufft/deconv_fp32.o \
 	$(OBJDIR)/nufft/deconv_fp64.o \
 	$(OBJDIR)/nufft/deconv_df.o \
-	$(OBJDIR)/nufft/plan.o
+	$(OBJDIR)/nufft/plan.o \
+	$(OBJDIR)/periodogram/subgrid_fp16.o \
+	$(OBJDIR)/periodogram/subgrid_fp32.o \
+	$(OBJDIR)/periodogram/subgrid_fp64.o \
+	$(OBJDIR)/periodogram/subgrid_df.o \
+	$(OBJDIR)/linalg/levinson_fp16.o \
+	$(OBJDIR)/linalg/levinson_fp32.o \
+	$(OBJDIR)/linalg/levinson_fp64.o \
+	$(OBJDIR)/linalg/levinson_df.o \
+	$(OBJDIR)/periodogram/engine.o
 
 IMPL_OBJS := \
 	$(OBJDIR)/impl.o
@@ -93,7 +110,7 @@ $(TARGET_SO): $(LIB_OBJS) $(VERSION_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_LINK_FLAGS) -shared $(LIB_OBJS) -o $@
 
-$(OBJDIR)/impl.o: impl.cpp
+$(OBJDIR)/impl.o: impl.cpp periodogram/engine.hpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(PICFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -111,7 +128,11 @@ KERNEL_HASH_INPUTS := \
 	nufft/aux.cpp \
 	nufft/spread.cpp \
 	nufft/deconv.cpp \
-	nufft/plan.cpp
+	nufft/plan.cpp \
+	periodogram/subgrid.hpp \
+	periodogram/subgrid.cpp \
+	linalg/levinson.hpp \
+	linalg/levinson.cpp
 
 KERNEL_CODE_HASH := $(shell (command -v sha256sum >/dev/null 2>&1 && sha256sum $(KERNEL_HASH_INPUTS) | sha256sum | cut -c1-16) || (command -v shasum >/dev/null 2>&1 && shasum -a 256 $(KERNEL_HASH_INPUTS) | shasum -a 256 | cut -c1-16) || echo "unknown")
 
@@ -149,6 +170,18 @@ $(OBJDIR)/nufft/deconv_%.o: nufft/deconv.cpp $(NUFFT_BASE_HEADERS) common/precis
 	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -c $< -o $@
 
 $(OBJDIR)/nufft/plan.o: nufft/plan.cpp $(NUFFT_BASE_HEADERS)
+	@mkdir -p $(dir $@)
+	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
+
+$(OBJDIR)/periodogram/subgrid_%.o: periodogram/subgrid.cpp $(COMMON_HEADERS) common/precision.hpp periodogram/subgrid.hpp
+	@mkdir -p $(dir $@)
+	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -c $< -o $@
+
+$(OBJDIR)/linalg/levinson_%.o: linalg/levinson.cpp $(NUFFT_BASE_HEADERS) common/precision.hpp linalg/levinson.hpp
+	@mkdir -p $(dir $@)
+	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -c $< -o $@
+
+$(OBJDIR)/periodogram/engine.o: periodogram/engine.cpp $(PERIODOGRAM_HEADERS)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
 

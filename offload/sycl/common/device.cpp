@@ -15,6 +15,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 #if !defined(_WIN32)
@@ -178,6 +179,32 @@ DeviceFftConfig DeviceFftConfig::query(const sycl::device& dev) {
         32, static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_cache_line_size>()));
     cfg.global_mem_size = static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_size>());
     cfg.max_mem_alloc_size = static_cast<size_t>(dev.get_info<sycl::info::device::max_mem_alloc_size>());
+    try {
+        cfg.has_host_unified_memory = dev.get_info<sycl::info::device::host_unified_memory>();
+    } catch (...) {
+        cfg.has_host_unified_memory = !cfg.is_gpu;
+    }
+
+    // Query backend-reported kernel & memcpy concurrency when available
+    cfg.max_kernel_concurrency = cfg.is_gpu ? size_t{2} : size_t{1};
+    cfg.max_memcpy_concurrency = cfg.is_gpu ? size_t{2} : size_t{1};
+#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
+    try {
+        const auto rt_id = dev.AdaptiveCpp_device_id();
+        auto* rt_ptr = dev.AdaptiveCpp_runtime();
+        if (rt_ptr) {
+            auto* be = rt_ptr->backends().get(rt_id.get_backend());
+            if (be && be->get_hardware_manager()) {
+                auto* hw = be->get_hardware_manager()->get_device(rt_id.get_id());
+                if (hw) {
+                    cfg.max_kernel_concurrency = std::max<size_t>(1, hw->get_max_kernel_concurrency());
+                    cfg.max_memcpy_concurrency = std::max<size_t>(1, hw->get_max_memcpy_concurrency());
+                }
+            }
+        }
+    } catch (...) {
+    }
+#endif
 
     if (!cfg.has_native_local_mem || !cfg.is_gpu) {
         cfg.bank_model = BankModelKind::None;
@@ -218,6 +245,66 @@ size_t DeviceFftConfig::default_wg_size(size_t total_threads, size_t reg_wg_cap)
     const size_t sg_hint = is_gpu ? std::min<size_t>(sub_group_size, 64) : size_t{8};
     const size_t preferred = std::max<size_t>(64, sg_hint * 8);
     return clamp_pow2_wg(total_threads, preferred, reg_wg_cap);
+}
+
+size_t DeviceFftConfig::default_padded_wg_size(size_t reg_wg_cap) const {
+    const size_t sg_hint = is_gpu ? std::min<size_t>(sub_group_size, 64) : size_t{8};
+    const size_t preferred = std::max<size_t>(64, sg_hint * 8);
+    size_t cap = std::min(preferred, max_work_group_size);
+    if (reg_wg_cap > 0) cap = std::min(cap, reg_wg_cap);
+    size_t wg = 1;
+    while ((wg << 1) <= cap) wg <<= 1;
+    return wg;
+}
+
+size_t DeviceFftConfig::safe_max_alloc_bytes() const {
+    const size_t gmem = global_mem_size;
+    const size_t amax = max_mem_alloc_size;
+    if (gmem > 0 && amax > 0) return std::min(gmem, amax);
+    if (gmem > 0) return gmem;
+    if (amax > 0 && amax < (std::numeric_limits<size_t>::max() >> 2)) return amax;
+    return size_t{256} * 1024 * 1024;
+}
+
+size_t DeviceFftConfig::recommended_stream_count() const {
+    // Non-GPU devices (OpenMP / OpenCL CPU): each SYCL kernel already fans out across
+    // all max_compute_units CPU threads unless the backend explicitly reports >1 concurrent kernels.
+    if (!is_gpu) {
+        return std::clamp<size_t>(max_kernel_concurrency, size_t{1}, std::max<size_t>(1, max_compute_units));
+    }
+
+    // If hardware reports strictly serial kernel & copy execution, a single stream avoids overhead.
+    if (max_kernel_concurrency <= 1 && max_memcpy_concurrency <= 1) {
+        return 1;
+    }
+
+    // Scale GPU streams from hardware concurrency engines and compute-unit count:
+    //   - overlap_floor ensures enough queues to overlap concurrent kernels + DMA engines
+    //   - cu_streams keeps at least ~4 CUs per active stream on wider GPUs
+    //   - host_cap avoids allocating idle queues beyond host CPU thread count
+    const size_t overlap_floor = std::max<size_t>(2, max_kernel_concurrency + max_memcpy_concurrency);
+    const size_t cu_streams    = std::max<size_t>(1, max_compute_units / 4);
+    const size_t host_threads  = std::max<size_t>(4, static_cast<size_t>(std::thread::hardware_concurrency()));
+    size_t streams = std::min<size_t>({std::max(overlap_floor, cu_streams), host_threads, size_t{16}});
+
+    // Ensure each stream gets a meaningful working slice of the 75% device memory pool
+    if (global_mem_size > 0) {
+        const size_t usable_mem = (global_mem_size / 4) * 3;
+        const size_t min_slice = std::max<size_t>(size_t{64} * 1024 * 1024, effective_l2_bytes() * 4);
+        const size_t mem_cap = std::max<size_t>(1, usable_mem / std::max<size_t>(1, min_slice));
+        streams = std::min(streams, mem_cap);
+    }
+    return std::max<size_t>(1, streams);
+}
+
+size_t DeviceFftConfig::per_stream_mem_budget(size_t num_streams) const {
+    const size_t k = std::max<size_t>(1, num_streams);
+    if (global_mem_size > 0) {
+        // Overflow-safe 75% of maximum device memory divided by number of streams
+        const size_t total_75 = (global_mem_size / 4) * 3 + ((global_mem_size % 4) * 3) / 4;
+        return std::max<size_t>(size_t{1} * 1024 * 1024, total_75 / k);
+    }
+    return size_t{256} * 1024 * 1024;
 }
 
 size_t DeviceFftConfig::effective_l2_bytes() const {
@@ -997,6 +1084,74 @@ void AutotuneCache::put(const std::string& path, const std::string& key, const A
 void AutotuneCache::clear_memory_cache() {
     std::lock_guard<std::mutex> lk(autotune_cache_mutex());
     autotune_cache_stores().clear();
+}
+
+const std::vector<SyclDeviceDescriptor>& enumerate_sycl_devices() {
+    static const std::vector<SyclDeviceDescriptor> devices = []() {
+        std::vector<SyclDeviceDescriptor> out;
+        try {
+            auto raw = sycl::device::get_devices();
+            out.reserve(raw.size());
+            for (const auto& dev : raw) {
+                SyclDeviceDescriptor d{};
+                d.device = dev;
+                d.name = sanitize_cache_token(dev.get_info<sycl::info::device::name>());
+                d.backend = backend_to_tag(dev);
+                d.is_gpu = dev.is_gpu();
+                if (dev.is_gpu()) {
+                    d.device_type = "gpu";
+                } else if (dev.is_cpu()) {
+                    d.device_type = "cpu";
+                } else if (dev.is_accelerator()) {
+                    d.device_type = "accelerator";
+                } else {
+                    d.device_type = "other";
+                }
+                d.max_compute_units = static_cast<size_t>(
+                    dev.get_info<sycl::info::device::max_compute_units>());
+                d.global_mem_size = static_cast<size_t>(
+                    dev.get_info<sycl::info::device::global_mem_size>());
+                d.has_fp64 = dev.has(sycl::aspect::fp64);
+                d.has_fp16 = dev.has(sycl::aspect::fp16);
+#if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
+                // AdaptiveCpp does not report sycl::aspect::fp16 on CUDA/HIP/OMP backends
+                // even though sycl::half / f16x2 arithmetic is natively supported.
+                if (!d.has_fp16 &&
+                    (d.backend == "cuda" || d.backend == "hip" ||
+                     d.backend == "level_zero" || d.backend == "metal" ||
+                     d.backend == "omp")) {
+                    d.has_fp16 = true;
+                }
+#endif
+                out.push_back(std::move(d));
+            }
+        } catch (...) {
+        }
+
+        auto backend_rank = [](const std::string& b) -> int {
+            if (b == "cuda" || b == "hip" || b == "level_zero") return 0;
+            if (b == "metal" || b == "vulkan") return 1;
+            if (b == "opencl") return 2;
+            if (b == "omp") return 3;
+            return 4;
+        };
+
+        std::stable_sort(out.begin(), out.end(), [&](const SyclDeviceDescriptor& a, const SyclDeviceDescriptor& b) {
+            if (a.is_gpu != b.is_gpu) return a.is_gpu > b.is_gpu;
+            const int ra = backend_rank(a.backend);
+            const int rb = backend_rank(b.backend);
+            if (ra != rb) return ra < rb;
+            if (a.max_compute_units != b.max_compute_units) return a.max_compute_units > b.max_compute_units;
+            if (a.global_mem_size != b.global_mem_size) return a.global_mem_size > b.global_mem_size;
+            return a.name < b.name;
+        });
+
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i].id = static_cast<int>(i);
+        }
+        return out;
+    }();
+    return devices;
 }
 
 } // namespace sycl_fft

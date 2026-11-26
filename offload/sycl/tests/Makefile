@@ -67,7 +67,16 @@ CORE_OBJS := \
 	$(OBJDIR)/nufft/deconv_fp32.o \
 	$(OBJDIR)/nufft/deconv_fp64.o \
 	$(OBJDIR)/nufft/deconv_df.o \
-	$(OBJDIR)/nufft/plan.o
+	$(OBJDIR)/nufft/plan.o \
+	$(OBJDIR)/periodogram/subgrid_fp16.o \
+	$(OBJDIR)/periodogram/subgrid_fp32.o \
+	$(OBJDIR)/periodogram/subgrid_fp64.o \
+	$(OBJDIR)/periodogram/subgrid_df.o \
+	$(OBJDIR)/linalg/levinson_fp16.o \
+	$(OBJDIR)/linalg/levinson_fp32.o \
+	$(OBJDIR)/linalg/levinson_fp64.o \
+	$(OBJDIR)/linalg/levinson_df.o \
+	$(OBJDIR)/periodogram/engine.o
 
 TEST_OBJS := $(TEST_BUILD)/main.o
 

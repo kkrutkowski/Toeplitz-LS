@@ -36,15 +36,18 @@ void dispatch_precompute(
 
 template <typename Traits>
 sycl_fft::UsmPtr<uint8_t> dispatch_upload_pswf_table(
-    sycl::queue& q, int w, PswfMode mode) {
+    sycl::queue& q, int w, PswfMode mode, bool geo_scale_fp16) {
     uint8_t* ptr = nullptr;
     if constexpr (Traits::kIsHalf) {
-        ptr = detail::upload_pswf_tableh(q, w, mode);
+        ptr = detail::upload_pswf_tableh(q, w, mode, geo_scale_fp16);
     } else if constexpr (Traits::kIsFp64) {
+        (void)geo_scale_fp16;
         ptr = detail::upload_pswf_table(q, w, mode);
     } else if constexpr (Traits::kIsDf) {
+        (void)geo_scale_fp16;
         ptr = detail::upload_pswf_tabledf(q, w, mode);
     } else {
+        (void)geo_scale_fp16;
         ptr = detail::upload_pswf_tablef(q, w, mode);
     }
     return sycl_fft::UsmPtr<uint8_t>(ptr, &q);
@@ -551,6 +554,7 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     const Nufft1LaunchConfig& nufft_cfg)
     : q_(q),
       M_(M),
+      M_cap_(M),
       N_(N),
       w_(w),
       mode_(mode),
@@ -569,7 +573,7 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     const std::string cache_path = sycl_fft::AutotuneCache::resolve_cache_path(launch_cfg_.fft_cfg.cache_path);
     const auto autotune_mode = launch_cfg_.fft_cfg.autotune;
 
-    precompute_wg_ = dev_cfg.default_wg_size(static_cast<size_t>(M_), 256);
+    precompute_wg_ = dev_cfg.default_padded_wg_size(256);
 
     // Precompute L2-resident d_weights[M * W] in set_points() when weights fit comfortably in L2
     const size_t weight_bytes = static_cast<size_t>(M_) * static_cast<size_t>(w_) * sizeof(ScalarT);
@@ -686,7 +690,7 @@ Nufft1PlanBase<Traits>::Nufft1PlanBase(
     packed_stride_ = ((max_packed + align_elems - 1) / align_elems) * align_elems;
 
     // 3. Allocate core device buffers (d_grid_T and d_bucket_* allocated ONLY if actually needed!)
-    d_pswf_tbl_ = dispatch_upload_pswf_table<Traits>(q_, w_, mode_);
+    d_pswf_tbl_ = dispatch_upload_pswf_table<Traits>(q_, w_, mode_, launch_cfg_.use_geo_scale_fp16);
     if (use_precomp_weights_) {
         d_weights_ = sycl_fft::UsmPtr<ScalarT>::alloc_device(
             static_cast<size_t>(M_) * static_cast<size_t>(w_), q_);
@@ -1140,7 +1144,7 @@ void Nufft1PlanBase<Traits>::allocate_collab_grid() {
 template <typename Traits>
 void Nufft1PlanBase<Traits>::allocate_window_buckets() {
     if (d_bucket_counts_ && d_bucket_off_ && d_bucket_m_) return;
-    const size_t max_ent = size_t{2} * static_cast<size_t>(M_);
+    const size_t max_ent = size_t{2} * static_cast<size_t>(M_cap_);
     auto cnt = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(spread_cfg_.num_wins), q_);
     auto off = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(spread_cfg_.num_wins + 1), q_);
     auto bm  = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
@@ -1164,11 +1168,77 @@ void Nufft1PlanBase<Traits>::allocate_window_buckets() {
 }
 
 template <typename Traits>
+void Nufft1PlanBase<Traits>::ensure_point_capacity(int M) {
+    if (M <= 0) {
+        throw std::invalid_argument("Nufft1Plan::set_points: M must be positive");
+    }
+    if (M <= M_cap_) {
+        M_ = M;
+        precompute_wg_ = fft_plan_.device_config().default_padded_wg_size(256);
+        return;
+    }
+    const int new_cap = std::max(M, M_cap_ + (M_cap_ >> 1));
+    q_.wait();
+    auto new_first = sycl_fft::UsmPtr<int>::alloc_device(static_cast<size_t>(new_cap), q_);
+    auto new_u     = sycl_fft::UsmPtr<ScalarT>::alloc_device(static_cast<size_t>(new_cap), q_);
+    auto new_shift = sycl_fft::UsmPtr<ComplexT>::alloc_device(static_cast<size_t>(new_cap), q_);
+    if (!new_first || !new_u || !new_shift) {
+        throw std::runtime_error("Nufft1Plan: point buffer reallocation failed");
+    }
+    sycl_fft::UsmPtr<ScalarT> new_weights;
+    if (use_precomp_weights_) {
+        new_weights = sycl_fft::UsmPtr<ScalarT>::alloc_device(
+            static_cast<size_t>(new_cap) * static_cast<size_t>(w_), q_);
+        if (!new_weights) {
+            throw std::runtime_error("Nufft1Plan: weights buffer reallocation failed");
+        }
+    }
+    if (spread_cfg_.use_smem && spread_cfg_.num_wins > 1) {
+        const size_t max_ent = size_t{2} * static_cast<size_t>(new_cap);
+        auto new_bm = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
+        if (!new_bm) {
+            throw std::runtime_error("Nufft1Plan: bucket_m reallocation failed");
+        }
+        sycl_fft::UsmPtr<int> new_bf;
+        sycl_fft::UsmPtr<ComplexT> new_bs;
+        sycl_fft::UsmPtr<ScalarT> new_bw;
+        if (use_precomp_weights_) {
+            new_bf = sycl_fft::UsmPtr<int>::alloc_device(max_ent, q_);
+            new_bs = sycl_fft::UsmPtr<ComplexT>::alloc_device(max_ent, q_);
+            new_bw = sycl_fft::UsmPtr<ScalarT>::alloc_device(max_ent * static_cast<size_t>(w_), q_);
+            if (!new_bf || !new_bs || !new_bw) {
+                throw std::runtime_error("Nufft1Plan: bucket geometry reallocation failed");
+            }
+        }
+        d_bucket_m_  = std::move(new_bm);
+        d_b_first_   = std::move(new_bf);
+        d_b_shift_   = std::move(new_bs);
+        d_b_weights_ = std::move(new_bw);
+    }
+    d_first_   = std::move(new_first);
+    d_u_       = std::move(new_u);
+    d_shift_   = std::move(new_shift);
+    if (use_precomp_weights_) {
+        d_weights_ = std::move(new_weights);
+    }
+    M_cap_ = new_cap;
+    M_ = M;
+    precompute_wg_ = fft_plan_.device_config().default_padded_wg_size(256);
+}
+
+template <typename Traits>
 Nufft1PlanBase<Traits>::~Nufft1PlanBase() {
     try {
         q_.wait();
     } catch (...) {
     }
+}
+
+template <typename Traits>
+void Nufft1PlanBase<Traits>::set_points(
+    const XCoordT* d_x, int M, XCoordT df, int freq_factor) {
+    ensure_point_capacity(M);
+    set_points(d_x, df, freq_factor);
 }
 
 template <typename Traits>
@@ -1217,12 +1287,25 @@ void Nufft1PlanBase<Traits>::set_output_scale(double scale) {
         throw std::invalid_argument("Nufft1Plan::set_output_scale: scale must be finite and non-zero");
     }
     if (scale == output_scale_) return;
-    if (d_slot_deconv_ || d_nat_deconv_) {
-        q_.wait();
-        d_slot_deconv_.reset();
-        d_nat_deconv_.reset();
-    }
     output_scale_ = scale;
+    // Rebuild already-allocated LUTs in place on the in-order queue (no blocking q_.wait()!)
+    if (d_slot_deconv_) {
+        dispatch_build_deconv_table<Traits>(
+            q_, w_, d_pswf_tbl_.get(), nfft_, log_nfft_, nout_, output_shift_,
+            mode_, 1, d_slot_deconv_.get(), output_scale_);
+    }
+    if (d_nat_deconv_) {
+        dispatch_build_deconv_table<Traits>(
+            q_, w_, d_pswf_tbl_.get(), nfft_, log_nfft_, nout_, output_shift_,
+            mode_, 2, d_nat_deconv_.get(), output_scale_);
+    }
+    if (d_slot_deconv_f32_) {
+        if constexpr (Traits::kIsHalf) {
+            detail::launch_build_deconv_tableh_f32(
+                q_, w_, d_pswf_tbl_.get(), nfft_, log_nfft_, nout_, output_shift_,
+                mode_, 1, d_slot_deconv_f32_.get(), output_scale_);
+        }
+    }
 }
 
 template <typename Traits>
@@ -1268,6 +1351,27 @@ const typename Traits::ScalarT* Nufft1PlanBase<Traits>::d_deconv() {
         d_nat_deconv_ = std::move(buf);
     }
     return d_nat_deconv_.get();
+}
+
+template <typename Traits>
+const float* Nufft1PlanBase<Traits>::d_slot_deconv_f32() {
+    if constexpr (Traits::kIsHalf) {
+        if (!d_slot_deconv_f32_) {
+            auto buf = sycl_fft::UsmPtr<float>::alloc_device(static_cast<size_t>(nout_), q_);
+            if (!buf) {
+                throw std::runtime_error("Nufft1Plan: d_slot_deconv_f32 allocation failed");
+            }
+            detail::launch_build_deconv_tableh_f32(
+                q_, w_, d_pswf_tbl_.get(), nfft_, log_nfft_, nout_, output_shift_,
+                mode_, 1, buf.get(), output_scale_);
+            d_slot_deconv_f32_ = std::move(buf);
+        }
+        return d_slot_deconv_f32_.get();
+    } else if constexpr (std::is_same_v<ScalarT, float>) {
+        return d_slot_deconv();
+    } else {
+        return nullptr;
+    }
 }
 
 template <typename Traits>

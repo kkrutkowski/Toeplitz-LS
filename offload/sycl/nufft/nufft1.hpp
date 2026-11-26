@@ -43,6 +43,7 @@ struct Nufft1LaunchConfig {
     std::string deconv_variant_override;  // e.g. "deconv_wg64_bt64"
     size_t      chunk_bytes_override = 0; // 0 = auto from DeviceFftConfig L2 & CUs
     bool        force_collab_spread  = false;
+    bool        use_geo_scale_fp16   = false; // true = geometric-mean-1 FP16 PSWF table (used by FP16 IHS)
 
     bool has_spread_overrides() const {
         return !spread_variant_override.empty() || force_collab_spread ||
@@ -207,8 +208,8 @@ void launch_transpose_and_zero_f16pair(
     int tile, int stride);
 
 // --- Device-resident PSWF table uploaders (avoids 1 KiB by-value kernel capture;
-//     applies exact geometric-mean-1 rescaling for FP32/FP64/DF, retains 2^e for FP16) ---
-uint8_t* upload_pswf_tableh(sycl::queue& q, int w, PswfMode mode);
+//     applies exact geometric-mean-1 rescaling for FP32/FP64/DF, retains 2^e for FP16 unless geo_scale=true) ---
+uint8_t* upload_pswf_tableh(sycl::queue& q, int w, PswfMode mode, bool geo_scale = false);
 uint8_t* upload_pswf_tablef(sycl::queue& q, int w, PswfMode mode);
 uint8_t* upload_pswf_table(sycl::queue& q, int w, PswfMode mode);
 uint8_t* upload_pswf_tabledf(sycl::queue& q, int w, PswfMode mode);
@@ -368,6 +369,12 @@ void launch_build_deconv_tableh(
     sycl::queue& q, int w, const void* d_tbl,
     int nfft, int log_nfft, int nout, int output_shift,
     PswfMode mode, int table_kind, sycl_fft::f16_scalar_t* d_out,
+    double output_scale = 1.0);
+
+void launch_build_deconv_tableh_f32(
+    sycl::queue& q, int w, const void* d_tbl,
+    int nfft, int log_nfft, int nout, int output_shift,
+    PswfMode mode, int table_kind, float* d_out,
     double output_scale = 1.0);
 
 void launch_build_deconv_tablef(
@@ -535,6 +542,10 @@ public:
     // and build O(M) window buckets when windowed SMEM spreading uses num_wins > 1.
     void set_points(const XCoordT* d_x, XCoordT df, int freq_factor = 1);
 
+    // Resizable overload for reusing a single cached Nufft1Plan across lightcurves of varying M
+    // with zero device reallocations whenever M <= M_cap_.
+    void set_points(const XCoordT* d_x, int M, XCoordT df, int freq_factor = 1);
+
     // Execute NuFFT-1 for a batch of `bs` signals d_y [bs][M] -> d_out [bs][N_out].
     void execute(
         const ComplexT* d_y,
@@ -562,14 +573,17 @@ public:
 
     // Lazy read-only device LUTs (length nout_) for deferred deconvolution and multi-NuFFT
     // index-wise combination with a single final bit-reversal pass:
-    //   d_slot_phi_hat(): phi_hat(k'_i) in compact SlotBitReversed order
-    //   d_slot_deconv():  output_scale / phi_hat(k'_i) in compact SlotBitReversed order
-    //   d_deconv():       output_scale / phi_hat(k') in Natural frequency order
+    //   d_slot_phi_hat():     phi_hat(k'_i) in compact SlotBitReversed order
+    //   d_slot_deconv():      output_scale / phi_hat(k'_i) in compact SlotBitReversed order
+    //   d_deconv():           output_scale / phi_hat(k') in Natural frequency order
+    //   d_slot_deconv_f32():  FP32-precision output_scale / phi_hat(k'_i) (FP16 IHS deferred deconv)
     const ScalarT* d_slot_phi_hat();
     const ScalarT* d_slot_deconv();
     const ScalarT* d_deconv();
+    const float*   d_slot_deconv_f32();
 
     int M() const { return M_; }
+    int M_capacity() const { return M_cap_; }
     int N() const { return N_; }
     int w() const { return w_; }
     int nfft() const { return nfft_; }
@@ -618,9 +632,11 @@ private:
 
     void allocate_collab_grid();
     void allocate_window_buckets();
+    void ensure_point_capacity(int M);
 
     sycl::queue&       q_;
     int                M_;
+    int                M_cap_;
     int                N_;
     int                w_;
     PswfMode           mode_;
@@ -650,6 +666,7 @@ private:
     sycl_fft::UsmPtr<ScalarT>  d_slot_phi_hat_;
     sycl_fft::UsmPtr<ScalarT>  d_slot_deconv_;
     sycl_fft::UsmPtr<ScalarT>  d_nat_deconv_;
+    sycl_fft::UsmPtr<float>    d_slot_deconv_f32_;
     sycl_fft::UsmPtr<int>      d_first_;
     sycl_fft::UsmPtr<ScalarT>  d_u_;
     sycl_fft::UsmPtr<ComplexT> d_shift_;

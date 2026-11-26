@@ -44,6 +44,22 @@ std::string compiler_id_tag();
 std::string kernel_code_hash();
 std::string backend_to_tag(const sycl::device& dev);
 
+struct SyclDeviceDescriptor {
+    int          id = 0;
+    std::string  name;
+    std::string  backend;
+    std::string  device_type; // "gpu", "cpu", "accelerator", "other"
+    size_t       max_compute_units = 0;
+    size_t       global_mem_size = 0;
+    bool         is_gpu = false;
+    bool         has_fp64 = false;
+    bool         has_fp16 = false;
+    sycl::device device;
+};
+
+// Enumerates all available SYCL devices sorted GPU-first (device 0 = primary GPU when present).
+const std::vector<SyclDeviceDescriptor>& enumerate_sycl_devices();
+
 // ============================================================================
 // Adaptive SYCL Device Query & Launch Configuration
 // ============================================================================
@@ -57,8 +73,11 @@ struct DeviceFftConfig {
     size_t cache_line_size = 128;
     size_t global_mem_size = 0;
     size_t max_mem_alloc_size = 0;
+    size_t max_kernel_concurrency = 1;
+    size_t max_memcpy_concurrency = 1;
     bool is_gpu = false;
     bool has_native_local_mem = false;
+    bool has_host_unified_memory = false;
     bool has_fp64 = true;
     bool has_fp16_aspect = false;
 
@@ -76,7 +95,16 @@ struct DeviceFftConfig {
     size_t pick_sub_group_size(size_t min_req) const;
     size_t clamp_pow2_wg(size_t total_threads, size_t requested_wg, size_t hard_cap = 0) const;
     size_t default_wg_size(size_t total_threads, size_t reg_wg_cap = 256) const;
+    // Optimal power-of-2 work-group size for bounds-checked (padded) 1D/2D kernels
+    // where total_threads does not need to be divisible by wg_size.
+    size_t default_padded_wg_size(size_t reg_wg_cap = 256) const;
     size_t effective_l2_bytes() const;
+    // Maximum single USM buffer allocation safe on this device (clamps UINT64_MAX on OMP CPU).
+    size_t safe_max_alloc_bytes() const;
+    // Hardware-derived concurrent in-order stream count (CPU/GPU portable, zero model constants).
+    size_t recommended_stream_count() const;
+    // Per-stream memory budget: 75% of max device memory divided by num_streams.
+    size_t per_stream_mem_budget(size_t num_streams) const;
     size_t compute_l2_chunk_bytes(
         size_t fft_bytes,
         size_t n1,
