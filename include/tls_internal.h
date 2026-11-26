@@ -18,8 +18,9 @@ extern "C" {
 
 /* How a PSWF NuFFT hands one block back to the caller. */
 enum {
-    TLS_NUFFT_OUT_NATURAL = 0, /* frequency order, Nout entries (classic contract) */
-    TLS_NUFFT_OUT_SLOTS = 1    /* kept FFT positions only, also Nout entries */
+    TLS_NUFFT_OUT_NATURAL = 0,   /* frequency order, Nout entries (classic contract) */
+    TLS_NUFFT_OUT_SLOTS = 1,     /* kept FFT positions only, Nout entries, deconvolved */
+    TLS_NUFFT_OUT_SLOTS_RAW = 2  /* kept FFT positions only, Nout entries, un-deconvolved */
 };
 
 /*
@@ -38,6 +39,9 @@ enum {
     export_attr void prefix##_nufft_pswf_execute_breadth(plan_type *plan, const input_type *x, const type *val, double f0, int block, int block_base,          \
                                                          int freq_factor, int mode, bvec_type *out_real, bvec_type *out_imag);                                 \
     export_attr int prefix##_nufft_pswf_slots_available(plan_type *plan);                                                                                      \
+    export_attr const type *prefix##_nufft_pswf_slot_phi_hat(plan_type *plan);                                                                                 \
+    export_attr const type *prefix##_nufft_pswf_slot_deconv(plan_type *plan);                                                                                  \
+    export_attr const type *prefix##_nufft_pswf_deconv(const plan_type *plan);                                                                                 \
     export_attr void prefix##_nufft_pswf_finish_slots(plan_type *plan, const type *compact, type *out, int count);                                             \
     export_attr void prefix##_nufft_pswf_finish_slots_breadth(plan_type *plan, const bvec_type *compact, type *out, int block, int active_lanes,               \
                                                               int total_remaining);                                                                            \
@@ -62,10 +66,12 @@ TLS_API int tlsh_nufft_pswf_bench_ppoly_gen(int w, const char upsamp[2], int rep
 int tlsh_nat_nufft_pswf_bench_ppoly_gen(int w, const char upsamp[2], int reps);
 #endif
 
+TLS_API void tlsh_nufft_pswf_set_output_scale(tlsh_nufft_pswf_plan *plan, double scale);
 TLS_API void tlsh_nufft_pswf_finish_slots_f32(tlsh_nufft_pswf_plan *plan, const float *compact, float *out, int count);
 TLS_API void tlsh_nufft_pswf_finish_slots_breadth_f32(tlsh_nufft_pswf_plan *plan, const float *compact, float *out, int block, int active_lanes,
                                                       int total_remaining);
 #ifdef HALF_NATIVE_EMBED
+void tlsh_nat_nufft_pswf_set_output_scale(tlsh_nat_nufft_pswf_plan *plan, double scale);
 void tlsh_nat_nufft_pswf_finish_slots_f32(tlsh_nat_nufft_pswf_plan *plan, const float *compact, float *out, int count);
 void tlsh_nat_nufft_pswf_finish_slots_breadth_f32(tlsh_nat_nufft_pswf_plan *plan, const float *compact, float *out, int block, int active_lanes,
                                                   int total_remaining);
