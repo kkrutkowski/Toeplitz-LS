@@ -1,15 +1,15 @@
 #pragma once
 
-#include "common/layout.hpp"
-
-#include <sycl/sycl.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <vector>
+
+#include "common/layout.hpp"
 
 // ============================================================================
 // SYCL 2020 Kernel Bundle & Required Sub-Group Size Capability Detection
@@ -18,26 +18,22 @@
 // ============================================================================
 #if !defined(SYCL_IMPLEMENTATION_ACPP) && !defined(SYCL_IMPLEMENTATION_HIPSYCL) && \
     (defined(__SYCL_COMPILER_VERSION) || (defined(SYCL_LANGUAGE_VERSION) && SYCL_LANGUAGE_VERSION >= 202001))
-#define SYCL_FFT_HAS_KERNEL_BUNDLE 1
-#define SYCL_FFT_HAS_REQD_SG_SIZE  1
+#    define SYCL_FFT_HAS_KERNEL_BUNDLE 1
+#    define SYCL_FFT_HAS_REQD_SG_SIZE 1
 #else
-#define SYCL_FFT_HAS_KERNEL_BUNDLE 0
-#define SYCL_FFT_HAS_REQD_SG_SIZE  0
+#    define SYCL_FFT_HAS_KERNEL_BUNDLE 0
+#    define SYCL_FFT_HAS_REQD_SG_SIZE 0
 #endif
 
 namespace sycl_fft {
 
 enum class AutotuneMode : uint8_t {
-    Auto  = 0, // Use persistent disk cache; tune once on cache miss
-    Off   = 1, // Heuristic selection only (no timing runs)
+    Auto = 0,  // Use persistent disk cache; tune once on cache miss
+    Off = 1,   // Heuristic selection only (no timing runs)
     Force = 2  // Always re-run micro-autotuner and overwrite cache entry
 };
 
-enum class PlanExecMode : uint8_t {
-    SinglePass       = 0,
-    TwoPass          = 1,
-    MultiStageGlobal = 2
-};
+enum class PlanExecMode : uint8_t { SinglePass = 0, TwoPass = 1, MultiStageGlobal = 2 };
 
 std::string sanitize_cache_token(const std::string& raw);
 std::string compiler_id_tag();
@@ -45,15 +41,15 @@ std::string kernel_code_hash();
 std::string backend_to_tag(const sycl::device& dev);
 
 struct SyclDeviceDescriptor {
-    int          id = 0;
-    std::string  name;
-    std::string  backend;
-    std::string  device_type; // "gpu", "cpu", "accelerator", "other"
-    size_t       max_compute_units = 0;
-    size_t       global_mem_size = 0;
-    bool         is_gpu = false;
-    bool         has_fp64 = false;
-    bool         has_fp16 = false;
+    int id = 0;
+    std::string name;
+    std::string backend;
+    std::string device_type;  // "gpu", "cpu", "accelerator", "other"
+    size_t max_compute_units = 0;
+    size_t global_mem_size = 0;
+    bool is_gpu = false;
+    bool has_fp64 = false;
+    bool has_fp16 = false;
     sycl::device device;
 };
 
@@ -105,38 +101,32 @@ struct DeviceFftConfig {
     size_t recommended_stream_count() const;
     // Per-stream memory budget: 75% of max device memory divided by num_streams.
     size_t per_stream_mem_budget(size_t num_streams) const;
-    size_t compute_l2_chunk_bytes(
-        size_t fft_bytes,
-        size_t n1,
-        bool is_compute_heavy,
-        size_t l2_num = 1,
-        size_t l2_den = 4,
-        size_t min_waves_per_cu = 0) const;
+    size_t compute_l2_chunk_bytes(size_t fft_bytes, size_t n1, bool is_compute_heavy, size_t l2_num = 1, size_t l2_den = 4, size_t min_waves_per_cu = 0) const;
 };
 
 struct FftLaunchConfig {
-    size_t l2_chunk_bytes = 0;        // 0 = auto from device L2 cache & compute units (or autotuner)
-    size_t pass0_wg_size = 0;         // 0 = auto from device sub-group & max work-group size
-    size_t bitrev_wg_size = 0;        // 0 = auto from device sub-group & max work-group size
-    int    two_pass_min_logN = 0;     // 0 = auto from device candidates / autotuner
-    int    two_pass_log_n1 = 0;       // 0 = auto
-    size_t l2_budget_num = 1;         // base L2 fraction numerator (default 1/4)
-    size_t l2_budget_den = 4;         // base L2 fraction denominator (default 1/4)
-    size_t min_waves_per_cu = 0;      // 0 = auto (1 CPU, 2 FP32/DF/fast-FP64, 8 slow-FP64)
-    bool   allow_wide_kernels = true; // allow 2-transpose kernels when hardware supports them
+    size_t l2_chunk_bytes = 0;       // 0 = auto from device L2 cache & compute units (or autotuner)
+    size_t pass0_wg_size = 0;        // 0 = auto from device sub-group & max work-group size
+    size_t bitrev_wg_size = 0;       // 0 = auto from device sub-group & max work-group size
+    int two_pass_min_logN = 0;       // 0 = auto from device candidates / autotuner
+    int two_pass_log_n1 = 0;         // 0 = auto
+    size_t l2_budget_num = 1;        // base L2 fraction numerator (default 1/4)
+    size_t l2_budget_den = 4;        // base L2 fraction denominator (default 1/4)
+    size_t min_waves_per_cu = 0;     // 0 = auto (1 CPU, 2 FP32/DF/fast-FP64, 8 slow-FP64)
+    bool allow_wide_kernels = true;  // allow 2-transpose kernels when hardware supports them
 
     // Generalization & autotuning controls
-    AutotuneMode autotune = AutotuneMode::Auto; // default on with persistent disk cache
-    std::string  cache_path;                    // empty = default env/XDG/$HOME cache path
-    bool   allow_emulated_local_mem = false;    // refuse smem transpose kernels when !has_native_local_mem
-    bool   allow_multistage_fallback = true;    // allow zero-smem multi-stage global fallback
-    bool   force_multistage = false;            // force zero-smem multi-stage global path
-    int    fp64_compute_heavy_override = -1;    // -1 = auto microbench, 0 = false, 1 = true
-    int    stash_8192_override = -1;            // -1 = auto probe/autotune, 0 = false, 1 = true
-    std::string variant_override;               // non-empty = pin specific single-pass variant_id
-    bool   skip_df_kat = false;                 // false = enforce plan-time DF Known-Answer Test
-    std::string bitrev_variant_override;        // non-empty = pin specific bit-reversal strategy
-    bool   skip_fp16_kat = false;               // false = enforce plan-time FP16 KAT
+    AutotuneMode autotune = AutotuneMode::Auto;  // default on with persistent disk cache
+    std::string cache_path;                      // empty = default env/XDG/$HOME cache path
+    bool allow_emulated_local_mem = false;       // refuse smem transpose kernels when !has_native_local_mem
+    bool allow_multistage_fallback = true;       // allow zero-smem multi-stage global fallback
+    bool force_multistage = false;               // force zero-smem multi-stage global path
+    int fp64_compute_heavy_override = -1;        // -1 = auto microbench, 0 = false, 1 = true
+    int stash_8192_override = -1;                // -1 = auto probe/autotune, 0 = false, 1 = true
+    std::string variant_override;                // non-empty = pin specific single-pass variant_id
+    bool skip_df_kat = false;                    // false = enforce plan-time DF Known-Answer Test
+    std::string bitrev_variant_override;         // non-empty = pin specific bit-reversal strategy
+    bool skip_fp16_kat = false;                  // false = enforce plan-time FP16 KAT
 
     bool has_plan_overrides() const;
     bool has_bitrev_overrides() const;
@@ -146,10 +136,10 @@ struct FftLaunchConfig {
 // SYCL 2020 kernel_bundle / kernel_device_specific Probe
 // ============================================================================
 struct KernelProbeInfo {
-    bool     available = false;
-    size_t   max_wg_size = 0;
-    size_t   private_mem_bytes = 0;
-    size_t   preferred_wg_multiple = 0;
+    bool available = false;
+    size_t max_wg_size = 0;
+    size_t private_mem_bytes = 0;
+    size_t preferred_wg_multiple = 0;
     uint32_t max_sg_size = 0;
     uint32_t compile_sg_size = 0;
 };
@@ -160,17 +150,14 @@ inline KernelProbeInfo probe_kernel_bundle(sycl::queue& q, const sycl::device& d
 #if SYCL_FFT_HAS_KERNEL_BUNDLE
     try {
         const auto kid = sycl::get_kernel_id<KernelTag>();
-        auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(
-            q.get_context(), {dev}, {kid});
+        auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), {dev}, {kid});
         auto k = bundle.get_kernel(kid);
         info.available = true;
         info.max_wg_size = k.template get_info<sycl::info::kernel_device_specific::work_group_size>(dev);
         info.private_mem_bytes = k.template get_info<sycl::info::kernel_device_specific::private_mem_size>(dev);
-        info.preferred_wg_multiple =
-            k.template get_info<sycl::info::kernel_device_specific::preferred_work_group_size_multiple>(dev);
+        info.preferred_wg_multiple = k.template get_info<sycl::info::kernel_device_specific::preferred_work_group_size_multiple>(dev);
         info.max_sg_size = k.template get_info<sycl::info::kernel_device_specific::max_sub_group_size>(dev);
-        info.compile_sg_size =
-            k.template get_info<sycl::info::kernel_device_specific::compile_sub_group_size>(dev);
+        info.compile_sg_size = k.template get_info<sycl::info::kernel_device_specific::compile_sub_group_size>(dev);
     } catch (...) {
         info.available = false;
     }
@@ -186,23 +173,23 @@ inline KernelProbeInfo probe_kernel_bundle(sycl::queue& q, const sycl::device& d
 //   Implemented in common/device.cpp (single isolated HCF module).
 // ============================================================================
 struct DeviceProbeResult {
-    bool     sg_probed = false;
-    size_t   raw_sg_size = 1;
-    size_t   effective_sg_size = 1;
-    bool     sg_linear_ok = false;
-    bool     sg_xor_ok = false;
+    bool sg_probed = false;
+    size_t raw_sg_size = 1;
+    size_t effective_sg_size = 1;
+    bool sg_linear_ok = false;
+    bool sg_xor_ok = false;
 
-    bool     df_kat_probed = false;
-    bool     df_kat_passed = false;
+    bool df_kat_probed = false;
+    bool df_kat_passed = false;
     std::string df_kat_error;
 
-    bool     fp16_kat_probed = false;
-    bool     fp16_kat_passed = false;
+    bool fp16_kat_probed = false;
+    bool fp16_kat_passed = false;
     std::string fp16_kat_error;
 
-    bool     fp64_probed = false;
-    double   fp64_to_fp32_ratio = 0.0;
-    bool     fp64_compute_heavy = true;
+    bool fp64_probed = false;
+    double fp64_to_fp32_ratio = 0.0;
+    bool fp64_compute_heavy = true;
 };
 
 DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig& dev_cfg);
@@ -219,23 +206,18 @@ DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cf
 // ============================================================================
 struct AutotuneEntry {
     PlanExecMode mode = PlanExecMode::SinglePass;
-    std::string  variant_id;
-    int          log_n1 = 0;
-    size_t       pass0_wg = 0;
-    size_t       l2_chunk_bytes = 0;
-    double       margin_pct = 0.0;
-    std::string  runner_up_id;
+    std::string variant_id;
+    int log_n1 = 0;
+    size_t pass0_wg = 0;
+    size_t l2_chunk_bytes = 0;
+    double margin_pct = 0.0;
+    std::string runner_up_id;
 };
 
 class AutotuneCache {
-public:
+   public:
     static std::string resolve_cache_path(const std::string& explicit_path);
-    static std::string make_key(
-        const DeviceFftConfig& dev_cfg,
-        const char* prec_tag,
-        int logN,
-        const char* slot_tag = "any",
-        int sign = 0);
+    static std::string make_key(const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag = "any", int sign = 0);
     static bool get(const std::string& path, const std::string& key, AutotuneEntry& out);
     static void put(const std::string& path, const std::string& key, const AutotuneEntry& val);
     static void clear_memory_cache();
@@ -248,35 +230,28 @@ public:
 //   most conservative candidate among all contenders within the noise band.
 // ============================================================================
 struct InterleavedBenchResult {
-    bool   ok            = false;
-    size_t chosen_idx    = 0;
-    size_t fastest_idx   = 0;
+    bool ok = false;
+    size_t chosen_idx = 0;
+    size_t fastest_idx = 0;
     size_t runner_up_idx = 0;
-    bool   has_runner_up = false;
-    double chosen_ms     = 0.0;
-    double fastest_ms    = 0.0;
-    double runner_up_ms  = 0.0;
-    double margin_pct    = 0.0; // (runner_up_ms - chosen_ms) / chosen_ms * 100 (or vs fastest if conservative fallback)
-    bool   conservative_fallback = false;
+    bool has_runner_up = false;
+    double chosen_ms = 0.0;
+    double fastest_ms = 0.0;
+    double runner_up_ms = 0.0;
+    double margin_pct = 0.0;  // (runner_up_ms - chosen_ms) / chosen_ms * 100 (or vs fastest if conservative fallback)
+    bool conservative_fallback = false;
 };
 
 template <typename LaunchFn, typename SyncFn, typename ConservativeLessFn>
-inline InterleavedBenchResult run_interleaved_bench(
-    size_t num_cands,
-    LaunchFn&& launch_one,
-    SyncFn&& sync_queue,
-    ConservativeLessFn&& is_more_conservative,
-    int num_rounds = 5,
-    double target_slice_ms = 2.0,
-    int max_batch_reps = 16,
-    double min_noise_frac = 0.03,
-    double max_noise_frac = 0.08) {
+inline InterleavedBenchResult run_interleaved_bench(size_t num_cands, LaunchFn&& launch_one, SyncFn&& sync_queue, ConservativeLessFn&& is_more_conservative,
+                                                    int num_rounds = 5, double target_slice_ms = 2.0, int max_batch_reps = 16, double min_noise_frac = 0.03,
+                                                    double max_noise_frac = 0.08) {
     InterleavedBenchResult res{};
     if (num_cands == 0) return res;
 
-    const int rounds = std::max(3, (num_rounds | 1)); // odd >= 3 for exact median
+    const int rounds = std::max(3, (num_rounds | 1));  // odd >= 3 for exact median
     std::vector<bool> alive(num_cands, false);
-    std::vector<int>  batch_reps(num_cands, 1);
+    std::vector<int> batch_reps(num_cands, 1);
     std::vector<std::vector<double>> samples(num_cands);
 
     // Stage 1: Warmup JIT + safety launch + per-candidate batch-rep calibration
@@ -289,16 +264,16 @@ inline InterleavedBenchResult run_interleaved_bench(
             const auto w0 = std::chrono::steady_clock::now();
             if (!launch_one(c)) continue;
             sync_queue();
-            const double est_ms = std::max(
-                0.01,
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
-            batch_reps[c] = std::clamp(
-                static_cast<int>(target_slice_ms / est_ms) + 1, 1, std::max(1, max_batch_reps));
+            const double est_ms = std::max(0.01, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+            batch_reps[c] = std::clamp(static_cast<int>(target_slice_ms / est_ms) + 1, 1, std::max(1, max_batch_reps));
             alive[c] = true;
             samples[c].reserve(static_cast<size_t>(rounds));
             if (first_alive == num_cands) first_alive = c;
         } catch (...) {
-            try { sync_queue(); } catch (...) {}
+            try {
+                sync_queue();
+            } catch (...) {
+            }
             alive[c] = false;
         }
     }
@@ -340,11 +315,13 @@ inline InterleavedBenchResult run_interleaved_bench(
                     (void)launch_one(c);
                 }
                 sync_queue();
-                const double ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count() / static_cast<double>(reps);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / static_cast<double>(reps);
                 samples[c].push_back(ms);
             } catch (...) {
-                try { sync_queue(); } catch (...) {}
+                try {
+                    sync_queue();
+                } catch (...) {
+                }
                 alive[c] = false;
             }
         }
@@ -418,7 +395,7 @@ inline InterleavedBenchResult run_interleaved_bench(
 // Move-only RAII wrapper for SYCL USM device allocations.
 template <typename T>
 class UsmPtr {
-public:
+   public:
     UsmPtr() = default;
     UsmPtr(T* ptr, sycl::queue* q) noexcept : ptr_(ptr), q_(q) {}
     ~UsmPtr() { reset(); }
@@ -468,9 +445,9 @@ public:
     T* get() const noexcept { return ptr_; }
     explicit operator bool() const noexcept { return ptr_ != nullptr; }
 
-private:
+   private:
     T* ptr_ = nullptr;
     sycl::queue* q_ = nullptr;
 };
 
-} // namespace sycl_fft
+}  // namespace sycl_fft

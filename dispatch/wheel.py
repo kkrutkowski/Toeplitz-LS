@@ -29,7 +29,19 @@ BUILD = ROOT / ".build"
 DIST = ROOT / "dist"
 PACKAGE = ROOT / "toeplitz-ls" / "toeplitz_ls"
 
-PACKAGE_FILES = ("__init__.py", "_fastchi2.py", "_ihs.py", "_dispatch.py", "utils.py")
+PACKAGE_FILES = (
+    "__init__.py",
+    "_fastchi2.py",
+    "_ihs.py",
+    "_dispatch.py",
+    "utils.py",
+    "offload/__init__.py",
+    "offload/_common.py",
+    "offload/vulkan/__init__.py",
+    "offload/vulkan/_lib.py",
+    "offload/vulkan/_fastchi2.py",
+    "offload/vulkan/_ihs.py",
+)
 LICENSE = P.LICENSE
 
 # glibc symbol versions the wheels are allowed to need.  Everything the library
@@ -68,7 +80,7 @@ def read_version() -> str:
 # ---------------------------------------------------------------------------
 # ABI checks
 # ---------------------------------------------------------------------------
-def check_abi(library: Path, target) -> list[str]:
+def check_abi(library: Path, target, *, is_vulkan: bool = False) -> list[str]:
     """Return human-readable findings; raise AbiError when the tag is not met."""
     notes = []
     if target.os == "linux" and target.libc == "glibc":
@@ -78,6 +90,8 @@ def check_abi(library: Path, target) -> list[str]:
         dynamic = _run([readelf, "-d", library]).stdout
         needed = re.findall(r"Shared library: \[([^\]]+)\]", dynamic)
         allowed = {"libc.so.6", "libm.so.6", "libgcc_s.so.1", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1"}
+        if is_vulkan:
+            allowed |= {"libdl.so.2", "libpthread.so.0"}
         unexpected = [n for n in needed if n not in allowed]
         if unexpected:
             raise AbiError("%s needs non-system libraries: %s" % (library.name, ", ".join(unexpected)))
@@ -119,8 +133,9 @@ def check_abi(library: Path, target) -> list[str]:
             raise AbiError("%s imports a non-system DLL: %s" % (library.name, ", ".join(sorted(unexpected))))
         exports = _run([readobj, "--coff-exports", library]).stdout
         exported = re.findall(r"Name: (\S+)", exports)
-        if len(exported) < 50:
-            raise AbiError("%s exports only %d symbols" % (library.name, len(exported)))
+        min_exports = 14 if is_vulkan else 50
+        if len(exported) < min_exports:
+            raise AbiError("%s exports only %d symbols (expected >= %d)" % (library.name, len(exported), min_exports))
         if any(name.startswith("_") or "@" in name for name in exported):
             raise AbiError("%s exports decorated names" % library.name)
         notes.append("%s PE, %d undecorated exports, imports %s" % (machine, len(exported), ",".join(sorted(names))))
@@ -149,6 +164,22 @@ def check_abi(library: Path, target) -> list[str]:
     return notes
 
 
+def check_moltenvk_abi(library: Path, target) -> list[str]:
+    """Verify the sliced bundled libMoltenVK.dylib only depends on Apple system libs/frameworks."""
+    objdump = _tool("llvm-objdump")
+    if not objdump:
+        raise AbiError("llvm-objdump is required to verify libMoltenVK.dylib")
+    headers = _run([objdump, "--macho", "--private-headers", library]).stdout
+    expected_cpu = "ARM64" if target.arch == "aarch64" else "X86_64"
+    if expected_cpu not in headers:
+        raise AbiError("%s does not match target arch %s" % (library.name, expected_cpu))
+    load_dylibs = re.findall(r"cmd LC_LOAD_DYLIB\n.*?\n\s+name ([^ ]+)", headers)
+    unexpected = [d for d in load_dylibs if not (d.startswith("/System/Library/Frameworks/") or d.startswith("/usr/lib/"))]
+    if unexpected:
+        raise AbiError("%s links non-system dylibs: %s" % (library.name, unexpected))
+    return ["Mach-O %s MoltenVK (%d system deps)" % (expected_cpu, len(load_dylibs))]
+
+
 def check_staging(staging: Path, target) -> list[str]:
     manifest = json.loads((staging / "manifest.json").read_text())
     notes = []
@@ -164,6 +195,17 @@ def check_staging(staging: Path, target) -> list[str]:
         if not path.exists():
             raise AbiError("manifest lists a missing library: %s" % entry["file"])
         notes.extend("%s: %s" % (entry["name"], note) for note in check_abi(path, target))
+
+    vk_staging = staging.parent / "_vulkan"
+    vk_lib = vk_staging / f"tls_vulkan{target.extension}"
+    if not vk_lib.exists():
+        raise AbiError("Vulkan offload library missing: %s (run dispatch.build)" % vk_lib)
+    notes.extend("vulkan: %s" % note for note in check_abi(vk_lib, target, is_vulkan=True))
+    if target.os == "macos":
+        mvk = vk_staging / "libMoltenVK.dylib"
+        if not mvk.exists():
+            raise AbiError("macOS wheel is missing bundled libMoltenVK.dylib: %s" % mvk)
+        notes.extend("moltenvk: %s" % note for note in check_moltenvk_abi(mvk, target))
     return notes
 
 
@@ -209,6 +251,11 @@ def build_wheel(target_name: str, version: str | None = None) -> Path:
         for item in sorted(staging.iterdir()):
             if item.is_file():
                 add("toeplitz_ls/_lib/" + item.name, item.read_bytes())
+        vk_staging = BUILD / target_name / "_vulkan"
+        if vk_staging.exists():
+            for item in sorted(vk_staging.iterdir()):
+                if item.is_file():
+                    add("toeplitz_ls/offload/vulkan/_lib/" + item.name, item.read_bytes())
 
         add(
             "%s/METADATA" % dist_info,

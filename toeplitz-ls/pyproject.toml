@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toeplitz-ls"
-version = "1.0.0"
+version = "1.1.0rc1"
 description = "The reference implementation of the Toeplitz formulation of the multiharmonic least-squares periodogram (AoVMH / FastChi2)."
 readme = "README.md"
 license = { text = "MIT" }
@@ -52,4 +52,12 @@ include = ["toeplitz_ls*"]
 [tool.setuptools.package-data]
 # The release wheels carry one shared object per microarchitecture variant plus
 # the manifest the dispatcher reads; source builds keep the single tls.so.
-toeplitz_ls = ["*.so", "_lib/*.so", "_lib/*.dll", "_lib/manifest.json"]
+toeplitz_ls = [
+    "*.so",
+    "_lib/*.so",
+    "_lib/*.dll",
+    "_lib/manifest.json",
+    "offload/vulkan/_lib/*.so",
+    "offload/vulkan/_lib/*.dll",
+    "offload/vulkan/_lib/*.dylib",
+]

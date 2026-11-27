@@ -5,39 +5,30 @@
  * Mirrors offload/sycl/periodogram/preprocess.hpp & src/chi2per.c identically,
  * using reusable _Thread_local scratch buffers for zero steady-state heap allocations. */
 
-#include "common/math.h"
-#include "common/vk_device.h"
-
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "common/math.h"
+#include "common/vk_device.h"
+
 typedef enum VkTlsStatus {
-    TLS_VK_OK             =  0,
-    TLS_VK_ERR_ARGUMENT   = -1,
-    TLS_VK_ERR_BACKEND    = -2,
-    TLS_VK_ERR_ALLOC      = -3,
+    TLS_VK_OK = 0,
+    TLS_VK_ERR_ARGUMENT = -1,
+    TLS_VK_ERR_BACKEND = -2,
+    TLS_VK_ERR_ALLOC = -3,
     TLS_VK_ERR_DEGENERATE = -4,
-    TLS_VK_ERR_SOLVER     = -5,
-    TLS_VK_ERR_DEVICE     = -6,
-    TLS_VK_ERR_RUNTIME    = -7,
-    TLS_VK_ERR_NO_FP16    = -8,
-    TLS_VK_ERR_NO_FP64    = -9
+    TLS_VK_ERR_SOLVER = -5,
+    TLS_VK_ERR_DEVICE = -6,
+    TLS_VK_ERR_RUNTIME = -7,
+    TLS_VK_ERR_NO_FP16 = -8,
+    TLS_VK_ERR_NO_FP64 = -9
 } VkTlsStatus;
 
-typedef enum VkTlsBackend {
-    TLS_VK_BACKEND_PSWF43 = 1,
-    TLS_VK_BACKEND_PSWF21 = 2
-} VkTlsBackend;
+typedef enum VkTlsBackend { TLS_VK_BACKEND_PSWF43 = 1, TLS_VK_BACKEND_PSWF21 = 2 } VkTlsBackend;
 
-typedef enum VkNormKind {
-    VK_NORM_STANDARD     = 0,
-    VK_NORM_ANOVA        = 1,
-    VK_NORM_NLL          = 2,
-    VK_NORM_REGULARIZED  = 3,
-    VK_NORM_UNNORMALIZED = 4
-} VkNormKind;
+typedef enum VkNormKind { VK_NORM_STANDARD = 0, VK_NORM_ANOVA = 1, VK_NORM_NLL = 2, VK_NORM_REGULARIZED = 3, VK_NORM_UNNORMALIZED = 4 } VkNormKind;
 
 typedef struct VkCybenkoModel {
     double var_S;
@@ -71,28 +62,28 @@ static inline VkCybenkoModel vk_init_cybenko_model(int d, double neff_w) {
 }
 
 typedef struct VkHostFastChi2Data {
-    void*   x;        /* M * 8B (VkDf or double) */
-    void*   w;        /* M * scalar_bytes */
-    void*   yw;       /* M * scalar_bytes */
-    double* w_tmp;    /* M * 8B reusable scratch */
-    size_t  cap_M;
-    double  ws_fft;
-    double  yws_fft;
-    double  chi2_ref;
-    double  neff_w;
-    double  b_param;
-    double  row_scale;
+    void* x;       /* M * 8B (VkDf or double) */
+    void* w;       /* M * scalar_bytes */
+    void* yw;      /* M * scalar_bytes */
+    double* w_tmp; /* M * 8B reusable scratch */
+    size_t cap_M;
+    double ws_fft;
+    double yws_fft;
+    double chi2_ref;
+    double neff_w;
+    double b_param;
+    double row_scale;
     VkCybenkoModel cyb;
 } VkHostFastChi2Data;
 
 typedef struct VkHostIhsData {
-    void*   x;        /* M * 8B (VkDf or double) */
-    void*   wy;       /* M * scalar_bytes */
-    double* w_tmp;    /* M * 8B reusable scratch */
-    size_t  cap_M;
-    double  standard_scale;
-    double  nll_scale;
-    double  norm_neff;
+    void* x;       /* M * 8B (VkDf or double) */
+    void* wy;      /* M * scalar_bytes */
+    double* w_tmp; /* M * 8B reusable scratch */
+    size_t cap_M;
+    double standard_scale;
+    double nll_scale;
+    double norm_neff;
 } VkHostIhsData;
 
 static inline bool vk_host_fc2_ensure(VkHostFastChi2Data* d, size_t M) {
@@ -110,7 +101,10 @@ static inline bool vk_host_fc2_ensure(VkHostFastChi2Data* d, size_t M) {
         if (nt) d->w_tmp = nt;
         return false;
     }
-    d->x = nx; d->w = nw; d->yw = ny; d->w_tmp = nt;
+    d->x = nx;
+    d->w = nw;
+    d->yw = ny;
+    d->w_tmp = nt;
     d->cap_M = nc;
     return true;
 }
@@ -128,22 +122,15 @@ static inline bool vk_host_ihs_ensure(VkHostIhsData* d, size_t M) {
         if (nt) d->w_tmp = nt;
         return false;
     }
-    d->x = nx; d->wy = nwy; d->w_tmp = nt;
+    d->x = nx;
+    d->wy = nwy;
+    d->w_tmp = nt;
     d->cap_M = nc;
     return true;
 }
 
-static inline int vk_preprocess_fastchi2(
-    VkPrecKind prec,
-    const double* t,
-    const float* y_f,
-    const double* y_d,
-    const float* dy_f,
-    const double* dy_d,
-    int M,
-    int degree,
-    int nfft,
-    VkHostFastChi2Data* out) {
+static inline int vk_preprocess_fastchi2(VkPrecKind prec, const double* t, const float* y_f, const double* y_d, const float* dy_f, const double* dy_d, int M,
+                                         int degree, int nfft, VkHostFastChi2Data* out) {
     if (!vk_host_fc2_ensure(out, (size_t)M)) return TLS_VK_ERR_ALLOC;
     const bool use_d = (y_d != nullptr && dy_d != nullptr);
     double* w_d = out->w_tmp;
@@ -155,8 +142,10 @@ static inline int vk_preprocess_fastchi2(
         if (!isfinite(dm) || dm <= 0.0) return TLS_VK_ERR_ARGUMENT;
         if (dm < dy_min) dy_min = dm;
         double xm = t[m] - t_mid;
-        if (prec == VK_PREC_DOUBLE) ((double*)out->x)[m] = xm;
-        else                        ((VkDf*)out->x)[m] = vk_df_from_double(xm);
+        if (prec == VK_PREC_DOUBLE)
+            ((double*)out->x)[m] = xm;
+        else
+            ((VkDf*)out->x)[m] = vk_df_from_double(xm);
     }
 
     double ws_raw = 0.0;
@@ -219,7 +208,7 @@ static inline int vk_preprocess_fastchi2(
             double ywm = yc * wm;
             yws += ywm;
             chi2_ref += yc * ywm;
-            ow[m]  = vk_f32_to_f16_bits((float)wm);
+            ow[m] = vk_f32_to_f16_bits((float)wm);
             oyw[m] = vk_f32_to_f16_bits((float)ywm);
         }
     } else if (prec == VK_PREC_FLOAT) {
@@ -232,7 +221,7 @@ static inline int vk_preprocess_fastchi2(
             double ywm = yc * wm;
             yws += ywm;
             chi2_ref += yc * ywm;
-            ow[m]  = (float)wm;
+            ow[m] = (float)wm;
             oyw[m] = (float)ywm;
         }
     } else if (prec == VK_PREC_DF) {
@@ -245,7 +234,7 @@ static inline int vk_preprocess_fastchi2(
             double ywm = yc * wm;
             yws += ywm;
             chi2_ref += yc * ywm;
-            ow[m]  = vk_df_from_double(wm);
+            ow[m] = vk_df_from_double(wm);
             oyw[m] = vk_df_from_double(ywm);
         }
     } else {
@@ -258,43 +247,35 @@ static inline int vk_preprocess_fastchi2(
             double ywm = yc * wm;
             yws += ywm;
             chi2_ref += yc * ywm;
-            ow[m]  = wm;
+            ow[m] = wm;
             oyw[m] = ywm;
         }
     }
     if (chi2_ref == 0.0 || !isfinite(chi2_ref)) return TLS_VK_ERR_DEGENERATE;
 
-    out->neff_w  = (ws * ws) / sum_w2;
-    out->cyb     = vk_init_cybenko_model(degree, out->neff_w);
+    out->neff_w = (ws * ws) / sum_w2;
+    out->cyb = vk_init_cybenko_model(degree, out->neff_w);
     out->b_param = 0.5 * (out->neff_w - 1.0 - 2.0 * (double)degree);
     if (prec == VK_PREC_HALF) {
         /* Use exact w_target (not FP64-summed ws) so row_scale is bit-identical across
          * lightcurves and never triggers spurious d_slot_deconv LUT rebuilds. */
-        double inv_wt  = 1.0 / w_target;
+        double inv_wt = 1.0 / w_target;
         out->row_scale = (double)nfft * inv_wt;
-        out->ws_fft    = ws * inv_wt;
-        out->yws_fft   = yws * inv_wt;
-        out->chi2_ref  = chi2_ref * inv_wt;
+        out->ws_fft = ws * inv_wt;
+        out->yws_fft = yws * inv_wt;
+        out->chi2_ref = chi2_ref * inv_wt;
     } else {
         double inv_nfft = 1.0 / (double)nfft;
         out->row_scale = 1.0;
-        out->ws_fft    = ws * inv_nfft;
-        out->yws_fft   = yws * inv_nfft;
-        out->chi2_ref  = chi2_ref * inv_nfft;
+        out->ws_fft = ws * inv_nfft;
+        out->yws_fft = yws * inv_nfft;
+        out->chi2_ref = chi2_ref * inv_nfft;
     }
     return TLS_VK_OK;
 }
 
-static inline int vk_preprocess_ihs(
-    VkPrecKind prec,
-    const double* t,
-    const float* y_f,
-    const double* y_d,
-    const float* dy_f,
-    const double* dy_d,
-    int M,
-    int nfft,
-    VkHostIhsData* out) {
+static inline int vk_preprocess_ihs(VkPrecKind prec, const double* t, const float* y_f, const double* y_d, const float* dy_f, const double* dy_d, int M,
+                                    int nfft, VkHostIhsData* out) {
     if (!vk_host_ihs_ensure(out, (size_t)M)) return TLS_VK_ERR_ALLOC;
     const bool use_d = (y_d != nullptr && dy_d != nullptr);
     double* w_d = out->w_tmp;
@@ -306,8 +287,10 @@ static inline int vk_preprocess_ihs(
         if (!isfinite(dm) || dm <= 0.0) return TLS_VK_ERR_ARGUMENT;
         if (dm < dy_min) dy_min = dm;
         double xm = t[m] - t_mid;
-        if (prec == VK_PREC_DOUBLE) ((double*)out->x)[m] = xm;
-        else                        ((VkDf*)out->x)[m] = vk_df_from_double(xm);
+        if (prec == VK_PREC_DOUBLE)
+            ((double*)out->x)[m] = xm;
+        else
+            ((VkDf*)out->x)[m] = vk_df_from_double(xm);
     }
 
     double ws_raw = 0.0;
@@ -366,10 +349,14 @@ static inline int vk_preprocess_ihs(
         wy_sum_abs += fabs(wym);
         wy_sq_sum += wym * wym;
         chi2_ref += wym * yc;
-        if (prec == VK_PREC_HALF)       ((uint16_t*)out->wy)[m] = vk_f32_to_f16_bits((float)wym);
-        else if (prec == VK_PREC_FLOAT) ((float*)out->wy)[m] = (float)wym;
-        else if (prec == VK_PREC_DF)    ((VkDf*)out->wy)[m] = vk_df_from_double(wym);
-        else                            ((double*)out->wy)[m] = wym;
+        if (prec == VK_PREC_HALF)
+            ((uint16_t*)out->wy)[m] = vk_f32_to_f16_bits((float)wym);
+        else if (prec == VK_PREC_FLOAT)
+            ((float*)out->wy)[m] = (float)wym;
+        else if (prec == VK_PREC_DF)
+            ((VkDf*)out->wy)[m] = vk_df_from_double(wym);
+        else
+            ((double*)out->wy)[m] = wym;
     }
     if (chi2_ref == 0.0 || wy_sq_sum == 0.0 || wy_sum_abs == 0.0) return TLS_VK_ERR_DEGENERATE;
 

@@ -409,23 +409,23 @@ void sincos2pif_branchless(float x, bool neg_sign, out float c_out, out float s_
 def glsl_sincos2pi_df() -> str:
     """Branchless DF minimax sincos2pi on [0, 0.125] (~47.3-48.1 bits)."""
     coeffs = [
-        ("kSinDf0", fmt_df( 6.28318530717955959e+00)),
-        ("kSinDf1", fmt_df(-4.13417022402757794e+01)),
-        ("kSinDf2", fmt_df( 8.16052491834839344e+01)),
-        ("kSinDf3", fmt_df(-7.67058344584512923e+01)),
-        ("kSinDf4", fmt_df( 4.20555692559449881e+01)),
-        ("kCosDf0", fmt_df( 1.00000000000000000e+00)),
-        ("kCosDf1", fmt_df(-1.97392088021784211e+01)),
-        ("kCosDf2", fmt_df( 6.49393940223653772e+01)),
-        ("kCosDf3", fmt_df(-8.54568170903411470e+01)),
-        ("kCosDf4", fmt_df( 6.02446200859302934e+01)),
+        ("kSinDf0", fmt_df(6.28318530717955959e00)),
+        ("kSinDf1", fmt_df(-4.13417022402757794e01)),
+        ("kSinDf2", fmt_df(8.16052491834839344e01)),
+        ("kSinDf3", fmt_df(-7.67058344584512923e01)),
+        ("kSinDf4", fmt_df(4.20555692559449881e01)),
+        ("kCosDf0", fmt_df(1.00000000000000000e00)),
+        ("kCosDf1", fmt_df(-1.97392088021784211e01)),
+        ("kCosDf2", fmt_df(6.49393940223653772e01)),
+        ("kCosDf3", fmt_df(-8.54568170903411470e01)),
+        ("kCosDf4", fmt_df(6.02446200859302934e01)),
     ]
     c_decls = "\n".join(f"const df_t {name} = {val};" for name, val in coeffs)
     return f"""
 {c_decls}
-const float kSinDf5 = {fmt_f32(-1.49165651188191184e+01)};
-const float kCosDf5 = {fmt_f32(-2.64242570348826895e+01)};
-const float kCosDf6 = {fmt_f32( 7.81029096814419077e+00)};
+const float kSinDf5 = {fmt_f32(-1.49165651188191184e01)};
+const float kCosDf5 = {fmt_f32(-2.64242570348826895e01)};
+const float kCosDf6 = {fmt_f32(7.81029096814419077e00)};
 
 void sincos2pidf_oct1_f(float f, bool neg_sign, out df_t c_out, out df_t s_out) {{
     float f2h, f2l;

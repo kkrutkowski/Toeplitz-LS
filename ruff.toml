@@ -14,6 +14,10 @@ extend-exclude = [
     "examples",
     "paper_repro",
     "probes",
+    "offload/vulkan/build",
+    "offload/sycl/build",
+    "offload/sycl/tests/build",
+    "offload/sycl/deploy",
     "**/__pycache__",
 ]
 
@@ -37,6 +41,7 @@ ignore = ["E501"]
 # The tests put the package directory on sys.path before importing it, which is
 # the point of the file; E402 would fight that.
 "toeplitz-ls/tests/*" = ["E402"]
+"offload/vulkan/codegen/compile_shaders.py" = ["E402"]
 
 [lint.isort]
 # Matches the .clang-format include categories: stdlib, third party, local.

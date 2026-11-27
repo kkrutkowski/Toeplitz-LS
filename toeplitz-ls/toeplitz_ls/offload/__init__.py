@@ -1,3 +1,8 @@
-"""Hardware-offloaded periodogram backends for Toeplitz-LS (SYCL and Vulkan/GLSL)."""
+"""Hardware-offloaded periodogram backends for Toeplitz-LS."""
 
-__all__ = ["sycl", "vulkan"]
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+__all__ = ["vulkan"]
+if (_HERE / "sycl").is_dir():
+    __all__.insert(0, "sycl")

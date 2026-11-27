@@ -11,8 +11,8 @@ Generates all proven SYCL DIF FFT schedules across 4 precisions (h, f, df, d):
 from __future__ import annotations
 
 import math
+
 from common_glsl import (
-    double_to_df,
     fmt_df,
     fmt_f32,
     fmt_f64,
@@ -36,30 +36,30 @@ K_W256_IM_NEG = [-math.sin(2.0 * math.pi * k / 256.0) for k in range(16)]
 # SinglePass schedule specifications:
 #   (variant_id, logN, logE, logChunks, B, staging, t1_layout, phase3, stash_chunk1)
 NARROW_SPECS = [
-    ("split_10_e3_b2_aff",   10, 3, 0, 2, "split", "aff", "shuf",  False),
-    ("split_10_e3_b1_aff",   10, 3, 0, 1, "split", "aff", "shuf",  False),
-    ("split_10_e4_b1_aff",   10, 4, 0, 1, "split", "aff", "shuf",  False),
-    ("seq_10_e4_b1_2tstr",   10, 4, 0, 1, "seq",   "aff", "2tstr", False),
-    ("split_11_e3_b1_aff",   11, 3, 0, 1, "split", "aff", "shuf",  False),
-    ("split_11_e4_b1_aff",   11, 4, 0, 1, "split", "aff", "shuf",  False),
+    ("split_10_e3_b2_aff", 10, 3, 0, 2, "split", "aff", "shuf", False),
+    ("split_10_e3_b1_aff", 10, 3, 0, 1, "split", "aff", "shuf", False),
+    ("split_10_e4_b1_aff", 10, 4, 0, 1, "split", "aff", "shuf", False),
+    ("seq_10_e4_b1_2tstr", 10, 4, 0, 1, "seq", "aff", "2tstr", False),
+    ("split_11_e3_b1_aff", 11, 3, 0, 1, "split", "aff", "shuf", False),
+    ("split_11_e4_b1_aff", 11, 4, 0, 1, "split", "aff", "shuf", False),
     ("split_11_e4_b1_2tstr", 11, 4, 0, 1, "split", "aff", "2tstr", False),
-    ("split_12_e4_b1_aff",   12, 4, 0, 1, "split", "aff", "shuf",  False),
-    ("seq_12_e4_b1_sg",      12, 4, 0, 1, "seq",   "aff", "shuf",  False),
-    ("seq_12_e4_b1_2txor",   12, 4, 0, 1, "seq",   "aff", "2txor", False),
-    ("seq_13_e4_b1_sg",      13, 4, 0, 1, "seq",   "aff", "shuf",  False),
-    ("seq_13_e5_c2_sg",      13, 5, 1, 1, "seq",   "aff", "shuf",  False),
-    ("seq_13_e5_c2_2txor",   13, 5, 1, 1, "seq",   "aff", "2txor", False),
-    ("seq_14_e5_c2_sg",      14, 5, 1, 1, "seq",   "aff", "shuf",  False),
+    ("split_12_e4_b1_aff", 12, 4, 0, 1, "split", "aff", "shuf", False),
+    ("seq_12_e4_b1_sg", 12, 4, 0, 1, "seq", "aff", "shuf", False),
+    ("seq_12_e4_b1_2txor", 12, 4, 0, 1, "seq", "aff", "2txor", False),
+    ("seq_13_e4_b1_sg", 13, 4, 0, 1, "seq", "aff", "shuf", False),
+    ("seq_13_e5_c2_sg", 13, 5, 1, 1, "seq", "aff", "shuf", False),
+    ("seq_13_e5_c2_2txor", 13, 5, 1, 1, "seq", "aff", "2txor", False),
+    ("seq_14_e5_c2_sg", 14, 5, 1, 1, "seq", "aff", "shuf", False),
 ]
 
 WIDE_SPECS = [
-    ("seq_10_e4_b1_2tstr",      10, 4, 0, 1, "seq",   "aff", "2tstr", False),
-    ("split_10_e4_b1_xor",      10, 4, 0, 1, "split", "xor", "shuf",  False),
-    ("wide_11_e4_b1_2tstr",     11, 4, 0, 1, "split", "aff", "2tstr", False),
-    ("seq_11_e4_b1_sg",         11, 4, 0, 1, "seq",   "aff", "shuf",  False),
-    ("wide_12_e4_b1_2txor",     12, 4, 0, 1, "seq",   "aff", "2txor", False),
-    ("seq_12_e4_b1_sg",         12, 4, 0, 1, "seq",   "aff", "shuf",  False),
-    ("wide_13_e5_c2_xor_stash", 13, 5, 1, 1, "seq",   "aff", "2txor", True),
+    ("seq_10_e4_b1_2tstr", 10, 4, 0, 1, "seq", "aff", "2tstr", False),
+    ("split_10_e4_b1_xor", 10, 4, 0, 1, "split", "xor", "shuf", False),
+    ("wide_11_e4_b1_2tstr", 11, 4, 0, 1, "split", "aff", "2tstr", False),
+    ("seq_11_e4_b1_sg", 11, 4, 0, 1, "seq", "aff", "shuf", False),
+    ("wide_12_e4_b1_2txor", 12, 4, 0, 1, "seq", "aff", "2txor", False),
+    ("seq_12_e4_b1_sg", 12, 4, 0, 1, "seq", "aff", "shuf", False),
+    ("wide_13_e5_c2_xor_stash", 13, 5, 1, 1, "seq", "aff", "2txor", True),
     ("wide_13_e5_c2_xor_nostash", 13, 5, 1, 1, "seq", "aff", "2txor", False),
 ]
 
@@ -71,9 +71,13 @@ def _prec_helpers(prec: str, need_shuf: bool) -> str:
         s32 = ", ".join(fmt_f32(v) for v in K_SIN32_NEG)
         w256r = ", ".join(fmt_f32(v) for v in K_W256_RE)
         w256i = ", ".join(fmt_f32(v) for v in K_W256_IM_NEG)
-        shuf = """
+        shuf = (
+            """
 float fft_shuf_xor(float v, uint mask) { return subgroupShuffleXor(v, mask); }
-""" if need_shuf else ""
+"""
+            if need_shuf
+            else ""
+        )
         return (
             glsl_sincos2pi_f32()
             + f"""
@@ -129,12 +133,16 @@ float from_smem(float s) {{ return s; }}
         s32 = ", ".join(fmt_f64(v) for v in K_SIN32_NEG)
         w256r = ", ".join(fmt_f64(v) for v in K_W256_RE)
         w256i = ", ".join(fmt_f64(v) for v in K_W256_IM_NEG)
-        shuf = """
+        shuf = (
+            """
 double fft_shuf_xor(double v, uint mask) {
     uvec2 u = unpackDouble2x32(v);
     return packDouble2x32(uvec2(subgroupShuffleXor(u.x, mask), subgroupShuffleXor(u.y, mask)));
 }
-""" if need_shuf else ""
+"""
+            if need_shuf
+            else ""
+        )
         return (
             glsl_sincos2pi_f64()
             + f"""
@@ -187,11 +195,15 @@ double from_smem(double s) {{ return s; }}
         s32 = ", ".join(fmt_df(v) for v in K_SIN32_NEG)
         w256r = ", ".join(fmt_df(v) for v in K_W256_RE)
         w256i = ", ".join(fmt_df(v) for v in K_W256_IM_NEG)
-        shuf = """
+        shuf = (
+            """
 df_t fft_shuf_xor(df_t v, uint mask) {
     return vec2(subgroupShuffleXor(v.x, mask), subgroupShuffleXor(v.y, mask));
 }
-""" if need_shuf else ""
+"""
+            if need_shuf
+            else ""
+        )
         return (
             glsl_df_math()
             + glsl_sincos2pi_df()
@@ -230,11 +242,15 @@ df_t from_smem(df_t s) {{ return s; }}
     s32h = ", ".join(f"f16vec2(float16_t({fmt_f32(v)}), float16_t({fmt_f32(v)}))" for v in K_SIN32_NEG)
     w256r = ", ".join(fmt_f32(v) for v in K_W256_RE)
     w256i = ", ".join(fmt_f32(v) for v in K_W256_IM_NEG)
-    shuf = """
+    shuf = (
+        """
 f16vec2 fft_shuf_xor(f16vec2 v, uint mask) {
     return u32_to_f16x2(subgroupShuffleXor(f16x2_to_u32(v), mask));
 }
-""" if need_shuf else ""
+"""
+        if need_shuf
+        else ""
+    )
     return (
         glsl_sincos2pi_f32()
         + glsl_f16x2_math()
@@ -287,10 +303,10 @@ def _emit_reg_base(log_e: int, arr_re: str = "r_re", arr_im: str = "r_im", fn_na
             for g in range(groups):
                 a = g * step + m
                 b = a + h
-                lines.append(f"    {{")
+                lines.append("    {")
                 lines.append(f"        REAL ar = fft_half({arr_re}[{a}]), ai = fft_half({arr_im}[{a}]);")
                 lines.append(f"        REAL br = fft_half({arr_re}[{b}]), bi = fft_half({arr_im}[{b}]);")
-                lines.append(f"        REAL dr = fft_sub(ar, br), di = fft_sub(ai, bi);")
+                lines.append("        REAL dr = fft_sub(ar, br), di = fft_sub(ai, bi);")
                 lines.append(f"        {arr_re}[{a}] = fft_add(ar, br); {arr_im}[{a}] = fft_add(ai, bi);")
                 if m == 0:
                     lines.append(f"        {arr_re}[{b}] = dr; {arr_im}[{b}] = di;")
@@ -305,14 +321,12 @@ def _emit_reg_base(log_e: int, arr_re: str = "r_re", arr_im: str = "r_im", fn_na
                     lines.append(f"        REAL cr = kCos32[{idx32}];")
                     lines.append(f"        REAL ci = fft_cond_neg(kSin32Neg[{idx32}], pos_sign);")
                     lines.append(f"        fft_cmul(dr, di, cr, ci, {arr_re}[{b}], {arr_im}[{b}]);")
-                lines.append(f"    }}")
+                lines.append("    }")
     lines.append("}")
     return "\n".join(lines) + "\n"
 
 
-def _emit_twiddle_block(prec: str, log_e: int, log_t: int | None, arr_re: str, arr_im: str,
-                        t_expr: str, inv_m_expr: str, pos_expr: str,
-                        on_elem_cb) -> str:
+def _emit_twiddle_block(prec: str, log_e: int, log_t: int | None, arr_re: str, arr_im: str, t_expr: str, inv_m_expr: str, pos_expr: str, on_elem_cb) -> str:
     """Emit factored bit-reversed twiddle ladder on E = 2^log_e elements.
 
     on_elem_cb(p, re_var, im_var) returns a list of GLSL lines for element p.
@@ -514,7 +528,8 @@ def _emit_twiddle_block(prec: str, log_e: int, log_t: int | None, arr_re: str, a
 def _emit_load_store_helpers(prec: str, writable_in: bool) -> str:
     in_qual = "" if writable_in else "readonly "
     if prec == "h":
-        stash = """
+        stash = (
+            """
 void load_stash(uint base0, uint base1, uint idx, bool v0, bool v1, out REAL re_o, out REAL im_o) {
     uint u0 = 0u, u1 = 0u;
     if (SPEC_COMPACT_MODE == 0u) {
@@ -537,7 +552,10 @@ void store_stash(uint base0, uint base1, uint idx, bool v0, bool v1, REAL re_i, 
         if (v1) in_buf[base1 + idx] = u1;
     }
 }
-""" if writable_in else ""
+"""
+            if writable_in
+            else ""
+        )
         return f"""
 layout(set = 0, binding = 0) {in_qual}buffer InBuf  {{ uint in_buf[]; }};
 layout(set = 0, binding = 1) buffer OutBuf          {{ uint out_buf[]; }};
@@ -560,7 +578,8 @@ REAL load_deconv_val(uint d0, uint d1, uint ci, uint log_n1) {{
 }}
 """
     if prec == "df":
-        stash = """
+        stash = (
+            """
 void load_stash(uint base0, uint base1, uint idx, bool v0, bool v1, out REAL re_o, out REAL im_o) {
     if (v0) {
         vec4 v = (SPEC_COMPACT_MODE == 0u) ? out_buf[base0 + idx] : in_buf[base0 + idx];
@@ -573,7 +592,10 @@ void store_stash(uint base0, uint base1, uint idx, bool v0, bool v1, REAL re_i, 
         else in_buf[base0 + idx] = vec4(re_i, im_i);
     }
 }
-""" if writable_in else ""
+"""
+            if writable_in
+            else ""
+        )
         return f"""
 layout(set = 0, binding = 0) {in_qual}buffer InBuf  {{ vec4 in_buf[]; }};
 layout(set = 0, binding = 1) buffer OutBuf          {{ vec4 out_buf[]; }};
@@ -592,7 +614,8 @@ REAL load_deconv_val(uint d0, uint d1, uint ci, uint log_n1) {{ return dec_buf[d
     # f or d
     btype = "vec2" if prec == "f" else "dvec2"
     dtype = "float" if prec == "f" else "double"
-    stash = f"""
+    stash = (
+        f"""
 void load_stash(uint base0, uint base1, uint idx, bool v0, bool v1, out REAL re_o, out REAL im_o) {{
     if (v0) {{
         {btype} v = (SPEC_COMPACT_MODE == 0u) ? out_buf[base0 + idx] : in_buf[base0 + idx];
@@ -605,7 +628,10 @@ void store_stash(uint base0, uint base1, uint idx, bool v0, bool v1, REAL re_i, 
         else in_buf[base0 + idx] = {btype}(re_i, im_i);
     }}
 }}
-""" if writable_in else ""
+"""
+        if writable_in
+        else ""
+    )
     return f"""
 layout(set = 0, binding = 0) {in_qual}buffer InBuf  {{ {btype} in_buf[]; }};
 layout(set = 0, binding = 1) buffer OutBuf          {{ {btype} out_buf[]; }};
@@ -717,7 +743,7 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
     W = 1 << logW
     WG = B * T
 
-    need_shuf = (phase3 == "shuf")
+    need_shuf = phase3 == "shuf"
     need_sg = need_shuf
 
     hdr = glsl_header(
@@ -752,18 +778,10 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
 
     # Transpose 1
     def t1_w(m: int) -> str:
-        return (
-            f"smem_base + {m * T}u + ((sub ^ {m}u) << {logW}u) + l"
-            if t1_layout == "xor"
-            else f"smem_base + {m}u * SPEC_ROW_STRIDE + t"
-        )
+        return f"smem_base + {m * T}u + ((sub ^ {m}u) << {logW}u) + l" if t1_layout == "xor" else f"smem_base + {m}u * SPEC_ROW_STRIDE + t"
 
     def t1_r(m: int) -> str:
-        return (
-            f"smem_base + sub * {T}u + (({m}u ^ sub) << {logW}u) + l"
-            if t1_layout == "xor"
-            else f"row_base + {m * W}u + l"
-        )
+        return f"smem_base + sub * {T}u + (({m}u ^ sub) << {logW}u) + l" if t1_layout == "xor" else f"row_base + {m * W}u + l"
 
     if staging == "split":
         for m in range(Chunk):
@@ -790,7 +808,14 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
         inv_m_p2 = fmt_f64(1.0 / (Chunk * W)) if prec == "d" else fmt_f32(1.0 / (Chunk * W))
         fc_lines.append(
             _emit_twiddle_block(
-                prec, logChunk, logW, "c_re", "c_im", "l", inv_m_p2, "pos_sign",
+                prec,
+                logChunk,
+                logW,
+                "c_re",
+                "c_im",
+                "l",
+                inv_m_p2,
+                "pos_sign",
                 lambda p, vr, vi: [] if p == 0 else [f"      c_re[{p}] = {vr}; c_im[{p}] = {vi};"],
             )
         )
@@ -831,7 +856,9 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
                 fc_lines.append(f"    {{ uint idx = row_base + {m * W}u + (l ^ {m}u); smem_re[idx] = to_smem(c_re[{m}]); smem_im[idx] = to_smem(c_im[{m}]); }}")
             fc_lines.append("    barrier();")
             for k in range(Chunk):
-                fc_lines.append(f"    {{ uint idx = row_base + l * {W}u + ({k}u ^ l); c_re[{k}] = from_smem(smem_re[idx]); c_im[{k}] = from_smem(smem_im[idx]); }}")
+                fc_lines.append(
+                    f"    {{ uint idx = row_base + l * {W}u + ({k}u ^ l); c_re[{k}] = from_smem(smem_re[idx]); c_im[{k}] = from_smem(smem_im[idx]); }}"
+                )
         else:
             for m in range(Chunk):
                 fc_lines.append(f"    smem_buf[row_base + {m * W}u + (l ^ {m}u)] = to_smem(c_re[{m}]);")
@@ -852,11 +879,13 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
             for k in range(Chunk):
                 fc_lines.append(f"    {{ uint idx = row_base + l * {W}u + ({k}u ^ l); smem_re[idx] = to_smem(c_re[{k}]); smem_im[idx] = to_smem(c_im[{k}]); }}")
             fc_lines.append("    barrier();")
-            fc_lines.append(_emit_epilogue_block(
-                Chunk, W,
-                lambda m: (f"from_smem(smem_re[row_base + {m * W}u + (l ^ {m}u)])",
-                           f"from_smem(smem_im[row_base + {m * W}u + (l ^ {m}u)])"),
-            ))
+            fc_lines.append(
+                _emit_epilogue_block(
+                    Chunk,
+                    W,
+                    lambda m: (f"from_smem(smem_re[row_base + {m * W}u + (l ^ {m}u)])", f"from_smem(smem_im[row_base + {m * W}u + (l ^ {m}u)])"),
+                )
+            )
         else:
             for k in range(Chunk):
                 fc_lines.append(f"    smem_buf[row_base + l * {W}u + ({k}u ^ l)] = to_smem(c_re[{k}]);")
@@ -879,7 +908,9 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
         fc_lines.append("    barrier();")
         if staging == "split":
             for m in range(Chunk):
-                fc_lines.append(f"    {{ uint idx = row_base + {m}u * SPEC_STRIDE2 + l; smem_re[idx] = to_smem(c_re[{m}]); smem_im[idx] = to_smem(c_im[{m}]); }}")
+                fc_lines.append(
+                    f"    {{ uint idx = row_base + {m}u * SPEC_STRIDE2 + l; smem_re[idx] = to_smem(c_re[{m}]); smem_im[idx] = to_smem(c_im[{m}]); }}"
+                )
             fc_lines.append("    barrier();")
             for g in range(groups):
                 fc_lines.append(f"    {{ uint off = row_base + (l + {g * W}u) * SPEC_STRIDE2;")
@@ -916,11 +947,13 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
                     fc_lines.append(f"      smem_re[off + {k}u] = to_smem(blk_re_{g}[{k}]); smem_im[off + {k}u] = to_smem(blk_im_{g}[{k}]);")
                 fc_lines.append("    }")
             fc_lines.append("    barrier();")
-            fc_lines.append(_emit_epilogue_block(
-                Chunk, W,
-                lambda m: (f"from_smem(smem_re[row_base + {m}u * SPEC_STRIDE2 + l])",
-                           f"from_smem(smem_im[row_base + {m}u * SPEC_STRIDE2 + l])"),
-            ))
+            fc_lines.append(
+                _emit_epilogue_block(
+                    Chunk,
+                    W,
+                    lambda m: (f"from_smem(smem_re[row_base + {m}u * SPEC_STRIDE2 + l])", f"from_smem(smem_im[row_base + {m}u * SPEC_STRIDE2 + l])"),
+                )
+            )
         else:
             for g in range(groups):
                 fc_lines.append(f"    {{ uint off = row_base + (l + {g * W}u) * SPEC_STRIDE2;")
@@ -983,7 +1016,14 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
         main_lines.append(f"    dif_radix2_reg_base_{logE}(r_re, r_im, pos_sign);")
         main_lines.append(
             _emit_twiddle_block(
-                prec, logE, logT, "r_re", "r_im", "t", inv_m_p1, "pos_sign",
+                prec,
+                logE,
+                logT,
+                "r_re",
+                "r_im",
+                "t",
+                inv_m_p1,
+                "pos_sign",
                 lambda p, vr, vi: [] if p == 0 else [f"      r_re[{p}] = {vr}; r_im[{p}] = {vi};"],
             )
         )
@@ -999,7 +1039,14 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
         main_lines.append(f"        dif_radix2_reg_base_{logE}(r_re, r_im, pos_sign);")
         main_lines.append(
             _emit_twiddle_block(
-                prec, logE, logT, "r_re", "r_im", "t", inv_m_p1, "pos_sign",
+                prec,
+                logE,
+                logT,
+                "r_re",
+                "r_im",
+                "t",
+                inv_m_p1,
+                "pos_sign",
                 lambda p, vr, vi: (
                     [f"      c_re[{p}] = {vr}; c_im[{p}] = {vi};"]
                     if p < Chunk
@@ -1020,7 +1067,14 @@ def _gen_single_pass(prec: str, spec: tuple) -> dict:
         main_lines.append(f"    dif_radix2_reg_base_{logE}(r_re, r_im, pos_sign);")
         main_lines.append(
             _emit_twiddle_block(
-                prec, logE, logT, "r_re", "r_im", "t", inv_m_p1, "pos_sign",
+                prec,
+                logE,
+                logT,
+                "r_re",
+                "r_im",
+                "t",
+                inv_m_p1,
+                "pos_sign",
                 lambda p, vr, vi: [] if p == 0 else [f"      r_re[{p}] = {vr}; r_im[{p}] = {vi};"],
             )
         )
@@ -1055,8 +1109,10 @@ layout(push_constant) uniform PC {
 } pc;
 """
         + reg_base_code
-        + "\n".join(fc_lines) + "\n"
-        + "\n".join(main_lines) + "\n"
+        + "\n".join(fc_lines)
+        + "\n"
+        + "\n".join(main_lines)
+        + "\n"
     )
 
     return {
@@ -1110,18 +1166,19 @@ void store_elem(uint b0, uint b1, uint idx, bool v0, bool v1, REAL ri, REAL ii) 
 """
 
     tw_store = _emit_twiddle_block(
-        prec, log_n1, None, "r_re", "r_im", "j", "pc.inv_m", "pos_sign",
+        prec,
+        log_n1,
+        None,
+        "r_re",
+        "r_im",
+        "j",
+        "pc.inv_m",
+        "pos_sign",
         lambda p, vr, vi: [f"      store_elem(g_out0, g_out1, {p}u * n2, valid0, valid1, {vr}, {vi});"],
     )
 
-    load_lines = "\n".join(
-        f"    load_elem(g_in0, g_in1, {m}u * n2, valid0, valid1, r_re[{m}], r_im[{m}]);"
-        for m in range(n1)
-    )
-    notw_lines = "\n".join(
-        f"        store_elem(g_out0, g_out1, {m}u, valid0, valid1, r_re[{m}], r_im[{m}]);"
-        for m in range(n1)
-    )
+    load_lines = "\n".join(f"    load_elem(g_in0, g_in1, {m}u * n2, valid0, valid1, r_re[{m}], r_im[{m}]);" for m in range(n1))
+    notw_lines = "\n".join(f"        store_elem(g_out0, g_out1, {m}u, valid0, valid1, r_re[{m}], r_im[{m}]);" for m in range(n1))
 
     src = (
         hdr

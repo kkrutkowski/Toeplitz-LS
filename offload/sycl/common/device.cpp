@@ -2,9 +2,6 @@
 // and persistent AutotuneCache.
 // Keeps all hardware probe kernels in a single tiny HCF module instead of
 // duplicating them across caller translation units.
-#include "common/device.hpp"
-#include "common/math.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -18,10 +15,13 @@
 #include <thread>
 #include <unordered_map>
 
+#include "common/device.hpp"
+#include "common/math.hpp"
+
 #if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
+#    include <fcntl.h>
+#    include <sys/file.h>
+#    include <unistd.h>
 #endif
 
 namespace sycl_fft {
@@ -46,17 +46,17 @@ std::string sanitize_cache_token(const std::string& raw) {
 std::string compiler_id_tag() {
     std::string tag;
 #if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
-#if defined(ACPP_VERSION_MAJOR) && defined(ACPP_VERSION_MINOR)
+#    if defined(ACPP_VERSION_MAJOR) && defined(ACPP_VERSION_MINOR)
     tag = "acpp-" + std::to_string(ACPP_VERSION_MAJOR) + "." + std::to_string(ACPP_VERSION_MINOR);
-#if defined(ACPP_VERSION_PATCH)
+#        if defined(ACPP_VERSION_PATCH)
     tag += "." + std::to_string(ACPP_VERSION_PATCH);
-#endif
-#if defined(ACPP_VERSION_SUFFIX)
+#        endif
+#        if defined(ACPP_VERSION_SUFFIX)
     tag += ACPP_VERSION_SUFFIX;
-#endif
-#else
+#        endif
+#    else
     tag = "acpp";
-#endif
+#    endif
 #elif defined(__INTEL_LLVM_COMPILER)
     tag = "dpcpp-" + std::to_string(__INTEL_LLVM_COMPILER);
 #elif defined(__SYCL_COMPILER_VERSION)
@@ -84,9 +84,9 @@ std::string kernel_code_hash() {
     };
     mix(__DATE__);
     mix(__TIME__);
-#if defined(__VERSION__)
+#    if defined(__VERSION__)
     mix(__VERSION__);
-#endif
+#    endif
     char buf[20];
     std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
     return std::string(buf);
@@ -97,22 +97,35 @@ std::string backend_to_tag(const sycl::device& dev) {
     const auto b = dev.get_backend();
 #if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
     switch (b) {
-        case sycl::backend::cuda:       return "cuda";
-        case sycl::backend::hip:        return "hip";
-        case sycl::backend::level_zero: return "level_zero";
-        case sycl::backend::ocl:        return "opencl";
-        case sycl::backend::omp:        return "omp";
-        case sycl::backend::metal:      return "metal";
-        case sycl::backend::vk:         return "vulkan";
-        default:                        return "unknown";
+        case sycl::backend::cuda:
+            return "cuda";
+        case sycl::backend::hip:
+            return "hip";
+        case sycl::backend::level_zero:
+            return "level_zero";
+        case sycl::backend::ocl:
+            return "opencl";
+        case sycl::backend::omp:
+            return "omp";
+        case sycl::backend::metal:
+            return "metal";
+        case sycl::backend::vk:
+            return "vulkan";
+        default:
+            return "unknown";
     }
 #else
     switch (b) {
-        case sycl::backend::opencl:               return "opencl";
-        case sycl::backend::ext_oneapi_level_zero: return "level_zero";
-        case sycl::backend::ext_oneapi_cuda:      return "cuda";
-        case sycl::backend::ext_oneapi_hip:       return "hip";
-        default:                                  return "unknown";
+        case sycl::backend::opencl:
+            return "opencl";
+        case sycl::backend::ext_oneapi_level_zero:
+            return "level_zero";
+        case sycl::backend::ext_oneapi_cuda:
+            return "cuda";
+        case sycl::backend::ext_oneapi_hip:
+            return "hip";
+        default:
+            return "unknown";
     }
 #endif
 }
@@ -123,10 +136,7 @@ std::string backend_to_tag(const sycl::device& dev) {
 std::string DeviceFftConfig::identity_key() const {
     char vid[48];
     std::snprintf(vid, sizeof(vid), "0x%x|cu%zu_smem%zu", vendor_id, max_compute_units, local_mem_size);
-    return sanitize_cache_token(device_name) + "|" +
-           std::string(vid) + "|" +
-           sanitize_cache_token(driver_version) + "|" +
-           backend_tag;
+    return sanitize_cache_token(device_name) + "|" + std::string(vid) + "|" + sanitize_cache_token(driver_version) + "|" + backend_tag;
 }
 
 DeviceFftConfig DeviceFftConfig::query(const sycl::device& dev) {
@@ -139,10 +149,8 @@ DeviceFftConfig DeviceFftConfig::query(const sycl::device& dev) {
     cfg.backend_tag = backend_to_tag(dev);
     cfg.vendor_id = static_cast<uint32_t>(dev.get_info<sycl::info::device::vendor_id>());
 
-    cfg.max_compute_units = std::max<size_t>(
-        1, static_cast<size_t>(dev.get_info<sycl::info::device::max_compute_units>()));
-    cfg.max_work_group_size = std::max<size_t>(
-        1, static_cast<size_t>(dev.get_info<sycl::info::device::max_work_group_size>()));
+    cfg.max_compute_units = std::max<size_t>(1, static_cast<size_t>(dev.get_info<sycl::info::device::max_compute_units>()));
+    cfg.max_work_group_size = std::max<size_t>(1, static_cast<size_t>(dev.get_info<sycl::info::device::max_work_group_size>()));
 
     auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
     cfg.sub_group_sizes.clear();
@@ -150,9 +158,7 @@ DeviceFftConfig DeviceFftConfig::query(const sycl::device& dev) {
         if (s > 0) cfg.sub_group_sizes.push_back(s);
     }
     std::sort(cfg.sub_group_sizes.begin(), cfg.sub_group_sizes.end());
-    cfg.sub_group_sizes.erase(
-        std::unique(cfg.sub_group_sizes.begin(), cfg.sub_group_sizes.end()),
-        cfg.sub_group_sizes.end());
+    cfg.sub_group_sizes.erase(std::unique(cfg.sub_group_sizes.begin(), cfg.sub_group_sizes.end()), cfg.sub_group_sizes.end());
 
     if (!cfg.sub_group_sizes.empty()) {
         cfg.min_sub_group_size = cfg.sub_group_sizes.front();
@@ -163,20 +169,16 @@ DeviceFftConfig DeviceFftConfig::query(const sycl::device& dev) {
         cfg.sub_group_sizes.push_back(cfg.sub_group_size);
     }
 
-    cfg.has_native_local_mem =
-        (dev.get_info<sycl::info::device::local_mem_type>() == sycl::info::local_mem_type::local);
+    cfg.has_native_local_mem = (dev.get_info<sycl::info::device::local_mem_type>() == sycl::info::local_mem_type::local);
     cfg.local_mem_size = static_cast<size_t>(dev.get_info<sycl::info::device::local_mem_size>());
 
-    if (dev.get_info<sycl::info::device::global_mem_cache_type>() !=
-        sycl::info::global_mem_cache_type::none) {
-        const size_t reported =
-            static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_cache_size>());
+    if (dev.get_info<sycl::info::device::global_mem_cache_type>() != sycl::info::global_mem_cache_type::none) {
+        const size_t reported = static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_cache_size>());
         if (reported >= size_t{64} * 1024) {
             cfg.l2_cache_size = reported;
         }
     }
-    cfg.cache_line_size = std::max<size_t>(
-        32, static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_cache_line_size>()));
+    cfg.cache_line_size = std::max<size_t>(32, static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_cache_line_size>()));
     cfg.global_mem_size = static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_size>());
     cfg.max_mem_alloc_size = static_cast<size_t>(dev.get_info<sycl::info::device::max_mem_alloc_size>());
     try {
@@ -216,9 +218,7 @@ DeviceFftConfig DeviceFftConfig::query(const sycl::device& dev) {
     return cfg;
 }
 
-bool DeviceFftConfig::supports_sub_group_size(size_t s) const {
-    return std::binary_search(sub_group_sizes.begin(), sub_group_sizes.end(), s);
-}
+bool DeviceFftConfig::supports_sub_group_size(size_t s) const { return std::binary_search(sub_group_sizes.begin(), sub_group_sizes.end(), s); }
 
 size_t DeviceFftConfig::pick_sub_group_size(size_t min_req) const {
     for (size_t s : sub_group_sizes) {
@@ -229,8 +229,7 @@ size_t DeviceFftConfig::pick_sub_group_size(size_t min_req) const {
     return 0;
 }
 
-size_t DeviceFftConfig::clamp_pow2_wg(
-    size_t total_threads, size_t requested_wg, size_t hard_cap) const {
+size_t DeviceFftConfig::clamp_pow2_wg(size_t total_threads, size_t requested_wg, size_t hard_cap) const {
     size_t cap = std::min(requested_wg, max_work_group_size);
     if (hard_cap > 0) cap = std::min(cap, hard_cap);
     if (total_threads == 0) return std::max<size_t>(1, cap);
@@ -283,8 +282,8 @@ size_t DeviceFftConfig::recommended_stream_count() const {
     //   - cu_streams keeps at least ~4 CUs per active stream on wider GPUs
     //   - host_cap avoids allocating idle queues beyond host CPU thread count
     const size_t overlap_floor = std::max<size_t>(2, max_kernel_concurrency + max_memcpy_concurrency);
-    const size_t cu_streams    = std::max<size_t>(1, max_compute_units / 4);
-    const size_t host_threads  = std::max<size_t>(4, static_cast<size_t>(std::thread::hardware_concurrency()));
+    const size_t cu_streams = std::max<size_t>(1, max_compute_units / 4);
+    const size_t host_threads = std::max<size_t>(4, static_cast<size_t>(std::thread::hardware_concurrency()));
     size_t streams = std::min<size_t>({std::max(overlap_floor, cu_streams), host_threads, size_t{16}});
 
     // Ensure each stream gets a meaningful working slice of the 75% device memory pool
@@ -311,28 +310,20 @@ size_t DeviceFftConfig::effective_l2_bytes() const {
     if (l2_cache_size > 0) return l2_cache_size;
     size_t fallback = is_gpu ? (size_t{16} * 1024 * 1024) : (size_t{4} * 1024 * 1024);
     if (global_mem_size > 0) {
-        fallback = std::clamp<size_t>(
-            global_mem_size / 256, size_t{2} * 1024 * 1024, size_t{32} * 1024 * 1024);
+        fallback = std::clamp<size_t>(global_mem_size / 256, size_t{2} * 1024 * 1024, size_t{32} * 1024 * 1024);
     }
     return fallback;
 }
 
-size_t DeviceFftConfig::compute_l2_chunk_bytes(
-    size_t fft_bytes,
-    size_t n1,
-    bool is_compute_heavy,
-    size_t l2_num,
-    size_t l2_den,
-    size_t min_waves_per_cu) const {
+size_t DeviceFftConfig::compute_l2_chunk_bytes(size_t fft_bytes, size_t n1, bool is_compute_heavy, size_t l2_num, size_t l2_den,
+                                               size_t min_waves_per_cu) const {
     const size_t effective_l2 = effective_l2_bytes();
     const size_t den = (l2_den == 0) ? 4 : l2_den;
     const size_t num = (l2_num == 0) ? 1 : l2_num;
     const size_t base_budget = std::max<size_t>(size_t{256} * 1024, (effective_l2 * num) / den);
     const size_t max_l2_budget = std::max<size_t>(base_budget, effective_l2 / 2);
 
-    const size_t target_waves = (min_waves_per_cu > 0)
-        ? min_waves_per_cu
-        : (!is_gpu ? size_t{1} : (is_compute_heavy ? size_t{8} : size_t{2}));
+    const size_t target_waves = (min_waves_per_cu > 0) ? min_waves_per_cu : (!is_gpu ? size_t{1} : (is_compute_heavy ? size_t{8} : size_t{2}));
     const size_t target_wgs = max_compute_units * target_waves;
     const size_t occ_chunk_bs = (n1 > 0) ? ((target_wgs + n1 - 1) / n1) : 1;
     const size_t occ_budget = occ_chunk_bs * fft_bytes;
@@ -349,15 +340,11 @@ size_t DeviceFftConfig::compute_l2_chunk_bytes(
 }
 
 bool FftLaunchConfig::has_plan_overrides() const {
-    return l2_chunk_bytes > 0 || pass0_wg_size > 0 || two_pass_min_logN > 0 ||
-           two_pass_log_n1 > 0 || !allow_wide_kernels || force_multistage ||
-           allow_emulated_local_mem || fp64_compute_heavy_override >= 0 ||
-           stash_8192_override >= 0 || !variant_override.empty();
+    return l2_chunk_bytes > 0 || pass0_wg_size > 0 || two_pass_min_logN > 0 || two_pass_log_n1 > 0 || !allow_wide_kernels || force_multistage ||
+           allow_emulated_local_mem || fp64_compute_heavy_override >= 0 || stash_8192_override >= 0 || !variant_override.empty();
 }
 
-bool FftLaunchConfig::has_bitrev_overrides() const {
-    return bitrev_wg_size > 0 || !bitrev_variant_override.empty() || allow_emulated_local_mem;
-}
+bool FftLaunchConfig::has_bitrev_overrides() const { return bitrev_wg_size > 0 || !bitrev_variant_override.empty() || allow_emulated_local_mem; }
 
 // ============================================================================
 // Hardware Probe Kernels & Process-Cached Probe Dispatchers
@@ -373,9 +360,7 @@ struct SubgroupTopologyProbeKernel {
         auto sg = item.get_sub_group();
         const uint32_t sg_sz = static_cast<uint32_t>(sg.get_max_local_range()[0]);
         auto mark_fail = [&](int idx) {
-            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
-                             sycl::memory_scope::device,
-                             sycl::access::address_space::global_space>(out[idx]).store(0u);
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(out[idx]).store(0u);
         };
         if (t == 0) {
             out[0] = sg_sz;
@@ -384,8 +369,7 @@ struct SubgroupTopologyProbeKernel {
         if (!pow2 || sg.get_local_linear_id() != (static_cast<uint32_t>(t) & (sg_sz - 1u))) {
             mark_fail(1);
         }
-        const uint32_t max_h = (sg_sz < static_cast<uint32_t>(probe_wg))
-            ? sg_sz : static_cast<uint32_t>(probe_wg);
+        const uint32_t max_h = (sg_sz < static_cast<uint32_t>(probe_wg)) ? sg_sz : static_cast<uint32_t>(probe_wg);
         const uint32_t self = static_cast<uint32_t>(t);
         if (max_h >= 2u) {
             if (sycl::permute_group_by_xor(sg, self, 1u) != (self ^ 1u)) mark_fail(2);
@@ -413,13 +397,16 @@ struct DfKatProbeKernel {
         float r, e;
         // 0: TwoSum(1.0f, 3*2^-24)
         df_two_sum(in[0], in[1], r, e);
-        out[0] = r; out[1] = e;
+        out[0] = r;
+        out[1] = e;
         // 1: TwoDiff(1.5f, 3*2^-24)
         df_two_difference(in[2], in[3], r, e);
-        out[2] = r; out[3] = e;
+        out[2] = r;
+        out[3] = e;
         // 2: TwoProd(1 + 2^-12, 1 + 2^-13)
         df_two_product(in[4], in[5], r, e);
-        out[4] = r; out[5] = e;
+        out[4] = r;
+        out[5] = e;
         // 3: df_add, df_mul, df_cmul_fused on non-trivial df_t inputs
         const df_t a{in[6], in[7]};
         const df_t b{in[8], in[9]};
@@ -429,10 +416,14 @@ struct DfKatProbeKernel {
         const df_t p = df_mul(a, c);
         df_t cm_r, cm_i;
         df_cmul_fused(a, b, c, d, cm_r, cm_i);
-        out[6]  = s.hi;    out[7]  = s.lo;
-        out[8]  = p.hi;    out[9]  = p.lo;
-        out[10] = cm_r.hi; out[11] = cm_r.lo;
-        out[12] = cm_i.hi; out[13] = cm_i.lo;
+        out[6] = s.hi;
+        out[7] = s.lo;
+        out[8] = p.hi;
+        out[9] = p.lo;
+        out[10] = cm_r.hi;
+        out[11] = cm_r.lo;
+        out[12] = cm_i.hi;
+        out[13] = cm_i.lo;
     }
 };
 
@@ -503,7 +494,7 @@ std::unordered_map<std::string, DeviceProbeResult>& probe_cache_map() {
     return cache;
 }
 
-} // namespace detail
+}  // namespace detail
 
 DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const std::string key = dev_cfg.identity_key();
@@ -526,10 +517,8 @@ DeviceProbeResult probe_subgroup_topology(sycl::queue& q, const DeviceFftConfig&
             const uint32_t h_init[4] = {0u, 1u, 1u, 0u};
             q.memcpy(d_out, h_init, sizeof(h_init)).wait();
             q.submit([&](sycl::handler& h) {
-                h.parallel_for(
-                    sycl::nd_range<1>(probe_wg, probe_wg),
-                    detail::SubgroupTopologyProbeKernel{d_out, static_cast<int>(probe_wg)});
-            }).wait_and_throw();
+                 h.parallel_for(sycl::nd_range<1>(probe_wg, probe_wg), detail::SubgroupTopologyProbeKernel{d_out, static_cast<int>(probe_wg)});
+             }).wait_and_throw();
             uint32_t h_out[4] = {0u, 0u, 0u, 0u};
             q.memcpy(h_out, d_out, sizeof(h_out)).wait();
             sycl::free(d_out, q);
@@ -591,12 +580,20 @@ DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
     const df_t dc = df_from_double(kC);
     const df_t dd = df_from_double(kD);
 
-    const float h_in[14] = {
-        1.0f, 3.0f * std::ldexp(1.0f, -24),                        // TwoSum
-        1.5f, 3.0f * std::ldexp(1.0f, -24),                        // TwoDiff
-        1.0f + std::ldexp(1.0f, -12), 1.0f + std::ldexp(1.0f, -13), // TwoProd
-        da.hi, da.lo, db.hi, db.lo, dc.hi, dc.lo, dd.hi, dd.lo
-    };
+    const float h_in[14] = {1.0f,
+                            3.0f * std::ldexp(1.0f, -24),  // TwoSum
+                            1.5f,
+                            3.0f * std::ldexp(1.0f, -24),  // TwoDiff
+                            1.0f + std::ldexp(1.0f, -12),
+                            1.0f + std::ldexp(1.0f, -13),  // TwoProd
+                            da.hi,
+                            da.lo,
+                            db.hi,
+                            db.lo,
+                            dc.hi,
+                            dc.lo,
+                            dd.hi,
+                            dd.lo};
 
     float* d_in = nullptr;
     float* d_out = nullptr;
@@ -607,9 +604,7 @@ DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
             err_msg = "allocation failure during DF KAT";
         } else {
             q.memcpy(d_in, h_in, sizeof(h_in)).wait();
-            q.submit([&](sycl::handler& h) {
-                h.parallel_for(sycl::range<1>(1), detail::DfKatProbeKernel{d_in, d_out});
-            }).wait_and_throw();
+            q.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<1>(1), detail::DfKatProbeKernel{d_in, d_out}); }).wait_and_throw();
             float h_out[14] = {};
             q.memcpy(h_out, d_out, sizeof(h_out)).wait();
 
@@ -622,9 +617,7 @@ DeviceProbeResult probe_df_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg) {
 
             auto fmt_err = [](const char* op, double got_r, double got_e, double exp_r, double exp_e) {
                 char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                              "%s mismatch (got r=%.9e e=%.9e, expected r=%.9e e=%.9e)",
-                              op, got_r, got_e, exp_r, exp_e);
+                std::snprintf(buf, sizeof(buf), "%s mismatch (got r=%.9e e=%.9e, expected r=%.9e e=%.9e)", op, got_r, got_e, exp_r, exp_e);
                 return std::string(buf);
             };
 
@@ -697,16 +690,8 @@ DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg)
     }
 #endif
 
-    const Complexh h_in0[3] = {
-        complexh_from_doubles(1.25, -0.75),
-        complexh_from_doubles(0.375, 0.625),
-        complexh_from_doubles(0.70703125, -0.70703125)
-    };
-    const Complexh h_in1[3] = {
-        complexh_from_doubles(-0.5, 0.875),
-        complexh_from_doubles(1.125, -0.25),
-        complexh_from_doubles(0.70703125, -0.70703125)
-    };
+    const Complexh h_in0[3] = {complexh_from_doubles(1.25, -0.75), complexh_from_doubles(0.375, 0.625), complexh_from_doubles(0.70703125, -0.70703125)};
+    const Complexh h_in1[3] = {complexh_from_doubles(-0.5, 0.875), complexh_from_doubles(1.125, -0.25), complexh_from_doubles(0.70703125, -0.70703125)};
 
     Complexh* d_in0 = nullptr;
     Complexh* d_in1 = nullptr;
@@ -722,9 +707,7 @@ DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg)
         } else {
             q.memcpy(d_in0, h_in0, sizeof(h_in0)).wait();
             q.memcpy(d_in1, h_in1, sizeof(h_in1)).wait();
-            q.submit([&](sycl::handler& h) {
-                h.parallel_for(sycl::range<1>(1), detail::Fp16KatProbeKernel{d_in0, d_in1, d_out0, d_out1});
-            }).wait_and_throw();
+            q.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<1>(1), detail::Fp16KatProbeKernel{d_in0, d_in1, d_out0, d_out1}); }).wait_and_throw();
             Complexh h_out0[3] = {}, h_out1[3] = {};
             q.memcpy(h_out0, d_out0, sizeof(h_out0)).wait();
             q.memcpy(h_out1, d_out1, sizeof(h_out1)).wait();
@@ -735,29 +718,19 @@ DeviceProbeResult probe_fp16_kat(sycl::queue& q, const DeviceFftConfig& dev_cfg)
                 complexh_to_long_doubles(in[1], br, bi);
                 complexh_to_long_doubles(in[2], wr, wi);
 
-                const double exp_r[3] = {
-                    static_cast<double>(0.5L * (ar + br)),
-                    static_cast<double>(0.5L * (ar - br) * wr - 0.5L * (ai - bi) * wi),
-                    static_cast<double>(((-ar) + ai) * 0.7071067811865475244L)
-                };
-                const double exp_i[3] = {
-                    static_cast<double>(0.5L * (ai + bi)),
-                    static_cast<double>(0.5L * (ar - br) * wi + 0.5L * (ai - bi) * wr),
-                    static_cast<double>((ai - (-ar)) * 0.7071067811865475244L)
-                };
+                const double exp_r[3] = {static_cast<double>(0.5L * (ar + br)), static_cast<double>(0.5L * (ar - br) * wr - 0.5L * (ai - bi) * wi),
+                                         static_cast<double>(((-ar) + ai) * 0.7071067811865475244L)};
+                const double exp_i[3] = {static_cast<double>(0.5L * (ai + bi)), static_cast<double>(0.5L * (ar - br) * wi + 0.5L * (ai - bi) * wr),
+                                         static_cast<double>((ai - (-ar)) * 0.7071067811865475244L)};
                 constexpr double kTol = 3e-3;
                 for (int i = 0; i < 3; ++i) {
                     long double gr, gi;
                     complexh_to_long_doubles(out[i], gr, gi);
                     if (!std::isfinite(static_cast<double>(gr)) || !std::isfinite(static_cast<double>(gi)) ||
-                        std::fabs(static_cast<double>(gr) - exp_r[i]) > kTol ||
-                        std::fabs(static_cast<double>(gi) - exp_i[i]) > kTol) {
+                        std::fabs(static_cast<double>(gr) - exp_r[i]) > kTol || std::fabs(static_cast<double>(gi) - exp_i[i]) > kTol) {
                         char buf[256];
-                        std::snprintf(buf, sizeof(buf),
-                                      "FP16 KAT %s op %d mismatch (got %.5f, %.5f; exp %.5f, %.5f)",
-                                      lane_tag, i,
-                                      static_cast<double>(gr), static_cast<double>(gi),
-                                      exp_r[i], exp_i[i]);
+                        std::snprintf(buf, sizeof(buf), "FP16 KAT %s op %d mismatch (got %.5f, %.5f; exp %.5f, %.5f)", lane_tag, i, static_cast<double>(gr),
+                                      static_cast<double>(gi), exp_r[i], exp_i[i]);
                         err_msg = buf;
                         return false;
                     }
@@ -799,10 +772,7 @@ DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cf
     bool compute_heavy = true;
 
     if (dev_cfg.has_fp64) {
-        const size_t num_items = std::clamp<size_t>(
-            dev_cfg.max_compute_units * (dev_cfg.is_gpu ? size_t{512} : size_t{64}),
-            size_t{256},
-            size_t{65536});
+        const size_t num_items = std::clamp<size_t>(dev_cfg.max_compute_units * (dev_cfg.is_gpu ? size_t{512} : size_t{64}), size_t{256}, size_t{65536});
         const size_t wg = dev_cfg.clamp_pow2_wg(num_items, 64);
 
         float* d_f32 = nullptr;
@@ -816,8 +786,7 @@ DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cf
                     for (int r = 0; r < reps; ++r) {
                         ev = q.submit([&](sycl::handler& h) {
                             if (r > 0) h.depends_on(ev);
-                            h.parallel_for(sycl::nd_range<1>(num_items, wg),
-                                           detail::FmaThroughputProbeKernel<float>{d_f32});
+                            h.parallel_for(sycl::nd_range<1>(num_items, wg), detail::FmaThroughputProbeKernel<float>{d_f32});
                         });
                     }
                     ev.wait_and_throw();
@@ -827,8 +796,7 @@ DeviceProbeResult probe_fp64_ratio(sycl::queue& q, const DeviceFftConfig& dev_cf
                     for (int r = 0; r < reps; ++r) {
                         ev = q.submit([&](sycl::handler& h) {
                             if (r > 0) h.depends_on(ev);
-                            h.parallel_for(sycl::nd_range<1>(num_items, wg),
-                                           detail::FmaThroughputProbeKernel<double>{d_f64});
+                            h.parallel_for(sycl::nd_range<1>(num_items, wg), detail::FmaThroughputProbeKernel<double>{d_f64});
                         });
                     }
                     ev.wait_and_throw();
@@ -884,9 +852,12 @@ std::unordered_map<std::string, EntryMap>& autotune_cache_stores() {
 
 const char* plan_mode_to_str(PlanExecMode m) {
     switch (m) {
-        case PlanExecMode::SinglePass:       return "1pass";
-        case PlanExecMode::TwoPass:          return "2pass";
-        case PlanExecMode::MultiStageGlobal: return "multistage";
+        case PlanExecMode::SinglePass:
+            return "1pass";
+        case PlanExecMode::TwoPass:
+            return "2pass";
+        case PlanExecMode::MultiStageGlobal:
+            return "multistage";
     }
     return "1pass";
 }
@@ -923,10 +894,14 @@ void parse_autotune_file(const std::string& path, EntryMap& map) {
             key += cols[i];
         }
         AutotuneEntry e{};
-        if (cols[12] == "1pass") e.mode = PlanExecMode::SinglePass;
-        else if (cols[12] == "2pass") e.mode = PlanExecMode::TwoPass;
-        else if (cols[12] == "multistage") e.mode = PlanExecMode::MultiStageGlobal;
-        else continue;
+        if (cols[12] == "1pass")
+            e.mode = PlanExecMode::SinglePass;
+        else if (cols[12] == "2pass")
+            e.mode = PlanExecMode::TwoPass;
+        else if (cols[12] == "multistage")
+            e.mode = PlanExecMode::MultiStageGlobal;
+        else
+            continue;
 
         e.variant_id = (cols[13] == "-") ? std::string{} : cols[13];
         try {
@@ -992,20 +967,15 @@ void flush_autotune_store_locked(const std::string& path, EntryMap& map) {
             std::ofstream ofs(tmp, std::ios::out | std::ios::trunc);
             if (!ofs.is_open()) return;
             ofs << "# sycl_fft autotune cache v2\n";
-            ofs << "# schema\tcompiler_jit\tcode_hash\tdevice\tvendor\tcu_smem\tdriver\tbackend\tprec\tsign\tslot\tlogN\tmode\tvariant\tlog_n1\tpass0_wg\tl2_chunk\tmargin_pct\trunner_up\n";
+            ofs << "# "
+                   "schema\tcompiler_jit\tcode_hash\tdevice\tvendor\tcu_smem\tdriver\tbackend\tprec\tsign\tslot\tlogN\tmode\tvariant\tlog_n1\tpass0_wg\tl2_"
+                   "chunk\tmargin_pct\trunner_up\n";
             for (const auto& kv : merged) {
                 const auto& e = kv.second;
                 char mbuf[32];
                 std::snprintf(mbuf, sizeof(mbuf), "%.2f", e.margin_pct);
-                ofs << kv.first
-                    << '\t' << plan_mode_to_str(e.mode)
-                    << '\t' << (e.variant_id.empty() ? "-" : e.variant_id)
-                    << '\t' << e.log_n1
-                    << '\t' << e.pass0_wg
-                    << '\t' << e.l2_chunk_bytes
-                    << '\t' << mbuf
-                    << '\t' << (e.runner_up_id.empty() ? "-" : e.runner_up_id)
-                    << '\n';
+                ofs << kv.first << '\t' << plan_mode_to_str(e.mode) << '\t' << (e.variant_id.empty() ? "-" : e.variant_id) << '\t' << e.log_n1 << '\t'
+                    << e.pass0_wg << '\t' << e.l2_chunk_bytes << '\t' << mbuf << '\t' << (e.runner_up_id.empty() ? "-" : e.runner_up_id) << '\n';
             }
             ofs.flush();
             if (!ofs.good()) return;
@@ -1020,7 +990,7 @@ void flush_autotune_store_locked(const std::string& path, EntryMap& map) {
     }
 }
 
-} // namespace
+}  // namespace
 
 std::string AutotuneCache::resolve_cache_path(const std::string& explicit_path) {
     if (!explicit_path.empty()) return explicit_path;
@@ -1036,30 +1006,16 @@ std::string AutotuneCache::resolve_cache_path(const std::string& explicit_path) 
     return {};
 }
 
-std::string AutotuneCache::make_key(
-    const DeviceFftConfig& dev_cfg,
-    const char* prec_tag,
-    int logN,
-    const char* slot_tag,
-    int sign) {
+std::string AutotuneCache::make_key(const DeviceFftConfig& dev_cfg, const char* prec_tag, int logN, const char* slot_tag, int sign) {
     char vid[16];
     std::snprintf(vid, sizeof(vid), "0x%x", dev_cfg.vendor_id);
     char cu_smem[48];
-    std::snprintf(cu_smem, sizeof(cu_smem), "cu%zu_smem%zu",
-                  dev_cfg.max_compute_units, dev_cfg.local_mem_size);
+    std::snprintf(cu_smem, sizeof(cu_smem), "cu%zu_smem%zu", dev_cfg.max_compute_units, dev_cfg.local_mem_size);
     const char* sign_tag = (sign > 0) ? "pos" : ((sign < 0) ? "neg" : "any");
     std::ostringstream oss;
-    oss << "v2\t" << compiler_id_tag()
-        << "\t" << kernel_code_hash()
-        << "\t" << sanitize_cache_token(dev_cfg.device_name)
-        << "\t" << vid
-        << "\t" << cu_smem
-        << "\t" << sanitize_cache_token(dev_cfg.driver_version)
-        << "\t" << dev_cfg.backend_tag
-        << "\t" << (prec_tag ? prec_tag : "any")
-        << "\t" << sign_tag
-        << "\t" << (slot_tag ? slot_tag : "any")
-        << "\t" << logN;
+    oss << "v2\t" << compiler_id_tag() << "\t" << kernel_code_hash() << "\t" << sanitize_cache_token(dev_cfg.device_name) << "\t" << vid << "\t" << cu_smem
+        << "\t" << sanitize_cache_token(dev_cfg.driver_version) << "\t" << dev_cfg.backend_tag << "\t" << (prec_tag ? prec_tag : "any") << "\t" << sign_tag
+        << "\t" << (slot_tag ? slot_tag : "any") << "\t" << logN;
     return oss.str();
 }
 
@@ -1107,19 +1063,14 @@ const std::vector<SyclDeviceDescriptor>& enumerate_sycl_devices() {
                 } else {
                     d.device_type = "other";
                 }
-                d.max_compute_units = static_cast<size_t>(
-                    dev.get_info<sycl::info::device::max_compute_units>());
-                d.global_mem_size = static_cast<size_t>(
-                    dev.get_info<sycl::info::device::global_mem_size>());
+                d.max_compute_units = static_cast<size_t>(dev.get_info<sycl::info::device::max_compute_units>());
+                d.global_mem_size = static_cast<size_t>(dev.get_info<sycl::info::device::global_mem_size>());
                 d.has_fp64 = dev.has(sycl::aspect::fp64);
                 d.has_fp16 = dev.has(sycl::aspect::fp16);
 #if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
                 // AdaptiveCpp does not report sycl::aspect::fp16 on CUDA/HIP/OMP backends
                 // even though sycl::half / f16x2 arithmetic is natively supported.
-                if (!d.has_fp16 &&
-                    (d.backend == "cuda" || d.backend == "hip" ||
-                     d.backend == "level_zero" || d.backend == "metal" ||
-                     d.backend == "omp")) {
+                if (!d.has_fp16 && (d.backend == "cuda" || d.backend == "hip" || d.backend == "level_zero" || d.backend == "metal" || d.backend == "omp")) {
                     d.has_fp16 = true;
                 }
 #endif
@@ -1154,4 +1105,4 @@ const std::vector<SyclDeviceDescriptor>& enumerate_sycl_devices() {
     return devices;
 }
 
-} // namespace sycl_fft
+}  // namespace sycl_fft

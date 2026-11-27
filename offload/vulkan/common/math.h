@@ -9,7 +9,7 @@
 #include <string.h>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846
+#    define M_PI 3.14159265358979323846
 #endif
 
 static inline uint32_t vk_bit_reverse(uint32_t x, int bits) {
@@ -35,7 +35,7 @@ static inline float vk_u32_to_f32(uint32_t u) {
 }
 
 static inline uint16_t vk_f32_to_f16_bits(float f) {
-#if defined(__FLT16_MAX__)
+#if defined(__FLT16_MAX__) && !defined(_MSC_VER)
     _Float16 h = (_Float16)f;
     uint16_t bits;
     memcpy(&bits, &h, sizeof(bits));
@@ -43,7 +43,7 @@ static inline uint16_t vk_f32_to_f16_bits(float f) {
 #else
     uint32_t u = vk_f32_to_u32(f);
     uint32_t sign = (u >> 16) & 0x8000u;
-    uint32_t exp  = (u >> 23) & 0xFFu;
+    uint32_t exp = (u >> 23) & 0xFFu;
     uint32_t mant = u & 0x007FFFFFu;
     if (exp == 0u) return (uint16_t)sign;
     if (exp == 255u) return (uint16_t)(sign | 0x7C00u | (mant ? 0x0200u : 0u));
@@ -68,7 +68,7 @@ static inline uint16_t vk_f32_to_f16_bits(float f) {
 
 static inline float vk_f16_bits_to_f32(uint16_t h) {
     uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
-    uint32_t exp  = ((uint32_t)h >> 10) & 0x1Fu;
+    uint32_t exp = ((uint32_t)h >> 10) & 0x1Fu;
     uint32_t mant = (uint32_t)h & 0x03FFu;
     uint32_t u = 0;
     if (exp == 0u) {
@@ -135,9 +135,7 @@ static inline VkDf vk_df_from_double(double d) {
     return v;
 }
 
-static inline double vk_df_to_double(VkDf a) {
-    return (double)a.hi + (double)a.lo;
-}
+static inline double vk_df_to_double(VkDf a) { return (double)a.hi + (double)a.lo; }
 
 static inline VkComplexh vk_complexh_from_doubles(double r, double i) {
     VkComplexh c = {vk_f32_to_f16_bits((float)r), vk_f32_to_f16_bits((float)i)};

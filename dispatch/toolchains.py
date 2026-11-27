@@ -18,6 +18,7 @@ a normal MSVC-compatible PE that needs no MinGW runtime.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tarfile
@@ -28,6 +29,9 @@ from pathlib import Path
 from .variants import repo_root
 
 TOOLCHAIN_DIR = repo_root() / ".toolchains"
+
+MOLTENVK_VERSION = "v1.4.2"
+MOLTENVK_URL = f"https://github.com/KhronosGroup/MoltenVK/releases/download/{MOLTENVK_VERSION}/MoltenVK-macos.tar"
 
 DEBIAN_AARCH64_PACKAGES = (
     "gcc-14-aarch64-linux-gnu",
@@ -307,6 +311,96 @@ def _xwin_splat(dest: Path, arch: str = "x86_64") -> None:
     run([xwin, "--accept-license", "--arch", arch, "splat", "--output", str(dest)])
 
 
+def aarch64_musl_gcc14() -> Toolchain:
+    """Debian's aarch64 GCC 14.2 pointed at musl.cc's aarch64 musl headers and libc.so.
+
+    Using GCC 14.2 instead of musl.cc's older GCC 11.2.1 gives full C23 support
+    (needed by offload/vulkan) and modern vectorization while still linking
+    exclusively against ``libc.musl-aarch64.so.1``.
+    """
+    deb = debian_aarch64()
+    musl = muslcc("aarch64")
+    musl_root = TOOLCHAIN_DIR / "aarch64-linux-musl-cross" / "aarch64-linux-musl"
+    deb_root = TOOLCHAIN_DIR / "debian-aarch64"
+    gcc_inc = deb_root / "usr" / "lib" / "gcc-cross" / "aarch64-linux-gnu" / "14" / "include"
+    gcc_lib = deb_root / "usr" / "lib" / "gcc-cross" / "aarch64-linux-gnu" / "14"
+    tc = gcc_toolchain(
+        "aarch64-musl-gcc14",
+        deb.cc[0],
+        can_run=False,
+        extra_cflags=[
+            "-nostdinc",
+            "-isystem",
+            str(musl_root / "include"),
+            "-isystem",
+            str(gcc_inc),
+        ],
+        musl=(musl.musl_soname, musl.musl_libdir),
+    )
+    tc.lib_dirs = [str(gcc_lib)]
+    return tc
+
+
+def vulkan_include_dir() -> Path:
+    """Locate a directory containing ``vulkan/vulkan.h``."""
+    candidates: list[Path] = []
+    sdk = os.environ.get("VULKAN_SDK", "").strip()
+    if sdk:
+        candidates.append(Path(sdk) / "include")
+    candidates.append(Path("/usr/local/VulkanSDK/default/include"))
+    candidates.append(Path("/usr/include"))
+    for path in candidates:
+        if (path / "vulkan" / "vulkan.h").is_file():
+            return path
+    raise ToolchainError("vulkan/vulkan.h not found (install libvulkan-dev or set VULKAN_SDK)")
+
+
+def _find_lipo() -> str:
+    for name in ("llvm-lipo-19", "llvm-lipo", "lipo"):
+        found = have(name)
+        if found:
+            return found
+    raise ToolchainError("llvm-lipo is required to slice universal libMoltenVK.dylib for macOS wheels")
+
+
+def moltenvk_dylib(arch: str) -> tuple[Path, Path | None]:
+    """Download KhronosGroup/MoltenVK and return (per-arch libMoltenVK.dylib, optional LICENSE)."""
+    lipo_arch = {"x86_64": "x86_64", "aarch64": "arm64", "arm64": "arm64"}[arch]
+    base = TOOLCHAIN_DIR / "moltenvk" / MOLTENVK_VERSION
+    sliced = base / f"libMoltenVK-{lipo_arch}.dylib"
+    license_dst = base / "LICENSE"
+    if sliced.is_file() and sliced.stat().st_size > 0:
+        return sliced, (license_dst if license_dst.is_file() else None)
+
+    base.mkdir(parents=True, exist_ok=True)
+    universal = base / "libMoltenVK-universal.dylib"
+    if not universal.is_file() or universal.stat().st_size == 0:
+        tarball = _download(MOLTENVK_URL, base / "MoltenVK-macos.tar")
+        print("[fetch] extracting libMoltenVK.dylib from %s" % tarball, flush=True)
+        with tarfile.open(tarball) as tar:
+            dylib_member = None
+            license_member = None
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                if m.name.endswith("dylib/macOS/libMoltenVK.dylib") or m.name.endswith("/libMoltenVK.dylib"):
+                    if "macOS" in m.name or dylib_member is None:
+                        dylib_member = m
+                elif m.name.endswith("/LICENSE") and license_member is None:
+                    license_member = m
+            if dylib_member is None:
+                raise ToolchainError("libMoltenVK.dylib not found inside %s" % tarball)
+            with tar.extractfile(dylib_member) as src, open(universal, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            if license_member is not None:
+                with tar.extractfile(license_member) as src, open(license_dst, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+    lipo = _find_lipo()
+    run([lipo, str(universal), "-thin", lipo_arch, "-output", str(sliced)])
+    return sliced, (license_dst if license_dst.is_file() else None)
+
+
 def for_target(target) -> Toolchain:
     """Pick the toolchain that builds `target`."""
     key = target.name
@@ -337,7 +431,7 @@ def for_target(target) -> Toolchain:
         ]
         return tc
     if key == "linux-aarch64-musl":
-        return muslcc("aarch64")
+        return aarch64_musl_gcc14()
     if key in ("win-amd64", "win-arm64"):
         return clang_cl(target.arch)
     if key == "macos-x86_64":
@@ -366,6 +460,10 @@ def report() -> int:
         ),
         ("MSVC toolset + Windows SDK (xwin)", lambda: (TOOLCHAIN_DIR / "msvc" / "sdk").exists() or bool(have("xwin"))),
         ("zig (macOS)", lambda: have("zig")),
+        ("vulkan headers", lambda: vulkan_include_dir().is_dir()),
+        ("glslc (Vulkan shaders)", lambda: have("glslc")),
+        ("llvm-lipo (macOS MoltenVK slice)", lambda: bool(_find_lipo())),
+        ("MoltenVK cache (%s)" % MOLTENVK_VERSION, lambda: (TOOLCHAIN_DIR / "moltenvk" / MOLTENVK_VERSION / "libMoltenVK-universal.dylib").exists()),
         ("qemu-aarch64 (test only)", lambda: have("qemu-aarch64")),
         ("wine (test only)", lambda: have("wine")),
         ("darling (test only)", lambda: have("darling")),
@@ -380,4 +478,14 @@ def report() -> int:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Report or provision build toolchains.")
+    parser.add_argument("--fetch-moltenvk", action="store_true", help="download and slice MoltenVK for macOS x86_64 and arm64")
+    args = parser.parse_args()
+    if args.fetch_moltenvk:
+        for arch in ("x86_64", "aarch64"):
+            dylib, _ = moltenvk_dylib(arch)
+            print("[moltenvk] %s -> %s" % (arch, dylib))
+        raise SystemExit(0)
     raise SystemExit(report())

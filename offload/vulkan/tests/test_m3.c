@@ -2,17 +2,14 @@
  * Tests PSWF21 & PSWF43, SlotBitReversed (fused epilogue) & Natural orders,
  * SinglePass (N=1024) & TwoPass/multi-window (N=8192), Sign=+1/-1, all 4 precisions
  * across every detected Vulkan device (NVIDIA RTX 5060, AMD Radeon 610M RADV, llvmpipe). */
-#include "nufft/vk_nufft1.h"
-
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void ref_nufft1(
-    const double* x, const double* yr, const double* yi,
-    int M, int nout, int nfft, double df, int sign,
-    double* out_r, double* out_i) {
+#include "nufft/vk_nufft1.h"
+
+static void ref_nufft1(const double* x, const double* yr, const double* yi, int M, int nout, int nfft, double df, int sign, double* out_r, double* out_i) {
     const double inv_nfft = 1.0 / (double)nfft;
     const double two_pi_s = (double)sign * 2.0 * M_PI * df;
     for (int k = 0; k < nout; ++k) {
@@ -29,10 +26,8 @@ static void ref_nufft1(
     }
 }
 
-static int run_nufft_case(
-    VkDeviceContext* ctx, VkCmdBatch* batch,
-    VkPrecKind prec, int sign, int M, int N, int w,
-    VkPswfMode mode, VkNufftOutOrder order, size_t bs, double tol) {
+static int run_nufft_case(VkDeviceContext* ctx, VkCmdBatch* batch, VkPrecKind prec, int sign, int M, int N, int w, VkPswfMode mode, VkNufftOutOrder order,
+                          size_t bs, double tol) {
     VkNufft1LaunchConfig cfg = vk_nufft1_launch_config_default();
     cfg.fft_cfg.autotune = VK_AUTOTUNE_OFF; /* deterministic fast test */
 
@@ -68,35 +63,34 @@ static int run_nufft_case(
     void* h_o_nat = malloc(o_bytes);
 
     for (int m = 0; m < M; ++m) {
-        if (prec == VK_PREC_DOUBLE) ((double*)h_x_dev)[m] = hx[m];
-        else                        ((VkDf*)h_x_dev)[m] = vk_df_from_double(hx[m]);
+        if (prec == VK_PREC_DOUBLE)
+            ((double*)h_x_dev)[m] = hx[m];
+        else
+            ((VkDf*)h_x_dev)[m] = vk_df_from_double(hx[m]);
     }
     for (size_t i = 0; i < bs * (size_t)M; ++i) {
-        if (prec == VK_PREC_HALF)        ((VkComplexh*)h_y_dev)[i] = vk_complexh_from_doubles(hy_r[i], hy_i[i]);
-        else if (prec == VK_PREC_FLOAT)  ((VkComplexf*)h_y_dev)[i] = (VkComplexf){(float)hy_r[i], (float)hy_i[i]};
-        else if (prec == VK_PREC_DF)     ((VkComplexdf*)h_y_dev)[i] = (VkComplexdf){vk_df_from_double(hy_r[i]), vk_df_from_double(hy_i[i])};
-        else                             ((VkComplex*)h_y_dev)[i] = (VkComplex){hy_r[i], hy_i[i]};
+        if (prec == VK_PREC_HALF)
+            ((VkComplexh*)h_y_dev)[i] = vk_complexh_from_doubles(hy_r[i], hy_i[i]);
+        else if (prec == VK_PREC_FLOAT)
+            ((VkComplexf*)h_y_dev)[i] = (VkComplexf){(float)hy_r[i], (float)hy_i[i]};
+        else if (prec == VK_PREC_DF)
+            ((VkComplexdf*)h_y_dev)[i] = (VkComplexdf){vk_df_from_double(hy_r[i]), vk_df_from_double(hy_i[i])};
+        else
+            ((VkComplex*)h_y_dev)[i] = (VkComplex){hy_r[i], hy_i[i]};
     }
 
     VkBufferAlloc d_x = {0}, d_y = {0}, d_out = {0};
-    bool ok =
-        vk_buf_create(ctx, x_bytes, VK_MEM_DEVICE_LOCAL, &d_x) &&
-        vk_buf_create(ctx, y_bytes, VK_MEM_DEVICE_LOCAL, &d_y) &&
-        vk_buf_create(ctx, o_bytes, VK_MEM_DEVICE_LOCAL, &d_out) &&
-        vk_batch_upload_sync(batch, h_x_dev, vk_buf_slice(&d_x, 0, VK_WHOLE_SIZE), x_bytes) &&
-        vk_batch_upload_sync(batch, h_y_dev, vk_buf_slice(&d_y, 0, VK_WHOLE_SIZE), y_bytes) &&
-        vk_batch_begin(batch) &&
-        vk_nufft1_record_set_points(&plan, batch, vk_buf_slice(&d_x, 0, VK_WHOLE_SIZE), M, df, 1) &&
-        vk_nufft1_record_execute(&plan, batch, vk_buf_slice(&d_y, 0, VK_WHOLE_SIZE), 0u,
-                                 vk_buf_slice(&d_out, 0, VK_WHOLE_SIZE), 0u, bs, order) &&
-        vk_batch_submit_and_wait(batch) &&
-        vk_batch_download_sync(batch, vk_buf_slice(&d_out, 0, VK_WHOLE_SIZE), h_o_raw, o_bytes);
+    bool ok = vk_buf_create(ctx, x_bytes, VK_MEM_DEVICE_LOCAL, &d_x) && vk_buf_create(ctx, y_bytes, VK_MEM_DEVICE_LOCAL, &d_y) &&
+              vk_buf_create(ctx, o_bytes, VK_MEM_DEVICE_LOCAL, &d_out) && vk_batch_upload_sync(batch, h_x_dev, vk_buf_slice(&d_x, 0, VK_WHOLE_SIZE), x_bytes) &&
+              vk_batch_upload_sync(batch, h_y_dev, vk_buf_slice(&d_y, 0, VK_WHOLE_SIZE), y_bytes) && vk_batch_begin(batch) &&
+              vk_nufft1_record_set_points(&plan, batch, vk_buf_slice(&d_x, 0, VK_WHOLE_SIZE), M, df, 1) &&
+              vk_nufft1_record_execute(&plan, batch, vk_buf_slice(&d_y, 0, VK_WHOLE_SIZE), 0u, vk_buf_slice(&d_out, 0, VK_WHOLE_SIZE), 0u, bs, order) &&
+              vk_batch_submit_and_wait(batch) && vk_batch_download_sync(batch, vk_buf_slice(&d_out, 0, VK_WHOLE_SIZE), h_o_raw, o_bytes);
 
     int fail = 0;
     double max_rel = 0.0;
     if (!ok) {
-        printf("    FAIL: execute failed prec=%s N=%d w=%d mode=%d ord=%d\n",
-               vk_prec_tag(prec), N, w, (int)mode, (int)order);
+        printf("    FAIL: execute failed prec=%s N=%d w=%d mode=%d ord=%d\n", vk_prec_tag(prec), N, w, (int)mode, (int)order);
         fail = 1;
     } else {
         if (order == VK_NUFFT_ORDER_SLOT_BIT_REVERSED) {
@@ -123,13 +117,16 @@ static int run_nufft_case(
                     gi = vk_f16_bits_to_f32(v.im);
                 } else if (prec == VK_PREC_FLOAT) {
                     VkComplexf v = ((VkComplexf*)h_o_nat)[idx];
-                    gr = v.re; gi = v.im;
+                    gr = v.re;
+                    gi = v.im;
                 } else if (prec == VK_PREC_DF) {
                     VkComplexdf v = ((VkComplexdf*)h_o_nat)[idx];
-                    gr = vk_df_to_double(v.re); gi = vk_df_to_double(v.im);
+                    gr = vk_df_to_double(v.re);
+                    gi = vk_df_to_double(v.im);
                 } else {
                     VkComplex v = ((VkComplex*)h_o_nat)[idx];
-                    gr = v.re; gi = v.im;
+                    gr = v.re;
+                    gi = v.im;
                 }
                 double dr = gr - rr[k], di = gi - ri[k];
                 err2 += dr * dr + di * di;
@@ -142,24 +139,25 @@ static int run_nufft_case(
         free(ri);
 
         if (!isfinite(max_rel) || max_rel > tol) {
-            printf("    FAIL: prec=%-2s sign=%+d N=%5d w=%2d mode=%s ord=%s spread=%-22s rel_l2=%.3e (tol=%.1e)\n",
-                   vk_prec_tag(prec), sign, N, w, mode == VK_PSWF43 ? "43" : "21",
-                   order == VK_NUFFT_ORDER_NATURAL ? "nat" : "slot",
-                   plan.spread_variant_name, max_rel, tol);
+            printf("    FAIL: prec=%-2s sign=%+d N=%5d w=%2d mode=%s ord=%s spread=%-22s rel_l2=%.3e (tol=%.1e)\n", vk_prec_tag(prec), sign, N, w,
+                   mode == VK_PSWF43 ? "43" : "21", order == VK_NUFFT_ORDER_NATURAL ? "nat" : "slot", plan.spread_variant_name, max_rel, tol);
             fail = 1;
         } else {
-            printf("    PASS: prec=%-2s sign=%+d N=%5d w=%2d mode=%s ord=%s spread=%-22s rel_l2=%.3e\n",
-                   vk_prec_tag(prec), sign, N, w, mode == VK_PSWF43 ? "43" : "21",
-                   order == VK_NUFFT_ORDER_NATURAL ? "nat" : "slot",
-                   plan.spread_variant_name, max_rel);
+            printf("    PASS: prec=%-2s sign=%+d N=%5d w=%2d mode=%s ord=%s spread=%-22s rel_l2=%.3e\n", vk_prec_tag(prec), sign, N, w,
+                   mode == VK_PSWF43 ? "43" : "21", order == VK_NUFFT_ORDER_NATURAL ? "nat" : "slot", plan.spread_variant_name, max_rel);
         }
     }
 
     vk_buf_destroy(&d_x);
     vk_buf_destroy(&d_y);
     vk_buf_destroy(&d_out);
-    free(hx); free(hy_r); free(hy_i);
-    free(h_x_dev); free(h_y_dev); free(h_o_raw); free(h_o_nat);
+    free(hx);
+    free(hy_r);
+    free(hy_i);
+    free(h_x_dev);
+    free(h_y_dev);
+    free(h_o_raw);
+    free(h_o_nat);
     vk_nufft1_plan_destroy(&plan);
     return fail;
 }
@@ -192,12 +190,12 @@ int main(void) {
 
         const struct {
             VkPrecKind prec;
-            int        w;
-            double     tol;
+            int w;
+            double tol;
         } precs[4] = {
-            {VK_PREC_HALF,   5,  1.5e-2},
-            {VK_PREC_FLOAT,  9,  2.0e-5},
-            {VK_PREC_DF,    16,  1.0e-11},
+            {VK_PREC_HALF, 5, 1.5e-2},
+            {VK_PREC_FLOAT, 9, 2.0e-5},
+            {VK_PREC_DF, 16, 1.0e-11},
             {VK_PREC_DOUBLE, 18, 5.0e-13},
         };
 
@@ -206,15 +204,14 @@ int main(void) {
             if (precs[pi].prec == VK_PREC_DOUBLE && !desc->has_fp64) continue;
 
             /* SinglePass PSWF43 SlotBitReversed (primary fast path, sign=+1) */
-            total_fails += run_nufft_case(ctx, &batch, precs[pi].prec, +1, 257, 1024, precs[pi].w,
-                                          VK_PSWF43, VK_NUFFT_ORDER_SLOT_BIT_REVERSED, 5, precs[pi].tol);
+            total_fails +=
+                run_nufft_case(ctx, &batch, precs[pi].prec, +1, 257, 1024, precs[pi].w, VK_PSWF43, VK_NUFFT_ORDER_SLOT_BIT_REVERSED, 5, precs[pi].tol);
             /* SinglePass PSWF21 Natural (sign=-1) */
-            total_fails += run_nufft_case(ctx, &batch, precs[pi].prec, -1, 193, 1024, precs[pi].w,
-                                          VK_PSWF21, VK_NUFFT_ORDER_NATURAL, 3, precs[pi].tol);
+            total_fails += run_nufft_case(ctx, &batch, precs[pi].prec, -1, 193, 1024, precs[pi].w, VK_PSWF21, VK_NUFFT_ORDER_NATURAL, 3, precs[pi].tol);
             /* TwoPass + multi-window buckets PSWF43 SlotBitReversed (N=8192 -> nfft=16384) */
             if (desc->is_gpu) {
-                total_fails += run_nufft_case(ctx, &batch, precs[pi].prec, +1, 513, 8192, precs[pi].w,
-                                              VK_PSWF43, VK_NUFFT_ORDER_SLOT_BIT_REVERSED, 3, precs[pi].tol);
+                total_fails +=
+                    run_nufft_case(ctx, &batch, precs[pi].prec, +1, 513, 8192, precs[pi].w, VK_PSWF43, VK_NUFFT_ORDER_SLOT_BIT_REVERSED, 3, precs[pi].tol);
             }
         }
 

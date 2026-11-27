@@ -1,9 +1,9 @@
-#include "bitrev/vk_bitrev.h"
-#include "common/math.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "bitrev/vk_bitrev.h"
+#include "common/math.h"
 
 static void lut_destroy(VkBitRevLutState* lut) {
     vk_buf_destroy(&lut->pairs_buf);
@@ -25,10 +25,16 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
     bool ok = true;
 
     if (kind == VK_BITREV_LUT_PAIRS) {
-        if (lut->pairs_buf.buffer != VK_NULL_HANDLE) { vk_batch_destroy(&up); return true; }
+        if (lut->pairs_buf.buffer != VK_NULL_HANDLE) {
+            vk_batch_destroy(&up);
+            return true;
+        }
         if (lut->logN <= 16) {
             uint32_t* packed = (uint32_t*)malloc((N / 2 + 1) * sizeof(uint32_t));
-            if (!packed) { vk_batch_destroy(&up); return false; }
+            if (!packed) {
+                vk_batch_destroy(&up);
+                return false;
+            }
             size_t cnt = 0;
             for (uint32_t i = 0; i < (uint32_t)N; ++i) {
                 uint32_t j = vk_bit_reverse(i, lut->logN);
@@ -41,11 +47,18 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
             free(packed);
         } else {
             uint32_t* host = (uint32_t*)malloc(N * sizeof(uint32_t));
-            if (!host) { vk_batch_destroy(&up); return false; }
+            if (!host) {
+                vk_batch_destroy(&up);
+                return false;
+            }
             size_t cnt = 0;
             for (uint32_t i = 0; i < (uint32_t)N; ++i) {
                 uint32_t j = vk_bit_reverse(i, lut->logN);
-                if (i < j) { host[2 * cnt] = i; host[2 * cnt + 1] = j; ++cnt; }
+                if (i < j) {
+                    host[2 * cnt] = i;
+                    host[2 * cnt + 1] = j;
+                    ++cnt;
+                }
             }
             lut->npairs = cnt;
             lut->pairs_packed_u16 = false;
@@ -58,15 +71,23 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
     }
 
     if (kind == VK_BITREV_LUT_IDX) {
-        if (lut->idx_buf.buffer != VK_NULL_HANDLE) { vk_batch_destroy(&up); return true; }
+        if (lut->idx_buf.buffer != VK_NULL_HANDLE) {
+            vk_batch_destroy(&up);
+            return true;
+        }
         if (lut->logN <= 16) {
             size_t nwords = (N + 1) / 2;
             uint32_t* packed = (uint32_t*)calloc(nwords, sizeof(uint32_t));
-            if (!packed) { vk_batch_destroy(&up); return false; }
+            if (!packed) {
+                vk_batch_destroy(&up);
+                return false;
+            }
             for (uint32_t i = 0; i < (uint32_t)N; ++i) {
                 uint32_t r = vk_bit_reverse(i, lut->logN) & 0xFFFFu;
-                if ((i & 1u) == 0u) packed[i >> 1] |= r;
-                else packed[i >> 1] |= (r << 16);
+                if ((i & 1u) == 0u)
+                    packed[i >> 1] |= r;
+                else
+                    packed[i >> 1] |= (r << 16);
             }
             lut->idx_packed_u16 = true;
             ok = vk_buf_create(lut->ctx, nwords * sizeof(uint32_t), VK_MEM_DEVICE_LOCAL, &lut->idx_buf) &&
@@ -74,7 +95,10 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
             free(packed);
         } else {
             uint32_t* host = (uint32_t*)malloc(N * sizeof(uint32_t));
-            if (!host) { vk_batch_destroy(&up); return false; }
+            if (!host) {
+                vk_batch_destroy(&up);
+                return false;
+            }
             for (uint32_t i = 0; i < (uint32_t)N; ++i) host[i] = vk_bit_reverse(i, lut->logN);
             lut->idx_packed_u16 = false;
             ok = vk_buf_create(lut->ctx, N * sizeof(uint32_t), VK_MEM_DEVICE_LOCAL, &lut->idx_buf) &&
@@ -88,9 +112,15 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
     if (kind == VK_BITREV_LUT_COBRA_W4 || kind == VK_BITREV_LUT_COBRA_W5) {
         int w = (kind == VK_BITREV_LUT_COBRA_W4) ? 4 : 5;
         int wi = w - 4;
-        if (lut->rev_w[wi].buffer != VK_NULL_HANDLE) { vk_batch_destroy(&up); return true; }
+        if (lut->rev_w[wi].buffer != VK_NULL_HANDLE) {
+            vk_batch_destroy(&up);
+            return true;
+        }
         int m = lut->logN - 2 * w;
-        if (m < 0 || m > 16) { vk_batch_destroy(&up); return false; }
+        if (m < 0 || m > 16) {
+            vk_batch_destroy(&up);
+            return false;
+        }
         uint32_t W = 1u << w;
         uint32_t num_b = 1u << m;
         size_t rw_words = (W + 1) / 2;
@@ -99,20 +129,26 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
         uint32_t* h_ba = (uint32_t*)calloc(ba_words, sizeof(uint32_t));
         uint32_t* h_bp = (uint32_t*)malloc((num_b + 64) * sizeof(uint32_t));
         if (!h_rw || !h_ba || !h_bp) {
-            free(h_rw); free(h_ba); free(h_bp);
+            free(h_rw);
+            free(h_ba);
+            free(h_bp);
             vk_batch_destroy(&up);
             return false;
         }
         for (uint32_t x = 0; x < W; ++x) {
             uint32_t rx = vk_bit_reverse(x, w) & 0xFFFFu;
-            if ((x & 1u) == 0u) h_rw[x >> 1] |= rx;
-            else h_rw[x >> 1] |= (rx << 16);
+            if ((x & 1u) == 0u)
+                h_rw[x >> 1] |= rx;
+            else
+                h_rw[x >> 1] |= (rx << 16);
         }
         size_t nbp = 0;
         for (uint32_t b = 0; b < num_b; ++b) {
             uint32_t brev = (m == 0) ? 0u : vk_bit_reverse(b, m);
-            if ((b & 1u) == 0u) h_ba[b >> 1] |= (brev & 0xFFFFu);
-            else h_ba[b >> 1] |= ((brev & 0xFFFFu) << 16);
+            if ((b & 1u) == 0u)
+                h_ba[b >> 1] |= (brev & 0xFFFFu);
+            else
+                h_ba[b >> 1] |= ((brev & 0xFFFFu) << 16);
             if (b <= brev) h_bp[nbp++] = (b & 0xFFFFu) | ((brev & 0xFFFFu) << 16);
         }
         lut->nb_pairs[wi] = nbp;
@@ -133,21 +169,18 @@ static bool lut_ensure(VkBitRevLutState* lut, VkBitRevLutKind kind) {
 static VkShaderId pick_bitrev_shader(int strategy, size_t elem_bytes) {
     int sz_idx = (elem_bytes <= 4u) ? 0 : (elem_bytes <= 8u ? 1 : 2);
     static const VkShaderId kTable[7][3] = {
-        {VK_SHADER_bitrev_naive_4b,        VK_SHADER_bitrev_naive_8b,        VK_SHADER_bitrev_naive_16b},
-        {VK_SHADER_bitrev_lut_pairs_4b,    VK_SHADER_bitrev_lut_pairs_8b,    VK_SHADER_bitrev_lut_pairs_16b},
-        {VK_SHADER_bitrev_lut_idx_4b,      VK_SHADER_bitrev_lut_idx_8b,      VK_SHADER_bitrev_lut_idx_16b},
-        {VK_SHADER_bitrev_whole_smem_4b,   VK_SHADER_bitrev_whole_smem_8b,   VK_SHADER_bitrev_whole_smem_16b},
-        {VK_SHADER_bitrev_cobra_w4_4b,     VK_SHADER_bitrev_cobra_w4_8b,     VK_SHADER_bitrev_cobra_w4_16b},
-        {VK_SHADER_bitrev_cobra_w5_4b,     VK_SHADER_bitrev_cobra_w5_8b,     VK_SHADER_bitrev_cobra_w5_16b},
+        {VK_SHADER_bitrev_naive_4b, VK_SHADER_bitrev_naive_8b, VK_SHADER_bitrev_naive_16b},
+        {VK_SHADER_bitrev_lut_pairs_4b, VK_SHADER_bitrev_lut_pairs_8b, VK_SHADER_bitrev_lut_pairs_16b},
+        {VK_SHADER_bitrev_lut_idx_4b, VK_SHADER_bitrev_lut_idx_8b, VK_SHADER_bitrev_lut_idx_16b},
+        {VK_SHADER_bitrev_whole_smem_4b, VK_SHADER_bitrev_whole_smem_8b, VK_SHADER_bitrev_whole_smem_16b},
+        {VK_SHADER_bitrev_cobra_w4_4b, VK_SHADER_bitrev_cobra_w4_8b, VK_SHADER_bitrev_cobra_w4_16b},
+        {VK_SHADER_bitrev_cobra_w5_4b, VK_SHADER_bitrev_cobra_w5_8b, VK_SHADER_bitrev_cobra_w5_16b},
         {VK_SHADER_bitrev_scalar_cobra_4b, VK_SHADER_bitrev_scalar_cobra_8b, VK_SHADER_bitrev_scalar_cobra_16b},
     };
     return kTable[strategy][sz_idx];
 }
 
-static size_t build_and_filter_cands(
-    const VkBitRevEngine* eng,
-    bool in_place,
-    VkBitRevCandidate* out) {
+static size_t build_and_filter_cands(const VkBitRevEngine* eng, bool in_place, VkBitRevCandidate* out) {
     const VkDeviceFftConfig* cfg = vk_ctx_config(eng->ctx);
     bool allow_smem = cfg->has_native_local_mem || eng->launch_cfg.allow_emulated_local_mem;
     VkBitRevCandidate raw[VK_BITREV_MAX_CANDS];
@@ -162,20 +195,20 @@ static size_t build_and_filter_cands(
     if (eng->logN >= 10 && eng->logN <= 26) {
         size_t sw5 = ((size_t)1u << 10) * (in_place ? 2u : 1u) * eng->elem_bytes;
         raw[nr++] = (VkBitRevCandidate){"cobra_w5_lut_wg256", 256, sw5, true, false, VK_BITREV_LUT_COBRA_W5, 5, true};
-        raw[nr++] = (VkBitRevCandidate){"cobra_w5_wg256",     256, sw5, true, false, VK_BITREV_LUT_NONE,     5, false};
-        raw[nr++] = (VkBitRevCandidate){"cobra_w5_wg128",     128, sw5, true, false, VK_BITREV_LUT_NONE,     5, false};
+        raw[nr++] = (VkBitRevCandidate){"cobra_w5_wg256", 256, sw5, true, false, VK_BITREV_LUT_NONE, 5, false};
+        raw[nr++] = (VkBitRevCandidate){"cobra_w5_wg128", 128, sw5, true, false, VK_BITREV_LUT_NONE, 5, false};
     }
     if (eng->logN >= 8 && eng->logN <= 24) {
         size_t sw4 = ((size_t)1u << 8) * (in_place ? 2u : 1u) * eng->elem_bytes;
         raw[nr++] = (VkBitRevCandidate){"cobra_w4_lut_wg256", 256, sw4, true, false, VK_BITREV_LUT_COBRA_W4, 4, true};
-        raw[nr++] = (VkBitRevCandidate){"cobra_w4_wg256",     256, sw4, true, false, VK_BITREV_LUT_NONE,     4, false};
-        raw[nr++] = (VkBitRevCandidate){"cobra_w4_wg128",     128, sw4, true, false, VK_BITREV_LUT_NONE,     4, false};
-        raw[nr++] = (VkBitRevCandidate){"scalar_cobra_w4",     32,   0, false, true, VK_BITREV_LUT_COBRA_W4, 6, true};
+        raw[nr++] = (VkBitRevCandidate){"cobra_w4_wg256", 256, sw4, true, false, VK_BITREV_LUT_NONE, 4, false};
+        raw[nr++] = (VkBitRevCandidate){"cobra_w4_wg128", 128, sw4, true, false, VK_BITREV_LUT_NONE, 4, false};
+        raw[nr++] = (VkBitRevCandidate){"scalar_cobra_w4", 32, 0, false, true, VK_BITREV_LUT_COBRA_W4, 6, true};
     }
     if (in_place) {
         raw[nr++] = (VkBitRevCandidate){"lut_pairs_w256", 256, 0, false, false, VK_BITREV_LUT_PAIRS, 1, true};
     } else {
-        raw[nr++] = (VkBitRevCandidate){"lut_idx_w256",   256, 0, false, false, VK_BITREV_LUT_IDX,   2, true};
+        raw[nr++] = (VkBitRevCandidate){"lut_idx_w256", 256, 0, false, false, VK_BITREV_LUT_IDX, 2, true};
     }
     raw[nr++] = (VkBitRevCandidate){"naive_w256", 256, 0, false, false, VK_BITREV_LUT_NONE, 0, false};
     raw[nr++] = (VkBitRevCandidate){"naive_w128", 128, 0, false, false, VK_BITREV_LUT_NONE, 0, false};
@@ -198,13 +231,7 @@ static size_t build_and_filter_cands(
     return n_out;
 }
 
-bool vk_bitrev_init(
-    VkBitRevEngine* eng,
-    VkDeviceContext* ctx,
-    int logN,
-    size_t elem_bytes,
-    const char* prec_tag_str,
-    const VkFftLaunchConfig* launch_cfg) {
+bool vk_bitrev_init(VkBitRevEngine* eng, VkDeviceContext* ctx, int logN, size_t elem_bytes, const char* prec_tag_str, const VkFftLaunchConfig* launch_cfg) {
     memset(eng, 0, sizeof(*eng));
     eng->ctx = ctx;
     eng->logN = logN;
@@ -212,8 +239,7 @@ bool vk_bitrev_init(
     snprintf(eng->prec_tag, sizeof(eng->prec_tag), "%s", prec_tag_str ? prec_tag_str : "f");
     eng->launch_cfg = launch_cfg ? *launch_cfg : vk_fft_launch_config_default();
     vk_autotune_resolve_cache_path(eng->launch_cfg.cache_path, eng->cache_path, sizeof(eng->cache_path));
-    eng->xor_k = vk_whole_smem_xor_k(
-        vk_bank_model_from_kind(vk_ctx_config(ctx)->bank_model), (int)elem_bytes);
+    eng->xor_k = vk_whole_smem_xor_k(vk_bank_model_from_kind(vk_ctx_config(ctx)->bank_model), (int)elem_bytes);
     eng->lut.ctx = ctx;
     eng->lut.logN = logN;
     eng->num_ip = build_and_filter_cands(eng, true, eng->valid_ip);
@@ -235,15 +261,8 @@ static size_t effective_wg(const VkBitRevEngine* eng, const VkBitRevCandidate* c
     return cand->wg_size;
 }
 
-static bool record_cand_impl(
-    VkBitRevEngine* eng,
-    VkCmdBatch* batch,
-    const VkBitRevCandidate* cand,
-    bool in_place,
-    VkBufferSlice src,
-    VkBufferSlice dst,
-    size_t bs,
-    uint32_t batch_offset) {
+static bool record_cand_impl(VkBitRevEngine* eng, VkCmdBatch* batch, const VkBitRevCandidate* cand, bool in_place, VkBufferSlice src, VkBufferSlice dst,
+                             size_t bs, uint32_t batch_offset) {
     if (bs == 0 || eng->logN <= 0) return true;
     if (cand->lut_kind != VK_BITREV_LUT_NONE && !lut_ensure(&eng->lut, cand->lut_kind)) return false;
 
@@ -251,9 +270,9 @@ static bool record_cand_impl(
     VkShaderId sid = pick_bitrev_shader(cand->strategy, eng->elem_bytes);
 
     if (cand->strategy == 0) {
-        struct { uint32_t total, logN, batch_offset; } pc = {
-            (uint32_t)(bs << eng->logN), (uint32_t)eng->logN, batch_offset
-        };
+        struct {
+            uint32_t total, logN, batch_offset;
+        } pc = {(uint32_t)(bs << eng->logN), (uint32_t)eng->logN, batch_offset};
         VkSpecConstEntry sp[2] = {{0u, wg}, {1u, in_place ? 1u : 0u}};
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(eng->ctx, sid, 2, sizeof(pc), sp, 2, 0);
         VkBufferSlice b[2] = {in_place ? dst : src, dst};
@@ -261,9 +280,9 @@ static bool record_cand_impl(
     }
 
     if (cand->strategy == 1) {
-        struct { uint32_t npairs, total_pairs, logN, batch_offset; } pc = {
-            (uint32_t)eng->lut.npairs, (uint32_t)(bs * eng->lut.npairs), (uint32_t)eng->logN, batch_offset
-        };
+        struct {
+            uint32_t npairs, total_pairs, logN, batch_offset;
+        } pc = {(uint32_t)eng->lut.npairs, (uint32_t)(bs * eng->lut.npairs), (uint32_t)eng->logN, batch_offset};
         if (pc.total_pairs == 0) return true;
         VkSpecConstEntry sp[2] = {{0u, wg}, {1u, eng->lut.pairs_packed_u16 ? 1u : 0u}};
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(eng->ctx, sid, 2, sizeof(pc), sp, 2, 0);
@@ -272,9 +291,9 @@ static bool record_cand_impl(
     }
 
     if (cand->strategy == 2) {
-        struct { uint32_t total, logN, batch_offset; } pc = {
-            (uint32_t)(bs << eng->logN), (uint32_t)eng->logN, batch_offset
-        };
+        struct {
+            uint32_t total, logN, batch_offset;
+        } pc = {(uint32_t)(bs << eng->logN), (uint32_t)eng->logN, batch_offset};
         VkSpecConstEntry sp[2] = {{0u, wg}, {1u, eng->lut.idx_packed_u16 ? 1u : 0u}};
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(eng->ctx, sid, 3, sizeof(pc), sp, 2, 0);
         VkBufferSlice b[3] = {src, dst, vk_buf_slice(&eng->lut.idx_buf, 0, VK_WHOLE_SIZE)};
@@ -282,9 +301,9 @@ static bool record_cand_impl(
     }
 
     if (cand->strategy == 3) {
-        struct { uint32_t logN, xor_k, batch_offset; } pc = {
-            (uint32_t)eng->logN, (uint32_t)eng->xor_k, batch_offset
-        };
+        struct {
+            uint32_t logN, xor_k, batch_offset;
+        } pc = {(uint32_t)eng->logN, (uint32_t)eng->xor_k, batch_offset};
         VkSpecConstEntry sp[3] = {{0u, wg}, {1u, 1u << eng->logN}, {2u, in_place ? 1u : 0u}};
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(eng->ctx, sid, 2, sizeof(pc), sp, 3, 0);
         VkBufferSlice b[2] = {in_place ? dst : src, dst};
@@ -308,12 +327,10 @@ static bool record_cand_impl(
                 b_s = vk_buf_slice(&eng->lut.b_all_rev[wi], 0, VK_WHOLE_SIZE);
             }
         }
-        struct { uint32_t work_per_batch, logN, batch_offset; } pc = {
-            work_per_batch, (uint32_t)eng->logN, batch_offset
-        };
-        VkSpecConstEntry sp[4] = {
-            {0u, wg}, {1u, in_place ? 1u : 0u}, {2u, cand->use_lut ? 1u : 0u}, {3u, smem_elems}
-        };
+        struct {
+            uint32_t work_per_batch, logN, batch_offset;
+        } pc = {work_per_batch, (uint32_t)eng->logN, batch_offset};
+        VkSpecConstEntry sp[4] = {{0u, wg}, {1u, in_place ? 1u : 0u}, {2u, cand->use_lut ? 1u : 0u}, {3u, smem_elems}};
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(eng->ctx, sid, 4, sizeof(pc), sp, 4, 0);
         VkBufferSlice b[4] = {in_place ? dst : src, dst, rev_s, b_s};
         return vk_batch_dispatch(batch, p, b, 4, &pc, sizeof(pc), (uint32_t)(bs * work_per_batch), 1, 1);
@@ -323,35 +340,31 @@ static bool record_cand_impl(
     uint32_t wpb = in_place ? (uint32_t)eng->lut.nb_pairs[0] : (1u << m);
     uint32_t total_work = (uint32_t)(bs * wpb);
     if (total_work == 0) return true;
-    struct { uint32_t work_per_batch, total_work, logN, batch_offset; } pc = {
-        wpb, total_work, (uint32_t)eng->logN, batch_offset
-    };
+    struct {
+        uint32_t work_per_batch, total_work, logN, batch_offset;
+    } pc = {wpb, total_work, (uint32_t)eng->logN, batch_offset};
     VkSpecConstEntry sp[2] = {{0u, wg}, {1u, in_place ? 1u : 0u}};
     const VkCompiledPipeline* p = vk_ctx_get_pipeline(eng->ctx, sid, 4, sizeof(pc), sp, 2, 0);
-    VkBufferSlice b[4] = {
-        in_place ? dst : src, dst,
-        vk_buf_slice(&eng->lut.rev_w[0], 0, VK_WHOLE_SIZE),
-        vk_buf_slice(in_place ? &eng->lut.b_pairs[0] : &eng->lut.b_all_rev[0], 0, VK_WHOLE_SIZE)
-    };
+    VkBufferSlice b[4] = {in_place ? dst : src, dst, vk_buf_slice(&eng->lut.rev_w[0], 0, VK_WHOLE_SIZE),
+                          vk_buf_slice(in_place ? &eng->lut.b_pairs[0] : &eng->lut.b_all_rev[0], 0, VK_WHOLE_SIZE)};
     return vk_batch_dispatch(batch, p, b, 4, &pc, sizeof(pc), (total_work + wg - 1u) / wg, 1, 1);
 }
 
 typedef struct BitRevTuneCtx {
-    VkBitRevEngine*          eng;
+    VkBitRevEngine* eng;
     const VkBitRevCandidate* cands;
-    bool                     in_place;
-    VkCmdBatch*              batch;
-    VkBufferSlice            buf_a;
-    VkBufferSlice            buf_b;
-    size_t                   tune_bs;
+    bool in_place;
+    VkCmdBatch* batch;
+    VkBufferSlice buf_a;
+    VkBufferSlice buf_b;
+    size_t tune_bs;
 } BitRevTuneCtx;
 
 static bool bitrev_bench_run(size_t ci, int reps, void* ud) {
     BitRevTuneCtx* tc = (BitRevTuneCtx*)ud;
     if (!vk_batch_begin(tc->batch)) return false;
     for (int r = 0; r < reps; ++r) {
-        if (!record_cand_impl(tc->eng, tc->batch, &tc->cands[ci], tc->in_place,
-                              tc->buf_a, tc->in_place ? tc->buf_a : tc->buf_b, tc->tune_bs, 0)) {
+        if (!record_cand_impl(tc->eng, tc->batch, &tc->cands[ci], tc->in_place, tc->buf_a, tc->in_place ? tc->buf_a : tc->buf_b, tc->tune_bs, 0)) {
             return false;
         }
         if (r + 1 < reps) vk_batch_barrier_c2c(tc->batch);
@@ -367,13 +380,7 @@ static bool bitrev_bench_conserv(size_t a, size_t b, void* ud) {
     return a < b;
 }
 
-static int tune_candidates(
-    VkBitRevEngine* eng,
-    bool in_place,
-    const VkBitRevCandidate* cands,
-    size_t ncands,
-    bool write_cache,
-    const char* cache_key) {
+static int tune_candidates(VkBitRevEngine* eng, bool in_place, const VkBitRevCandidate* cands, size_t ncands, bool write_cache, const char* cache_key) {
     size_t N = (size_t)1u << eng->logN;
     size_t target = vk_ctx_config(eng->ctx)->is_gpu ? ((size_t)8 << 20) : ((size_t)1 << 20);
     size_t tune_bs = target / (N * eng->elem_bytes > 0 ? N * eng->elem_bytes : 1u);
@@ -398,14 +405,9 @@ static int tune_candidates(
     if (!in_place) vk_batch_fill(&batch, vk_buf_slice(&bb, 0, bytes), bytes, 0u);
     vk_batch_submit_and_wait(&batch);
 
-    BitRevTuneCtx tc = {
-        eng, cands, in_place, &batch,
-        vk_buf_slice(&ba, 0, bytes),
-        in_place ? vk_buf_slice(&ba, 0, bytes) : vk_buf_slice(&bb, 0, bytes),
-        tune_bs
-    };
-    VkInterleavedBenchResult res = vk_run_interleaved_bench(
-        ncands, bitrev_bench_run, bitrev_bench_conserv, &tc, 5, 2.0, 16, 0.03, 0.08);
+    BitRevTuneCtx tc = {eng,    cands, in_place, &batch, vk_buf_slice(&ba, 0, bytes), in_place ? vk_buf_slice(&ba, 0, bytes) : vk_buf_slice(&bb, 0, bytes),
+                        tune_bs};
+    VkInterleavedBenchResult res = vk_run_interleaved_bench(ncands, bitrev_bench_run, bitrev_bench_conserv, &tc, 5, 2.0, 16, 0.03, 0.08);
     int winner = res.ok ? (int)res.chosen_idx : 0;
     if (write_cache && res.ok) {
         VkAutotuneEntry e = {0};
@@ -494,9 +496,8 @@ bool vk_bitrev_record_out_of_place(VkBitRevEngine* eng, VkCmdBatch* batch, VkBuf
     return record_cand_impl(eng, batch, &eng->valid_oop[eng->chosen_oop], false, src, dst, bs, batch_offset);
 }
 
-bool vk_bitrev_record_candidate(
-    VkBitRevEngine* eng, VkCmdBatch* batch, bool in_place, const char* variant_id,
-    VkBufferSlice src, VkBufferSlice dst, size_t bs, uint32_t batch_offset) {
+bool vk_bitrev_record_candidate(VkBitRevEngine* eng, VkCmdBatch* batch, bool in_place, const char* variant_id, VkBufferSlice src, VkBufferSlice dst, size_t bs,
+                                uint32_t batch_offset) {
     const VkBitRevCandidate* cands = in_place ? eng->valid_ip : eng->valid_oop;
     size_t ncands = in_place ? eng->num_ip : eng->num_oop;
     for (size_t i = 0; i < ncands; ++i) {
@@ -509,8 +510,7 @@ bool vk_bitrev_record_candidate(
 
 const char* vk_bitrev_variant_name(VkBitRevEngine* eng, bool in_place) {
     if (!vk_bitrev_resolve(eng, in_place)) return "none";
-    return in_place ? eng->valid_ip[eng->chosen_ip].variant_id
-                    : eng->valid_oop[eng->chosen_oop].variant_id;
+    return in_place ? eng->valid_ip[eng->chosen_ip].variant_id : eng->valid_oop[eng->chosen_oop].variant_id;
 }
 
 bool vk_bitrev_cache_hit(VkBitRevEngine* eng, bool in_place) {

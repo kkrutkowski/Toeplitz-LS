@@ -9,8 +9,8 @@ GEN_DIR  := $(BUILD)/gen
 OBJ_DIR  := $(BUILD)/obj
 TARGET   := $(BUILD)/tls_vulkan.so
 
-CFLAGS   := -O3 -std=c23 -Wall -Wextra -fno-math-errno -fno-trapping-math -ffp-contract=fast -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -I. -I$(GEN_DIR)
-LDFLAGS  := -shared -Wl,--version-script=tls_vulkan.map -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed -lvulkan -lm -lpthread
+CFLAGS   := -O3 -std=c23 -D_GNU_SOURCE -Wall -Wextra -fno-math-errno -fno-trapping-math -ffp-contract=fast -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -I. -I$(GEN_DIR)
+LDFLAGS  := -shared -Wl,--version-script=tls_vulkan.map -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed -ldl -lm -lpthread
 
 CODEGEN_SCRIPTS := $(wildcard codegen/*.py)
 PSWF_HDR        := nufft/pswf_coeffs.h
@@ -18,6 +18,7 @@ SPV_HDR         := $(GEN_DIR)/shaders_spv.h
 SPV_SRC         := $(GEN_DIR)/shaders_spv.c
 
 C_SRCS := \
+	common/vk_loader.c \
 	common/vk_device.c \
 	common/vk_context.c \
 	bitrev/vk_bitrev.c \

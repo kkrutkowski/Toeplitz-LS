@@ -10,45 +10,38 @@ typedef struct VkBankModel {
     int bank_width_bytes;
 } VkBankModel;
 
-typedef enum VkBankModelKind {
-    VK_BANK_32x4 = 0,
-    VK_BANK_16x4 = 1,
-    VK_BANK_32x8 = 2,
-    VK_BANK_NONE = 3
-} VkBankModelKind;
+typedef enum VkBankModelKind { VK_BANK_32x4 = 0, VK_BANK_16x4 = 1, VK_BANK_32x8 = 2, VK_BANK_NONE = 3 } VkBankModelKind;
 
-typedef enum VkStagingPolicy {
-    VK_STAGING_SPLIT = 0,
-    VK_STAGING_SEQ   = 1
-} VkStagingPolicy;
+typedef enum VkStagingPolicy { VK_STAGING_SPLIT = 0, VK_STAGING_SEQ = 1 } VkStagingPolicy;
 
-typedef enum VkT1LayoutPolicy {
-    VK_T1_AFFINE = 0,
-    VK_T1_XOR    = 1
-} VkT1LayoutPolicy;
+typedef enum VkT1LayoutPolicy { VK_T1_AFFINE = 0, VK_T1_XOR = 1 } VkT1LayoutPolicy;
 
-typedef enum VkPhase3Policy {
-    VK_PHASE3_SHUFFLE   = 0,
-    VK_PHASE3_2T_XOR    = 1,
-    VK_PHASE3_2T_STRIDE = 2
-} VkPhase3Policy;
+typedef enum VkPhase3Policy { VK_PHASE3_SHUFFLE = 0, VK_PHASE3_2T_XOR = 1, VK_PHASE3_2T_STRIDE = 2 } VkPhase3Policy;
 
 static inline VkBankModel vk_bank_model_from_kind(VkBankModelKind kind) {
     switch (kind) {
-        case VK_BANK_32x4: return (VkBankModel){32, 4};
-        case VK_BANK_16x4: return (VkBankModel){16, 4};
-        case VK_BANK_32x8: return (VkBankModel){32, 8};
-        case VK_BANK_NONE: return (VkBankModel){1, 1};
+        case VK_BANK_32x4:
+            return (VkBankModel){32, 4};
+        case VK_BANK_16x4:
+            return (VkBankModel){16, 4};
+        case VK_BANK_32x8:
+            return (VkBankModel){32, 8};
+        case VK_BANK_NONE:
+            return (VkBankModel){1, 1};
     }
     return (VkBankModel){32, 4};
 }
 
 static inline const char* vk_bank_model_name(VkBankModelKind kind) {
     switch (kind) {
-        case VK_BANK_32x4: return "32x4";
-        case VK_BANK_16x4: return "16x4";
-        case VK_BANK_32x8: return "32x8";
-        case VK_BANK_NONE: return "none";
+        case VK_BANK_32x4:
+            return "32x4";
+        case VK_BANK_16x4:
+            return "16x4";
+        case VK_BANK_32x8:
+            return "32x8";
+        case VK_BANK_NONE:
+            return "none";
     }
     return "32x4";
 }
@@ -62,8 +55,7 @@ static inline int vk_gcd_int(int a, int b) {
     return (a < 0) ? -a : a;
 }
 
-static inline int vk_eval_bank_conflicts(
-    VkBankModel b, int elem_bytes, int total_lanes, const int* elem_indices) {
+static inline int vk_eval_bank_conflicts(VkBankModel b, int elem_bytes, int total_lanes, const int* elem_indices) {
     if (b.banks <= 1) return 1;
     int banks_per_elem = (elem_bytes + b.bank_width_bytes - 1) / b.bank_width_bytes;
     int window = (b.banks / banks_per_elem > 0) ? (b.banks / banks_per_elem) : 1;
@@ -81,7 +73,10 @@ static inline int vk_eval_bank_conflicts(
             int elem_idx = elem_indices[lane];
             int dup = 0;
             for (int j = 0; j < n_elems; ++j) {
-                if (seen_elems[j] == elem_idx) { dup = 1; break; }
+                if (seen_elems[j] == elem_idx) {
+                    dup = 1;
+                    break;
+                }
             }
             if (!dup && n_elems < 32) {
                 seen_elems[n_elems++] = elem_idx;
@@ -111,8 +106,7 @@ static inline int vk_t1_affine_conflicts(VkBankModel b, int elem_bytes, int T, i
     return (dw > dr) ? dw : dr;
 }
 
-static inline int vk_t2_stride_conflicts(
-    VkBankModel b, int elem_bytes, int T, int W, int row_stride, int stride2) {
+static inline int vk_t2_stride_conflicts(VkBankModel b, int elem_bytes, int T, int W, int row_stride, int stride2) {
     int w_idx[32], r_idx[32];
     int lanes = (T < 32) ? T : 32;
     for (int t = 0; t < lanes; ++t) {
@@ -136,8 +130,7 @@ static inline int vk_find_min_conflict_stride2(VkBankModel b, int elem_bytes, in
     return W + 1;
 }
 
-static inline int vk_find_min_conflict_row_stride(
-    VkBankModel b, int elem_bytes, int T, int W, int min_row, int stride2, int chunk) {
+static inline int vk_find_min_conflict_row_stride(VkBankModel b, int elem_bytes, int T, int W, int min_row, int stride2, int chunk) {
     if (b.banks <= 1) return min_row;
     int best_stride = min_row;
     int best_deg = 1000000;

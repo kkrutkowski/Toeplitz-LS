@@ -106,8 +106,111 @@ def compile_library(build_dir: Path) -> Path:
     library = build_dir / (PACKAGE + ".so")
     link = [_cc(), *flags, "-shared", "-o", str(library), *objects, "-lm"]
     if platform.system() == "Darwin":
-        link += ["-Wl,-install_name,@loader_path/" + library.name]
+        link += ["-Wl,-install_name,@loader_path/" + library.name, "-Wl,-S", "-Wl,-x"]
     _run(link)
+    if platform.system() == "Linux":
+        strip = shutil.which("llvm-strip") or shutil.which("strip")
+        if strip:
+            subprocess.run([strip, "-s", str(library)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return library
+
+
+VULKAN_SOURCES = (
+    "common/vk_loader.c",
+    "common/vk_device.c",
+    "common/vk_context.c",
+    "bitrev/vk_bitrev.c",
+    "fft/vk_dif.c",
+    "nufft/vk_nufft1.c",
+    "periodogram/vk_subgrid.c",
+    "linalg/vk_levinson.c",
+    "periodogram/vk_engine.c",
+    "impl.c",
+)
+
+
+def _vulkan_requested(config_settings=None) -> bool:
+    env_flag = os.environ.get("TOEPLITZ_LS_BUILD_VULKAN", "").strip().lower()
+    if env_flag in ("1", "true", "yes", "on"):
+        return True
+    if isinstance(config_settings, dict):
+        val = str(config_settings.get("vulkan", "")).strip().lower()
+        if val in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def _vulkan_include_dir() -> Path:
+    candidates = []
+    sdk = os.environ.get("VULKAN_SDK", "").strip()
+    if sdk:
+        candidates.append(Path(sdk) / "include")
+    candidates.extend([Path("/usr/local/VulkanSDK/default/include"), Path("/usr/include"), Path("/usr/local/include")])
+    for path in candidates:
+        if (path / "vulkan" / "vulkan.h").is_file():
+            return path
+    raise BuildError("vulkan/vulkan.h not found (install Vulkan headers or set VULKAN_SDK)")
+
+
+def compile_vulkan_library(build_dir: Path) -> Path:
+    """Generate shaders + PSWF tables and compile ``tls_vulkan.so`` (opt-in C23 build)."""
+    vk_dir = HERE / "offload" / "vulkan"
+    gen_dir = build_dir / "vulkan-gen"
+    obj_dir = build_dir / "vulkan-obj"
+    gen_dir.mkdir(parents=True, exist_ok=True)
+    obj_dir.mkdir(parents=True, exist_ok=True)
+
+    _run([sys.executable, str(vk_dir / "codegen" / "pswf_tables.py")])
+    _run([sys.executable, str(vk_dir / "codegen" / "compile_shaders.py"), "--out-dir", str(gen_dir)])
+
+    vk_inc = _vulkan_include_dir()
+    base_flags = [
+        "-std=c23",
+        "-Wall",
+        "-Wextra",
+        "-fno-math-errno",
+        "-fno-trapping-math",
+        "-ffp-contract=fast",
+        "-fPIC",
+        "-fvisibility=hidden",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-DVK_NO_PROTOTYPES",
+        "-I" + str(vk_dir),
+        "-I" + str(gen_dir),
+        "-I" + str(vk_inc),
+    ]
+    if platform.system() == "Linux":
+        base_flags.append("-D_GNU_SOURCE")
+
+    objects = []
+    for rel in VULKAN_SOURCES:
+        obj = obj_dir / (rel.replace("/", "_") + ".o")
+        _run([_cc(), "-O3", *base_flags, "-c", str(vk_dir / rel), "-o", str(obj)])
+        objects.append(obj)
+    spv_obj = obj_dir / "shaders_spv.o"
+    _run([_cc(), "-Os", "-fno-asynchronous-unwind-tables", *base_flags, "-c", str(gen_dir / "shaders_spv.c"), "-o", str(spv_obj)])
+    objects.append(spv_obj)
+
+    library = build_dir / "tls_vulkan.so"
+    link = [_cc(), "-shared", "-o", str(library), *objects]
+    if platform.system() == "Darwin":
+        link += ["-Wl,-install_name,@loader_path/tls_vulkan.so", "-Wl,-S", "-Wl,-x"]
+    else:
+        link += [
+            "-Wl,--version-script=" + str(vk_dir / "tls_vulkan.map"),
+            "-Wl,--gc-sections",
+            "-Wl,-O1",
+            "-Wl,--as-needed",
+            "-ldl",
+            "-lm",
+            "-lpthread",
+        ]
+    _run(link)
+    if platform.system() == "Linux":
+        strip = shutil.which("llvm-strip") or shutil.which("strip")
+        if strip:
+            subprocess.run([strip, "-s", str(library)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return library
 
 
@@ -193,6 +296,7 @@ def _wheel_metadata() -> str:
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     build_dir = HERE / ".tls-build"
     library = compile_library(build_dir)
+    vk_library = compile_vulkan_library(build_dir) if _vulkan_requested(config_settings) else None
 
     dist_info = _dist_info()
     out = Path(wheel_directory) / _wheel_file()
@@ -203,9 +307,12 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
             wheel.writestr(name, data)
             record.append(_record(name, data))
 
-        for source in sorted((HERE / PACKAGE).glob("*.py")):
-            add("%s/%s" % (PACKAGE, source.name), source.read_bytes())
+        for source in sorted((HERE / PACKAGE).rglob("*.py")):
+            rel = source.relative_to(HERE / PACKAGE).as_posix()
+            add("%s/%s" % (PACKAGE, rel), source.read_bytes())
         add("%s/tls.so" % PACKAGE, library.read_bytes())
+        if vk_library is not None:
+            add("%s/offload/vulkan/_lib/tls_vulkan.so" % PACKAGE, vk_library.read_bytes())
         add("%s/METADATA" % dist_info, _pkg_info().encode("utf-8"))
         add("%s/WHEEL" % dist_info, _wheel_metadata().encode("utf-8"))
         add("%s/licenses/LICENSE" % dist_info, (HERE / "LICENSE").read_bytes())
@@ -228,7 +335,15 @@ def build_sdist(sdist_directory, config_settings=None):
 
 
 if __name__ == "__main__":
-    # Usable by hand after unpacking the sdist: `python tls_source_build.py`
-    # builds .tls-build/toeplitz_ls.so and reports what it found.
+    # Usable by hand after unpacking the sdist:
+    #   python tls_source_build.py                # CPU library only (default)
+    #   python tls_source_build.py --with-vulkan  # CPU + Vulkan offload library
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Compile Toeplitz-LS from source distribution.")
+    parser.add_argument("--with-vulkan", action="store_true", help="also generate shaders and compile tls_vulkan.so (requires C23 + glslc + Vulkan headers)")
+    args = parser.parse_args()
     print("compiling %s for %s" % (PACKAGE, platform_tag()))
     print(compile_library(HERE / ".tls-build"))
+    if args.with_vulkan:
+        print(compile_vulkan_library(HERE / ".tls-build"))

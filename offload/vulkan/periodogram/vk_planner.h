@@ -5,66 +5,74 @@
  * Zero GPU-model-specific constants; strictly enforces per-stream memory budget
  * of 75% of max device memory / num_streams and safe_max_alloc_bytes(). */
 
-#include "common/vk_device.h"
-#include "nufft/vk_nufft1.h"
-
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "common/vk_device.h"
+#include "nufft/vk_nufft1.h"
+
 typedef struct VkGpuPlanChoice {
-    int        N_block;
-    int        nfft;
-    int        nout;
-    int        w;
-    int        B_total;
-    int        B_chunk;
-    size_t     plan_max_bs;
-    size_t     slot_budget_bytes;
-    size_t     required_min_bytes;
-    bool       fits_budget;
+    int N_block;
+    int nfft;
+    int nout;
+    int w;
+    int B_total;
+    int B_chunk;
+    size_t plan_max_bs;
+    size_t slot_budget_bytes;
+    size_t required_min_bytes;
+    bool fits_budget;
     VkPswfMode mode;
 } VkGpuPlanChoice;
 
 static inline int vk_kernel_width_for(VkPrecKind prec, VkPswfMode mode) {
     bool m43 = (mode == VK_PSWF43);
     switch (prec) {
-        case VK_PREC_HALF:   return m43 ? 5  : 4;
-        case VK_PREC_FLOAT:  return m43 ? 9  : 8;
-        case VK_PREC_DF:     return m43 ? 16 : 14;
-        case VK_PREC_DOUBLE: return m43 ? 18 : 16;
+        case VK_PREC_HALF:
+            return m43 ? 5 : 4;
+        case VK_PREC_FLOAT:
+            return m43 ? 9 : 8;
+        case VK_PREC_DF:
+            return m43 ? 16 : 14;
+        case VK_PREC_DOUBLE:
+            return m43 ? 18 : 16;
     }
     return 9;
 }
 
 static inline size_t vk_complex_bytes_for(VkPrecKind prec) {
     switch (prec) {
-        case VK_PREC_HALF:   return 4u;
-        case VK_PREC_FLOAT:  return 8u;
-        case VK_PREC_DF:     return 16u;
-        case VK_PREC_DOUBLE: return 16u;
+        case VK_PREC_HALF:
+            return 4u;
+        case VK_PREC_FLOAT:
+            return 8u;
+        case VK_PREC_DF:
+            return 16u;
+        case VK_PREC_DOUBLE:
+            return 16u;
     }
     return 8u;
 }
 
 static inline size_t vk_scalar_bytes_for(VkPrecKind prec) {
     switch (prec) {
-        case VK_PREC_HALF:   return 2u;
-        case VK_PREC_FLOAT:  return 4u;
-        case VK_PREC_DF:     return 8u;
-        case VK_PREC_DOUBLE: return 8u;
+        case VK_PREC_HALF:
+            return 2u;
+        case VK_PREC_FLOAT:
+            return 4u;
+        case VK_PREC_DF:
+            return 8u;
+        case VK_PREC_DOUBLE:
+            return 8u;
     }
     return 4u;
 }
 
-static inline size_t vk_dev_out_bytes_for(VkPrecKind prec) {
-    return (prec == VK_PREC_HALF || prec == VK_PREC_FLOAT) ? 4u : 8u;
-}
+static inline size_t vk_dev_out_bytes_for(VkPrecKind prec) { return (prec == VK_PREC_HALF || prec == VK_PREC_FLOAT) ? 4u : 8u; }
 
-static inline size_t vk_solve_real_bytes_for(VkPrecKind prec) {
-    return (prec == VK_PREC_HALF || prec == VK_PREC_FLOAT) ? 4u : 8u;
-}
+static inline size_t vk_solve_real_bytes_for(VkPrecKind prec) { return (prec == VK_PREC_HALF || prec == VK_PREC_FLOAT) ? 4u : 8u; }
 
 static inline size_t vk_pow2_floor_sz(size_t v) {
     if (v == 0u) return 1u;
@@ -83,17 +91,15 @@ static inline int vk_env_int_or(const char* name, int fallback) {
 }
 
 typedef struct VkChunkMemoryFit {
-    bool   fits;
-    int    B_chunk;
+    bool fits;
+    int B_chunk;
     size_t plan_max_bs;
     size_t fixed_plus_plan;
     size_t bytes_per_blk;
 } VkChunkMemoryFit;
 
-static inline VkChunkMemoryFit vk_evaluate_chunk_memory(
-    int Nf, int M, int degree, bool is_ihs, bool has_cond,
-    VkPswfMode mode, VkPrecKind prec, int N_block,
-    const VkDeviceFftConfig* dev_cfg, size_t slot_budget) {
+static inline VkChunkMemoryFit vk_evaluate_chunk_memory(int Nf, int M, int degree, bool is_ihs, bool has_cond, VkPswfMode mode, VkPrecKind prec, int N_block,
+                                                        const VkDeviceFftConfig* dev_cfg, size_t slot_budget) {
     VkChunkMemoryFit fit = {0};
     int nfft = 2 * N_block;
     int nout = vk_nufft1_nout(N_block, mode);
@@ -149,8 +155,7 @@ static inline VkChunkMemoryFit vk_evaluate_chunk_memory(
     if (scr_per_blk > max_single) max_single = scr_per_blk;
     fit.bytes_per_blk = per_blk_total;
 
-    if (in_bytes > max_alloc || out_bytes > max_alloc ||
-        fixed_total >= slot_budget || max_single > max_alloc) {
+    if (in_bytes > max_alloc || out_bytes > max_alloc || fixed_total >= slot_budget || max_single > max_alloc) {
         fit.fits = false;
         return fit;
     }
@@ -178,10 +183,8 @@ static inline VkChunkMemoryFit vk_evaluate_chunk_memory(
     return fit;
 }
 
-static inline double vk_eval_gpu_block_cost(
-    int Nf, int M, int degree, bool is_ihs,
-    VkPswfMode mode, VkPrecKind prec, int N_block,
-    const VkDeviceFftConfig* dev_cfg, int num_slots, double fp64_to_fp32_ratio) {
+static inline double vk_eval_gpu_block_cost(int Nf, int M, int degree, bool is_ihs, VkPswfMode mode, VkPrecKind prec, int N_block,
+                                            const VkDeviceFftConfig* dev_cfg, int num_slots, double fp64_to_fp32_ratio) {
     int nout = vk_nufft1_nout(N_block, mode);
     int nfft = 2 * N_block;
     int log_nfft = 0;
@@ -212,10 +215,14 @@ static inline double vk_eval_gpu_block_cost(
     }
 
     double fft_pass_mult = 1.0;
-    if ((size_t)nfft > 65536u) fft_pass_mult = 4.0;
-    else if ((size_t)nfft > 4u * sp_nfft) fft_pass_mult = 2.8;
-    else if ((size_t)nfft > sp_nfft) fft_pass_mult = 2.25;
-    else if ((size_t)nfft == sp_nfft && sp_nfft >= 4096u) fft_pass_mult = 1.25;
+    if ((size_t)nfft > 65536u)
+        fft_pass_mult = 4.0;
+    else if ((size_t)nfft > 4u * sp_nfft)
+        fft_pass_mult = 2.8;
+    else if ((size_t)nfft > sp_nfft)
+        fft_pass_mult = 2.25;
+    else if ((size_t)nfft == sp_nfft && sp_nfft >= 4096u)
+        fft_pass_mult = 1.25;
     double fft_cost = n_exec * B * (double)nfft * (0.35 + 0.065 * (double)log_nfft) * fft_pass_mult * (prec_bytes / 8.0) * fp64_alu_mult;
 
     size_t win_cap = (size_t)nfft;
@@ -228,9 +235,7 @@ static inline double vk_eval_gpu_block_cost(
     if (num_wins < 1.0) num_wins = 1.0;
     double win_pen = (num_wins <= 1.0) ? 1.0 : (1.0 + 0.14 * log2(num_wins));
     /* Account for per-window grid zero/flush & fragmentation when num_wins grows large */
-    double win_flush_cost = (num_wins > 1.0)
-        ? (n_exec * B * num_wins * (double)win_cap * 0.18 * (prec_bytes / 8.0))
-        : 0.0;
+    double win_flush_cost = (num_wins > 1.0) ? (n_exec * B * num_wins * (double)win_cap * 0.18 * (prec_bytes / 8.0)) : 0.0;
     double spread_cost = n_exec * B * (double)M * (double)w * (0.55 * fp64_alu_mult) * win_pen + win_flush_cost;
 
     double phase_beta = (prec == VK_PREC_DF) ? 2.2 : ((prec == VK_PREC_DOUBLE) ? (1.2 * fp64_alu_mult) : 0.75);
@@ -251,10 +256,8 @@ static inline double vk_eval_gpu_block_cost(
     return (fft_cost + spread_cost + phase_cost + launch_overhead) * occ_pen + pre_cost;
 }
 
-static inline VkGpuPlanChoice vk_choose_gpu_periodogram_plan(
-    int Nf, int M, int degree, bool is_ihs, bool has_cond,
-    VkPswfMode mode, VkPrecKind prec,
-    const VkDeviceFftConfig* dev_cfg, int num_slots, double fp64_to_fp32_ratio) {
+static inline VkGpuPlanChoice vk_choose_gpu_periodogram_plan(int Nf, int M, int degree, bool is_ihs, bool has_cond, VkPswfMode mode, VkPrecKind prec,
+                                                             const VkDeviceFftConfig* dev_cfg, int num_slots, double fp64_to_fp32_ratio) {
     VkGpuPlanChoice out = {0};
     out.mode = mode;
     out.w = vk_kernel_width_for(prec, mode);
@@ -276,7 +279,10 @@ static inline VkGpuPlanChoice vk_choose_gpu_periodogram_plan(
         for (int cand = 512; cand <= max_cand; cand <<= 1) {
             VkChunkMemoryFit fit = vk_evaluate_chunk_memory(Nf, M, degree, is_ihs, has_cond, mode, prec, cand, dev_cfg, out.slot_budget_bytes);
             if (!fit.fits) {
-                if (!found_any) { best_block = cand; best_fit = fit; }
+                if (!found_any) {
+                    best_block = cand;
+                    best_fit = fit;
+                }
                 continue;
             }
             double c = vk_eval_gpu_block_cost(Nf, M, degree, is_ihs, mode, prec, cand, dev_cfg, num_slots, fp64_to_fp32_ratio);

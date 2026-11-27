@@ -1,13 +1,13 @@
 #pragma once
 
-#include "common/device.hpp"
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#include "common/device.hpp"
 
 namespace sycl_fft {
 
@@ -19,19 +19,28 @@ namespace sycl_fft {
 // ============================================================================
 template <size_t Bytes>
 struct RawBitRevStorage;
-template <> struct RawBitRevStorage<4>  { using type = uint32_t; };
-template <> struct RawBitRevStorage<8>  { using type = uint64_t; };
-template <> struct RawBitRevStorage<16> { using type = sycl::uint4; };
+template <>
+struct RawBitRevStorage<4> {
+    using type = uint32_t;
+};
+template <>
+struct RawBitRevStorage<8> {
+    using type = uint64_t;
+};
+template <>
+struct RawBitRevStorage<16> {
+    using type = sycl::uint4;
+};
 
 template <typename ComplexT>
 using RawBitRevStorageT = typename RawBitRevStorage<sizeof(ComplexT)>::type;
 
 enum class BitRevLutKind : uint8_t {
     None = 0,
-    Pairs = 1,   // in-place (i, j) pairs with i < j
-    Idx = 2,     // out-of-place full rev[N] index table
-    CobraW4 = 3, // rev_w (w=4) + compact b_pairs (in-place) / b_all_rev (out-of-place)
-    CobraW5 = 4  // rev_w (w=5) + compact b_pairs (in-place) / b_all_rev (out-of-place)
+    Pairs = 1,    // in-place (i, j) pairs with i < j
+    Idx = 2,      // out-of-place full rev[N] index table
+    CobraW4 = 3,  // rev_w (w=4) + compact b_pairs (in-place) / b_all_rev (out-of-place)
+    CobraW5 = 4   // rev_w (w=5) + compact b_pairs (in-place) / b_all_rev (out-of-place)
 };
 
 // Opaque device LUT state (defined in bitrev/bitrev.cpp)
@@ -39,16 +48,15 @@ struct BitRevLutState;
 
 template <typename RawT>
 struct BitRevCandidate {
-    using LaunchFn = void (*)(
-        sycl::queue&, const RawT*, RawT*, size_t, int, BitRevLutState&, size_t, int);
+    using LaunchFn = void (*)(sycl::queue&, const RawT*, RawT*, size_t, int, BitRevLutState&, size_t, int);
 
-    const char*   variant_id;
-    size_t        wg_size;
-    size_t        smem_bytes;
-    bool          requires_native_local_mem;
-    bool          cpu_only;
+    const char* variant_id;
+    size_t wg_size;
+    size_t smem_bytes;
+    bool requires_native_local_mem;
+    bool cpu_only;
     BitRevLutKind lut_kind;
-    LaunchFn      launch;
+    LaunchFn launch;
 };
 
 // Capability-filtered, shortlist-autotuned bit-reversal engine
@@ -56,10 +64,9 @@ struct BitRevCandidate {
 // Requires an in-order sycl::queue (enforced in constructor).
 template <typename RawT>
 class BitRevEngine {
-public:
+   public:
     BitRevEngine();
-    BitRevEngine(sycl::queue q, int logN, const char* prec_tag,
-                 const DeviceFftConfig& dev_cfg, const FftLaunchConfig& launch_cfg);
+    BitRevEngine(sycl::queue q, int logN, const char* prec_tag, const DeviceFftConfig& dev_cfg, const FftLaunchConfig& launch_cfg);
     ~BitRevEngine();
 
     BitRevEngine(const BitRevEngine&) = delete;
@@ -67,28 +74,22 @@ public:
     BitRevEngine(BitRevEngine&&) noexcept;
     BitRevEngine& operator=(BitRevEngine&&) noexcept;
 
-    const std::vector<BitRevCandidate<RawT>>& valid_candidates(bool in_place) const {
-        return in_place ? valid_ip_ : valid_oop_;
-    }
+    const std::vector<BitRevCandidate<RawT>>& valid_candidates(bool in_place) const { return in_place ? valid_ip_ : valid_oop_; }
 
     void resolve(bool in_place);
     void execute_in_place(RawT* buf, size_t bs);
     void execute(const RawT* src, RawT* dst, size_t bs);
-    void execute_candidate(const BitRevCandidate<RawT>& cand,
-                           const RawT* src, RawT* dst, size_t bs);
+    void execute_candidate(const BitRevCandidate<RawT>& cand, const RawT* src, RawT* dst, size_t bs);
     const char* variant_name(bool in_place = true);
     bool cache_hit(bool in_place = true);
 
-private:
+   private:
     size_t effective_wg_override(const BitRevCandidate<RawT>& cand) const;
-    std::vector<BitRevCandidate<RawT>> filter_candidates(
-        const std::vector<BitRevCandidate<RawT>>& all) const;
+    std::vector<BitRevCandidate<RawT>> filter_candidates(const std::vector<BitRevCandidate<RawT>>& all) const;
     void set_resolved(bool in_place, int idx, bool hit);
-    std::vector<size_t> shortlist_for_tuning(
-        bool in_place, const std::vector<BitRevCandidate<RawT>>& cands) const;
+    std::vector<size_t> shortlist_for_tuning(bool in_place, const std::vector<BitRevCandidate<RawT>>& cands) const;
     size_t representative_tune_bs() const;
-    int tune_candidates(bool in_place, const std::vector<BitRevCandidate<RawT>>& cands,
-                        bool persist_cache, const std::string& cache_key);
+    int tune_candidates(bool in_place, const std::vector<BitRevCandidate<RawT>>& cands, bool persist_cache, const std::string& cache_key);
 
     sycl::queue q_;
     int logN_ = 0;
@@ -116,7 +117,7 @@ extern template class BitRevEngine<sycl::uint4>;
 // Zero-overhead typed wrapper mapping ComplexT -> RawBitRevStorageT<ComplexT>.
 template <typename ComplexT>
 class BitRevPlan {
-public:
+   public:
     using RawT = RawBitRevStorageT<ComplexT>;
     using CandidateT = BitRevCandidate<RawT>;
 
@@ -125,23 +126,16 @@ public:
 
     BitRevPlan() = default;
 
-    BitRevPlan(sycl::queue q, int logN, const char* prec_tag,
-               const DeviceFftConfig& dev_cfg, const FftLaunchConfig& launch_cfg)
+    BitRevPlan(sycl::queue q, int logN, const char* prec_tag, const DeviceFftConfig& dev_cfg, const FftLaunchConfig& launch_cfg)
         : engine_(std::move(q), logN, prec_tag, dev_cfg, launch_cfg) {}
 
-    const std::vector<CandidateT>& valid_candidates(bool in_place) const {
-        return engine_.valid_candidates(in_place);
-    }
+    const std::vector<CandidateT>& valid_candidates(bool in_place) const { return engine_.valid_candidates(in_place); }
 
     void resolve(bool in_place) { engine_.resolve(in_place); }
 
-    void execute_in_place(ComplexT* buf, size_t bs) {
-        engine_.execute_in_place(reinterpret_cast<RawT*>(buf), bs);
-    }
+    void execute_in_place(ComplexT* buf, size_t bs) { engine_.execute_in_place(reinterpret_cast<RawT*>(buf), bs); }
 
-    void execute(const ComplexT* src, ComplexT* dst, size_t bs) {
-        engine_.execute(reinterpret_cast<const RawT*>(src), reinterpret_cast<RawT*>(dst), bs);
-    }
+    void execute(const ComplexT* src, ComplexT* dst, size_t bs) { engine_.execute(reinterpret_cast<const RawT*>(src), reinterpret_cast<RawT*>(dst), bs); }
 
     void execute_candidate(const CandidateT& cand, const ComplexT* src, ComplexT* dst, size_t bs) {
         engine_.execute_candidate(cand, reinterpret_cast<const RawT*>(src), reinterpret_cast<RawT*>(dst), bs);
@@ -150,8 +144,8 @@ public:
     const char* variant_name(bool in_place = true) { return engine_.variant_name(in_place); }
     bool cache_hit(bool in_place = true) { return engine_.cache_hit(in_place); }
 
-private:
+   private:
     BitRevEngine<RawT> engine_{};
 };
 
-} // namespace sycl_fft
+}  // namespace sycl_fft

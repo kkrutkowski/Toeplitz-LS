@@ -157,10 +157,10 @@ df_t df_log(df_t x) {{
     df_t poly = vec2(1.0f / 15.0f, 0.0f);
     poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 13.0)});
     poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 11.0)});
-    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 /  9.0)});
-    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 /  7.0)});
-    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 /  5.0)});
-    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 /  3.0)});
+    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 9.0)});
+    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 7.0)});
+    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 5.0)});
+    poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 3.0)});
     poly = df_add(df_mul(poly, t2), vec2(1.0f, 0.0f));
     df_t ln_m = df_scale_pow2(df_mul(t, poly), 2.0f);
     return df_add(ln_m, df_mul_f(kLn2Df, float(e)));
@@ -228,6 +228,7 @@ float f_log1p(float x) {{
 # ============================================================================
 # 1. Subgrid Phase-Modulation Shaders
 # ============================================================================
+
 
 def _gen_subgrid(prec: str) -> dict:
     if prec == "d":
@@ -435,6 +436,7 @@ void main() {{
 # ============================================================================
 # 2. Normalization & Precision Helpers for FastChi2 Solvers
 # ============================================================================
+
 
 def _glsl_fastchi2_norm_helpers(prec: str) -> str:
     if prec == "d":
@@ -976,6 +978,7 @@ layout(push_constant) uniform Push {{
 # 3. FastChi2 GLS (d == 1) Shaders
 # ============================================================================
 
+
 def _gen_fastchi2_gls(prec: str) -> dict:
     p = _solve_prec_macros(prec)
 
@@ -1147,13 +1150,13 @@ layout(constant_id = 4) const uint SPEC_USE_RAW  = 0u;
 layout(constant_id = 5) const uint SPEC_MODE43   = 1u;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly  buffer TrigBuf   {{ {p['buf_t']} d_trig[]; }};
-layout(std430, binding = 1) readonly  buffer PhiBuf    {{ {p['sc_t']}  d_slot_phi_hat[]; }};
-layout(std430, binding = 2) readonly  buffer DecBuf    {{ {p['sc_t']}  d_slot_deconv[]; }};
-layout(std430, binding = 3) writeonly buffer PowBuf    {{ {p['out_t']} d_power[]; }};
-layout(std430, binding = 4) writeonly buffer CondBuf   {{ {p['out_t']} d_cond[]; }};
-{_fastchi2_push_block(p['push_sc_t'])}
-{p['ops']}
+layout(std430, binding = 0) readonly  buffer TrigBuf   {{ {p["buf_t"]} d_trig[]; }};
+layout(std430, binding = 1) readonly  buffer PhiBuf    {{ {p["sc_t"]}  d_slot_phi_hat[]; }};
+layout(std430, binding = 2) readonly  buffer DecBuf    {{ {p["sc_t"]}  d_slot_deconv[]; }};
+layout(std430, binding = 3) writeonly buffer PowBuf    {{ {p["out_t"]} d_power[]; }};
+layout(std430, binding = 4) writeonly buffer CondBuf   {{ {p["out_t"]} d_cond[]; }};
+{_fastchi2_push_block(p["push_sc_t"])}
+{p["ops"]}
 {_glsl_fastchi2_norm_helpers(prec)}
 {trig_helper}
 void main() {{
@@ -1243,6 +1246,7 @@ void main() {{
 # ============================================================================
 # 4. FastChi2 Levinson-Durbin (d >= 2) Shaders
 # ============================================================================
+
 
 def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
     """mode: 'unrolled' (exact_deg 2..5 in registers), 'smem' (d>=6 bank-conflict-free SoA SMEM), 'large' (global scratch)."""
@@ -1357,15 +1361,10 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
             ]
             for q in range(1, 2 * exact_deg + 1):
                 wrow = (2 * (q - 1)) if q <= exact_deg else (exact_deg + q - 1)
-                preload_lines.append(
-                    f"    load_trig_slot({wrow}u * chunk_bins, bin_idx, R_r[{q - 1}], R_i[{q - 1}]); "
-                    f"R_i[{q - 1}] = s_neg(R_i[{q - 1}]);"
-                )
+                preload_lines.append(f"    load_trig_slot({wrow}u * chunk_bins, bin_idx, R_r[{q - 1}], R_i[{q - 1}]); R_i[{q - 1}] = s_neg(R_i[{q - 1}]);")
             for q in range(1, exact_deg + 1):
                 yrow = 2 * (q - 1) + 1
-                preload_lines.append(
-                    f"    load_trig_slot({yrow}u * chunk_bins, bin_idx, Y_r[{q - 1}], Y_i[{q - 1}]);"
-                )
+                preload_lines.append(f"    load_trig_slot({yrow}u * chunk_bins, bin_idx, Y_r[{q - 1}], Y_i[{q - 1}]);")
             pre_y0_block = "\n".join(preload_lines)
             y0_load = f"    y0r = Y_r[{exact_deg - 1}]; y0i = Y_i[{exact_deg - 1}];"
             pred_decl = ""
@@ -1434,11 +1433,7 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
             step_lines.append("    }")
         lev_body = "\n".join(step_lines)
     elif mode == "smem":  # bank-conflict-free SoA shared memory (a_r[], a_i[] in LDS/SMEM; zero global scratch)
-        extra_decls = (
-            f"layout(constant_id = 6) const uint SMEM_ELEMS = 1024u;\n"
-            f"shared {p['scr_t']} l_ar[SMEM_ELEMS];\n"
-            f"shared {p['scr_t']} l_ai[SMEM_ELEMS];\n"
-        )
+        extra_decls = f"layout(constant_id = 6) const uint SMEM_ELEMS = 1024u;\nshared {p['scr_t']} l_ar[SMEM_ELEMS];\nshared {p['scr_t']} l_ai[SMEM_ELEMS];\n"
         pred_decl = "    uint tid = gl_LocalInvocationID.x;"
         lev_body = """
     for (int k = 1; k < norder; ++k) {
@@ -1506,10 +1501,7 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
         r2 = s_fma(abs2_xi, inv_E, r2);
     }"""
     else:  # large (warp-tiled contiguous paired scratch parameterized by TILE_LANES)
-        extra_decls = (
-            "layout(constant_id = 6) const uint TILE_LANES      = 32u;\n"
-            "layout(constant_id = 7) const uint LOG2_TILE_LANES = 5u;\n"
-        )
+        extra_decls = "layout(constant_id = 6) const uint TILE_LANES      = 32u;\nlayout(constant_id = 7) const uint LOG2_TILE_LANES = 5u;\n"
         scratch_binding = f"layout(std430, binding = 5) buffer ScratchBuf {{ {p['scr_pair_t']} d_a_scratch[]; }};"
         pred_decl = (
             "    uint item_stride = (uint(items_per_blk) + TILE_LANES - 1u) & ~(TILE_LANES - 1u);\n"
@@ -1591,14 +1583,14 @@ layout(constant_id = 4) const uint SPEC_USE_RAW  = 0u;
 layout(constant_id = 5) const uint SPEC_MODE43   = 1u;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 {extra_decls}
-layout(std430, binding = 0) readonly  buffer TrigBuf {{ {p['buf_t']} d_trig[]; }};
-layout(std430, binding = 1) readonly  buffer PhiBuf  {{ {p['sc_t']}  d_slot_phi_hat[]; }};
-layout(std430, binding = 2) readonly  buffer DecBuf  {{ {p['sc_t']}  d_slot_deconv[]; }};
-layout(std430, binding = 3) writeonly buffer PowBuf  {{ {p['out_t']} d_power[]; }};
-layout(std430, binding = 4) writeonly buffer CondBuf {{ {p['out_t']} d_cond[]; }};
+layout(std430, binding = 0) readonly  buffer TrigBuf {{ {p["buf_t"]} d_trig[]; }};
+layout(std430, binding = 1) readonly  buffer PhiBuf  {{ {p["sc_t"]}  d_slot_phi_hat[]; }};
+layout(std430, binding = 2) readonly  buffer DecBuf  {{ {p["sc_t"]}  d_slot_deconv[]; }};
+layout(std430, binding = 3) writeonly buffer PowBuf  {{ {p["out_t"]} d_power[]; }};
+layout(std430, binding = 4) writeonly buffer CondBuf {{ {p["out_t"]} d_cond[]; }};
 {scratch_binding}
-{_fastchi2_push_block(p['push_sc_t'])}
-{p['ops']}
+{_fastchi2_push_block(p["push_sc_t"])}
+{p["ops"]}
 {_glsl_fastchi2_norm_helpers(prec)}
 
 uint trig_w_row(int q, int degree) {{
@@ -1688,6 +1680,7 @@ void main() {{
 # ============================================================================
 # 5. IHS Shaders (single, accum, finalize)
 # ============================================================================
+
 
 def _glsl_ihs_math(prec: str) -> str:
     if prec == "d":
@@ -1950,7 +1943,10 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
     }"""
 
     out[f"ihs_single_{prec}"] = {
-        "source": hdr + slot_blk + ihs_specs + f"""
+        "source": hdr
+        + slot_blk
+        + ihs_specs
+        + f"""
 layout(std430, binding = 0) readonly  buffer ZBuf   {{ {z_t}   d_z[]; }};
 layout(std430, binding = 1) readonly  buffer DecBuf {{ {out_t} d_slot_deconv[]; }};
 layout(std430, binding = 2) writeonly buffer PowBuf {{ {out_t} d_power[]; }};
@@ -1969,7 +1965,9 @@ void main() {{{ihs_coord}
     }
 
     out[f"ihs_accum_{prec}"] = {
-        "source": hdr + ihs_specs + f"""
+        "source": hdr
+        + ihs_specs
+        + f"""
 layout(std430, binding = 0) readonly buffer ZBuf   {{ {z_t}   d_z[]; }};
 layout(std430, binding = 1) readonly buffer DecBuf {{ {out_t} d_slot_deconv[]; }};
 layout(std430, binding = 2) buffer          AccBuf {{ {out_t} d_acc[]; }};
@@ -1984,7 +1982,10 @@ void main() {{{ihs_coord}
     }
 
     out[f"ihs_finalize_{prec}"] = {
-        "source": hdr + slot_blk + ihs_specs + f"""
+        "source": hdr
+        + slot_blk
+        + ihs_specs
+        + f"""
 layout(std430, binding = 0) readonly  buffer AccBuf {{ {out_t} d_acc[]; }};
 layout(std430, binding = 1) readonly  buffer DecBuf {{ {out_t} d_slot_deconv[]; }};
 layout(std430, binding = 2) writeonly buffer PowBuf {{ {out_t} d_power[]; }};

@@ -27,23 +27,23 @@ from common_glsl import (
 
 # (prec_tag, W, NEven, NOdd)
 PSWF_WIDTH_SPECS = [
-    ("h",  4, 4, 3),
-    ("h",  5, 4, 3),
-    ("f",  8, 5, 4),
-    ("f",  9, 5, 4),
+    ("h", 4, 4, 3),
+    ("h", 5, 4, 3),
+    ("f", 8, 5, 4),
+    ("f", 9, 5, 4),
     ("df", 14, 7, 6),
     ("df", 15, 7, 6),
     ("df", 16, 7, 6),
-    ("d",  16, 8, 7),
-    ("d",  17, 8, 7),
-    ("d",  18, 8, 7),
+    ("d", 16, 8, 7),
+    ("d", 17, 8, 7),
+    ("d", 18, 8, 7),
 ]
 
 REG_Q_BY_PREC = {
-    "h":  (8, 16, 32),
-    "f":  (4, 8, 16, 32),
+    "h": (8, 16, 32),
+    "f": (4, 8, 16, 32),
     "df": (4, 8, 16),
-    "d":  (2, 4, 8, 16),
+    "d": (2, 4, 8, 16),
 }
 
 
@@ -83,33 +83,24 @@ def _emit_weight_eval_body(prec: str, w: int, n_even: int, n_odd: int) -> list[s
         ]
         for j in range(n_left):
             lines.append(
-                f"    f16vec2 eo_{j} = f16vec2(float16_t(d_tbl[{4 + j * n_even + (n_even - 1)}]), "
-                f"float16_t(d_tbl[{odd_base + j * n_odd + (n_odd - 1)}]));"
+                f"    f16vec2 eo_{j} = f16vec2(float16_t(d_tbl[{4 + j * n_even + (n_even - 1)}]), float16_t(d_tbl[{odd_base + j * n_odd + (n_odd - 1)}]));"
             )
             max_terms = max(n_even, n_odd)
             for k in range(max_terms - 2, -1, -1):
                 e_idx = 4 + j * n_even + k
                 o_idx = odd_base + j * n_odd + k
                 if k < n_odd:
-                    lines.append(
-                        f"    eo_{j} = fma(eo_{j}, t_v, f16vec2(float16_t(d_tbl[{e_idx}]), float16_t(d_tbl[{o_idx}])));"
-                    )
+                    lines.append(f"    eo_{j} = fma(eo_{j}, t_v, f16vec2(float16_t(d_tbl[{e_idx}]), float16_t(d_tbl[{o_idx}])));")
                 else:
-                    lines.append(
-                        f"    eo_{j}.x = fma(eo_{j}.x, t_v.x, float16_t(d_tbl[{e_idx}]));"
-                    )
+                    lines.append(f"    eo_{j}.x = fma(eo_{j}.x, t_v.x, float16_t(d_tbl[{e_idx}]));")
             lines.append(f"    float16_t uo_{j} = u * eo_{j}.y;")
             lines.append(f"    d_weights[base + {j}u] = eo_{j}.x + uo_{j};")
             lines.append(f"    d_weights[base + {w - 1 - j}u] = eo_{j}.x - uo_{j};")
         if w & 1:
             j_mid = w // 2
-            lines.append(
-                f"    float16_t em_acc = float16_t(d_tbl[{4 + j_mid * n_even + (n_even - 1)}]);"
-            )
+            lines.append(f"    float16_t em_acc = float16_t(d_tbl[{4 + j_mid * n_even + (n_even - 1)}]);")
             for k in range(n_even - 2, -1, -1):
-                lines.append(
-                    f"    em_acc = fma(em_acc, t_v.x, float16_t(d_tbl[{4 + j_mid * n_even + k}]));"
-                )
+                lines.append(f"    em_acc = fma(em_acc, t_v.x, float16_t(d_tbl[{4 + j_mid * n_even + k}]));")
             lines.append(f"    d_weights[base + {j_mid}u] = em_acc;")
         return lines
 
@@ -740,8 +731,8 @@ def _gen_spread_smem(prec: str) -> dict:
 
     if d["pack_smem"]:
         smem_decl = f"""
-shared {d['smem_pair_t']} l_grid[SMEM_GRID_ELEMS];
-shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];
+shared {d["smem_pair_t"]} l_grid[SMEM_GRID_ELEMS];
+shared {d["smem_pair_t"]} l_sy[SMEM_SY_ELEMS];
 """
         zero_body = f"        l_grid[idx] = {d['zero_pair']};"
         if prec == "h":
@@ -798,15 +789,15 @@ shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];
         }"""
     else:
         smem_decl = f"""
-shared {d['real_t']} l_re[SMEM_GRID_ELEMS];
-shared {d['real_t']} l_im[SMEM_GRID_ELEMS];
-shared {d['real_t']} l_sy_re[SMEM_SY_ELEMS];
-shared {d['real_t']} l_sy_im[SMEM_SY_ELEMS];
+shared {d["real_t"]} l_re[SMEM_GRID_ELEMS];
+shared {d["real_t"]} l_im[SMEM_GRID_ELEMS];
+shared {d["real_t"]} l_sy_re[SMEM_SY_ELEMS];
+shared {d["real_t"]} l_sy_im[SMEM_SY_ELEMS];
 """
         zero_body = f"        l_re[idx] = {d['zero_expr']};\n        l_im[idx] = {d['zero_expr']};"
         store_sy = "                    l_sy_re[sy_slot] = sy_re;\n                    l_sy_im[sy_slot] = sy_im;"
-        load_sy = f"""                {d['real_t']} sy_re = l_sy_re[k * sy_stride + eff_lane_b];
-                {d['real_t']} sy_im = l_sy_im[k * sy_stride + eff_lane_b];"""
+        load_sy = f"""                {d["real_t"]} sy_re = l_sy_re[k * sy_stride + eff_lane_b];
+                {d["real_t"]} sy_im = l_sy_im[k * sy_stride + eff_lane_b];"""
         if prec == "df":
             accum_code = """
                     int g_idx = grid_base + bin;
@@ -857,13 +848,13 @@ layout(constant_id = 12) const uint SPLIT_M         = 1u;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly  buffer WBuf     {{ {d['sc_t']}  d_weights[]; }};
+layout(std430, binding = 0) readonly  buffer WBuf     {{ {d["sc_t"]}  d_weights[]; }};
 layout(std430, binding = 1) readonly  buffer FirstBuf {{ int          d_first[]; }};
-layout(std430, binding = 2) readonly  buffer ShiftBuf {{ {d['buf_t']} d_shift[]; }};
+layout(std430, binding = 2) readonly  buffer ShiftBuf {{ {d["buf_t"]} d_shift[]; }};
 layout(std430, binding = 3) readonly  buffer OffBuf   {{ int          d_bucket_off[]; }};
 layout(std430, binding = 4) readonly  buffer MBuf     {{ int          d_bucket_m[]; }};
-layout(std430, binding = 5) readonly  buffer YBuf     {{ {d['buf_t']} d_y[]; }};
-layout(std430, binding = 6) writeonly buffer FftBuf   {{ {d['buf_t']} d_fft_buf[]; }};
+layout(std430, binding = 5) readonly  buffer YBuf     {{ {d["buf_t"]} d_y[]; }};
+layout(std430, binding = 6) writeonly buffer FftBuf   {{ {d["buf_t"]} d_fft_buf[]; }};
 
 layout(push_constant) uniform Push {{
     int  M;
@@ -879,7 +870,7 @@ layout(push_constant) uniform Push {{
 }} pc;
 {smem_decl}
 shared int l_first[TILE_M];
-shared {d['sc_t']} l_w[SMEM_W_ELEMS];
+shared {d["sc_t"]} l_w[SMEM_W_ELEMS];
 {_emit_load_shifted_y(prec)}
 void main() {{
     int tid = int(gl_LocalInvocationID.x);
@@ -899,7 +890,7 @@ void main() {{
     uint my_bp   = bp_base + uint(eff_lane_b);
     int grid_base = lane_b * int(GRID_STRIDE);
     int nfft_mask = pc.nfft - 1;
-    uint bs_packed = (pc.chunk_bs + {d['lanes'] - 1}u) / {d['lanes']}u;
+    uint bs_packed = (pc.chunk_bs + {d["lanes"] - 1}u) / {d["lanes"]}u;
 
     for (int idx = tid; idx < int(SMEM_GRID_ELEMS); idx += int(WG_SIZE)) {{
 {zero_body}
@@ -946,7 +937,7 @@ void main() {{
                 if (bp < bs_packed) {{
                     int p_idx = p_base + k;
                     int m_idx = (pc.num_wins == 1) ? p_idx : d_bucket_m[p_idx];
-                    {d['real_t']} sy_re, sy_im;
+                    {d["real_t"]} sy_re, sy_im;
                     load_shifted_y(bp, pc.total_M_stride, pc.chunk_bs, pc.y_offset_elems, m_idx, p_idx, sy_re, sy_im);
                     int sy_slot = k * sy_stride + b_sub;
 {store_sy}
@@ -1036,37 +1027,49 @@ def _gen_spread_reg(prec: str, q_val: int) -> dict:
     d = _spread_prec_defs(prec)
 
     if d["pack_smem"]:
-        smem_decl = (
-            f"shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];\n"
-            f"shared {d['smem_pair_t']} l_red[SMEM_RED_ELEMS];"
-        )
+        smem_decl = f"shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];\nshared {d['smem_pair_t']} l_red[SMEM_RED_ELEMS];"
         if prec == "h":
             store_sy = "                    l_sy[sy_slot] = uvec2(f16x2_to_u32(sy_re), f16x2_to_u32(sy_im));"
             load_sy = """                uvec2 sy_p = l_sy[k * sy_stride + eff_lane_b];
                 f16vec2 sy_re = u32_to_f16x2(sy_p.x);
                 f16vec2 sy_im = u32_to_f16x2(sy_p.y);"""
-            red_store = lambda qi: f"        l_red[tid] = uvec2(f16x2_to_u32(acc_re[{qi}]), f16x2_to_u32(acc_im[{qi}]));"
-            red_add   = lambda qi: f"            {{ uvec2 rp = l_red[ridx]; acc_re[{qi}] += u32_to_f16x2(rp.x); acc_im[{qi}] += u32_to_f16x2(rp.y); }}"
+
+            def red_store(qi):
+                return f"        l_red[tid] = uvec2(f16x2_to_u32(acc_re[{qi}]), f16x2_to_u32(acc_im[{qi}]));"
+
+            def red_add(qi):
+                return f"            {{ uvec2 rp = l_red[ridx]; acc_re[{qi}] += u32_to_f16x2(rp.x); acc_im[{qi}] += u32_to_f16x2(rp.y); }}"
         else:
             store_sy = "                    l_sy[sy_slot] = vec2(sy_re, sy_im);"
             load_sy = """                vec2 sy_p = l_sy[k * sy_stride + eff_lane_b];
                 float sy_re = sy_p.x;
                 float sy_im = sy_p.y;"""
-            red_store = lambda qi: f"        l_red[tid] = vec2(acc_re[{qi}], acc_im[{qi}]);"
-            red_add   = lambda qi: f"            {{ vec2 rp = l_red[ridx]; acc_re[{qi}] += rp.x; acc_im[{qi}] += rp.y; }}"
+
+            def red_store(qi):
+                return f"        l_red[tid] = vec2(acc_re[{qi}], acc_im[{qi}]);"
+
+            def red_add(qi):
+                return f"            {{ vec2 rp = l_red[ridx]; acc_re[{qi}] += rp.x; acc_im[{qi}] += rp.y; }}"
     else:
-        smem_decl = f"""shared {d['real_t']} l_sy_re[SMEM_SY_ELEMS];
-shared {d['real_t']} l_sy_im[SMEM_SY_ELEMS];
-shared {d['real_t']} l_red_re[SMEM_RED_ELEMS];
-shared {d['real_t']} l_red_im[SMEM_RED_ELEMS];"""
+        smem_decl = f"""shared {d["real_t"]} l_sy_re[SMEM_SY_ELEMS];
+shared {d["real_t"]} l_sy_im[SMEM_SY_ELEMS];
+shared {d["real_t"]} l_red_re[SMEM_RED_ELEMS];
+shared {d["real_t"]} l_red_im[SMEM_RED_ELEMS];"""
         store_sy = "                    l_sy_re[sy_slot] = sy_re;\n                    l_sy_im[sy_slot] = sy_im;"
-        load_sy = f"""                {d['real_t']} sy_re = l_sy_re[k * sy_stride + eff_lane_b];
-                {d['real_t']} sy_im = l_sy_im[k * sy_stride + eff_lane_b];"""
-        red_store = lambda qi: f"        l_red_re[tid] = acc_re[{qi}]; l_red_im[tid] = acc_im[{qi}];"
+        load_sy = f"""                {d["real_t"]} sy_re = l_sy_re[k * sy_stride + eff_lane_b];
+                {d["real_t"]} sy_im = l_sy_im[k * sy_stride + eff_lane_b];"""
+
+        def red_store(qi):
+            return f"        l_red_re[tid] = acc_re[{qi}]; l_red_im[tid] = acc_im[{qi}];"
+
         if prec == "df":
-            red_add = lambda qi: f"            acc_re[{qi}] = df_add(acc_re[{qi}], l_red_re[ridx]); acc_im[{qi}] = df_add(acc_im[{qi}], l_red_im[ridx]);"
+
+            def red_add(qi):
+                return f"            acc_re[{qi}] = df_add(acc_re[{qi}], l_red_re[ridx]); acc_im[{qi}] = df_add(acc_im[{qi}], l_red_im[ridx]);"
         else:
-            red_add = lambda qi: f"            acc_re[{qi}] += l_red_re[ridx]; acc_im[{qi}] += l_red_im[ridx];"
+
+            def red_add(qi):
+                return f"            acc_re[{qi}] += l_red_re[ridx]; acc_im[{qi}] += l_red_im[ridx];"
 
     # Register accumulator update helper using compile-time binary search (0 local spills)
     if prec == "df":
@@ -1096,8 +1099,8 @@ void reg_acc_update(int q_idx, inout df_t acc_re[{q_val}], inout df_t acc_im[{q_
             )
         )
         reg_helper = f"""
-void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['real_t']} acc_im[{q_val}],
-                    {d['real_t']} sy_re, {d['real_t']} sy_im, {d['real_t']} wv) {{
+void reg_acc_update(int q_idx, inout {d["real_t"]} acc_re[{q_val}], inout {d["real_t"]} acc_im[{q_val}],
+                    {d["real_t"]} sy_re, {d["real_t"]} sy_im, {d["real_t"]} wv) {{
 {fma_tree}
 }}
 """
@@ -1105,8 +1108,8 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
     wv_expr = "f16vec2(ws, ws)" if prec == "h" else "ws"
     accum_call = f"""
                     int q_idx = bin >> int(LOG2_TJ);
-                    {d['sc_t']} ws = l_w[w_base + j_val];
-                    {d['real_t']} wv = {wv_expr};
+                    {d["sc_t"]} ws = l_w[w_base + j_val];
+                    {d["real_t"]} wv = {wv_expr};
                     reg_acc_update(q_idx, acc_re, acc_im, sy_re, sy_im, wv);"""
 
     # Unrolled direct register-to-global writeback (and optional SPLIT_M SMEM reduction)
@@ -1123,12 +1126,14 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
         ]
         wb_lines.extend(hdr_wb)
         for qi in range(q_val):
-            wb_lines.extend([
-                f"        {{ uint u0, u1; f16x2_pack_pair_u32(acc_re[{qi}], acc_im[{qi}], u0, u1);",
-                f"          uint off_n = uint({qi}) * T_J + uint(lane_t);",
-                f"          if (v0) d_fft_buf[dst0 + off_n] = u0;",
-                f"          if (v1) d_fft_buf[dst1 + off_n] = u1; }}",
-            ])
+            wb_lines.extend(
+                [
+                    f"        {{ uint u0, u1; f16x2_pack_pair_u32(acc_re[{qi}], acc_im[{qi}], u0, u1);",
+                    f"          uint off_n = uint({qi}) * T_J + uint(lane_t);",
+                    "          if (v0) d_fft_buf[dst0 + off_n] = u0;",
+                    "          if (v1) d_fft_buf[dst1 + off_n] = u1; }",
+                ]
+            )
         for qi in range(q_val):
             red_wb_lines.append(red_store(qi))
             red_wb_lines.append("        barrier();")
@@ -1148,16 +1153,21 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
                 red_wb_lines.append("        barrier();")
     else:
         if prec == "df":
-            pack_expr = lambda qi: f"vec4(acc_re[{qi}].x, acc_re[{qi}].y, acc_im[{qi}].x, acc_im[{qi}].y)"
+
+            def pack_expr(qi):
+                return f"vec4(acc_re[{qi}].x, acc_re[{qi}].y, acc_im[{qi}].x, acc_im[{qi}].y)"
         elif prec == "f":
-            pack_expr = lambda qi: f"vec2(acc_re[{qi}], acc_im[{qi}])"
+
+            def pack_expr(qi):
+                return f"vec2(acc_re[{qi}], acc_im[{qi}])"
         else:
-            pack_expr = lambda qi: f"dvec2(acc_re[{qi}], acc_im[{qi}])"
+
+            def pack_expr(qi):
+                return f"dvec2(acc_re[{qi}], acc_im[{qi}])"
+
         wb_lines.append("        uint dst = km_off + my_bp * uint(pc.nfft) + uint(win_lo);")
         for qi in range(q_val):
-            wb_lines.append(
-                f"        d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = {pack_expr(qi)};"
-            )
+            wb_lines.append(f"        d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = {pack_expr(qi)};")
         for qi in range(q_val):
             red_wb_lines.append(red_store(qi))
             red_wb_lines.append("        barrier();")
@@ -1172,10 +1182,7 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
             if qi + 1 < q_val:
                 red_wb_lines.append("        barrier();")
 
-    init_acc = "\n".join(
-        f"    acc_re[{qi}] = {d['zero_expr']}; acc_im[{qi}] = {d['zero_expr']};"
-        for qi in range(q_val)
-    )
+    init_acc = "\n".join(f"    acc_re[{qi}] = {d['zero_expr']}; acc_im[{qi}] = {d['zero_expr']};" for qi in range(q_val))
 
     src = (
         d["hdr"]
@@ -1195,13 +1202,13 @@ layout(constant_id = 13) const uint SMEM_RED_ELEMS = 1u;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly  buffer WBuf     {{ {d['sc_t']}  d_weights[]; }};
+layout(std430, binding = 0) readonly  buffer WBuf     {{ {d["sc_t"]}  d_weights[]; }};
 layout(std430, binding = 1) readonly  buffer FirstBuf {{ int          d_first[]; }};
-layout(std430, binding = 2) readonly  buffer ShiftBuf {{ {d['buf_t']} d_shift[]; }};
+layout(std430, binding = 2) readonly  buffer ShiftBuf {{ {d["buf_t"]} d_shift[]; }};
 layout(std430, binding = 3) readonly  buffer OffBuf   {{ int          d_bucket_off[]; }};
 layout(std430, binding = 4) readonly  buffer MBuf     {{ int          d_bucket_m[]; }};
-layout(std430, binding = 5) readonly  buffer YBuf     {{ {d['buf_t']} d_y[]; }};
-layout(std430, binding = 6) writeonly buffer FftBuf   {{ {d['buf_t']} d_fft_buf[]; }};
+layout(std430, binding = 5) readonly  buffer YBuf     {{ {d["buf_t"]} d_y[]; }};
+layout(std430, binding = 6) writeonly buffer FftBuf   {{ {d["buf_t"]} d_fft_buf[]; }};
 
 layout(push_constant) uniform Push {{
     int  M;
@@ -1218,7 +1225,7 @@ layout(push_constant) uniform Push {{
 
 {smem_decl}
 shared int l_first[TILE_M];
-shared {d['sc_t']} l_w[SMEM_W_ELEMS];
+shared {d["sc_t"]} l_w[SMEM_W_ELEMS];
 {_emit_load_shifted_y(prec)}
 {reg_helper}
 void main() {{
@@ -1238,10 +1245,10 @@ void main() {{
     uint bp_base = b_group * B_PER_WG;
     uint my_bp   = bp_base + uint(eff_lane_b);
     int nfft_mask = pc.nfft - 1;
-    uint bs_packed = (pc.chunk_bs + {d['lanes'] - 1}u) / {d['lanes']}u;
+    uint bs_packed = (pc.chunk_bs + {d["lanes"] - 1}u) / {d["lanes"]}u;
 
-    {d['real_t']} acc_re[{q_val}];
-    {d['real_t']} acc_im[{q_val}];
+    {d["real_t"]} acc_re[{q_val}];
+    {d["real_t"]} acc_im[{q_val}];
 {init_acc}
 
     int p_start = (pc.num_wins == 1) ? 0 : d_bucket_off[win];
@@ -1284,7 +1291,7 @@ void main() {{
                 if (bp < bs_packed) {{
                     int p_idx = p_base + k;
                     int m_idx = (pc.num_wins == 1) ? p_idx : d_bucket_m[p_idx];
-                    {d['real_t']} sy_re, sy_im;
+                    {d["real_t"]} sy_re, sy_im;
                     load_shifted_y(bp, pc.total_M_stride, pc.chunk_bs, pc.y_offset_elems, m_idx, p_idx, sy_re, sy_im);
                     int sy_slot = k * sy_stride + b_sub;
 {store_sy}
@@ -1411,11 +1418,11 @@ layout(constant_id = 1) const uint W_CONST = 8u;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly buffer WBuf     {{ {d['sc_t']}  d_weights[]; }};
+layout(std430, binding = 0) readonly buffer WBuf     {{ {d["sc_t"]}  d_weights[]; }};
 layout(std430, binding = 1) readonly buffer FirstBuf {{ int          d_first[]; }};
-layout(std430, binding = 2) readonly buffer ShiftBuf {{ {d['buf_t']} d_shift[]; }};
-layout(std430, binding = 3) readonly buffer YBuf     {{ {d['buf_t']} d_y[]; }};
-layout(std430, binding = 4) buffer          FftBuf   {{ {d['buf_t']} d_fft_buf[]; }};
+layout(std430, binding = 2) readonly buffer ShiftBuf {{ {d["buf_t"]} d_shift[]; }};
+layout(std430, binding = 3) readonly buffer YBuf     {{ {d["buf_t"]} d_y[]; }};
+layout(std430, binding = 4) buffer          FftBuf   {{ {d["buf_t"]} d_fft_buf[]; }};
 
 layout(push_constant) uniform Push {{
     int  M;
@@ -1427,12 +1434,12 @@ layout(push_constant) uniform Push {{
 {_emit_load_shifted_y(prec)}
 void main() {{
     uint bp = gl_GlobalInvocationID.x;
-    uint bs_packed = (pc.chunk_bs + {d['lanes'] - 1}u) / {d['lanes']}u;
+    uint bs_packed = (pc.chunk_bs + {d["lanes"] - 1}u) / {d["lanes"]}u;
     if (bp >= bs_packed) return;
     int nfft_mask = pc.nfft - 1;
 {zero_loop}
     for (int m = 0; m < pc.M; ++m) {{
-        {d['real_t']} sy_re, sy_im;
+        {d["real_t"]} sy_re, sy_im;
         load_shifted_y(bp, pc.total_M_stride, pc.chunk_bs, pc.y_offset_elems, m, m, sy_re, sy_im);
         int first = d_first[m];
         uint w_off = uint(m) * W_CONST;

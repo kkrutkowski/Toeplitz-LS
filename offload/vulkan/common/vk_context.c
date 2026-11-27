@@ -1,22 +1,23 @@
-#define _POSIX_C_SOURCE 200809L
-
-#include "common/vk_context.h"
-#include "common/math.h"
+#if !defined(_WIN32) && !defined(__APPLE__)
+#    define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include "common/math.h"
+#include "common/vk_context.h"
+#include "common/vk_os.h"
 
 typedef struct DslEntry {
-    uint32_t              num_bindings;
+    uint32_t num_bindings;
     VkDescriptorSetLayout layout;
 } DslEntry;
 
 typedef struct PlEntry {
-    uint64_t         key;
+    uint64_t key;
     VkPipelineLayout layout;
 } PlEntry;
 
@@ -30,18 +31,15 @@ typedef struct VkPipeKey {
 } VkPipeKey;
 
 typedef struct PipeCacheEntry {
-    uint64_t            hash;
-    VkPipeKey           key;
+    uint64_t hash;
+    VkPipeKey key;
     VkCompiledPipeline* pipe;
-    bool                occupied;
+    bool occupied;
 } PipeCacheEntry;
 
 static uint64_t pipe_key_hash(const VkPipeKey* k) {
     uint64_t h = 14695981039346656037ull;
-    const uint32_t head[5] = {
-        k->shader_id, k->num_bindings, k->push_const_bytes,
-        k->required_subgroup_size, k->num_specs
-    };
+    const uint32_t head[5] = {k->shader_id, k->num_bindings, k->push_const_bytes, k->required_subgroup_size, k->num_specs};
     for (size_t i = 0; i < 5; ++i) {
         h ^= (uint64_t)head[i];
         h *= 1099511628211ull;
@@ -55,16 +53,12 @@ static uint64_t pipe_key_hash(const VkPipeKey* k) {
 }
 
 static bool pipe_key_eq(const VkPipeKey* a, const VkPipeKey* b) {
-    if (a->shader_id != b->shader_id ||
-        a->num_bindings != b->num_bindings ||
-        a->push_const_bytes != b->push_const_bytes ||
-        a->required_subgroup_size != b->required_subgroup_size ||
-        a->num_specs != b->num_specs) {
+    if (a->shader_id != b->shader_id || a->num_bindings != b->num_bindings || a->push_const_bytes != b->push_const_bytes ||
+        a->required_subgroup_size != b->required_subgroup_size || a->num_specs != b->num_specs) {
         return false;
     }
     for (uint32_t i = 0; i < a->num_specs; ++i) {
-        if (a->specs[i].constant_id != b->specs[i].constant_id ||
-            a->specs[i].value != b->specs[i].value) {
+        if (a->specs[i].constant_id != b->specs[i].constant_id || a->specs[i].value != b->specs[i].value) {
             return false;
         }
     }
@@ -72,32 +66,32 @@ static bool pipe_key_eq(const VkPipeKey* a, const VkPipeKey* b) {
 }
 
 struct VkDeviceContext {
-    int                              device_id;
-    VkDeviceDescriptor               desc;
-    VkDeviceFftConfig                cfg;
-    VkDevice                         device;
-    PFN_vkCmdPushDescriptorSetKHR    pfn_push_desc;
-    VkPipelineCache                  pipeline_cache;
-    char                             pipeline_cache_path[512];
+    int device_id;
+    VkDeviceDescriptor desc;
+    VkDeviceFftConfig cfg;
+    VkDevice device;
+    PFN_vkCmdPushDescriptorSetKHR pfn_push_desc;
+    VkPipelineCache pipeline_cache;
+    char pipeline_cache_path[512];
     VkPhysicalDeviceMemoryProperties mem_props;
 
-    VkQueue         queues[8];
-    pthread_mutex_t queue_mtxs[8];
-    uint32_t        num_queues;
+    VkQueue queues[8];
+    vk_mutex_t queue_mtxs[8];
+    uint32_t num_queues;
 
-    pthread_rwlock_t pipe_rwlock;
-    VkShaderModule   modules[VK_SHADER_COUNT];
-    DslEntry         dsls[24];
-    size_t           num_dsls;
-    PlEntry          pls[64];
-    size_t           num_pls;
-    PipeCacheEntry*  pipe_buckets; /* open-addressed power-of-2 hash table */
-    size_t           pipe_mask;
-    size_t           num_pipes;
+    vk_rwlock_t pipe_rwlock;
+    VkShaderModule modules[VK_SHADER_COUNT];
+    DslEntry dsls[24];
+    size_t num_dsls;
+    PlEntry pls[64];
+    size_t num_pls;
+    PipeCacheEntry* pipe_buckets; /* open-addressed power-of-2 hash table */
+    size_t pipe_mask;
+    size_t num_pipes;
 
     VkBufferAlloc dummy_buf;
 
-    pthread_mutex_t     probe_mtx;
+    vk_mutex_t probe_mtx;
     VkDeviceProbeResult probe_res;
 };
 
@@ -111,34 +105,22 @@ static bool has_dev_ext(VkPhysicalDevice pdev, const char* name) {
     bool ok = false;
     if (vkEnumerateDeviceExtensionProperties(pdev, nullptr, &n, v) == VK_SUCCESS) {
         for (uint32_t i = 0; i < n; ++i) {
-            if (strcmp(v[i].extensionName, name) == 0) { ok = true; break; }
+            if (strcmp(v[i].extensionName, name) == 0) {
+                ok = true;
+                break;
+            }
         }
     }
     free(v);
     return ok;
 }
 
-static void mkdir_p_parent_ctx(const char* filepath) {
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", filepath);
-    char* slash = strrchr(tmp, '/');
-    if (!slash || slash == tmp) return;
-    *slash = '\0';
-    for (char* p = tmp + 1; *p; ++p) {
-        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
-    }
-    mkdir(tmp, 0755);
-}
+static void mkdir_p_parent_ctx(const char* filepath) { vk_os_mkdir_p_parent(filepath); }
 
 static void resolve_pipe_cache_path(const VkDeviceFftConfig* cfg, char* out, size_t out_cap) {
-    const char* xdg = getenv("XDG_CACHE_HOME");
-    const char* home = getenv("HOME");
     char dir[384];
-    if (xdg && xdg[0] != '\0') snprintf(dir, sizeof(dir), "%s/toeplitz_ls", xdg);
-    else if (home && home[0] != '\0') snprintf(dir, sizeof(dir), "%s/.cache/toeplitz_ls", home);
-    else snprintf(dir, sizeof(dir), "/tmp/toeplitz_ls_vk_cache");
-    snprintf(out, out_cap, "%s/vk_pipe_%x_%x_%s.bin",
-             dir, cfg->vendor_id, cfg->device_id, vk_kernel_code_hash());
+    vk_os_default_cache_dir(dir, sizeof(dir));
+    snprintf(out, out_cap, "%s/vk_pipe_%x_%x_%s.bin", dir, cfg->vendor_id, cfg->device_id, vk_kernel_code_hash());
 }
 
 /* ============================================================================
@@ -152,9 +134,7 @@ bool vk_buf_create(VkDeviceContext* ctx, size_t bytes, VkBufferMemKind kind, VkB
     VkBufferCreateInfo bci = {0};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = alloc_sz;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer buf = VK_NULL_HANDLE;
@@ -237,8 +217,7 @@ bool vk_batch_init(VkCmdBatch* b, VkDeviceContext* ctx, uint32_t queue_index) {
 
     VkCommandPoolCreateInfo cpci = {0};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT |
-                 VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     cpci.queueFamilyIndex = ctx->cfg.compute_queue_family;
     if (vkCreateCommandPool(ctx->device, &cpci, nullptr, &b->cmd_pool) != VK_SUCCESS) return false;
 
@@ -315,10 +294,8 @@ void vk_batch_fill(VkCmdBatch* b, VkBufferSlice dst, VkDeviceSize bytes, uint32_
     vkCmdFillBuffer(b->cmd_buf, dst.buffer, dst.offset, aligned, val);
 }
 
-static void emit_mem_barrier(
-    VkCommandBuffer cmd,
-    VkPipelineStageFlags src_stage, VkAccessFlags src_acc,
-    VkPipelineStageFlags dst_stage, VkAccessFlags dst_acc) {
+static void emit_mem_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage, VkAccessFlags src_acc, VkPipelineStageFlags dst_stage,
+                             VkAccessFlags dst_acc) {
     VkMemoryBarrier mb = {0};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = src_acc;
@@ -327,51 +304,33 @@ static void emit_mem_barrier(
 }
 
 void vk_batch_barrier_t2c(VkCmdBatch* b) {
-    emit_mem_barrier(b->cmd_buf,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    emit_mem_barrier(b->cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
 void vk_batch_barrier_c2c(VkCmdBatch* b) {
-    emit_mem_barrier(b->cmd_buf,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    emit_mem_barrier(b->cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
 void vk_batch_barrier_tc2c(VkCmdBatch* b) {
-    emit_mem_barrier(b->cmd_buf,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                     VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    emit_mem_barrier(b->cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
 void vk_batch_barrier_c2t(VkCmdBatch* b) {
-    emit_mem_barrier(b->cmd_buf,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+    emit_mem_barrier(b->cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                      VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 void vk_batch_barrier_t2t(VkCmdBatch* b) {
-    emit_mem_barrier(b->cmd_buf,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+    emit_mem_barrier(b->cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                      VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
-bool vk_batch_dispatch(
-    VkCmdBatch* b,
-    const VkCompiledPipeline* pipe,
-    const VkBufferSlice* bindings,
-    uint32_t num_bindings,
-    const void* push_data,
-    uint32_t push_bytes,
-    uint32_t gx,
-    uint32_t gy,
-    uint32_t gz) {
+bool vk_batch_dispatch(VkCmdBatch* b, const VkCompiledPipeline* pipe, const VkBufferSlice* bindings, uint32_t num_bindings, const void* push_data,
+                       uint32_t push_bytes, uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!pipe || gx == 0 || gy == 0 || gz == 0) return true;
     const bool use_push = (b->ctx->pfn_push_desc != nullptr);
     if (!use_push && b->ds_used >= b->ds_cap) {
@@ -409,8 +368,7 @@ bool vk_batch_dispatch(
 
     if (nb > 0) {
         if (use_push) {
-            b->ctx->pfn_push_desc(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  pipe->layout, 0, nb, writes);
+            b->ctx->pfn_push_desc(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout, 0, nb, writes);
         } else {
             VkDescriptorSet dset = VK_NULL_HANDLE;
             VkDescriptorSetAllocateInfo dsai = {0};
@@ -422,13 +380,11 @@ bool vk_batch_dispatch(
             ++b->ds_used;
             for (uint32_t i = 0; i < nb; ++i) writes[i].dstSet = dset;
             vkUpdateDescriptorSets(b->ctx->device, nb, writes, 0, nullptr);
-            vkCmdBindDescriptorSets(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pipe->layout, 0, 1, &dset, 0, nullptr);
+            vkCmdBindDescriptorSets(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout, 0, 1, &dset, 0, nullptr);
         }
     }
     if (push_data && push_bytes > 0) {
-        vkCmdPushConstants(b->cmd_buf, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, push_bytes, push_data);
+        vkCmdPushConstants(b->cmd_buf, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push_data);
     }
     vkCmdDispatch(b->cmd_buf, gx, gy, gz);
     return true;
@@ -483,8 +439,12 @@ static void load_pipe_cache(VkDeviceContext* ctx) {
         if (len > 0) {
             fseek(fp, 0, SEEK_SET);
             blob = malloc((size_t)len);
-            if (blob && fread(blob, 1, (size_t)len, fp) == (size_t)len) sz = (size_t)len;
-            else { free(blob); blob = nullptr; }
+            if (blob && fread(blob, 1, (size_t)len, fp) == (size_t)len)
+                sz = (size_t)len;
+            else {
+                free(blob);
+                blob = nullptr;
+            }
         }
         fclose(fp);
     }
@@ -509,12 +469,12 @@ static void save_pipe_cache(VkDeviceContext* ctx) {
     if (vkGetPipelineCacheData(ctx->device, ctx->pipeline_cache, &sz, blob) == VK_SUCCESS) {
         mkdir_p_parent_ctx(ctx->pipeline_cache_path);
         char tmp[560];
-        snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", ctx->pipeline_cache_path, (long)getpid());
+        snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", ctx->pipeline_cache_path, vk_os_getpid());
         FILE* fp = fopen(tmp, "wb");
         if (fp) {
             fwrite(blob, 1, sz, fp);
             fclose(fp);
-            if (rename(tmp, ctx->pipeline_cache_path) != 0) unlink(tmp);
+            (void)vk_os_replace_file(tmp, ctx->pipeline_cache_path);
         }
     }
     free(blob);
@@ -568,26 +528,30 @@ static VkDeviceContext* create_vk_context(int device_id, char* err_out, size_t e
     if (ctx->cfg.has_fp16) {
         if (ctx->cfg.api_version >= VK_API_VERSION_1_2) {
             f12.shaderFloat16 = VK_TRUE;
-            *tail = &f12; tail = &f12.pNext;
+            *tail = &f12;
+            tail = &f12.pNext;
             f16s.storageBuffer16BitAccess = VK_TRUE;
-            *tail = &f16s; tail = &f16s.pNext;
+            *tail = &f16s;
+            tail = &f16s.pNext;
         } else {
             exts[nexts++] = VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME;
             exts[nexts++] = VK_KHR_16BIT_STORAGE_EXTENSION_NAME;
             f16i8.shaderFloat16 = VK_TRUE;
             f16s.storageBuffer16BitAccess = VK_TRUE;
-            *tail = &f16i8; tail = &f16i8.pNext;
-            *tail = &f16s; tail = &f16s.pNext;
+            *tail = &f16i8;
+            tail = &f16i8.pNext;
+            *tail = &f16s;
+            tail = &f16s.pNext;
         }
     }
     if (ctx->cfg.has_subgroup_size_control) {
-        if (ctx->cfg.api_version < VK_API_VERSION_1_3 &&
-            has_dev_ext(ctx->desc.phys_dev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+        if (ctx->cfg.api_version < VK_API_VERSION_1_3 && has_dev_ext(ctx->desc.phys_dev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
             exts[nexts++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
         }
         sg_ctrl.subgroupSizeControl = VK_TRUE;
         sg_ctrl.computeFullSubgroups = VK_TRUE;
-        *tail = &sg_ctrl; tail = &sg_ctrl.pNext;
+        *tail = &sg_ctrl;
+        tail = &sg_ctrl.pNext;
     }
     if (ctx->cfg.has_push_descriptor) {
         exts[nexts++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
@@ -611,17 +575,16 @@ static VkDeviceContext* create_vk_context(int device_id, char* err_out, size_t e
     }
 
     if (ctx->cfg.has_push_descriptor) {
-        ctx->pfn_push_desc = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(
-            ctx->device, "vkCmdPushDescriptorSetKHR");
+        ctx->pfn_push_desc = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(ctx->device, "vkCmdPushDescriptorSetKHR");
     }
 
     ctx->num_queues = nq;
     for (uint32_t i = 0; i < nq; ++i) {
         vkGetDeviceQueue(ctx->device, ctx->cfg.compute_queue_family, i, &ctx->queues[i]);
-        pthread_mutex_init(&ctx->queue_mtxs[i], nullptr);
+        vk_mutex_init(&ctx->queue_mtxs[i]);
     }
-    pthread_rwlock_init(&ctx->pipe_rwlock, nullptr);
-    pthread_mutex_init(&ctx->probe_mtx, nullptr);
+    vk_rwlock_init(&ctx->pipe_rwlock);
+    vk_mutex_init(&ctx->probe_mtx);
     ctx->pipe_buckets = (PipeCacheEntry*)calloc(256u, sizeof(PipeCacheEntry));
     ctx->pipe_mask = ctx->pipe_buckets ? 255u : 0u;
 
@@ -631,7 +594,7 @@ static VkDeviceContext* create_vk_context(int device_id, char* err_out, size_t e
     return ctx;
 }
 
-static pthread_mutex_t  g_ctx_mtx = PTHREAD_MUTEX_INITIALIZER;
+static vk_mutex_t g_ctx_mtx = VK_MUTEX_INITIALIZER;
 static VkDeviceContext* g_ctxs[32] = {nullptr};
 
 VkDeviceContext* vk_ctx_get_shared(int device_id, char* err_out, size_t err_cap) {
@@ -641,22 +604,22 @@ VkDeviceContext* vk_ctx_get_shared(int device_id, char* err_out, size_t err_cap)
         }
         return nullptr;
     }
-    pthread_mutex_lock(&g_ctx_mtx);
+    vk_mutex_lock(&g_ctx_mtx);
     VkDeviceContext* ctx = g_ctxs[device_id];
     if (!ctx) {
         ctx = create_vk_context(device_id, err_out, err_cap);
         g_ctxs[device_id] = ctx;
     }
-    pthread_mutex_unlock(&g_ctx_mtx);
+    vk_mutex_unlock(&g_ctx_mtx);
     return ctx;
 }
 
 const VkDeviceDescriptor* vk_ctx_desc(const VkDeviceContext* ctx) { return &ctx->desc; }
-const VkDeviceFftConfig*  vk_ctx_config(const VkDeviceContext* ctx) { return &ctx->cfg; }
-VkDevice                  vk_ctx_device(const VkDeviceContext* ctx) { return ctx->device; }
-uint32_t                  vk_ctx_queue_family(const VkDeviceContext* ctx) { return ctx->cfg.compute_queue_family; }
-uint32_t                  vk_ctx_queue_count(const VkDeviceContext* ctx) { return ctx->num_queues; }
-VkBufferSlice             vk_ctx_dummy_buffer(const VkDeviceContext* ctx) { return vk_buf_slice(&ctx->dummy_buf, 0, VK_WHOLE_SIZE); }
+const VkDeviceFftConfig* vk_ctx_config(const VkDeviceContext* ctx) { return &ctx->cfg; }
+VkDevice vk_ctx_device(const VkDeviceContext* ctx) { return ctx->device; }
+uint32_t vk_ctx_queue_family(const VkDeviceContext* ctx) { return ctx->cfg.compute_queue_family; }
+uint32_t vk_ctx_queue_count(const VkDeviceContext* ctx) { return ctx->num_queues; }
+VkBufferSlice vk_ctx_dummy_buffer(const VkDeviceContext* ctx) { return vk_buf_slice(&ctx->dummy_buf, 0, VK_WHOLE_SIZE); }
 
 int vk_ctx_find_memory_type(const VkDeviceContext* ctx, uint32_t type_bits, VkBufferMemKind kind) {
     const VkPhysicalDeviceMemoryProperties* mp = &ctx->mem_props;
@@ -679,7 +642,8 @@ int vk_ctx_find_memory_type(const VkDeviceContext* ctx, uint32_t type_bits, VkBu
         req_list[n_tries] = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         avoid_list[n_tries++] = 0;
     } else if (kind == VK_MEM_UMA_READBACK) {
-        req_list[n_tries] = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        req_list[n_tries] = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                            VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         avoid_list[n_tries++] = 0;
         req_list[n_tries] = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         avoid_list[n_tries++] = 0;
@@ -711,13 +675,13 @@ int vk_ctx_find_memory_type(const VkDeviceContext* ctx, uint32_t type_bits, VkBu
 
 bool vk_ctx_submit_queue(VkDeviceContext* ctx, uint32_t queue_idx, VkCommandBuffer cmd, VkFence fence) {
     uint32_t qi = queue_idx % ctx->num_queues;
-    pthread_mutex_lock(&ctx->queue_mtxs[qi]);
+    vk_mutex_lock(&ctx->queue_mtxs[qi]);
     VkSubmitInfo si = {0};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
     VkResult r = vkQueueSubmit(ctx->queues[qi], 1, &si, fence);
-    pthread_mutex_unlock(&ctx->queue_mtxs[qi]);
+    vk_mutex_unlock(&ctx->queue_mtxs[qi]);
     return r == VK_SUCCESS;
 }
 
@@ -815,14 +779,8 @@ static bool pipe_table_grow_unlocked(VkDeviceContext* ctx) {
     return true;
 }
 
-const VkCompiledPipeline* vk_ctx_get_pipeline(
-    VkDeviceContext* ctx,
-    VkShaderId shader_id,
-    uint32_t num_bindings,
-    uint32_t push_const_bytes,
-    const VkSpecConstEntry* specs,
-    size_t num_specs,
-    uint32_t required_subgroup_size) {
+const VkCompiledPipeline* vk_ctx_get_pipeline(VkDeviceContext* ctx, VkShaderId shader_id, uint32_t num_bindings, uint32_t push_const_bytes,
+                                              const VkSpecConstEntry* specs, size_t num_specs, uint32_t required_subgroup_size) {
     VkPipeKey key = {0};
     key.shader_id = (uint32_t)shader_id;
     key.num_bindings = num_bindings;
@@ -834,16 +792,16 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
     uint64_t h = pipe_key_hash(&key);
 
     /* Fast path: concurrent O(1) read-locked lookup (zero snprintf/strcmp/mutex contention) */
-    pthread_rwlock_rdlock(&ctx->pipe_rwlock);
+    vk_rwlock_rdlock(&ctx->pipe_rwlock);
     const VkCompiledPipeline* hit = pipe_table_find(ctx, h, &key);
-    pthread_rwlock_unlock(&ctx->pipe_rwlock);
+    vk_rwlock_rdunlock(&ctx->pipe_rwlock);
     if (hit) return hit;
 
     /* Slow path: compile pipeline once under write lock */
-    pthread_rwlock_wrlock(&ctx->pipe_rwlock);
+    vk_rwlock_wrlock(&ctx->pipe_rwlock);
     hit = pipe_table_find(ctx, h, &key);
     if (hit) {
-        pthread_rwlock_unlock(&ctx->pipe_rwlock);
+        vk_rwlock_wrunlock(&ctx->pipe_rwlock);
         return hit;
     }
 
@@ -851,7 +809,7 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
     VkDescriptorSetLayout dsl = get_or_create_dsl_unlocked(ctx, num_bindings);
     VkPipelineLayout pl = get_or_create_pl_unlocked(ctx, num_bindings, push_const_bytes);
     if (mod == VK_NULL_HANDLE || pl == VK_NULL_HANDLE) {
-        pthread_rwlock_unlock(&ctx->pipe_rwlock);
+        vk_rwlock_wrunlock(&ctx->pipe_rwlock);
         return nullptr;
     }
 
@@ -879,8 +837,7 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
     stage.module = mod;
     stage.pName = "main";
     stage.pSpecializationInfo = (ns > 0) ? &spec_info : nullptr;
-    if (required_subgroup_size > 0 && ctx->cfg.has_subgroup_size_control &&
-        vk_device_supports_sg_size(&ctx->cfg, required_subgroup_size)) {
+    if (required_subgroup_size > 0 && ctx->cfg.has_subgroup_size_control && vk_device_supports_sg_size(&ctx->cfg, required_subgroup_size)) {
         stage.pNext = &req_sg;
         stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
@@ -892,14 +849,14 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
 
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(ctx->device, ctx->pipeline_cache, 1, &cpci, nullptr, &pipe) != VK_SUCCESS) {
-        pthread_rwlock_unlock(&ctx->pipe_rwlock);
+        vk_rwlock_wrunlock(&ctx->pipe_rwlock);
         return nullptr;
     }
 
     VkCompiledPipeline* cp = (VkCompiledPipeline*)malloc(sizeof(VkCompiledPipeline));
     if (!cp) {
         vkDestroyPipeline(ctx->device, pipe, nullptr);
-        pthread_rwlock_unlock(&ctx->pipe_rwlock);
+        vk_rwlock_wrunlock(&ctx->pipe_rwlock);
         return nullptr;
     }
     *cp = (VkCompiledPipeline){pipe, pl, dsl, num_bindings, push_const_bytes};
@@ -909,7 +866,7 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
         if (!pipe_table_grow_unlocked(ctx)) {
             free(cp);
             vkDestroyPipeline(ctx->device, pipe, nullptr);
-            pthread_rwlock_unlock(&ctx->pipe_rwlock);
+            vk_rwlock_wrunlock(&ctx->pipe_rwlock);
             return nullptr;
         }
     }
@@ -925,7 +882,7 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
     bool should_save = ((ctx->num_pipes % 16u) == 1u);
     const VkCompiledPipeline* out = cp;
 
-    pthread_rwlock_unlock(&ctx->pipe_rwlock);
+    vk_rwlock_wrunlock(&ctx->pipe_rwlock);
     if (should_save) save_pipe_cache(ctx);
     return out;
 }
@@ -934,10 +891,10 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
  * Hardware Probes
  * ============================================================================ */
 VkDeviceProbeResult vk_ctx_probe_subgroup(VkDeviceContext* ctx) {
-    pthread_mutex_lock(&ctx->probe_mtx);
+    vk_mutex_lock(&ctx->probe_mtx);
     if (ctx->probe_res.sg_probed) {
         VkDeviceProbeResult r = ctx->probe_res;
-        pthread_mutex_unlock(&ctx->probe_mtx);
+        vk_mutex_unlock(&ctx->probe_mtx);
         return r;
     }
     ctx->probe_res.sg_probed = true;
@@ -953,12 +910,10 @@ VkDeviceProbeResult vk_ctx_probe_subgroup(VkDeviceContext* ctx) {
         if (vk_buf_create(ctx, 16, VK_MEM_DEVICE_LOCAL, &out_buf) && vk_batch_init(&batch, ctx, 0)) {
             uint32_t init_vals[4] = {0u, 1u, 1u, 0u};
             VkSpecConstEntry sp = {0u, probe_wg};
-            const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(
-                ctx, VK_SHADER_probe_subgroup, 1, sizeof(uint32_t), &sp, 1, 0);
+            const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(ctx, VK_SHADER_probe_subgroup, 1, sizeof(uint32_t), &sp, 1, 0);
             if (pipe && vk_batch_upload_sync(&batch, init_vals, vk_buf_slice(&out_buf, 0, 16), 16)) {
                 VkBufferSlice binds[1] = {vk_buf_slice(&out_buf, 0, 16)};
-                if (vk_batch_begin(&batch) &&
-                    vk_batch_dispatch(&batch, pipe, binds, 1, &probe_wg, sizeof(uint32_t), 1, 1, 1) &&
+                if (vk_batch_begin(&batch) && vk_batch_dispatch(&batch, pipe, binds, 1, &probe_wg, sizeof(uint32_t), 1, 1, 1) &&
                     vk_batch_submit_and_wait(&batch)) {
                     uint32_t res_vals[4] = {0};
                     if (vk_batch_download_sync(&batch, vk_buf_slice(&out_buf, 0, 16), res_vals, 16)) {
@@ -977,49 +932,44 @@ VkDeviceProbeResult vk_ctx_probe_subgroup(VkDeviceContext* ctx) {
     }
 
     VkDeviceProbeResult r = ctx->probe_res;
-    pthread_mutex_unlock(&ctx->probe_mtx);
+    vk_mutex_unlock(&ctx->probe_mtx);
     return r;
 }
 
 VkDeviceProbeResult vk_ctx_probe_df_kat(VkDeviceContext* ctx) {
-    pthread_mutex_lock(&ctx->probe_mtx);
+    vk_mutex_lock(&ctx->probe_mtx);
     if (ctx->probe_res.df_kat_probed) {
         VkDeviceProbeResult r = ctx->probe_res;
-        pthread_mutex_unlock(&ctx->probe_mtx);
+        vk_mutex_unlock(&ctx->probe_mtx);
         return r;
     }
     ctx->probe_res.df_kat_probed = true;
 
     double x_ang = 1.0 / 7.0;
     VkDf ang_df = vk_df_from_double(x_ang);
-    float h_in[10] = {
-        1.0f, 3.0f * ldexpf(1.0f, -24),
-        1.5f, 3.0f * ldexpf(1.0f, -24),
-        1.0f + ldexpf(1.0f, -12), 1.0f + ldexpf(1.0f, -13),
-        ldexpf(1.0f, -25), -ldexpf(1.0f, -26),
-        ang_df.hi, ang_df.lo
-    };
+    float h_in[10] = {1.0f,
+                      3.0f * ldexpf(1.0f, -24),
+                      1.5f,
+                      3.0f * ldexpf(1.0f, -24),
+                      1.0f + ldexpf(1.0f, -12),
+                      1.0f + ldexpf(1.0f, -13),
+                      ldexpf(1.0f, -25),
+                      -ldexpf(1.0f, -26),
+                      ang_df.hi,
+                      ang_df.lo};
 
     VkBufferAlloc in_buf = {0}, out_buf = {0};
     VkCmdBatch batch = {0};
     bool ok = false;
     bool used_veltkamp = false;
-    if (vk_buf_create(ctx, sizeof(h_in), VK_MEM_DEVICE_LOCAL, &in_buf) &&
-        vk_buf_create(ctx, 12 * sizeof(float), VK_MEM_DEVICE_LOCAL, &out_buf) &&
-        vk_batch_init(&batch, ctx, 0) &&
-        vk_batch_upload_sync(&batch, h_in, vk_buf_slice(&in_buf, 0, sizeof(h_in)), sizeof(h_in))) {
-        VkBufferSlice binds[2] = {
-            vk_buf_slice(&in_buf, 0, sizeof(h_in)),
-            vk_buf_slice(&out_buf, 0, 12 * sizeof(float))
-        };
+    if (vk_buf_create(ctx, sizeof(h_in), VK_MEM_DEVICE_LOCAL, &in_buf) && vk_buf_create(ctx, 12 * sizeof(float), VK_MEM_DEVICE_LOCAL, &out_buf) &&
+        vk_batch_init(&batch, ctx, 0) && vk_batch_upload_sync(&batch, h_in, vk_buf_slice(&in_buf, 0, sizeof(h_in)), sizeof(h_in))) {
+        VkBufferSlice binds[2] = {vk_buf_slice(&in_buf, 0, sizeof(h_in)), vk_buf_slice(&out_buf, 0, 12 * sizeof(float))};
         for (uint32_t vmode = 0u; vmode <= 1u && !ok; ++vmode) {
             VkSpecConstEntry sp = {15u, vmode};
-            const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(
-                ctx, VK_SHADER_probe_df_kat, 2, 0, &sp, 1, 0);
+            const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(ctx, VK_SHADER_probe_df_kat, 2, 0, &sp, 1, 0);
             float h_out[12] = {0};
-            if (pipe && vk_batch_begin(&batch) &&
-                vk_batch_dispatch(&batch, pipe, binds, 2, nullptr, 0, 1, 1, 1) &&
-                vk_batch_submit_and_wait(&batch) &&
+            if (pipe && vk_batch_begin(&batch) && vk_batch_dispatch(&batch, pipe, binds, 2, nullptr, 0, 1, 1, 1) && vk_batch_submit_and_wait(&batch) &&
                 vk_batch_download_sync(&batch, binds[1], h_out, sizeof(h_out))) {
                 double s0 = (double)h_out[0] + (double)h_out[1];
                 double e0 = (double)h_in[0] + (double)h_in[1];
@@ -1034,18 +984,15 @@ VkDeviceProbeResult vk_ctx_probe_df_kat(VkDeviceContext* ctx) {
                 double ec = cos(2.0 * M_PI * x_ang);
                 double es = sin(2.0 * M_PI * x_ang);
 
-                ok = isfinite(s0) && fabs(s0 - e0) <= 1e-14 && h_out[1] != 0.0f &&
-                     isfinite(s1) && fabs(s1 - e1) <= 1e-14 && h_out[3] != 0.0f &&
-                     isfinite(s2) && fabs(s2 - e2) <= 1e-14 && h_out[5] != 0.0f &&
-                     isfinite(s3) && fabs(s3 - e3) <= 1e-13 &&
-                     isfinite(gc) && fabs(gc - ec) <= 1e-13 &&
+                ok = isfinite(s0) && fabs(s0 - e0) <= 1e-14 && h_out[1] != 0.0f && isfinite(s1) && fabs(s1 - e1) <= 1e-14 && h_out[3] != 0.0f && isfinite(s2) &&
+                     fabs(s2 - e2) <= 1e-14 && h_out[5] != 0.0f && isfinite(s3) && fabs(s3 - e3) <= 1e-13 && isfinite(gc) && fabs(gc - ec) <= 1e-13 &&
                      isfinite(gs) && fabs(gs - es) <= 1e-13;
                 if (ok) {
                     used_veltkamp = (vmode != 0u);
                 } else if (vmode == 1u) {
                     snprintf(ctx->probe_res.df_kat_error, sizeof(ctx->probe_res.df_kat_error),
-                             "DF KAT failed on '%.80s' (err_terms: %.3e %.3e %.3e, s3=%.12g vs %.12g)",
-                             ctx->cfg.device_name, h_out[1], h_out[3], h_out[5], s3, e3);
+                             "DF KAT failed on '%.80s' (err_terms: %.3e %.3e %.3e, s3=%.12g vs %.12g)", ctx->cfg.device_name, h_out[1], h_out[3], h_out[5], s3,
+                             e3);
                 }
             }
         }
@@ -1057,53 +1004,42 @@ VkDeviceProbeResult vk_ctx_probe_df_kat(VkDeviceContext* ctx) {
     ctx->probe_res.df_kat_passed = ok;
     ctx->probe_res.df_use_veltkamp = used_veltkamp;
     VkDeviceProbeResult r = ctx->probe_res;
-    pthread_mutex_unlock(&ctx->probe_mtx);
+    vk_mutex_unlock(&ctx->probe_mtx);
     return r;
 }
 
 VkDeviceProbeResult vk_ctx_probe_fp16_kat(VkDeviceContext* ctx) {
-    pthread_mutex_lock(&ctx->probe_mtx);
+    vk_mutex_lock(&ctx->probe_mtx);
     if (ctx->probe_res.fp16_kat_probed) {
         VkDeviceProbeResult r = ctx->probe_res;
-        pthread_mutex_unlock(&ctx->probe_mtx);
+        vk_mutex_unlock(&ctx->probe_mtx);
         return r;
     }
     ctx->probe_res.fp16_kat_probed = true;
     if (!ctx->cfg.has_fp16) {
         ctx->probe_res.fp16_kat_passed = false;
-        snprintf(ctx->probe_res.fp16_kat_error, sizeof(ctx->probe_res.fp16_kat_error),
-                 "Device lacks native FP16");
+        snprintf(ctx->probe_res.fp16_kat_error, sizeof(ctx->probe_res.fp16_kat_error), "Device lacks native FP16");
         VkDeviceProbeResult r = ctx->probe_res;
-        pthread_mutex_unlock(&ctx->probe_mtx);
+        vk_mutex_unlock(&ctx->probe_mtx);
         return r;
     }
 
-    uint16_t h_in[6] = {
-        vk_f32_to_f16_bits(1.5f), vk_f32_to_f16_bits(-2.25f),
-        vk_f32_to_f16_bits(3.0f), vk_f32_to_f16_bits(4.0f),
-        vk_f32_to_f16_bits(0.5f), vk_f32_to_f16_bits(1.25f)
-    };
+    uint16_t h_in[6] = {vk_f32_to_f16_bits(1.5f), vk_f32_to_f16_bits(-2.25f), vk_f32_to_f16_bits(3.0f),
+                        vk_f32_to_f16_bits(4.0f), vk_f32_to_f16_bits(0.5f),   vk_f32_to_f16_bits(1.25f)};
     VkBufferAlloc in_buf = {0}, out_buf = {0};
     VkCmdBatch batch = {0};
     bool ok = false;
-    if (vk_buf_create(ctx, sizeof(h_in), VK_MEM_DEVICE_LOCAL, &in_buf) &&
-        vk_buf_create(ctx, 2 * sizeof(float), VK_MEM_DEVICE_LOCAL, &out_buf) &&
+    if (vk_buf_create(ctx, sizeof(h_in), VK_MEM_DEVICE_LOCAL, &in_buf) && vk_buf_create(ctx, 2 * sizeof(float), VK_MEM_DEVICE_LOCAL, &out_buf) &&
         vk_batch_init(&batch, ctx, 0)) {
         const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(ctx, VK_SHADER_probe_fp16_kat, 2, 0, nullptr, 0, 0);
         if (pipe && vk_batch_upload_sync(&batch, h_in, vk_buf_slice(&in_buf, 0, sizeof(h_in)), sizeof(h_in))) {
-            VkBufferSlice binds[2] = {
-                vk_buf_slice(&in_buf, 0, sizeof(h_in)),
-                vk_buf_slice(&out_buf, 0, 2 * sizeof(float))
-            };
+            VkBufferSlice binds[2] = {vk_buf_slice(&in_buf, 0, sizeof(h_in)), vk_buf_slice(&out_buf, 0, 2 * sizeof(float))};
             float h_out[2] = {0};
-            if (vk_batch_begin(&batch) &&
-                vk_batch_dispatch(&batch, pipe, binds, 2, nullptr, 0, 1, 1, 1) &&
-                vk_batch_submit_and_wait(&batch) &&
+            if (vk_batch_begin(&batch) && vk_batch_dispatch(&batch, pipe, binds, 2, nullptr, 0, 1, 1, 1) && vk_batch_submit_and_wait(&batch) &&
                 vk_batch_download_sync(&batch, binds[1], h_out, sizeof(h_out))) {
                 ok = fabsf(h_out[0] - 5.0f) < 1e-3f && fabsf(h_out[1] - (-7.75f)) < 1e-3f;
                 if (!ok) {
-                    snprintf(ctx->probe_res.fp16_kat_error, sizeof(ctx->probe_res.fp16_kat_error),
-                             "FP16 KAT mismatch (got %.4f, %.4f)", h_out[0], h_out[1]);
+                    snprintf(ctx->probe_res.fp16_kat_error, sizeof(ctx->probe_res.fp16_kat_error), "FP16 KAT mismatch (got %.4f, %.4f)", h_out[0], h_out[1]);
                 }
             }
         }
@@ -1114,15 +1050,15 @@ VkDeviceProbeResult vk_ctx_probe_fp16_kat(VkDeviceContext* ctx) {
 
     ctx->probe_res.fp16_kat_passed = ok;
     VkDeviceProbeResult r = ctx->probe_res;
-    pthread_mutex_unlock(&ctx->probe_mtx);
+    vk_mutex_unlock(&ctx->probe_mtx);
     return r;
 }
 
 VkDeviceProbeResult vk_ctx_probe_fp64_ratio(VkDeviceContext* ctx) {
-    pthread_mutex_lock(&ctx->probe_mtx);
+    vk_mutex_lock(&ctx->probe_mtx);
     if (ctx->probe_res.fp64_probed) {
         VkDeviceProbeResult r = ctx->probe_res;
-        pthread_mutex_unlock(&ctx->probe_mtx);
+        vk_mutex_unlock(&ctx->probe_mtx);
         return r;
     }
     ctx->probe_res.fp64_probed = true;
@@ -1130,19 +1066,18 @@ VkDeviceProbeResult vk_ctx_probe_fp64_ratio(VkDeviceContext* ctx) {
     ctx->probe_res.fp64_compute_heavy = true;
     if (!ctx->cfg.has_fp64) {
         VkDeviceProbeResult r = ctx->probe_res;
-        pthread_mutex_unlock(&ctx->probe_mtx);
+        vk_mutex_unlock(&ctx->probe_mtx);
         return r;
     }
 
-    struct { uint32_t iters; uint32_t total; } pc = {
-        ctx->cfg.is_gpu ? 512u : 128u,
-        ctx->cfg.is_gpu ? 65536u : 4096u
-    };
+    struct {
+        uint32_t iters;
+        uint32_t total;
+    } pc = {ctx->cfg.is_gpu ? 512u : 128u, ctx->cfg.is_gpu ? 65536u : 4096u};
     uint32_t groups = (pc.total + 255u) / 256u;
     VkBufferAlloc b32 = {0}, b64 = {0};
     VkCmdBatch batch = {0};
-    if (vk_buf_create(ctx, pc.total * sizeof(float), VK_MEM_DEVICE_LOCAL, &b32) &&
-        vk_buf_create(ctx, pc.total * sizeof(double), VK_MEM_DEVICE_LOCAL, &b64) &&
+    if (vk_buf_create(ctx, pc.total * sizeof(float), VK_MEM_DEVICE_LOCAL, &b32) && vk_buf_create(ctx, pc.total * sizeof(double), VK_MEM_DEVICE_LOCAL, &b64) &&
         vk_batch_init(&batch, ctx, 0)) {
         const VkCompiledPipeline* p32 = vk_ctx_get_pipeline(ctx, VK_SHADER_probe_fp64_ratio_f32, 1, sizeof(pc), nullptr, 0, 0);
         const VkCompiledPipeline* p64 = vk_ctx_get_pipeline(ctx, VK_SHADER_probe_fp64_ratio_f64, 1, sizeof(pc), nullptr, 0, 0);
@@ -1183,6 +1118,6 @@ VkDeviceProbeResult vk_ctx_probe_fp64_ratio(VkDeviceContext* ctx) {
     vk_buf_destroy(&b64);
 
     VkDeviceProbeResult r = ctx->probe_res;
-    pthread_mutex_unlock(&ctx->probe_mtx);
+    vk_mutex_unlock(&ctx->probe_mtx);
     return r;
 }

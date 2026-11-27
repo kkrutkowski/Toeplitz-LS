@@ -1,31 +1,31 @@
 /* Plain C23 Quadruple-Precision Vulkan Type-1 NuFFT Engine. */
-#include "nufft/vk_nufft1.h"
-
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "nufft/vk_nufft1.h"
 
 /* ============================================================================
  * Push Constant Structs (matching gen_nufft.py std430 layouts byte-for-byte)
  * ============================================================================ */
 
 typedef struct VkPrecompPtsDfPush {
-    float    df_hi;
-    float    df_lo;
-    int32_t  M;
-    int32_t  nfft;
-    int32_t  w;
-    int32_t  phase_shift;
+    float df_hi;
+    float df_lo;
+    int32_t M;
+    int32_t nfft;
+    int32_t w;
+    int32_t phase_shift;
     uint32_t flags;
 } VkPrecompPtsDfPush;
 
 typedef struct VkPrecompPtsDPush {
-    double   df_scaled;
-    int32_t  M;
-    int32_t  nfft;
-    int32_t  w;
-    int32_t  phase_shift;
+    double df_scaled;
+    int32_t M;
+    int32_t nfft;
+    int32_t w;
+    int32_t phase_shift;
     uint32_t flags;
     uint32_t _pad;
 } VkPrecompPtsDPush;
@@ -53,11 +53,11 @@ typedef struct VkPackGeomPush {
 } VkPackGeomPush;
 
 typedef struct VkSpreadPush {
-    int32_t  M;
-    int32_t  nfft;
-    int32_t  win_elems;
-    int32_t  num_wins;
-    int32_t  log2_nw;
+    int32_t M;
+    int32_t nfft;
+    int32_t win_elems;
+    int32_t num_wins;
+    int32_t log2_nw;
     uint32_t total_M_stride;
     uint32_t chunk_bs;
     uint32_t y_offset_elems;
@@ -71,15 +71,15 @@ typedef struct VkReduceGridPush {
 } VkReduceGridPush;
 
 typedef struct VkSpreadCpuPush {
-    int32_t  M;
-    int32_t  nfft;
+    int32_t M;
+    int32_t nfft;
     uint32_t total_M_stride;
     uint32_t chunk_bs;
     uint32_t y_offset_elems;
 } VkSpreadCpuPush;
 
 typedef struct VkDeconvTblF32Push {
-    float   output_scale;
+    float output_scale;
     int32_t nfft;
     int32_t log_nfft;
     int32_t nout;
@@ -89,8 +89,8 @@ typedef struct VkDeconvTblF32Push {
 } VkDeconvTblF32Push;
 
 typedef struct VkDeconvTblDfPush {
-    float   scale_hi;
-    float   scale_lo;
+    float scale_hi;
+    float scale_lo;
     int32_t nfft;
     int32_t log_nfft;
     int32_t nout;
@@ -100,7 +100,7 @@ typedef struct VkDeconvTblDfPush {
 } VkDeconvTblDfPush;
 
 typedef struct VkDeconvTblF64Push {
-    double  output_scale;
+    double output_scale;
     int32_t nfft;
     int32_t log_nfft;
     int32_t nout;
@@ -110,43 +110,43 @@ typedef struct VkDeconvTblF64Push {
 } VkDeconvTblF64Push;
 
 typedef struct VkDeconvEmitF32Push {
-    float    output_scale;
-    int32_t  nfft;
-    int32_t  log_nfft;
-    int32_t  nout;
-    int32_t  output_shift;
-    int32_t  mode43;
-    int32_t  order_mode;
-    int32_t  batch_tile;
+    float output_scale;
+    int32_t nfft;
+    int32_t log_nfft;
+    int32_t nout;
+    int32_t output_shift;
+    int32_t mode43;
+    int32_t order_mode;
+    int32_t batch_tile;
     uint32_t chunk_bs;
     uint32_t total_nout_stride;
     uint32_t out_offset_elems;
 } VkDeconvEmitF32Push;
 
 typedef struct VkDeconvEmitDfPush {
-    float    scale_hi;
-    float    scale_lo;
-    int32_t  nfft;
-    int32_t  log_nfft;
-    int32_t  nout;
-    int32_t  output_shift;
-    int32_t  mode43;
-    int32_t  order_mode;
-    int32_t  batch_tile;
+    float scale_hi;
+    float scale_lo;
+    int32_t nfft;
+    int32_t log_nfft;
+    int32_t nout;
+    int32_t output_shift;
+    int32_t mode43;
+    int32_t order_mode;
+    int32_t batch_tile;
     uint32_t chunk_bs;
     uint32_t total_nout_stride;
     uint32_t out_offset_elems;
 } VkDeconvEmitDfPush;
 
 typedef struct VkDeconvEmitF64Push {
-    double   output_scale;
-    int32_t  nfft;
-    int32_t  log_nfft;
-    int32_t  nout;
-    int32_t  output_shift;
-    int32_t  mode43;
-    int32_t  order_mode;
-    int32_t  batch_tile;
+    double output_scale;
+    int32_t nfft;
+    int32_t log_nfft;
+    int32_t nout;
+    int32_t output_shift;
+    int32_t mode43;
+    int32_t order_mode;
+    int32_t batch_tile;
     uint32_t chunk_bs;
     uint32_t total_nout_stride;
     uint32_t out_offset_elems;
@@ -194,20 +194,28 @@ static int log2_pow2_i(int n) {
 
 static bool valid_width_for_prec(VkPrecKind prec, int w) {
     switch (prec) {
-        case VK_PREC_HALF:   return w == 4 || w == 5;
-        case VK_PREC_FLOAT:  return w == 8 || w == 9;
-        case VK_PREC_DF:     return w == 14 || w == 15 || w == 16;
-        case VK_PREC_DOUBLE: return w == 16 || w == 17 || w == 18;
+        case VK_PREC_HALF:
+            return w == 4 || w == 5;
+        case VK_PREC_FLOAT:
+            return w == 8 || w == 9;
+        case VK_PREC_DF:
+            return w == 14 || w == 15 || w == 16;
+        case VK_PREC_DOUBLE:
+            return w == 16 || w == 17 || w == 18;
     }
     return false;
 }
 
 static bool reg_q_supported(VkPrecKind prec, int q_val) {
     switch (prec) {
-        case VK_PREC_HALF:   return q_val == 8 || q_val == 16 || q_val == 32;
-        case VK_PREC_FLOAT:  return q_val == 4 || q_val == 8 || q_val == 16 || q_val == 32;
-        case VK_PREC_DF:     return q_val == 4 || q_val == 8 || q_val == 16;
-        case VK_PREC_DOUBLE: return q_val == 2 || q_val == 4 || q_val == 8 || q_val == 16;
+        case VK_PREC_HALF:
+            return q_val == 8 || q_val == 16 || q_val == 32;
+        case VK_PREC_FLOAT:
+            return q_val == 4 || q_val == 8 || q_val == 16 || q_val == 32;
+        case VK_PREC_DF:
+            return q_val == 4 || q_val == 8 || q_val == 16;
+        case VK_PREC_DOUBLE:
+            return q_val == 2 || q_val == 4 || q_val == 8 || q_val == 16;
     }
     return false;
 }
@@ -215,11 +223,9 @@ static bool reg_q_supported(VkPrecKind prec, int q_val) {
 static VkShaderId shader_precompute_points_weights(VkPrecKind prec, int w) {
     switch (prec) {
         case VK_PREC_HALF:
-            return (w == 4) ? VK_SHADER_nufft_precompute_points_weights_h_w4
-                            : VK_SHADER_nufft_precompute_points_weights_h_w5;
+            return (w == 4) ? VK_SHADER_nufft_precompute_points_weights_h_w4 : VK_SHADER_nufft_precompute_points_weights_h_w5;
         case VK_PREC_FLOAT:
-            return (w == 8) ? VK_SHADER_nufft_precompute_points_weights_f_w8
-                            : VK_SHADER_nufft_precompute_points_weights_f_w9;
+            return (w == 8) ? VK_SHADER_nufft_precompute_points_weights_f_w8 : VK_SHADER_nufft_precompute_points_weights_f_w9;
         case VK_PREC_DF:
             if (w == 14) return VK_SHADER_nufft_precompute_points_weights_df_w14;
             if (w == 15) return VK_SHADER_nufft_precompute_points_weights_df_w15;
@@ -234,30 +240,42 @@ static VkShaderId shader_precompute_points_weights(VkPrecKind prec, int w) {
 
 static VkShaderId shader_reduce_grid(VkPrecKind prec) {
     switch (prec) {
-        case VK_PREC_HALF:   return VK_SHADER_nufft_reduce_grid_h;
-        case VK_PREC_FLOAT:  return VK_SHADER_nufft_reduce_grid_f;
-        case VK_PREC_DF:     return VK_SHADER_nufft_reduce_grid_df;
-        case VK_PREC_DOUBLE: return VK_SHADER_nufft_reduce_grid_d;
+        case VK_PREC_HALF:
+            return VK_SHADER_nufft_reduce_grid_h;
+        case VK_PREC_FLOAT:
+            return VK_SHADER_nufft_reduce_grid_f;
+        case VK_PREC_DF:
+            return VK_SHADER_nufft_reduce_grid_df;
+        case VK_PREC_DOUBLE:
+            return VK_SHADER_nufft_reduce_grid_d;
     }
     return VK_SHADER_COUNT;
 }
 
 static VkShaderId shader_pack_bucket_geom(VkPrecKind prec) {
     switch (prec) {
-        case VK_PREC_HALF:   return VK_SHADER_nufft_pack_bucket_geom_h;
-        case VK_PREC_FLOAT:  return VK_SHADER_nufft_pack_bucket_geom_f;
-        case VK_PREC_DF:     return VK_SHADER_nufft_pack_bucket_geom_df;
-        case VK_PREC_DOUBLE: return VK_SHADER_nufft_pack_bucket_geom_d;
+        case VK_PREC_HALF:
+            return VK_SHADER_nufft_pack_bucket_geom_h;
+        case VK_PREC_FLOAT:
+            return VK_SHADER_nufft_pack_bucket_geom_f;
+        case VK_PREC_DF:
+            return VK_SHADER_nufft_pack_bucket_geom_df;
+        case VK_PREC_DOUBLE:
+            return VK_SHADER_nufft_pack_bucket_geom_d;
     }
     return VK_SHADER_COUNT;
 }
 
 static VkShaderId shader_spread_smem(VkPrecKind prec) {
     switch (prec) {
-        case VK_PREC_HALF:   return VK_SHADER_nufft_spread_smem_h;
-        case VK_PREC_FLOAT:  return VK_SHADER_nufft_spread_smem_f;
-        case VK_PREC_DF:     return VK_SHADER_nufft_spread_smem_df;
-        case VK_PREC_DOUBLE: return VK_SHADER_nufft_spread_smem_d;
+        case VK_PREC_HALF:
+            return VK_SHADER_nufft_spread_smem_h;
+        case VK_PREC_FLOAT:
+            return VK_SHADER_nufft_spread_smem_f;
+        case VK_PREC_DF:
+            return VK_SHADER_nufft_spread_smem_df;
+        case VK_PREC_DOUBLE:
+            return VK_SHADER_nufft_spread_smem_d;
     }
     return VK_SHADER_COUNT;
 }
@@ -265,25 +283,25 @@ static VkShaderId shader_spread_smem(VkPrecKind prec) {
 static VkShaderId shader_spread_reg(VkPrecKind prec, int q_val) {
     switch (prec) {
         case VK_PREC_HALF:
-            if (q_val == 8)  return VK_SHADER_nufft_spread_reg_h_q8;
+            if (q_val == 8) return VK_SHADER_nufft_spread_reg_h_q8;
             if (q_val == 16) return VK_SHADER_nufft_spread_reg_h_q16;
             if (q_val == 32) return VK_SHADER_nufft_spread_reg_h_q32;
             break;
         case VK_PREC_FLOAT:
-            if (q_val == 4)  return VK_SHADER_nufft_spread_reg_f_q4;
-            if (q_val == 8)  return VK_SHADER_nufft_spread_reg_f_q8;
+            if (q_val == 4) return VK_SHADER_nufft_spread_reg_f_q4;
+            if (q_val == 8) return VK_SHADER_nufft_spread_reg_f_q8;
             if (q_val == 16) return VK_SHADER_nufft_spread_reg_f_q16;
             if (q_val == 32) return VK_SHADER_nufft_spread_reg_f_q32;
             break;
         case VK_PREC_DF:
-            if (q_val == 4)  return VK_SHADER_nufft_spread_reg_df_q4;
-            if (q_val == 8)  return VK_SHADER_nufft_spread_reg_df_q8;
+            if (q_val == 4) return VK_SHADER_nufft_spread_reg_df_q4;
+            if (q_val == 8) return VK_SHADER_nufft_spread_reg_df_q8;
             if (q_val == 16) return VK_SHADER_nufft_spread_reg_df_q16;
             break;
         case VK_PREC_DOUBLE:
-            if (q_val == 2)  return VK_SHADER_nufft_spread_reg_d_q2;
-            if (q_val == 4)  return VK_SHADER_nufft_spread_reg_d_q4;
-            if (q_val == 8)  return VK_SHADER_nufft_spread_reg_d_q8;
+            if (q_val == 2) return VK_SHADER_nufft_spread_reg_d_q2;
+            if (q_val == 4) return VK_SHADER_nufft_spread_reg_d_q4;
+            if (q_val == 8) return VK_SHADER_nufft_spread_reg_d_q8;
             if (q_val == 16) return VK_SHADER_nufft_spread_reg_d_q16;
             break;
     }
@@ -292,26 +310,27 @@ static VkShaderId shader_spread_reg(VkPrecKind prec, int q_val) {
 
 static VkShaderId shader_spread_cpu_direct(VkPrecKind prec) {
     switch (prec) {
-        case VK_PREC_HALF:   return VK_SHADER_nufft_spread_cpu_direct_h;
-        case VK_PREC_FLOAT:  return VK_SHADER_nufft_spread_cpu_direct_f;
-        case VK_PREC_DF:     return VK_SHADER_nufft_spread_cpu_direct_df;
-        case VK_PREC_DOUBLE: return VK_SHADER_nufft_spread_cpu_direct_d;
+        case VK_PREC_HALF:
+            return VK_SHADER_nufft_spread_cpu_direct_h;
+        case VK_PREC_FLOAT:
+            return VK_SHADER_nufft_spread_cpu_direct_f;
+        case VK_PREC_DF:
+            return VK_SHADER_nufft_spread_cpu_direct_df;
+        case VK_PREC_DOUBLE:
+            return VK_SHADER_nufft_spread_cpu_direct_d;
     }
     return VK_SHADER_COUNT;
 }
 
 static VkShaderId shader_deconv_table(VkPrecKind prec, int w, bool h_f32) {
     if (h_f32 && prec == VK_PREC_HALF) {
-        return (w == 4) ? VK_SHADER_nufft_deconv_table_h_f32_w4
-                        : VK_SHADER_nufft_deconv_table_h_f32_w5;
+        return (w == 4) ? VK_SHADER_nufft_deconv_table_h_f32_w4 : VK_SHADER_nufft_deconv_table_h_f32_w5;
     }
     switch (prec) {
         case VK_PREC_HALF:
-            return (w == 4) ? VK_SHADER_nufft_deconv_table_h_w4
-                            : VK_SHADER_nufft_deconv_table_h_w5;
+            return (w == 4) ? VK_SHADER_nufft_deconv_table_h_w4 : VK_SHADER_nufft_deconv_table_h_w5;
         case VK_PREC_FLOAT:
-            return (w == 8) ? VK_SHADER_nufft_deconv_table_f_w8
-                            : VK_SHADER_nufft_deconv_table_f_w9;
+            return (w == 8) ? VK_SHADER_nufft_deconv_table_f_w8 : VK_SHADER_nufft_deconv_table_f_w9;
         case VK_PREC_DF:
             if (w == 14) return VK_SHADER_nufft_deconv_table_df_w14;
             if (w == 15) return VK_SHADER_nufft_deconv_table_df_w15;
@@ -327,11 +346,9 @@ static VkShaderId shader_deconv_table(VkPrecKind prec, int w, bool h_f32) {
 static VkShaderId shader_deconv_emit(VkPrecKind prec, int w) {
     switch (prec) {
         case VK_PREC_HALF:
-            return (w == 4) ? VK_SHADER_nufft_deconv_emit_h_w4
-                            : VK_SHADER_nufft_deconv_emit_h_w5;
+            return (w == 4) ? VK_SHADER_nufft_deconv_emit_h_w4 : VK_SHADER_nufft_deconv_emit_h_w5;
         case VK_PREC_FLOAT:
-            return (w == 8) ? VK_SHADER_nufft_deconv_emit_f_w8
-                            : VK_SHADER_nufft_deconv_emit_f_w9;
+            return (w == 8) ? VK_SHADER_nufft_deconv_emit_f_w8 : VK_SHADER_nufft_deconv_emit_f_w9;
         case VK_PREC_DF:
             if (w == 14) return VK_SHADER_nufft_deconv_emit_df_w14;
             if (w == 15) return VK_SHADER_nufft_deconv_emit_df_w15;
@@ -348,12 +365,7 @@ static VkShaderId shader_deconv_emit(VkPrecKind prec, int w) {
  * Kernel Dispatch Recorders
  * ============================================================================ */
 
-static bool record_precompute_points_weights(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    VkBufferSlice d_x,
-    int M,
-    double df_scaled_d) {
+static bool record_precompute_points_weights(VkNufft1Plan* plan, VkCmdBatch* batch, VkBufferSlice d_x, int M, double df_scaled_d) {
     const uint32_t wg = (uint32_t)(plan->precompute_wg > 0 ? plan->precompute_wg : 64u);
     const uint32_t gx = ((uint32_t)M + wg - 1u) / wg;
     const bool mode43 = (plan->mode == VK_PSWF43);
@@ -377,30 +389,20 @@ static bool record_precompute_points_weights(
 
     if (plan->prec == VK_PREC_DOUBLE) {
         VkPrecompPtsDPush pc = {df_scaled_d, M, plan->nfft, plan->w, phase_shift, flags, 0u};
-        const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(
-            plan->ctx, sid, 5u, sizeof(pc), specs, nspec, 0u);
+        const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(plan->ctx, sid, 5u, sizeof(pc), specs, nspec, 0u);
         if (!pipe) return false;
         return vk_batch_dispatch(batch, pipe, binds, 5u, &pc, sizeof(pc), gx, 1u, 1u);
     } else {
         VkDf dfs = vk_df_from_double(df_scaled_d);
         VkPrecompPtsDfPush pc = {dfs.hi, dfs.lo, M, plan->nfft, plan->w, phase_shift, flags};
-        const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(
-            plan->ctx, sid, 5u, sizeof(pc), specs, nspec, 0u);
+        const VkCompiledPipeline* pipe = vk_ctx_get_pipeline(plan->ctx, sid, 5u, sizeof(pc), specs, nspec, 0u);
         if (!pipe) return false;
         return vk_batch_dispatch(batch, pipe, binds, 5u, &pc, sizeof(pc), gx, 1u, 1u);
     }
 }
 
-static bool record_build_window_buckets(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    int M,
-    int win_elems,
-    int num_wins,
-    VkBufferSlice d_cnt,
-    VkBufferSlice d_off,
-    VkBufferSlice d_bm,
-    bool counts_pre_zeroed) {
+static bool record_build_window_buckets(VkNufft1Plan* plan, VkCmdBatch* batch, int M, int win_elems, int num_wins, VkBufferSlice d_cnt, VkBufferSlice d_off,
+                                        VkBufferSlice d_bm, bool counts_pre_zeroed) {
     if (num_wins <= 1 || M <= 0) return true;
     const VkDeviceFftConfig* dev_cfg = vk_ctx_config(plan->ctx);
     const uint32_t wg = (uint32_t)(plan->precompute_wg > 0 ? plan->precompute_wg : 64u);
@@ -418,17 +420,13 @@ static bool record_build_window_buckets(
     /* Pass 1: count (use per-WG SMEM histogram when num_wins <= 256 and M >= 2048 to cut global atomic contention) */
     {
         const bool use_smem_hist =
-            dev_cfg->has_native_local_mem &&
-            num_wins <= 256 &&
-            M >= 2048 &&
-            ((size_t)num_wins * sizeof(int32_t) <= dev_cfg->local_mem_size / 8u);
+            dev_cfg->has_native_local_mem && num_wins <= 256 && M >= 2048 && ((size_t)num_wins * sizeof(int32_t) <= dev_cfg->local_mem_size / 8u);
         VkSpecConstEntry cspecs[3] = {
             {0u, wg},
             {1u, use_smem_hist ? 1u : 0u},
             {2u, use_smem_hist ? (uint32_t)num_wins : 1u},
         };
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, VK_SHADER_nufft_bucket_count, 2u, sizeof(pc), cspecs, 3u, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, VK_SHADER_nufft_bucket_count, 2u, sizeof(pc), cspecs, 3u, 0u);
         if (!p) return false;
         VkBufferSlice b[2] = {vk_buf_slice(&plan->d_first, 0, VK_WHOLE_SIZE), d_cnt};
         if (!vk_batch_dispatch(batch, p, b, 2u, &pc, sizeof(pc), gx, 1u, 1u)) return false;
@@ -438,8 +436,7 @@ static bool record_build_window_buckets(
     /* Pass 2: exclusive scan */
     {
         VkBucketScanPush spc = {num_wins};
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, VK_SHADER_nufft_bucket_scan, 2u, sizeof(spc), nullptr, 0u, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, VK_SHADER_nufft_bucket_scan, 2u, sizeof(spc), nullptr, 0u, 0u);
         if (!p) return false;
         VkBufferSlice b[2] = {d_cnt, d_off};
         if (!vk_batch_dispatch(batch, p, b, 2u, &spc, sizeof(spc), 1u, 1u, 1u)) return false;
@@ -448,8 +445,7 @@ static bool record_build_window_buckets(
 
     /* Pass 3: scatter */
     {
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, VK_SHADER_nufft_bucket_scatter, 3u, sizeof(pc), &spec_wg, 1u, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, VK_SHADER_nufft_bucket_scatter, 3u, sizeof(pc), &spec_wg, 1u, 0u);
         if (!p) return false;
         VkBufferSlice b[3] = {vk_buf_slice(&plan->d_first, 0, VK_WHOLE_SIZE), d_cnt, d_bm};
         if (!vk_batch_dispatch(batch, p, b, 3u, &pc, sizeof(pc), gx, 1u, 1u)) return false;
@@ -465,8 +461,7 @@ static bool record_build_window_buckets(
             sort_wg = (uint32_t)pow2_floor_i((int)vk_ctx_config(plan->ctx)->max_work_group_size);
         }
         VkSpecConstEntry spec_sort = {0u, sort_wg};
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, VK_SHADER_nufft_bucket_sort, 2u, 0u, &spec_sort, 1u, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, VK_SHADER_nufft_bucket_sort, 2u, 0u, &spec_sort, 1u, 0u);
         if (!p) return false;
         VkBufferSlice b[2] = {d_off, d_bm};
         if (!vk_batch_dispatch(batch, p, b, 2u, nullptr, 0u, (uint32_t)num_wins, 1u, 1u)) return false;
@@ -474,23 +469,14 @@ static bool record_build_window_buckets(
     return true;
 }
 
-static bool record_pack_bucket_geom(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    int num_wins,
-    int max_entries,
-    VkBufferSlice d_off,
-    VkBufferSlice d_bm,
-    VkBufferSlice d_bf,
-    VkBufferSlice d_bs,
-    VkBufferSlice d_bw) {
+static bool record_pack_bucket_geom(VkNufft1Plan* plan, VkCmdBatch* batch, int num_wins, int max_entries, VkBufferSlice d_off, VkBufferSlice d_bm,
+                                    VkBufferSlice d_bf, VkBufferSlice d_bs, VkBufferSlice d_bw) {
     if (num_wins <= 1 || max_entries <= 0) return true;
     const uint32_t wg = (uint32_t)(plan->precompute_wg > 0 ? plan->precompute_wg : 64u);
     const uint32_t gx = ((uint32_t)max_entries + wg - 1u) / wg;
     VkSpecConstEntry spec_wg = {0u, wg};
     VkPackGeomPush pc = {plan->w, num_wins, 1};
-    const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-        plan->ctx, shader_pack_bucket_geom(plan->prec), 8u, sizeof(pc), &spec_wg, 1u, 0u);
+    const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, shader_pack_bucket_geom(plan->prec), 8u, sizeof(pc), &spec_wg, 1u, 0u);
     if (!p) return false;
     VkBufferSlice b[8] = {
         d_off,
@@ -505,21 +491,9 @@ static bool record_pack_bucket_geom(
     return vk_batch_dispatch(batch, p, b, 8u, &pc, sizeof(pc), gx, 1u, 1u);
 }
 
-static bool record_spread_cfg(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    const VkSpreadConfig* sc,
-    VkBufferSlice d_weights,
-    VkBufferSlice d_first,
-    VkBufferSlice d_shift,
-    VkBufferSlice d_off,
-    VkBufferSlice d_bm,
-    VkBufferSlice d_y,
-    uint32_t y_offset_elems,
-    VkBufferSlice d_fft_buf,
-    int M,
-    size_t cur_bs,
-    bool allow_km) {
+static bool record_spread_cfg(VkNufft1Plan* plan, VkCmdBatch* batch, const VkSpreadConfig* sc, VkBufferSlice d_weights, VkBufferSlice d_first,
+                              VkBufferSlice d_shift, VkBufferSlice d_off, VkBufferSlice d_bm, VkBufferSlice d_y, uint32_t y_offset_elems,
+                              VkBufferSlice d_fft_buf, int M, size_t cur_bs, bool allow_km) {
     const VkDeviceFftConfig* dev_cfg = vk_ctx_config(plan->ctx);
     const size_t bs_packed = (cur_bs + plan->lanes - 1u) / plan->lanes;
 
@@ -532,8 +506,7 @@ static bool record_spread_cfg(
         };
         size_t nspec = (plan->prec == VK_PREC_DF) ? 3u : 2u;
         VkSpreadCpuPush pc = {M, plan->nfft, (uint32_t)M, (uint32_t)cur_bs, y_offset_elems};
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, shader_spread_cpu_direct(plan->prec), 5u, sizeof(pc), specs, nspec, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, shader_spread_cpu_direct(plan->prec), 5u, sizeof(pc), specs, nspec, 0u);
         if (!p) return false;
         VkBufferSlice b[5] = {d_weights, d_first, d_shift, d_y, d_fft_buf};
         return vk_batch_dispatch(batch, p, b, 5u, &pc, sizeof(pc), (uint32_t)bs_packed, 1u, 1u);
@@ -547,14 +520,12 @@ static bool record_spread_cfg(
     /* 1. Intra-WG M-splitting when bs_packed < b_per_wg (M >> N small-B regime):
      *    repurposes idle lane_b slots to parallelize the inner tile loop with zero extra VRAM. */
     uint32_t split_m = 1u;
-    if (allow_km && sc->use_smem && num_b_groups == 1u && bs_packed > 0 &&
-        bs_packed * 2u <= (size_t)sc->b_per_wg && M >= 1024) {
+    if (allow_km && sc->use_smem && num_b_groups == 1u && bs_packed > 0 && bs_packed * 2u <= (size_t)sc->b_per_wg && M >= 1024) {
         int raw_sm = pow2_floor_i(sc->b_per_wg / (int)bs_packed);
         if (raw_sm > sc->tile_m) raw_sm = pow2_floor_i(sc->tile_m);
         if (raw_sm >= 2) {
             if (sc->use_reg_acc) {
-                size_t cur_smem = (size_t)sc->tile_m * sizeof(int32_t) +
-                                  2u * (size_t)sc->tile_m * (size_t)sy_stride * plan->real_bytes +
+                size_t cur_smem = (size_t)sc->tile_m * sizeof(int32_t) + 2u * (size_t)sc->tile_m * (size_t)sy_stride * plan->real_bytes +
                                   (size_t)sc->tile_m * (size_t)plan->w * plan->scalar_bytes;
                 size_t red_smem = 2u * (size_t)sc->wg_size * plan->real_bytes;
                 size_t smem_lim = dev_cfg->local_mem_size - (dev_cfg->local_mem_size / 16u);
@@ -569,8 +540,7 @@ static bool record_spread_cfg(
     uint32_t k_m_splits = 1u;
     VkBufferSlice spread_dst = d_fft_buf;
     uint32_t grid_elems = (uint32_t)(cur_bs * (size_t)plan->nfft);
-    if (allow_km && sc->use_smem && dev_cfg->is_gpu &&
-        total_wgs < 2u * (uint32_t)dev_cfg->max_compute_units &&
+    if (allow_km && sc->use_smem && dev_cfg->is_gpu && total_wgs < 2u * (uint32_t)dev_cfg->max_compute_units &&
         (size_t)M / (size_t)(sc->num_wins > 0 ? sc->num_wins : 1) >= 512u) {
         size_t target_wgs = 2u * dev_cfg->max_compute_units;
         int raw_km = (int)((target_wgs + total_wgs - 1u) / (total_wgs > 0 ? total_wgs : 1u));
@@ -594,27 +564,14 @@ static bool record_spread_cfg(
     }
 
     VkSpreadPush pc = {
-        M,
-        plan->nfft,
-        sc->win_elems,
-        sc->num_wins,
-        log2_pow2_i(sc->num_wins),
-        (uint32_t)M,
-        (uint32_t)cur_bs,
-        y_offset_elems,
-        k_m_splits,
-        (k_m_splits > 1u) ? grid_elems : 0u,
+        M,           plan->nfft,       sc->win_elems,  sc->num_wins, log2_pow2_i(sc->num_wins),
+        (uint32_t)M, (uint32_t)cur_bs, y_offset_elems, k_m_splits,   (k_m_splits > 1u) ? grid_elems : 0u,
     };
 
     VkBufferSlice dummy = vk_ctx_dummy_buffer(plan->ctx);
     VkBufferSlice b[7] = {
-        d_weights,
-        d_first,
-        d_shift,
-        (sc->num_wins > 1 && vk_slice_valid(d_off)) ? d_off : dummy,
-        (sc->num_wins > 1 && vk_slice_valid(d_bm))  ? d_bm  : dummy,
-        d_y,
-        spread_dst,
+        d_weights, d_first,    d_shift, (sc->num_wins > 1 && vk_slice_valid(d_off)) ? d_off : dummy, (sc->num_wins > 1 && vk_slice_valid(d_bm)) ? d_bm : dummy,
+        d_y,       spread_dst,
     };
 
     bool ok = false;
@@ -623,14 +580,14 @@ static bool record_spread_cfg(
         VkShaderId sid = shader_spread_reg(plan->prec, q_val);
         if (sid == VK_SHADER_COUNT) return false;
         VkSpecConstEntry specs[13] = {
-            {0u,  (uint32_t)sc->wg_size},
-            {1u,  (uint32_t)plan->w},
-            {2u,  (uint32_t)sc->t_j},
-            {3u,  (uint32_t)log2_pow2_i(sc->t_j)},
-            {4u,  (uint32_t)sc->b_per_wg},
-            {5u,  (uint32_t)sc->tile_m},
-            {6u,  (uint32_t)log2_pow2_i(sc->tile_m)},
-            {9u,  (uint32_t)sc->tile_m * sy_stride},
+            {0u, (uint32_t)sc->wg_size},
+            {1u, (uint32_t)plan->w},
+            {2u, (uint32_t)sc->t_j},
+            {3u, (uint32_t)log2_pow2_i(sc->t_j)},
+            {4u, (uint32_t)sc->b_per_wg},
+            {5u, (uint32_t)sc->tile_m},
+            {6u, (uint32_t)log2_pow2_i(sc->tile_m)},
+            {9u, (uint32_t)sc->tile_m * sy_stride},
             {10u, (uint32_t)sc->tile_m * (uint32_t)plan->w},
             {11u, multipass},
             {12u, split_m},
@@ -638,30 +595,28 @@ static bool record_spread_cfg(
             {15u, plan->fft_plan.df_use_veltkamp ? 1u : 0u},
         };
         size_t nspec = (plan->prec == VK_PREC_DF) ? 13u : 12u;
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, sid, 7u, sizeof(pc), specs, nspec, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, sid, 7u, sizeof(pc), specs, nspec, 0u);
         if (!p) return false;
         ok = vk_batch_dispatch(batch, p, b, 7u, &pc, sizeof(pc), total_wgs, k_m_splits, 1u);
     } else {
         VkSpecConstEntry specs[14] = {
-            {0u,  (uint32_t)sc->wg_size},
-            {1u,  (uint32_t)plan->w},
-            {2u,  (uint32_t)sc->t_j},
-            {3u,  (uint32_t)log2_pow2_i(sc->t_j)},
-            {4u,  (uint32_t)sc->b_per_wg},
-            {5u,  (uint32_t)sc->tile_m},
-            {6u,  (uint32_t)log2_pow2_i(sc->tile_m)},
-            {7u,  (uint32_t)sc->grid_stride},
-            {8u,  (uint32_t)(sc->b_per_wg * sc->grid_stride)},
-            {9u,  (uint32_t)sc->tile_m * sy_stride},
+            {0u, (uint32_t)sc->wg_size},
+            {1u, (uint32_t)plan->w},
+            {2u, (uint32_t)sc->t_j},
+            {3u, (uint32_t)log2_pow2_i(sc->t_j)},
+            {4u, (uint32_t)sc->b_per_wg},
+            {5u, (uint32_t)sc->tile_m},
+            {6u, (uint32_t)log2_pow2_i(sc->tile_m)},
+            {7u, (uint32_t)sc->grid_stride},
+            {8u, (uint32_t)(sc->b_per_wg * sc->grid_stride)},
+            {9u, (uint32_t)sc->tile_m * sy_stride},
             {10u, (uint32_t)sc->tile_m * (uint32_t)plan->w},
             {11u, multipass},
             {12u, split_m},
             {15u, plan->fft_plan.df_use_veltkamp ? 1u : 0u},
         };
         size_t nspec = (plan->prec == VK_PREC_DF) ? 14u : 13u;
-        const VkCompiledPipeline* p = vk_ctx_get_pipeline(
-            plan->ctx, shader_spread_smem(plan->prec), 7u, sizeof(pc), specs, nspec, 0u);
+        const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, shader_spread_smem(plan->prec), 7u, sizeof(pc), specs, nspec, 0u);
         if (!p) return false;
         ok = vk_batch_dispatch(batch, p, b, 7u, &pc, sizeof(pc), total_wgs, k_m_splits, 1u);
     }
@@ -677,8 +632,7 @@ static bool record_spread_cfg(
         };
         size_t rnspec = (plan->prec == VK_PREC_DF) ? 2u : 1u;
         VkReduceGridPush rpc = {grid_elems, k_m_splits};
-        const VkCompiledPipeline* rp = vk_ctx_get_pipeline(
-            plan->ctx, shader_reduce_grid(plan->prec), 2u, sizeof(rpc), rspecs, rnspec, 0u);
+        const VkCompiledPipeline* rp = vk_ctx_get_pipeline(plan->ctx, shader_reduce_grid(plan->prec), 2u, sizeof(rpc), rspecs, rnspec, 0u);
         if (!rp) return false;
         VkBufferSlice rb[2] = {spread_dst, d_fft_buf};
         return vk_batch_dispatch(batch, rp, rb, 2u, &rpc, sizeof(rpc), rgx, 1u, 1u);
@@ -686,13 +640,7 @@ static bool record_spread_cfg(
     return true;
 }
 
-static bool record_build_deconv_table(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    int table_kind,
-    bool h_f32,
-    VkBufferSlice d_out,
-    double output_scale) {
+static bool record_build_deconv_table(VkNufft1Plan* plan, VkCmdBatch* batch, int table_kind, bool h_f32, VkBufferSlice d_out, double output_scale) {
     const uint32_t gx = ((uint32_t)plan->nout + 63u) / 64u;
     const int mode43 = (plan->mode == VK_PSWF43) ? 1 : 0;
     VkBufferSlice b[2] = {vk_buf_slice(&plan->d_pswf_tbl, 0, VK_WHOLE_SIZE), d_out};
@@ -718,17 +666,10 @@ static bool record_build_deconv_table(
     }
 }
 
-static bool record_deconv_emit(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    const VkDeconvConfig* dc,
-    VkBufferSlice d_fft_buf,
-    VkBufferSlice d_out,
-    uint32_t out_offset_elems,
-    size_t cur_bs,
-    VkNufftOutOrder order) {
+static bool record_deconv_emit(VkNufft1Plan* plan, VkCmdBatch* batch, const VkDeconvConfig* dc, VkBufferSlice d_fft_buf, VkBufferSlice d_out,
+                               uint32_t out_offset_elems, size_t cur_bs, VkNufftOutOrder order) {
     const uint32_t wg_i = (uint32_t)(dc->wg_i > 0 ? dc->wg_i : 64);
-    const uint32_t bt   = (uint32_t)(dc->batch_tile > 0 ? dc->batch_tile : 32);
+    const uint32_t bt = (uint32_t)(dc->batch_tile > 0 ? dc->batch_tile : 32);
     const size_t bs_packed = (cur_bs + plan->lanes - 1u) / plan->lanes;
     const uint32_t gx = ((uint32_t)plan->nout + wg_i - 1u) / wg_i;
     const uint32_t gy = (uint32_t)((bs_packed + bt - 1u) / bt);
@@ -748,8 +689,8 @@ static bool record_deconv_emit(
 
     if (plan->prec == VK_PREC_DOUBLE) {
         VkDeconvEmitF64Push pc = {
-            plan->output_scale, plan->nfft, plan->log_nfft, plan->nout, plan->output_shift,
-            mode43, (int32_t)order, (int32_t)bt, (uint32_t)cur_bs, (uint32_t)plan->nout, out_offset_elems,
+            plan->output_scale, plan->nfft,  plan->log_nfft,   plan->nout,           plan->output_shift, mode43,
+            (int32_t)order,     (int32_t)bt, (uint32_t)cur_bs, (uint32_t)plan->nout, out_offset_elems,
         };
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, sid, 3u, sizeof(pc), specs, nspec, 0u);
         if (!p) return false;
@@ -757,7 +698,7 @@ static bool record_deconv_emit(
     } else if (plan->prec == VK_PREC_DF) {
         VkDf sc = vk_df_from_double(plan->output_scale);
         VkDeconvEmitDfPush pc = {
-            sc.hi, sc.lo, plan->nfft, plan->log_nfft, plan->nout, plan->output_shift,
+            sc.hi,  sc.lo,          plan->nfft,  plan->log_nfft,   plan->nout,           plan->output_shift,
             mode43, (int32_t)order, (int32_t)bt, (uint32_t)cur_bs, (uint32_t)plan->nout, out_offset_elems,
         };
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, sid, 3u, sizeof(pc), specs, nspec, 0u);
@@ -765,8 +706,8 @@ static bool record_deconv_emit(
         return vk_batch_dispatch(batch, p, b, 3u, &pc, sizeof(pc), gx, gy, 1u);
     } else {
         VkDeconvEmitF32Push pc = {
-            (float)plan->output_scale, plan->nfft, plan->log_nfft, plan->nout, plan->output_shift,
-            mode43, (int32_t)order, (int32_t)bt, (uint32_t)cur_bs, (uint32_t)plan->nout, out_offset_elems,
+            (float)plan->output_scale, plan->nfft,           plan->log_nfft,   plan->nout, plan->output_shift, mode43, (int32_t)order, (int32_t)bt,
+            (uint32_t)cur_bs,          (uint32_t)plan->nout, out_offset_elems,
         };
         const VkCompiledPipeline* p = vk_ctx_get_pipeline(plan->ctx, sid, 3u, sizeof(pc), specs, nspec, 0u);
         if (!p) return false;
@@ -779,40 +720,26 @@ static bool record_deconv_emit(
  * ============================================================================ */
 
 typedef struct VkSpreadCandidate {
-    char           variant_id[64];
+    char variant_id[64];
     VkSpreadConfig cfg;
-    size_t         smem_bytes;
-    int            score;
+    size_t smem_bytes;
+    int score;
 } VkSpreadCandidate;
 
 typedef struct VkDeconvCandidate {
-    char           variant_id[64];
+    char variant_id[64];
     VkDeconvConfig cfg;
 } VkDeconvCandidate;
 
-static size_t calc_spread_smem_bytes(
-    size_t real_bytes, size_t scalar_bytes, int w,
-    int b_per_wg, int win_elems, int tile_m, int grid_pad, bool use_reg_acc) {
+static size_t calc_spread_smem_bytes(size_t real_bytes, size_t scalar_bytes, int w, int b_per_wg, int win_elems, int tile_m, int grid_pad, bool use_reg_acc) {
     int grid_stride = win_elems + grid_pad;
     int sy_stride = b_per_wg + 1;
     size_t grid_b = use_reg_acc ? 0u : (2u * (size_t)b_per_wg * (size_t)grid_stride * real_bytes);
-    return grid_b +
-           (size_t)tile_m * sizeof(int32_t) +
-           2u * (size_t)tile_m * (size_t)sy_stride * real_bytes +
-           (size_t)tile_m * (size_t)w * scalar_bytes;
+    return grid_b + (size_t)tile_m * sizeof(int32_t) + 2u * (size_t)tile_m * (size_t)sy_stride * real_bytes + (size_t)tile_m * (size_t)w * scalar_bytes;
 }
 
-static size_t build_spread_candidates(
-    const VkDeviceFftConfig* dev_cfg,
-    VkPrecKind prec,
-    size_t real_bytes,
-    size_t scalar_bytes,
-    size_t eff_sg,
-    int nfft,
-    int w,
-    bool allow_emulated_smem,
-    VkSpreadCandidate* out,
-    size_t cap) {
+static size_t build_spread_candidates(const VkDeviceFftConfig* dev_cfg, VkPrecKind prec, size_t real_bytes, size_t scalar_bytes, size_t eff_sg, int nfft, int w,
+                                      bool allow_emulated_smem, VkSpreadCandidate* out, size_t cap) {
     size_t n = 0;
     VkBankModel bm = vk_bank_model_from_kind(dev_cfg->bank_model);
     size_t sg_unit = (eff_sg > 1u) ? eff_sg : (dev_cfg->sub_group_size > 1u ? dev_cfg->sub_group_size : 1u);
@@ -850,7 +777,8 @@ static size_t build_spread_candidates(
                 int wg = pow2_floor_i((int)sg_unit * mults[mi]);
                 if (wg >= wg_min && wg <= wg_max && (wg % t_j) == 0) {
                     bool dup = false;
-                    for (int k = 0; k < n_wg; ++k) if (wg_list[k] == wg) dup = true;
+                    for (int k = 0; k < n_wg; ++k)
+                        if (wg_list[k] == wg) dup = true;
                     if (!dup) wg_list[n_wg++] = wg;
                 }
             }
@@ -873,18 +801,20 @@ static size_t build_spread_candidates(
 
                     int tile_m = (wg_size < (int)(sg_unit > 32u ? sg_unit : 32u)) ? wg_size : (int)(sg_unit > 32u ? sg_unit : 32u);
                     tile_m = pow2_clamp_i(tile_m, 16, 64);
-                    while (tile_m > 16 &&
-                           calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, true) > smem_limit) {
+                    while (tile_m > 16 && calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, true) > smem_limit) {
                         tile_m >>= 1;
                     }
                     size_t smem_b = calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, true);
                     if (smem_b > smem_limit) continue;
 
                     char id[64];
-                    if (t_j < w) snprintf(id, sizeof(id), "reg_wg%d_win%d_tj%d", wg_size, win_elems, t_j);
-                    else         snprintf(id, sizeof(id), "reg_wg%d_win%d", wg_size, win_elems);
+                    if (t_j < w)
+                        snprintf(id, sizeof(id), "reg_wg%d_win%d_tj%d", wg_size, win_elems, t_j);
+                    else
+                        snprintf(id, sizeof(id), "reg_wg%d_win%d", wg_size, win_elems);
                     bool dup = false;
-                    for (size_t k = 0; k < n; ++k) if (strcmp(out[k].variant_id, id) == 0) dup = true;
+                    for (size_t k = 0; k < n; ++k)
+                        if (strcmp(out[k].variant_id, id) == 0) dup = true;
                     if (dup || n >= cap) continue;
 
                     VkSpreadConfig sc = {true, true, false, wg_size, t_j, b_per_wg, win_elems, nfft / win_elems, win_elems + grid_pad, tile_m};
@@ -894,9 +824,12 @@ static size_t build_spread_candidates(
                     int score = (act_w < 16 ? act_w : 16) * 20 + (b_per_wg < 32 ? b_per_wg : 32) * 10;
                     score += (q_val <= 8) ? 40 : ((q_val == 16) ? 15 : -20);
                     if (t_j < w) score += 25;
-                    if (sc.num_wins == 1) score += 30;
-                    else if (sc.num_wins <= 4) score += 18;
-                    else score -= log2_pow2_i(sc.num_wins) * 8;
+                    if (sc.num_wins == 1)
+                        score += 30;
+                    else if (sc.num_wins <= 4)
+                        score += 18;
+                    else
+                        score -= log2_pow2_i(sc.num_wins) * 8;
                     if (win_elems < 128) score -= 25;
 
                     VkSpreadCandidate cand = {0};
@@ -909,8 +842,7 @@ static size_t build_spread_candidates(
 
                 /* SMEM-grid candidates */
                 int max_win = nfft;
-                while (max_win >= min_win &&
-                       calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, max_win, 16, grid_pad, false) > smem_limit) {
+                while (max_win >= min_win && calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, max_win, 16, grid_pad, false) > smem_limit) {
                     max_win >>= 1;
                 }
                 int win_tries[3] = {max_win, max_win / 2, max_win / 4};
@@ -924,28 +856,32 @@ static size_t build_spread_candidates(
                     int win_elems = win_tries[wti];
                     int tile_m = (wg_size < (int)(sg_unit > 32u ? sg_unit : 32u)) ? wg_size : (int)(sg_unit > 32u ? sg_unit : 32u);
                     tile_m = pow2_clamp_i(tile_m, 16, 64);
-                    while (tile_m > 16 &&
-                           calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, false) > smem_limit) {
+                    while (tile_m > 16 && calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, false) > smem_limit) {
                         tile_m >>= 1;
                     }
                     while (tile_m > 16) {
-                        size_t cur_b  = calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, false);
+                        size_t cur_b = calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, false);
                         size_t next_b = calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m >> 1, grid_pad, false);
                         int cur_r = (int)(dev_cfg->local_mem_size / (cur_b > 0 ? cur_b : 1u));
                         int nxt_r = (int)(dev_cfg->local_mem_size / (next_b > 0 ? next_b : 1u));
                         if (cur_r > 4) cur_r = 4;
                         if (nxt_r > 4) nxt_r = 4;
-                        if (nxt_r > cur_r) tile_m >>= 1;
-                        else break;
+                        if (nxt_r > cur_r)
+                            tile_m >>= 1;
+                        else
+                            break;
                     }
                     size_t smem_b = calc_spread_smem_bytes(real_bytes, scalar_bytes, w, b_per_wg, win_elems, tile_m, grid_pad, false);
                     if (smem_b > smem_limit) continue;
 
                     char id[64];
-                    if (t_j < w) snprintf(id, sizeof(id), "smem_wg%d_win%d_tj%d", wg_size, win_elems, t_j);
-                    else         snprintf(id, sizeof(id), "smem_wg%d_win%d", wg_size, win_elems);
+                    if (t_j < w)
+                        snprintf(id, sizeof(id), "smem_wg%d_win%d_tj%d", wg_size, win_elems, t_j);
+                    else
+                        snprintf(id, sizeof(id), "smem_wg%d_win%d", wg_size, win_elems);
                     bool dup = false;
-                    for (size_t k = 0; k < n; ++k) if (strcmp(out[k].variant_id, id) == 0) dup = true;
+                    for (size_t k = 0; k < n; ++k)
+                        if (strcmp(out[k].variant_id, id) == 0) dup = true;
                     if (dup || n >= cap) continue;
 
                     VkSpreadConfig sc = {true, false, false, wg_size, t_j, b_per_wg, win_elems, nfft / win_elems, win_elems + grid_pad, tile_m};
@@ -954,9 +890,12 @@ static size_t build_spread_candidates(
                     int act_w = res_wgs * (wg_size / (int)sg_unit > 0 ? wg_size / (int)sg_unit : 1);
                     int score = (act_w < 16 ? act_w : 16) * 20 + (b_per_wg < 32 ? b_per_wg : 32) * 10;
                     if (t_j < w) score += 25;
-                    if (sc.num_wins == 1) score += 30;
-                    else if (sc.num_wins <= 4) score += 18;
-                    else score -= log2_pow2_i(sc.num_wins) * 8;
+                    if (sc.num_wins == 1)
+                        score += 30;
+                    else if (sc.num_wins <= 4)
+                        score += 18;
+                    else
+                        score -= log2_pow2_i(sc.num_wins) * 8;
                     if (win_elems < 128) score -= 25;
 
                     VkSpreadCandidate cand = {0};
@@ -1001,14 +940,8 @@ static size_t build_spread_candidates(
     return n;
 }
 
-static size_t build_deconv_candidates(
-    const VkDeviceFftConfig* dev_cfg,
-    size_t eff_sg,
-    size_t lanes,
-    int nout,
-    size_t chunk_bs,
-    VkDeconvCandidate* out,
-    size_t cap) {
+static size_t build_deconv_candidates(const VkDeviceFftConfig* dev_cfg, size_t eff_sg, size_t lanes, int nout, size_t chunk_bs, VkDeconvCandidate* out,
+                                      size_t cap) {
     size_t n = 0;
     size_t sg_unit = (eff_sg > 1u) ? eff_sg : (dev_cfg->sub_group_size > 1u ? dev_cfg->sub_group_size : 1u);
     size_t bs_packed = ((chunk_bs > 0 ? chunk_bs : 1u) + lanes - 1u) / lanes;
@@ -1040,7 +973,8 @@ static size_t build_deconv_candidates(
             char id[64];
             snprintf(id, sizeof(id), "deconv_wg%d_bt%d", wg_i, bt);
             bool dup = false;
-            for (size_t k = 0; k < n; ++k) if (strcmp(out[k].variant_id, id) == 0) dup = true;
+            for (size_t k = 0; k < n; ++k)
+                if (strcmp(out[k].variant_id, id) == 0) dup = true;
             if (!dup && n < cap) {
                 snprintf(out[n].variant_id, sizeof(out[n].variant_id), "%s", id);
                 out[n].cfg.wg_i = wg_i;
@@ -1063,21 +997,21 @@ static size_t build_deconv_candidates(
  * ============================================================================ */
 
 typedef struct VkBucketCacheEntry {
-    int           win_elems;
+    int win_elems;
     VkBufferAlloc cnt, off, m, bf, bs, bw;
 } VkBucketCacheEntry;
 
 typedef struct VkSpreadTuneCtx {
-    VkNufft1Plan*            plan;
-    VkCmdBatch*              batch;
+    VkNufft1Plan* plan;
+    VkCmdBatch* batch;
     const VkSpreadCandidate* cands;
-    const size_t*            cand_indices;
-    VkBufferAlloc*           d_tune_y;
-    VkBucketCacheEntry*      bcache;
-    size_t                   bcache_len;
-    size_t                   tune_bs;
-    int                      target_cons_wg;
-    bool                     phase_b;
+    const size_t* cand_indices;
+    VkBufferAlloc* d_tune_y;
+    VkBucketCacheEntry* bcache;
+    size_t bcache_len;
+    size_t tune_bs;
+    int target_cons_wg;
+    bool phase_b;
 } VkSpreadTuneCtx;
 
 static const VkBucketCacheEntry* find_bcache(const VkSpreadTuneCtx* tc, int win_elems) {
@@ -1094,27 +1028,24 @@ static bool spread_bench_run(size_t pos, int reps, void* user) {
 
     VkBufferSlice first_s = vk_buf_slice(&plan->d_first, 0, VK_WHOLE_SIZE);
     VkBufferSlice shift_s = vk_buf_slice(&plan->d_shift, 0, VK_WHOLE_SIZE);
-    VkBufferSlice w_s     = vk_buf_slice(&plan->d_weights, 0, VK_WHOLE_SIZE);
-    VkBufferSlice off_s   = {0};
-    VkBufferSlice bm_s    = {0};
+    VkBufferSlice w_s = vk_buf_slice(&plan->d_weights, 0, VK_WHOLE_SIZE);
+    VkBufferSlice off_s = {0};
+    VkBufferSlice bm_s = {0};
     if (sc->use_smem && sc->num_wins > 1) {
         const VkBucketCacheEntry* bc = find_bcache(tc, sc->win_elems);
         if (!bc) return false;
-        off_s   = vk_buf_slice(&bc->off, 0, VK_WHOLE_SIZE);
-        bm_s    = vk_buf_slice(&bc->m, 0, VK_WHOLE_SIZE);
+        off_s = vk_buf_slice(&bc->off, 0, VK_WHOLE_SIZE);
+        bm_s = vk_buf_slice(&bc->m, 0, VK_WHOLE_SIZE);
         first_s = vk_buf_slice(&bc->bf, 0, VK_WHOLE_SIZE);
         shift_s = vk_buf_slice(&bc->bs, 0, VK_WHOLE_SIZE);
-        w_s     = vk_buf_slice(&bc->bw, 0, VK_WHOLE_SIZE);
+        w_s = vk_buf_slice(&bc->bw, 0, VK_WHOLE_SIZE);
     }
 
     if (!vk_batch_begin(tc->batch)) return false;
     for (int r = 0; r < reps; ++r) {
         if (r > 0) vk_batch_barrier_c2c(tc->batch);
-        if (!record_spread_cfg(
-                plan, tc->batch, sc, w_s, first_s, shift_s, off_s, bm_s,
-                vk_buf_slice(tc->d_tune_y, 0, VK_WHOLE_SIZE), 0u,
-                vk_buf_slice(&plan->d_fft_buf, 0, VK_WHOLE_SIZE),
-                plan->M, tc->tune_bs, false)) {
+        if (!record_spread_cfg(plan, tc->batch, sc, w_s, first_s, shift_s, off_s, bm_s, vk_buf_slice(tc->d_tune_y, 0, VK_WHOLE_SIZE), 0u,
+                               vk_buf_slice(&plan->d_fft_buf, 0, VK_WHOLE_SIZE), plan->M, tc->tune_bs, false)) {
             return false;
         }
     }
@@ -1163,10 +1094,14 @@ static void fill_synth_scalar(void* dst, VkPrecKind prec, size_t n, uint64_t see
     for (size_t k = 0; k < n; ++k) {
         uint64_t s = k + seed_off;
         double v = -0.9 + 1.8 * (double)((s * 2654435761ULL) & 0xFFFFu) / 65535.0;
-        if (prec == VK_PREC_HALF)       ((uint16_t*)dst)[k] = vk_f32_to_f16_bits((float)v);
-        else if (prec == VK_PREC_FLOAT) ((float*)dst)[k] = (float)v;
-        else if (prec == VK_PREC_DF)    ((VkDf*)dst)[k] = vk_df_from_double(v);
-        else                            ((double*)dst)[k] = v;
+        if (prec == VK_PREC_HALF)
+            ((uint16_t*)dst)[k] = vk_f32_to_f16_bits((float)v);
+        else if (prec == VK_PREC_FLOAT)
+            ((float*)dst)[k] = (float)v;
+        else if (prec == VK_PREC_DF)
+            ((VkDf*)dst)[k] = vk_df_from_double(v);
+        else
+            ((double*)dst)[k] = v;
     }
 }
 
@@ -1188,17 +1123,8 @@ static bool allocate_window_buckets(VkNufft1Plan* plan) {
     return true;
 }
 
-bool vk_nufft1_plan_init(
-    VkNufft1Plan* plan,
-    VkDeviceContext* ctx,
-    VkPrecKind prec,
-    int sign,
-    int M,
-    int N,
-    int w,
-    VkPswfMode mode,
-    size_t max_bs,
-    const VkNufft1LaunchConfig* cfg) {
+bool vk_nufft1_plan_init(VkNufft1Plan* plan, VkDeviceContext* ctx, VkPrecKind prec, int sign, int M, int N, int w, VkPswfMode mode, size_t max_bs,
+                         const VkNufft1LaunchConfig* cfg) {
     memset(plan, 0, sizeof(*plan));
     if (!ctx || M <= 0 || N < 512 || N > (1 << 17) || (N & (N - 1)) != 0) return false;
     if (mode == VK_PSWF43 && (N % 4) != 0) return false;
@@ -1222,17 +1148,32 @@ bool vk_nufft1_plan_init(
 
     switch (prec) {
         case VK_PREC_HALF:
-            plan->scalar_bytes = 2u; plan->complex_bytes = 4u; plan->real_bytes = 4u; plan->lanes = 2u; break;
+            plan->scalar_bytes = 2u;
+            plan->complex_bytes = 4u;
+            plan->real_bytes = 4u;
+            plan->lanes = 2u;
+            break;
         case VK_PREC_FLOAT:
-            plan->scalar_bytes = 4u; plan->complex_bytes = 8u; plan->real_bytes = 4u; plan->lanes = 1u; break;
+            plan->scalar_bytes = 4u;
+            plan->complex_bytes = 8u;
+            plan->real_bytes = 4u;
+            plan->lanes = 1u;
+            break;
         case VK_PREC_DF:
-            plan->scalar_bytes = 8u; plan->complex_bytes = 16u; plan->real_bytes = 8u; plan->lanes = 1u; break;
+            plan->scalar_bytes = 8u;
+            plan->complex_bytes = 16u;
+            plan->real_bytes = 8u;
+            plan->lanes = 1u;
+            break;
         case VK_PREC_DOUBLE:
-            plan->scalar_bytes = 8u; plan->complex_bytes = 16u; plan->real_bytes = 8u; plan->lanes = 1u; break;
+            plan->scalar_bytes = 8u;
+            plan->complex_bytes = 16u;
+            plan->real_bytes = 8u;
+            plan->lanes = 1u;
+            break;
     }
 
-    if (!vk_dif_plan_init(&plan->fft_plan, ctx, prec, plan->sign, plan->log_nfft,
-                          plan->max_bs, &plan->launch_cfg.fft_cfg)) {
+    if (!vk_dif_plan_init(&plan->fft_plan, ctx, prec, plan->sign, plan->log_nfft, plan->max_bs, &plan->launch_cfg.fft_cfg)) {
         return false;
     }
 
@@ -1242,11 +1183,8 @@ bool vk_nufft1_plan_init(
 
     /* 1. Build spreading candidates */
     VkSpreadCandidate cands[64];
-    size_t ncands = build_spread_candidates(
-        dev_cfg, prec, plan->real_bytes, plan->scalar_bytes,
-        plan->fft_plan.effective_sg_size, plan->nfft, w,
-        plan->launch_cfg.fft_cfg.allow_emulated_local_mem,
-        cands, 64u);
+    size_t ncands = build_spread_candidates(dev_cfg, prec, plan->real_bytes, plan->scalar_bytes, plan->fft_plan.effective_sg_size, plan->nfft, w,
+                                            plan->launch_cfg.fft_cfg.allow_emulated_local_mem, cands, 64u);
     if (ncands == 0) {
         vk_nufft1_plan_destroy(plan);
         return false;
@@ -1254,8 +1192,7 @@ bool vk_nufft1_plan_init(
 
     size_t chosen_spread = 0;
     bool need_spread_tune = false;
-    bool has_spread_ov = plan->launch_cfg.spread_variant_override[0] != '\0' ||
-                         plan->launch_cfg.fft_cfg.allow_emulated_local_mem;
+    bool has_spread_ov = plan->launch_cfg.spread_variant_override[0] != '\0' || plan->launch_cfg.fft_cfg.allow_emulated_local_mem;
     bool allow_rt_tune = (plan->max_bs >= 32u) || (plan->launch_cfg.fft_cfg.autotune == VK_AUTOTUNE_FORCE);
     int m_bin = (M <= 128) ? 0 : ((M <= 1024) ? 1 : ((M <= 8192) ? 2 : 3));
     char spr_slot[64], spr_key[512];
@@ -1299,16 +1236,12 @@ bool vk_nufft1_plan_init(
     /* 2. Unified L2-aware chunk_bs coordinated with fft_plan */
     size_t fft_bytes = (size_t)plan->nfft * plan->complex_bytes;
     size_t l2_bytes = plan->launch_cfg.chunk_bytes_override > 0
-        ? plan->launch_cfg.chunk_bytes_override
-        : (plan->launch_cfg.fft_cfg.l2_chunk_bytes > 0
-               ? plan->launch_cfg.fft_cfg.l2_chunk_bytes
-               : vk_device_compute_l2_chunk_bytes(
-                     dev_cfg, fft_bytes,
-                     (size_t)(plan->spread_cfg.num_wins > 1 ? plan->spread_cfg.num_wins : 1),
-                     plan->fft_plan.is_compute_heavy,
-                     plan->launch_cfg.fft_cfg.l2_budget_num,
-                     plan->launch_cfg.fft_cfg.l2_budget_den,
-                     plan->launch_cfg.fft_cfg.min_waves_per_cu));
+                          ? plan->launch_cfg.chunk_bytes_override
+                          : (plan->launch_cfg.fft_cfg.l2_chunk_bytes > 0
+                                 ? plan->launch_cfg.fft_cfg.l2_chunk_bytes
+                                 : vk_device_compute_l2_chunk_bytes(dev_cfg, fft_bytes, (size_t)(plan->spread_cfg.num_wins > 1 ? plan->spread_cfg.num_wins : 1),
+                                                                    plan->fft_plan.is_compute_heavy, plan->launch_cfg.fft_cfg.l2_budget_num,
+                                                                    plan->launch_cfg.fft_cfg.l2_budget_den, plan->launch_cfg.fft_cfg.min_waves_per_cu));
     size_t cbs = l2_bytes / (fft_bytes > 0 ? fft_bytes : 1u);
     if (cbs < 1u) cbs = 1u;
     if (cbs > plan->max_bs) cbs = plan->max_bs;
@@ -1354,22 +1287,28 @@ bool vk_nufft1_plan_init(
             bool seen = false;
             for (size_t k = 0; k < n_pa; ++k) {
                 const VkSpreadConfig* p = &cands[phase_a[k]].cfg;
-                if (p->use_smem == cands[i].cfg.use_smem && p->use_reg_acc == cands[i].cfg.use_reg_acc &&
-                    p->use_cpu_direct == cands[i].cfg.use_cpu_direct &&
-                    p->win_elems == cands[i].cfg.win_elems && p->t_j == cands[i].cfg.t_j) seen = true;
+                if (p->use_smem == cands[i].cfg.use_smem && p->use_reg_acc == cands[i].cfg.use_reg_acc && p->use_cpu_direct == cands[i].cfg.use_cpu_direct &&
+                    p->win_elems == cands[i].cfg.win_elems && p->t_j == cands[i].cfg.t_j)
+                    seen = true;
             }
-            if (!seen) { phase_a[n_pa++] = i; ++n_reg; }
+            if (!seen) {
+                phase_a[n_pa++] = i;
+                ++n_reg;
+            }
         }
         for (size_t i = 0; i < ncands && n_smem < 3u && n_pa < 16u; ++i) {
             if (!cands[i].cfg.use_smem || cands[i].cfg.use_reg_acc) continue;
             bool seen = false;
             for (size_t k = 0; k < n_pa; ++k) {
                 const VkSpreadConfig* p = &cands[phase_a[k]].cfg;
-                if (p->use_smem == cands[i].cfg.use_smem && p->use_reg_acc == cands[i].cfg.use_reg_acc &&
-                    p->use_cpu_direct == cands[i].cfg.use_cpu_direct &&
-                    p->win_elems == cands[i].cfg.win_elems && p->t_j == cands[i].cfg.t_j) seen = true;
+                if (p->use_smem == cands[i].cfg.use_smem && p->use_reg_acc == cands[i].cfg.use_reg_acc && p->use_cpu_direct == cands[i].cfg.use_cpu_direct &&
+                    p->win_elems == cands[i].cfg.win_elems && p->t_j == cands[i].cfg.t_j)
+                    seen = true;
             }
-            if (!seen) { phase_a[n_pa++] = i; ++n_smem; }
+            if (!seen) {
+                phase_a[n_pa++] = i;
+                ++n_smem;
+            }
         }
 
         if (n_pa > 1u) {
@@ -1395,7 +1334,6 @@ bool vk_nufft1_plan_init(
                         vk_batch_upload_sync(&init_batch, h_w, vk_buf_slice(&plan->d_weights, 0, VK_WHOLE_SIZE), (size_t)M * (size_t)w * plan->scalar_bytes) &&
                         vk_batch_upload_sync(&init_batch, h_shift, vk_buf_slice(&plan->d_shift, 0, VK_WHOLE_SIZE), (size_t)M * plan->complex_bytes);
                     if (up_ok) {
-
                         VkBucketCacheEntry bcache[16];
                         memset(bcache, 0, sizeof(bcache));
                         size_t bcache_len = 0;
@@ -1416,34 +1354,30 @@ bool vk_nufft1_plan_init(
                                 vk_buf_create(ctx, max_ent * sizeof(int32_t), VK_MEM_DEVICE_LOCAL, &bc->m) &&
                                 vk_buf_create(ctx, max_ent * sizeof(int32_t), VK_MEM_DEVICE_LOCAL, &bc->bf) &&
                                 vk_buf_create(ctx, max_ent * plan->complex_bytes, VK_MEM_DEVICE_LOCAL, &bc->bs) &&
-                                vk_buf_create(ctx, max_ent * (size_t)w * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &bc->bw) &&
-                                vk_batch_begin(&init_batch) &&
-                                record_build_window_buckets(plan, &init_batch, M, sc->win_elems, sc->num_wins,
-                                    vk_buf_slice(&bc->cnt, 0, VK_WHOLE_SIZE),
-                                    vk_buf_slice(&bc->off, 0, VK_WHOLE_SIZE),
-                                    vk_buf_slice(&bc->m, 0, VK_WHOLE_SIZE), false) &&
+                                vk_buf_create(ctx, max_ent * (size_t)w * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &bc->bw) && vk_batch_begin(&init_batch) &&
+                                record_build_window_buckets(plan, &init_batch, M, sc->win_elems, sc->num_wins, vk_buf_slice(&bc->cnt, 0, VK_WHOLE_SIZE),
+                                                            vk_buf_slice(&bc->off, 0, VK_WHOLE_SIZE), vk_buf_slice(&bc->m, 0, VK_WHOLE_SIZE), false) &&
                                 (vk_batch_barrier_c2c(&init_batch), true) &&
-                                record_pack_bucket_geom(plan, &init_batch, sc->num_wins, (int)max_ent,
-                                    vk_buf_slice(&bc->off, 0, VK_WHOLE_SIZE),
-                                    vk_buf_slice(&bc->m, 0, VK_WHOLE_SIZE),
-                                    vk_buf_slice(&bc->bf, 0, VK_WHOLE_SIZE),
-                                    vk_buf_slice(&bc->bs, 0, VK_WHOLE_SIZE),
-                                    vk_buf_slice(&bc->bw, 0, VK_WHOLE_SIZE)) &&
+                                record_pack_bucket_geom(plan, &init_batch, sc->num_wins, (int)max_ent, vk_buf_slice(&bc->off, 0, VK_WHOLE_SIZE),
+                                                        vk_buf_slice(&bc->m, 0, VK_WHOLE_SIZE), vk_buf_slice(&bc->bf, 0, VK_WHOLE_SIZE),
+                                                        vk_buf_slice(&bc->bs, 0, VK_WHOLE_SIZE), vk_buf_slice(&bc->bw, 0, VK_WHOLE_SIZE)) &&
                                 vk_batch_submit_and_wait(&init_batch)) {
                                 ++bcache_len;
                             } else {
-                                vk_buf_destroy(&bc->cnt); vk_buf_destroy(&bc->off); vk_buf_destroy(&bc->m);
-                                vk_buf_destroy(&bc->bf); vk_buf_destroy(&bc->bs); vk_buf_destroy(&bc->bw);
+                                vk_buf_destroy(&bc->cnt);
+                                vk_buf_destroy(&bc->off);
+                                vk_buf_destroy(&bc->m);
+                                vk_buf_destroy(&bc->bf);
+                                vk_buf_destroy(&bc->bs);
+                                vk_buf_destroy(&bc->bw);
                             }
                         }
 
                         VkSpreadTuneCtx tc = {
-                            plan, &init_batch, cands, phase_a, &d_tune_y,
-                            bcache, bcache_len, tune_bs,
-                            (int)vk_device_clamp_pow2_wg(dev_cfg, 256u, 0u, 128u), false,
+                            plan,  &init_batch, cands, phase_a, &d_tune_y, bcache, bcache_len, tune_bs, (int)vk_device_clamp_pow2_wg(dev_cfg, 256u, 0u, 128u),
+                            false,
                         };
-                        VkInterleavedBenchResult res_a = vk_run_interleaved_bench(
-                            n_pa, spread_bench_run, spread_bench_conserv, &tc, 5, 2.0, 16, 0.015, 0.06);
+                        VkInterleavedBenchResult res_a = vk_run_interleaved_bench(n_pa, spread_bench_run, spread_bench_conserv, &tc, 5, 2.0, 16, 0.015, 0.06);
                         if (res_a.ok) {
                             size_t best_idx = phase_a[res_a.chosen_idx];
                             double margin = res_a.margin_pct;
@@ -1461,8 +1395,7 @@ bool vk_nufft1_plan_init(
                                 for (size_t i = 0; i < ncands && n_pb < 8u; ++i) {
                                     if (i == best_idx) continue;
                                     const VkSpreadConfig* p = &cands[i].cfg;
-                                    if (p->use_smem == wf->use_smem && p->use_reg_acc == wf->use_reg_acc &&
-                                        p->use_cpu_direct == wf->use_cpu_direct &&
+                                    if (p->use_smem == wf->use_smem && p->use_reg_acc == wf->use_reg_acc && p->use_cpu_direct == wf->use_cpu_direct &&
                                         p->win_elems == wf->win_elems && p->t_j == wf->t_j) {
                                         phase_b[n_pb++] = i;
                                     }
@@ -1470,8 +1403,8 @@ bool vk_nufft1_plan_init(
                                 if (n_pb > 1u) {
                                     tc.cand_indices = phase_b;
                                     tc.phase_b = true;
-                                    VkInterleavedBenchResult res_b = vk_run_interleaved_bench(
-                                        n_pb, spread_bench_run, spread_bench_conserv, &tc, 5, 2.0, 16, 0.015, 0.06);
+                                    VkInterleavedBenchResult res_b =
+                                        vk_run_interleaved_bench(n_pb, spread_bench_run, spread_bench_conserv, &tc, 5, 2.0, 16, 0.015, 0.06);
                                     if (res_b.ok) {
                                         best_idx = phase_b[res_b.chosen_idx];
                                         if (res_b.has_runner_up && (!res_a.has_runner_up || fabs(res_b.margin_pct) < fabs(margin))) {
@@ -1526,8 +1459,7 @@ bool vk_nufft1_plan_init(
 
     /* 5. Deconv config */
     VkDeconvCandidate dcands[16];
-    size_t ndc = build_deconv_candidates(
-        dev_cfg, plan->fft_plan.effective_sg_size, plan->lanes, plan->nout, plan->chunk_bs, dcands, 16u);
+    size_t ndc = build_deconv_candidates(dev_cfg, plan->fft_plan.effective_sg_size, plan->lanes, plan->nout, plan->chunk_bs, dcands, 16u);
     size_t chosen_dc = 0;
     if (plan->launch_cfg.deconv_variant_override[0] != '\0') {
         bool found = false;
@@ -1544,10 +1476,8 @@ bool vk_nufft1_plan_init(
         }
     }
     plan->deconv_cfg = dcands[chosen_dc].cfg;
-    bool fused_primary = (plan->fft_plan.exec_mode != VK_PLAN_MULTISTAGE_GLOBAL) &&
-                         (plan->launch_cfg.deconv_variant_override[0] == '\0');
-    snprintf(plan->deconv_variant_name, sizeof(plan->deconv_variant_name), "%s",
-             fused_primary ? "fused_fft_epilogue" : dcands[chosen_dc].variant_id);
+    bool fused_primary = (plan->fft_plan.exec_mode != VK_PLAN_MULTISTAGE_GLOBAL) && (plan->launch_cfg.deconv_variant_override[0] == '\0');
+    snprintf(plan->deconv_variant_name, sizeof(plan->deconv_variant_name), "%s", fused_primary ? "fused_fft_epilogue" : dcands[chosen_dc].variant_id);
 
     return true;
 }
@@ -1587,7 +1517,9 @@ bool vk_nufft1_ensure_point_capacity(VkNufft1Plan* plan, int M) {
     if (!vk_buf_create(plan->ctx, (size_t)new_cap * sizeof(int32_t), VK_MEM_DEVICE_LOCAL, &nf) ||
         !vk_buf_create(plan->ctx, (size_t)new_cap * plan->complex_bytes, VK_MEM_DEVICE_LOCAL, &ns) ||
         !vk_buf_create(plan->ctx, (size_t)new_cap * (size_t)plan->w * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &nw)) {
-        vk_buf_destroy(&nf); vk_buf_destroy(&ns); vk_buf_destroy(&nw);
+        vk_buf_destroy(&nf);
+        vk_buf_destroy(&ns);
+        vk_buf_destroy(&nw);
         return false;
     }
 
@@ -1598,8 +1530,13 @@ bool vk_nufft1_ensure_point_capacity(VkNufft1Plan* plan, int M) {
             !vk_buf_create(plan->ctx, max_ent * sizeof(int32_t), VK_MEM_DEVICE_LOCAL, &nbf) ||
             !vk_buf_create(plan->ctx, max_ent * plan->complex_bytes, VK_MEM_DEVICE_LOCAL, &nbs) ||
             !vk_buf_create(plan->ctx, max_ent * (size_t)plan->w * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &nbw)) {
-            vk_buf_destroy(&nf); vk_buf_destroy(&ns); vk_buf_destroy(&nw);
-            vk_buf_destroy(&nbm); vk_buf_destroy(&nbf); vk_buf_destroy(&nbs); vk_buf_destroy(&nbw);
+            vk_buf_destroy(&nf);
+            vk_buf_destroy(&ns);
+            vk_buf_destroy(&nw);
+            vk_buf_destroy(&nbm);
+            vk_buf_destroy(&nbf);
+            vk_buf_destroy(&nbs);
+            vk_buf_destroy(&nbw);
             return false;
         }
         vk_buf_destroy(&plan->d_bucket_m);
@@ -1623,13 +1560,7 @@ bool vk_nufft1_ensure_point_capacity(VkNufft1Plan* plan, int M) {
     return true;
 }
 
-bool vk_nufft1_record_set_points(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    VkBufferSlice d_x,
-    int M,
-    double df,
-    int freq_factor) {
+bool vk_nufft1_record_set_points(VkNufft1Plan* plan, VkCmdBatch* batch, VkBufferSlice d_x, int M, double df, int freq_factor) {
     if (!plan || !batch || M <= 0 || M > plan->M_cap || freq_factor <= 0) return false;
     plan->M = M;
     double df_scaled = df * (double)freq_factor;
@@ -1640,29 +1571,22 @@ bool vk_nufft1_record_set_points(
      * transfer-to-compute + compute-to-compute into a single barrier. */
     if (use_buckets) {
         vk_batch_barrier_c2t(batch);
-        vk_batch_fill(batch, vk_buf_slice(&plan->d_bucket_counts, 0, VK_WHOLE_SIZE),
-                      (VkDeviceSize)plan->spread_cfg.num_wins * sizeof(int32_t), 0u);
+        vk_batch_fill(batch, vk_buf_slice(&plan->d_bucket_counts, 0, VK_WHOLE_SIZE), (VkDeviceSize)plan->spread_cfg.num_wins * sizeof(int32_t), 0u);
     }
 
     if (!record_precompute_points_weights(plan, batch, d_x, M, df_scaled)) return false;
 
     if (use_buckets) {
         vk_batch_barrier_tc2c(batch);
-        if (!record_build_window_buckets(
-                plan, batch, M, plan->spread_cfg.win_elems, plan->spread_cfg.num_wins,
-                vk_buf_slice(&plan->d_bucket_counts, 0, VK_WHOLE_SIZE),
-                vk_buf_slice(&plan->d_bucket_off, 0, VK_WHOLE_SIZE),
-                vk_buf_slice(&plan->d_bucket_m, 0, VK_WHOLE_SIZE), true)) {
+        if (!record_build_window_buckets(plan, batch, M, plan->spread_cfg.win_elems, plan->spread_cfg.num_wins,
+                                         vk_buf_slice(&plan->d_bucket_counts, 0, VK_WHOLE_SIZE), vk_buf_slice(&plan->d_bucket_off, 0, VK_WHOLE_SIZE),
+                                         vk_buf_slice(&plan->d_bucket_m, 0, VK_WHOLE_SIZE), true)) {
             return false;
         }
         vk_batch_barrier_c2c(batch);
-        if (!record_pack_bucket_geom(
-                plan, batch, plan->spread_cfg.num_wins, 2 * M,
-                vk_buf_slice(&plan->d_bucket_off, 0, VK_WHOLE_SIZE),
-                vk_buf_slice(&plan->d_bucket_m, 0, VK_WHOLE_SIZE),
-                vk_buf_slice(&plan->d_b_first, 0, VK_WHOLE_SIZE),
-                vk_buf_slice(&plan->d_b_shift, 0, VK_WHOLE_SIZE),
-                vk_buf_slice(&plan->d_b_weights, 0, VK_WHOLE_SIZE))) {
+        if (!record_pack_bucket_geom(plan, batch, plan->spread_cfg.num_wins, 2 * M, vk_buf_slice(&plan->d_bucket_off, 0, VK_WHOLE_SIZE),
+                                     vk_buf_slice(&plan->d_bucket_m, 0, VK_WHOLE_SIZE), vk_buf_slice(&plan->d_b_first, 0, VK_WHOLE_SIZE),
+                                     vk_buf_slice(&plan->d_b_shift, 0, VK_WHOLE_SIZE), vk_buf_slice(&plan->d_b_weights, 0, VK_WHOLE_SIZE))) {
             return false;
         }
     }
@@ -1676,18 +1600,15 @@ bool vk_nufft1_record_set_output_scale(VkNufft1Plan* plan, VkCmdBatch* batch, do
     plan->output_scale = scale;
     bool rebuilt = false;
     if (plan->d_slot_deconv.buffer != VK_NULL_HANDLE) {
-        if (!record_build_deconv_table(plan, batch, 1, false,
-                vk_buf_slice(&plan->d_slot_deconv, 0, VK_WHOLE_SIZE), scale)) return false;
+        if (!record_build_deconv_table(plan, batch, 1, false, vk_buf_slice(&plan->d_slot_deconv, 0, VK_WHOLE_SIZE), scale)) return false;
         rebuilt = true;
     }
     if (plan->d_nat_deconv.buffer != VK_NULL_HANDLE) {
-        if (!record_build_deconv_table(plan, batch, 2, false,
-                vk_buf_slice(&plan->d_nat_deconv, 0, VK_WHOLE_SIZE), scale)) return false;
+        if (!record_build_deconv_table(plan, batch, 2, false, vk_buf_slice(&plan->d_nat_deconv, 0, VK_WHOLE_SIZE), scale)) return false;
         rebuilt = true;
     }
     if (plan->d_slot_deconv_f32.buffer != VK_NULL_HANDLE && plan->prec == VK_PREC_HALF) {
-        if (!record_build_deconv_table(plan, batch, 1, true,
-                vk_buf_slice(&plan->d_slot_deconv_f32, 0, VK_WHOLE_SIZE), scale)) return false;
+        if (!record_build_deconv_table(plan, batch, 1, true, vk_buf_slice(&plan->d_slot_deconv_f32, 0, VK_WHOLE_SIZE), scale)) return false;
         rebuilt = true;
     }
     if (rebuilt) vk_batch_barrier_c2c(batch);
@@ -1701,8 +1622,7 @@ VkBufferSlice vk_nufft1_get_slot_phi_hat(VkNufft1Plan* plan, VkCmdBatch* batch) 
         if (!vk_buf_create(plan->ctx, (size_t)plan->nout * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &plan->d_slot_phi_hat)) {
             return empty;
         }
-        if (!record_build_deconv_table(plan, batch, 0, false,
-                vk_buf_slice(&plan->d_slot_phi_hat, 0, VK_WHOLE_SIZE), 1.0)) {
+        if (!record_build_deconv_table(plan, batch, 0, false, vk_buf_slice(&plan->d_slot_phi_hat, 0, VK_WHOLE_SIZE), 1.0)) {
             vk_buf_destroy(&plan->d_slot_phi_hat);
             return empty;
         }
@@ -1718,8 +1638,7 @@ VkBufferSlice vk_nufft1_get_slot_deconv(VkNufft1Plan* plan, VkCmdBatch* batch) {
         if (!vk_buf_create(plan->ctx, (size_t)plan->nout * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &plan->d_slot_deconv)) {
             return empty;
         }
-        if (!record_build_deconv_table(plan, batch, 1, false,
-                vk_buf_slice(&plan->d_slot_deconv, 0, VK_WHOLE_SIZE), plan->output_scale)) {
+        if (!record_build_deconv_table(plan, batch, 1, false, vk_buf_slice(&plan->d_slot_deconv, 0, VK_WHOLE_SIZE), plan->output_scale)) {
             vk_buf_destroy(&plan->d_slot_deconv);
             return empty;
         }
@@ -1735,8 +1654,7 @@ VkBufferSlice vk_nufft1_get_nat_deconv(VkNufft1Plan* plan, VkCmdBatch* batch) {
         if (!vk_buf_create(plan->ctx, (size_t)plan->nout * plan->scalar_bytes, VK_MEM_DEVICE_LOCAL, &plan->d_nat_deconv)) {
             return empty;
         }
-        if (!record_build_deconv_table(plan, batch, 2, false,
-                vk_buf_slice(&plan->d_nat_deconv, 0, VK_WHOLE_SIZE), plan->output_scale)) {
+        if (!record_build_deconv_table(plan, batch, 2, false, vk_buf_slice(&plan->d_nat_deconv, 0, VK_WHOLE_SIZE), plan->output_scale)) {
             vk_buf_destroy(&plan->d_nat_deconv);
             return empty;
         }
@@ -1756,8 +1674,7 @@ VkBufferSlice vk_nufft1_get_slot_deconv_f32(VkNufft1Plan* plan, VkCmdBatch* batc
         if (!vk_buf_create(plan->ctx, (size_t)plan->nout * sizeof(float), VK_MEM_DEVICE_LOCAL, &plan->d_slot_deconv_f32)) {
             return empty;
         }
-        if (!record_build_deconv_table(plan, batch, 1, true,
-                vk_buf_slice(&plan->d_slot_deconv_f32, 0, VK_WHOLE_SIZE), plan->output_scale)) {
+        if (!record_build_deconv_table(plan, batch, 1, true, vk_buf_slice(&plan->d_slot_deconv_f32, 0, VK_WHOLE_SIZE), plan->output_scale)) {
             vk_buf_destroy(&plan->d_slot_deconv_f32);
             return empty;
         }
@@ -1766,22 +1683,13 @@ VkBufferSlice vk_nufft1_get_slot_deconv_f32(VkNufft1Plan* plan, VkCmdBatch* batc
     return vk_buf_slice(&plan->d_slot_deconv_f32, 0, VK_WHOLE_SIZE);
 }
 
-bool vk_nufft1_record_execute(
-    VkNufft1Plan* plan,
-    VkCmdBatch* batch,
-    VkBufferSlice d_y,
-    uint32_t y_offset_elems,
-    VkBufferSlice d_out,
-    uint32_t out_offset_elems,
-    size_t bs,
-    VkNufftOutOrder order) {
+bool vk_nufft1_record_execute(VkNufft1Plan* plan, VkCmdBatch* batch, VkBufferSlice d_y, uint32_t y_offset_elems, VkBufferSlice d_out, uint32_t out_offset_elems,
+                              size_t bs, VkNufftOutOrder order) {
     if (!plan || !batch) return false;
     if (bs == 0) return true;
 
-    const bool use_fused =
-        (plan->fft_plan.exec_mode != VK_PLAN_MULTISTAGE_GLOBAL) &&
-        (plan->launch_cfg.deconv_variant_override[0] == '\0') &&
-        (order == VK_NUFFT_ORDER_SLOT_BIT_REVERSED || order == VK_NUFFT_ORDER_SLOT_BIT_REVERSED_RAW);
+    const bool use_fused = (plan->fft_plan.exec_mode != VK_PLAN_MULTISTAGE_GLOBAL) && (plan->launch_cfg.deconv_variant_override[0] == '\0') &&
+                           (order == VK_NUFFT_ORDER_SLOT_BIT_REVERSED || order == VK_NUFFT_ORDER_SLOT_BIT_REVERSED_RAW);
     const int compact_mode = (plan->mode == VK_PSWF43) ? 2 : 1;
     VkBufferSlice fused_deconv = {0};
     bool apply_deconv = false;
@@ -1794,38 +1702,33 @@ bool vk_nufft1_record_execute(
     const bool use_packed = plan->spread_cfg.use_smem && plan->spread_cfg.num_wins > 1;
     VkBufferSlice first_s = vk_buf_slice(use_packed ? &plan->d_b_first : &plan->d_first, 0, VK_WHOLE_SIZE);
     VkBufferSlice shift_s = vk_buf_slice(use_packed ? &plan->d_b_shift : &plan->d_shift, 0, VK_WHOLE_SIZE);
-    VkBufferSlice w_s     = vk_buf_slice(use_packed ? &plan->d_b_weights : &plan->d_weights, 0, VK_WHOLE_SIZE);
-    VkBufferSlice off_s   = use_packed ? vk_buf_slice(&plan->d_bucket_off, 0, VK_WHOLE_SIZE) : (VkBufferSlice){0};
-    VkBufferSlice bm_s    = use_packed ? vk_buf_slice(&plan->d_bucket_m, 0, VK_WHOLE_SIZE) : (VkBufferSlice){0};
-    VkBufferSlice fft_s   = vk_buf_slice(&plan->d_fft_buf, 0, VK_WHOLE_SIZE);
+    VkBufferSlice w_s = vk_buf_slice(use_packed ? &plan->d_b_weights : &plan->d_weights, 0, VK_WHOLE_SIZE);
+    VkBufferSlice off_s = use_packed ? vk_buf_slice(&plan->d_bucket_off, 0, VK_WHOLE_SIZE) : (VkBufferSlice){0};
+    VkBufferSlice bm_s = use_packed ? vk_buf_slice(&plan->d_bucket_m, 0, VK_WHOLE_SIZE) : (VkBufferSlice){0};
+    VkBufferSlice fft_s = vk_buf_slice(&plan->d_fft_buf, 0, VK_WHOLE_SIZE);
 
     for (size_t b_off = 0; b_off < bs; b_off += plan->chunk_bs) {
         if (b_off > 0) vk_batch_barrier_c2c(batch);
         size_t cur_bs = (bs - b_off < plan->chunk_bs) ? (bs - b_off) : plan->chunk_bs;
-        uint32_t cur_y_off   = y_offset_elems + (uint32_t)(b_off * (size_t)plan->M);
+        uint32_t cur_y_off = y_offset_elems + (uint32_t)(b_off * (size_t)plan->M);
         uint32_t cur_out_off = out_offset_elems + (uint32_t)(b_off * (size_t)plan->nout);
 
-        if (!record_spread_cfg(
-                plan, batch, &plan->spread_cfg, w_s, first_s, shift_s, off_s, bm_s,
-                d_y, cur_y_off, fft_s, plan->M, cur_bs, true)) {
+        if (!record_spread_cfg(plan, batch, &plan->spread_cfg, w_s, first_s, shift_s, off_s, bm_s, d_y, cur_y_off, fft_s, plan->M, cur_bs, true)) {
             return false;
         }
         vk_batch_barrier_c2c(batch);
 
         if (use_fused) {
-            if (!vk_dif_record_execute_raw_compact(
-                    &plan->fft_plan, batch, fft_s, d_out, cur_bs, 0u, cur_out_off,
-                    compact_mode, fused_deconv, apply_deconv, plan->chunk_bs)) {
+            if (!vk_dif_record_execute_raw_compact(&plan->fft_plan, batch, fft_s, d_out, cur_bs, 0u, cur_out_off, compact_mode, fused_deconv, apply_deconv,
+                                                   plan->chunk_bs)) {
                 return false;
             }
         } else {
-            if (!vk_dif_record_execute_raw(
-                    &plan->fft_plan, batch, fft_s, fft_s, cur_bs, 0u, 0u, plan->chunk_bs)) {
+            if (!vk_dif_record_execute_raw(&plan->fft_plan, batch, fft_s, fft_s, cur_bs, 0u, 0u, plan->chunk_bs)) {
                 return false;
             }
             vk_batch_barrier_c2c(batch);
-            if (!record_deconv_emit(
-                    plan, batch, &plan->deconv_cfg, fft_s, d_out, cur_out_off, cur_bs, order)) {
+            if (!record_deconv_emit(plan, batch, &plan->deconv_cfg, fft_s, d_out, cur_out_off, cur_bs, order)) {
                 return false;
             }
         }
@@ -1833,13 +1736,7 @@ bool vk_nufft1_record_execute(
     return true;
 }
 
-void vk_nufft1_unpermute_slots_to_natural_host(
-    const void* h_slots,
-    void* h_nat,
-    size_t elem_bytes,
-    int N,
-    VkPswfMode mode,
-    size_t bs) {
+void vk_nufft1_unpermute_slots_to_natural_host(const void* h_slots, void* h_nat, size_t elem_bytes, int N, VkPswfMode mode, size_t bs) {
     int nfft = next_pow2_i(2 * N);
     int log_nfft = log2_pow2_i(nfft);
     int nout = vk_nufft1_nout(N, mode);

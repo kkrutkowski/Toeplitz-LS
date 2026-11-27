@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from .._common import CDeviceInfo, OffloadDevice, bind_offload_abi
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[3]
 ENV_LIB = "TOEPLITZ_LS_VULKAN_LIB"
+LIB_NAME = "tls_vulkan.dll" if sys.platform == "win32" else "tls_vulkan.so"
 
 _STATUS_MESSAGES = {
     -1: "invalid argument",
@@ -41,9 +43,9 @@ def _candidate_library_paths() -> list[Path]:
     env_path = os.environ.get(ENV_LIB, "").strip()
     if env_path:
         paths.append(Path(env_path))
-    paths.append(HERE / "tls_vulkan.so")
-    paths.append(HERE / "_lib" / "tls_vulkan.so")
-    paths.append(REPO_ROOT / "offload" / "vulkan" / "build" / "tls_vulkan.so")
+    paths.append(HERE / "_lib" / LIB_NAME)
+    paths.append(HERE / LIB_NAME)
+    paths.append(REPO_ROOT / "offload" / "vulkan" / "build" / LIB_NAME)
     return paths
 
 
@@ -53,7 +55,7 @@ def _resolve_library_path() -> Path:
         if path.is_file():
             return path
     searched = ", ".join(str(p) for p in candidates)
-    raise FileNotFoundError(f"tls_vulkan.so not found (searched: {searched}). Build it with 'make -C offload/vulkan -j$(nproc)' or set TOEPLITZ_LS_VULKAN_LIB.")
+    raise FileNotFoundError(f"{LIB_NAME} not found (searched: {searched}). Build it with 'make -C offload/vulkan -j$(nproc)' or set TOEPLITZ_LS_VULKAN_LIB.")
 
 
 def load_library():

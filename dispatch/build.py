@@ -115,7 +115,7 @@ def compile_command(tc, *, src, obj, variant, define, include_dirs, dd, depth_in
 
 def link_command(tc, *, objs, out, variant, musl_tmp=None):
     if _is_cl(tc):
-        cmd = [*tc.cc, *tc.cflags, "/LD", "/MT", "/Fe" + str(out), *[str(o) for o in objs], "/link", "/NOLOGO"]
+        cmd = [*tc.cc, *tc.cflags, "/LD", "/MT", "/Fe" + str(out), *[str(o) for o in objs], "/link", "/NOLOGO", "/OPT:REF", "/OPT:ICF", "/DEBUG:NONE"]
         for path in tc.msvc_lib:
             cmd.append("/LIBPATH:" + path)
         return cmd
@@ -126,8 +126,9 @@ def link_command(tc, *, objs, out, variant, musl_tmp=None):
     cmd += ["-L" + d for d in tc.lib_dirs]
     cmd += ["-shared", "-o", str(out), *[str(o) for o in objs]]
     if "macos" in tc.name:
-        # Do not bake the build machine's absolute path into LC_ID_DYLIB.
-        cmd += ["-Wl,-install_name,@loader_path/" + out.name]
+        # Do not bake the build machine's absolute path into LC_ID_DYLIB, and
+        # strip debug/local symbols before zig writes LC_CODE_SIGNATURE.
+        cmd += ["-Wl,-install_name,@loader_path/" + out.name, "-Wl,-S", "-Wl,-x"]
     if tc.musl_soname:
         # musl's own shared object has no usable SONAME on every distro, and
         # musllinux wheels must record the canonical one.  Linking against a
@@ -260,7 +261,9 @@ def _cached(vl_arch: str, vl: int) -> tuple[Path, Path] | None:
     base = CACHE / f"{vl_arch}-vl{vl}"
     scaling, table = base / "scaling.h", base / "nanofft_depth_table.h"
     if scaling.exists() and table.exists():
-        if "D_B_ALPHA" in scaling.read_text(encoding="utf-8") and "nanofft_bdepth_double" in table.read_text(encoding="utf-8"):
+        scaling_text = scaling.read_text(encoding="utf-8")
+        table_text = table.read_text(encoding="utf-8")
+        if "D_B_ALPHA" in scaling_text and "H_B_ALPHA" in scaling_text and "nanofft_bdepth_double" in table_text and "nanofft_bdepth_half" in table_text:
             return scaling, table
     return None
 
@@ -426,8 +429,7 @@ def build_variant(target, variant, tc: T.Toolchain, *, run: bool, reference: tup
         shutil.copyfile(Path(tc.musl_libdir) / "libc.so", musl_tmp / tc.musl_soname)
     out = work / f"{variant.library_stem}{target.extension}"
     _run_quietly(link_command(tc, objs=objs, out=out, variant=variant, musl_tmp=musl_tmp), env=tc.env)
-    if not _is_cl(tc):
-        _quiet_strip(out)
+    _quiet_strip(out, target)
 
     return VariantArtifacts(
         target=target.name,
@@ -439,18 +441,169 @@ def build_variant(target, variant, tc: T.Toolchain, *, run: bool, reference: tup
     )
 
 
-def _quiet_strip(path: Path) -> None:
+def _quiet_strip(path: Path, target) -> None:
+    if target.os != "linux":
+        # macOS strips via -Wl,-S -Wl,-x at link time (preserving arm64
+        # LC_CODE_SIGNATURE); Windows strips via lld-link /OPT:REF /OPT:ICF /DEBUG:NONE.
+        return
     strip = T.have("llvm-strip") or T.have("strip")
     if not strip:
         return
-    # Do not fail the build over an unstripped library.
-    subprocess.run([strip, "--strip-unneeded", str(path)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # -s (--strip-all) removes .symtab/.strtab while keeping .dynsym intact.
+    subprocess.run([strip, "-s", str(path)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------------------
+# Vulkan offload shared library (one per target, C23 + runtime Vulkan loader)
+# ---------------------------------------------------------------------------
+VULKAN_DIR = ROOT / "offload" / "vulkan"
+VULKAN_GEN = BUILD / "vulkan-gen"
+VULKAN_SOURCES = (
+    "common/vk_loader.c",
+    "common/vk_device.c",
+    "common/vk_context.c",
+    "bitrev/vk_bitrev.c",
+    "fft/vk_dif.c",
+    "nufft/vk_nufft1.c",
+    "periodogram/vk_subgrid.c",
+    "linalg/vk_levinson.c",
+    "periodogram/vk_engine.c",
+    "impl.c",
+)
+
+
+def _ensure_vulkan_codegen() -> Path:
+    """Generate architecture-independent PSWF tables and SPIR-V C bundle once."""
+    VULKAN_GEN.mkdir(parents=True, exist_ok=True)
+    _run_quietly([sys.executable, str(VULKAN_DIR / "codegen" / "pswf_tables.py")])
+    _run_quietly([sys.executable, str(VULKAN_DIR / "codegen" / "compile_shaders.py"), "--out-dir", str(VULKAN_GEN)])
+    return VULKAN_GEN
+
+
+def _vulkan_compile_cmd(tc: T.Toolchain, target, *, src: Path, obj: Path, vk_inc: Path, gen_dir: Path, compact: bool = False) -> list[str]:
+    if _is_cl(tc):
+        opt = "/O1" if compact else "/O2"
+        cmd = [
+            *tc.cc,
+            *tc.cflags,
+            "/clang:-std=c23",
+            "/TC",
+            opt,
+            "/MT",
+            "/W3",
+            "/DVK_NO_PROTOTYPES",
+            "/D_CRT_SECURE_NO_WARNINGS",
+            "/I" + str(VULKAN_DIR),
+            "/I" + str(gen_dir),
+            "/I" + str(vk_inc),
+        ]
+        for inc in tc.msvc_include:
+            cmd.append("-imsvc" + inc)
+        cmd += ["/c", str(src), "/Fo" + str(obj)]
+        return cmd
+
+    opt = "-Os" if compact else "-O3"
+    cmd = [
+        *tc.cc,
+        *tc.cflags,
+        "-std=c23",
+        opt,
+        "-Wall",
+        "-Wextra",
+        "-fno-math-errno",
+        "-fno-trapping-math",
+        "-ffp-contract=fast",
+        "-fPIC",
+        "-fvisibility=hidden",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-DVK_NO_PROTOTYPES",
+    ]
+    if target.os == "linux":
+        cmd.append("-D_GNU_SOURCE")
+    if compact:
+        cmd.append("-fno-asynchronous-unwind-tables")
+    if tc.sysroot:
+        cmd.append("--sysroot=" + tc.sysroot)
+    cmd += ["-I" + str(VULKAN_DIR), "-I" + str(gen_dir), "-I" + str(vk_inc), "-c", str(src), "-o", str(obj)]
+    return cmd
+
+
+def _vulkan_link_cmd(tc: T.Toolchain, target, *, objs: list[Path], out: Path, musl_tmp: Path | None) -> list[str]:
+    if _is_cl(tc):
+        cmd = [*tc.cc, *tc.cflags, "/LD", "/MT", "/Fe" + str(out), *[str(o) for o in objs], "/link", "/NOLOGO", "/OPT:REF", "/OPT:ICF", "/DEBUG:NONE"]
+        for path in tc.msvc_lib:
+            cmd.append("/LIBPATH:" + path)
+        return cmd
+
+    cmd = [*tc.cc, *tc.cflags]
+    if tc.sysroot:
+        cmd.append("--sysroot=" + tc.sysroot)
+    cmd += ["-L" + d for d in tc.lib_dirs]
+    cmd += ["-shared", "-o", str(out), *[str(o) for o in objs]]
+    if target.os == "macos":
+        cmd += ["-Wl,-install_name,@loader_path/" + out.name, "-Wl,-S", "-Wl,-x"]
+    else:
+        cmd += [
+            "-Wl,--version-script=" + str(VULKAN_DIR / "tls_vulkan.map"),
+            "-Wl,--gc-sections",
+            "-Wl,-O1",
+            "-Wl,--as-needed",
+        ]
+        if tc.musl_soname:
+            cmd += ["-nodefaultlibs", "-L" + str(musl_tmp), "-l:" + tc.musl_soname, "-lgcc"]
+        else:
+            cmd += ["-ldl", "-lm", "-lpthread"]
+    return cmd
+
+
+def build_vulkan_offload(target, tc: T.Toolchain) -> Path:
+    """Compile and stage ``tls_vulkan.<ext>`` (+ sliced ``libMoltenVK.dylib`` on macOS)."""
+    print("[vulkan] %s (%s)" % (target.name, tc.name), flush=True)
+    gen_dir = _ensure_vulkan_codegen()
+    vk_inc = T.vulkan_include_dir()
+
+    work = BUILD / target.name / "vulkan-obj"
+    work.mkdir(parents=True, exist_ok=True)
+    staging = BUILD / target.name / "_vulkan"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+
+    objs: list[Path] = []
+    for rel in VULKAN_SOURCES:
+        obj = work / (rel.replace("/", "_") + ".o")
+        _run_quietly(_vulkan_compile_cmd(tc, target, src=VULKAN_DIR / rel, obj=obj, vk_inc=vk_inc, gen_dir=gen_dir, compact=False), env=tc.env)
+        objs.append(obj)
+
+    spv_obj = work / "shaders_spv.o"
+    _run_quietly(_vulkan_compile_cmd(tc, target, src=gen_dir / "shaders_spv.c", obj=spv_obj, vk_inc=vk_inc, gen_dir=gen_dir, compact=True), env=tc.env)
+    objs.append(spv_obj)
+
+    musl_tmp = None
+    if tc.musl_soname:
+        musl_tmp = work / "musl-link"
+        musl_tmp.mkdir(exist_ok=True)
+        shutil.copyfile(Path(tc.musl_libdir) / "libc.so", musl_tmp / tc.musl_soname)
+
+    out = staging / f"tls_vulkan{target.extension}"
+    _run_quietly(_vulkan_link_cmd(tc, target, objs=objs, out=out, musl_tmp=musl_tmp), env=tc.env)
+    _quiet_strip(out, target)
+
+    if target.os == "macos":
+        mvk_dylib, mvk_license = T.moltenvk_dylib(target.arch)
+        shutil.copyfile(mvk_dylib, staging / "libMoltenVK.dylib")
+        if mvk_license is not None:
+            shutil.copyfile(mvk_license, staging / "LICENSE.MoltenVK")
+
+    print("[vulkan] %s (%.1f KiB)" % (out, out.stat().st_size / 1024.0), flush=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # One target
 # ---------------------------------------------------------------------------
-def build_target(name: str, *, only=None, keep_going=False) -> tuple[list[VariantArtifacts], Path]:
+def build_target(name: str, *, only=None, keep_going=False, with_vulkan: bool = True) -> tuple[list[VariantArtifacts], Path]:
     target = V.TARGETS[name]
     tc = T.for_target(target)
     print("\n=== %s (%s) ===" % (name, tc.name), flush=True)
@@ -483,6 +636,8 @@ def build_target(name: str, *, only=None, keep_going=False) -> tuple[list[Varian
         artifacts.append(build_variant(target, variant, tc, run=runnable, reference=reference))
 
     manifest = write_manifest(target, artifacts)
+    if with_vulkan:
+        build_vulkan_offload(target, tc)
     return artifacts, manifest
 
 
@@ -536,6 +691,7 @@ def main(argv=None):
     parser.add_argument("--target", action="append", dest="targets", choices=sorted(V.TARGETS), help="wheel target (repeatable)")
     parser.add_argument("--all", action="store_true", help="build every target this host can build")
     parser.add_argument("--variant", action="append", dest="variants", help="restrict to these variant names (repeatable)")
+    parser.add_argument("--no-vulkan", action="store_true", help="skip building the Vulkan offload library")
     parser.add_argument("--list", action="store_true", help="print the target/variant matrix and exit")
     args = parser.parse_args(argv)
 
@@ -560,7 +716,7 @@ def main(argv=None):
         parser.error("give --target, --all or --list")
 
     for name in names:
-        artifacts, manifest = build_target(name, only=args.variants)
+        artifacts, manifest = build_target(name, only=args.variants, with_vulkan=not args.no_vulkan)
         print("[done] %s: %d libraries -> %s" % (name, len(artifacts), manifest))
     return 0
 

@@ -1,23 +1,18 @@
-#define _POSIX_C_SOURCE 200809L
-
-#include "common/vk_device.h"
-#include "shaders_spv.h"
+#if !defined(_WIN32) && !defined(__APPLE__)
+#    define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <errno.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
 
-double vk_now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec * 1e-6;
-}
+#include "common/vk_device.h"
+#include "common/vk_os.h"
+#include "shaders_spv.h"
+
+double vk_now_ms(void) { return vk_os_now_ms(); }
 
 void vk_sanitize_cache_token(const char* raw, char* out, size_t out_cap) {
     if (!out || out_cap == 0) return;
@@ -45,27 +40,32 @@ void vk_sanitize_cache_token(const char* raw, char* out, size_t out_cap) {
     if (w == 0) snprintf(out, out_cap, "unknown");
 }
 
-const char* vk_kernel_code_hash(void) {
-    return vk_shader_bundle_hash();
-}
+const char* vk_kernel_code_hash(void) { return vk_shader_bundle_hash(); }
 
-static pthread_once_t g_inst_once = PTHREAD_ONCE_INIT;
-static VkInstance     g_instance  = VK_NULL_HANDLE;
+static vk_once_t g_inst_once = VK_ONCE_INIT;
+static VkInstance g_instance = VK_NULL_HANDLE;
 
 static void create_global_instance(void) {
+    if (!vk_loader_init()) {
+        g_instance = VK_NULL_HANDLE;
+        return;
+    }
+
     uint32_t loader_ver = VK_API_VERSION_1_0;
     uint32_t api_ver = VK_API_VERSION_1_1;
-    if (vkEnumerateInstanceVersion(&loader_ver) == VK_SUCCESS) {
-        if (loader_ver >= VK_API_VERSION_1_3) api_ver = VK_API_VERSION_1_3;
-        else if (loader_ver >= VK_API_VERSION_1_2) api_ver = VK_API_VERSION_1_2;
+    if (vkEnumerateInstanceVersion && vkEnumerateInstanceVersion(&loader_ver) == VK_SUCCESS) {
+        if (loader_ver >= VK_API_VERSION_1_3)
+            api_ver = VK_API_VERSION_1_3;
+        else if (loader_ver >= VK_API_VERSION_1_2)
+            api_ver = VK_API_VERSION_1_2;
     }
 
     VkApplicationInfo app = {0};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "toeplitz_ls_vulkan";
-    app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    app.applicationVersion = VK_MAKE_VERSION(1, 1, 0);
     app.pEngineName = "toeplitz_ls";
-    app.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    app.engineVersion = VK_MAKE_VERSION(1, 1, 0);
     app.apiVersion = api_ver;
 
     VkInstanceCreateInfo ci = {0};
@@ -77,50 +77,76 @@ static void create_global_instance(void) {
         app.apiVersion = VK_API_VERSION_1_1;
         r = vkCreateInstance(&ci, nullptr, &g_instance);
     }
-    if (r != VK_SUCCESS) g_instance = VK_NULL_HANDLE;
+    if (r != VK_SUCCESS || !vk_loader_load_instance(g_instance)) {
+        g_instance = VK_NULL_HANDLE;
+    }
 }
 
 VkInstance vk_get_instance(void) {
-    pthread_once(&g_inst_once, create_global_instance);
+    vk_call_once(&g_inst_once, create_global_instance);
     return g_instance;
 }
 
 static int device_type_rank(VkPhysicalDeviceType t) {
     switch (t) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 0;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 1;
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return 2;
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:            return 3;
-        default:                                     return 4;
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            return 0;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            return 1;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            return 2;
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:
+            return 3;
+        default:
+            return 4;
     }
 }
 
 static const char* device_type_str(VkPhysicalDeviceType t) {
     switch (t) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return "discrete_gpu";
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated_gpu";
-        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return "virtual_gpu";
-        case VK_PHYSICAL_DEVICE_TYPE_CPU:            return "cpu";
-        default:                                     return "other";
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            return "discrete_gpu";
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            return "integrated_gpu";
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            return "virtual_gpu";
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:
+            return "cpu";
+        default:
+            return "other";
     }
 }
 
 static const char* driver_id_tag(VkDriverId id, uint32_t vendor_id) {
     switch (id) {
-        case VK_DRIVER_ID_NVIDIA_PROPRIETARY:         return "nvidia";
-        case VK_DRIVER_ID_MESA_RADV:                  return "radv";
-        case VK_DRIVER_ID_AMD_PROPRIETARY:            return "amdvlk";
-        case VK_DRIVER_ID_AMD_OPEN_SOURCE:            return "amdvlk";
-        case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:     return "anv";
-        case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:  return "intel";
-        case VK_DRIVER_ID_MESA_LLVMPIPE:              return "llvmpipe";
-        case VK_DRIVER_ID_MOLTENVK:                   return "moltenvk";
-        case VK_DRIVER_ID_MESA_NVK:                   return "nvk";
-        case VK_DRIVER_ID_MESA_TURNIP:                return "turnip";
-        case VK_DRIVER_ID_MESA_PANVK:                 return "panvk";
-        case VK_DRIVER_ID_ARM_PROPRIETARY:            return "mali";
-        case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:       return "adreno";
-        default: break;
+        case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+            return "nvidia";
+        case VK_DRIVER_ID_MESA_RADV:
+            return "radv";
+        case VK_DRIVER_ID_AMD_PROPRIETARY:
+            return "amdvlk";
+        case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+            return "amdvlk";
+        case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+            return "anv";
+        case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+            return "intel";
+        case VK_DRIVER_ID_MESA_LLVMPIPE:
+            return "llvmpipe";
+        case VK_DRIVER_ID_MOLTENVK:
+            return "moltenvk";
+        case VK_DRIVER_ID_MESA_NVK:
+            return "nvk";
+        case VK_DRIVER_ID_MESA_TURNIP:
+            return "turnip";
+        case VK_DRIVER_ID_MESA_PANVK:
+            return "panvk";
+        case VK_DRIVER_ID_ARM_PROPRIETARY:
+            return "mali";
+        case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
+            return "adreno";
+        default:
+            break;
     }
     if (vendor_id == 0x10deu) return "nvidia";
     if (vendor_id == 0x1002u) return "amd";
@@ -169,9 +195,9 @@ static uint64_t query_device_local_heap_bytes(VkPhysicalDevice pdev) {
 }
 
 typedef struct RawDevEntry {
-    int                rank;
-    uint64_t           mem;
-    size_t             orig_idx;
+    int rank;
+    uint64_t mem;
+    size_t orig_idx;
     VkDeviceDescriptor desc;
 } RawDevEntry;
 
@@ -183,9 +209,9 @@ static int cmp_raw_dev(const void* a, const void* b) {
     return (x->orig_idx < y->orig_idx) ? -1 : 1;
 }
 
-static pthread_once_t      g_devs_once  = PTHREAD_ONCE_INIT;
-static VkDeviceDescriptor* g_devs       = nullptr;
-static size_t              g_dev_count  = 0;
+static vk_once_t g_devs_once = VK_ONCE_INIT;
+static VkDeviceDescriptor* g_devs = nullptr;
+static size_t g_dev_count = 0;
 
 static void enumerate_devices_once(void) {
     VkInstance inst = vk_get_instance();
@@ -252,10 +278,8 @@ static void enumerate_devices_once(void) {
         if (props.apiVersion >= VK_API_VERSION_1_2) {
             has_fp16 = (f12.shaderFloat16 == VK_TRUE) && (f16s.storageBuffer16BitAccess == VK_TRUE);
         } else {
-            has_fp16 = (f16i8.shaderFloat16 == VK_TRUE) &&
-                       (f16s.storageBuffer16BitAccess == VK_TRUE) &&
-                       has_device_ext(pdev, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) &&
-                       has_device_ext(pdev, VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+            has_fp16 = (f16i8.shaderFloat16 == VK_TRUE) && (f16s.storageBuffer16BitAccess == VK_TRUE) &&
+                       has_device_ext(pdev, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) && has_device_ext(pdev, VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
         }
         bool has_fp64 = (f2.features.shaderFloat64 == VK_TRUE);
 
@@ -264,8 +288,7 @@ static void enumerate_devices_once(void) {
         VkPhysicalDeviceDriverProperties dp = {0};
         dp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
         void** p2_tail = &p2.pNext;
-        if (props.apiVersion >= VK_API_VERSION_1_2 ||
-            has_device_ext(pdev, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+        if (props.apiVersion >= VK_API_VERSION_1_2 || has_device_ext(pdev, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
             *p2_tail = &dp;
             p2_tail = &dp.pNext;
         }
@@ -288,26 +311,21 @@ static void enumerate_devices_once(void) {
 
         VkDeviceDescriptor* d = &e->desc;
         vk_sanitize_cache_token(props.deviceName, d->name, sizeof(d->name));
-        snprintf(d->backend, sizeof(d->backend), "vulkan/%s",
-                 driver_id_tag(dp.driverID, props.vendorID));
+        snprintf(d->backend, sizeof(d->backend), "vulkan/%s", driver_id_tag(dp.driverID, props.vendorID));
         snprintf(d->device_type, sizeof(d->device_type), "%s", device_type_str(props.deviceType));
         size_t est_cus = best_q;
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            long ncpu = vk_os_cpu_count();
             if (ncpu > 0) est_cus = (size_t)ncpu;
         }
 #ifdef VK_AMD_SHADER_CORE_PROPERTIES_EXTENSION_NAME
-        if (has_amd_core && amd_core.shaderEngineCount > 0 &&
-            amd_core.shaderArraysPerEngineCount > 0 && amd_core.computeUnitsPerShaderArray > 0) {
-            est_cus = (size_t)amd_core.shaderEngineCount *
-                      (size_t)amd_core.shaderArraysPerEngineCount *
-                      (size_t)amd_core.computeUnitsPerShaderArray;
+        if (has_amd_core && amd_core.shaderEngineCount > 0 && amd_core.shaderArraysPerEngineCount > 0 && amd_core.computeUnitsPerShaderArray > 0) {
+            est_cus = (size_t)amd_core.shaderEngineCount * (size_t)amd_core.shaderArraysPerEngineCount * (size_t)amd_core.computeUnitsPerShaderArray;
         }
 #endif
         d->max_compute_units = est_cus;
         d->global_mem_size = (size_t)mem_bytes;
-        d->is_gpu = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ||
-                     props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+        d->is_gpu = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
                      props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU);
         d->is_discrete_gpu = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
         if (env_flag_set("TLS_VK_TEST_DISABLE_FP16")) has_fp16 = false;
@@ -317,11 +335,8 @@ static void enumerate_devices_once(void) {
         d->api_version = props.apiVersion;
         d->vendor_id = props.vendorID;
         d->device_id = props.deviceID;
-        snprintf(d->driver_version, sizeof(d->driver_version), "%u.%u.%u_%u",
-                 VK_API_VERSION_MAJOR(props.apiVersion),
-                 VK_API_VERSION_MINOR(props.apiVersion),
-                 VK_API_VERSION_PATCH(props.apiVersion),
-                 props.driverVersion);
+        snprintf(d->driver_version, sizeof(d->driver_version), "%u.%u.%u_%u", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
+                 VK_API_VERSION_PATCH(props.apiVersion), props.driverVersion);
         d->phys_dev = pdev;
         ++n_valid;
     }
@@ -342,17 +357,12 @@ static void enumerate_devices_once(void) {
 }
 
 size_t vk_enumerate_devices(const VkDeviceDescriptor** out_list) {
-    pthread_once(&g_devs_once, enumerate_devices_once);
+    vk_call_once(&g_devs_once, enumerate_devices_once);
     if (out_list) *out_list = g_devs;
     return g_dev_count;
 }
 
-int vk_validate_device_precision(
-    const VkDeviceDescriptor* desc,
-    VkPrecKind prec,
-    bool is_ihs,
-    char* err_out,
-    size_t err_cap) {
+int vk_validate_device_precision(const VkDeviceDescriptor* desc, VkPrecKind prec, bool is_ihs, char* err_out, size_t err_cap) {
     bool fp16_ok = desc->has_fp16 && !env_flag_set("TLS_VK_TEST_DISABLE_FP16");
     bool fp64_ok = desc->has_fp64 && !env_flag_set("TLS_VK_TEST_DISABLE_FP64");
     if (prec == VK_PREC_HALF && !fp16_ok) {
@@ -396,11 +406,16 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
     p2.pNext = &sg_props;
     sg_props.pNext = &m3_props;
     void** ptail = &m3_props.pNext;
-    bool has_sg_ctrl_ext = (desc->api_version >= VK_API_VERSION_1_3) ||
-        has_device_ext(pdev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
-    if (has_sg_ctrl_ext) { *ptail = &sg_ctrl_props; ptail = &sg_ctrl_props.pNext; }
+    bool has_sg_ctrl_ext = (desc->api_version >= VK_API_VERSION_1_3) || has_device_ext(pdev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    if (has_sg_ctrl_ext) {
+        *ptail = &sg_ctrl_props;
+        ptail = &sg_ctrl_props.pNext;
+    }
     bool has_push_desc_ext = has_device_ext(pdev, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    if (has_push_desc_ext) { *ptail = &push_desc_props; ptail = &push_desc_props.pNext; }
+    if (has_push_desc_ext) {
+        *ptail = &push_desc_props;
+        ptail = &push_desc_props.pNext;
+    }
     vkGetPhysicalDeviceProperties2(pdev, &p2);
     cfg->has_push_descriptor = has_push_desc_ext && (push_desc_props.maxPushDescriptors >= 16u);
 
@@ -419,28 +434,21 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
     cfg->has_native_local_mem = (props->deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU);
 
     cfg->local_mem_size = (size_t)props->limits.maxComputeSharedMemorySize;
-    cfg->max_work_group_size = props->limits.maxComputeWorkGroupInvocations > 0
-        ? (size_t)props->limits.maxComputeWorkGroupInvocations : 256u;
+    cfg->max_work_group_size = props->limits.maxComputeWorkGroupInvocations > 0 ? (size_t)props->limits.maxComputeWorkGroupInvocations : 256u;
     for (int i = 0; i < 3; ++i) {
         cfg->max_wg_size_xyz[i] = props->limits.maxComputeWorkGroupSize[i];
         cfg->max_wg_count_xyz[i] = props->limits.maxComputeWorkGroupCount[i];
     }
     cfg->max_storage_buffer_range = (size_t)props->limits.maxStorageBufferRange;
-    cfg->min_storage_buffer_offset_alignment = props->limits.minStorageBufferOffsetAlignment > 16
-        ? (size_t)props->limits.minStorageBufferOffsetAlignment : 16u;
+    cfg->min_storage_buffer_offset_alignment = props->limits.minStorageBufferOffsetAlignment > 16 ? (size_t)props->limits.minStorageBufferOffsetAlignment : 16u;
     cfg->cache_line_size = 128;
     cfg->global_mem_size = desc->global_mem_size;
-    cfg->max_mem_alloc_size = (m3_props.maxMemoryAllocationSize > 0)
-        ? (size_t)m3_props.maxMemoryAllocationSize : cfg->global_mem_size;
+    cfg->max_mem_alloc_size = (m3_props.maxMemoryAllocationSize > 0) ? (size_t)m3_props.maxMemoryAllocationSize : cfg->global_mem_size;
 
     cfg->sub_group_size = sg_props.subgroupSize > 0 ? (size_t)sg_props.subgroupSize : 1u;
-    cfg->has_subgroup_basic =
-        (sg_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
-        (sg_props.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT);
-    cfg->has_subgroup_shuffle = cfg->has_subgroup_basic &&
-        (sg_props.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
-    cfg->has_subgroup_arithmetic = cfg->has_subgroup_basic &&
-        (sg_props.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    cfg->has_subgroup_basic = (sg_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) && (sg_props.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT);
+    cfg->has_subgroup_shuffle = cfg->has_subgroup_basic && (sg_props.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    cfg->has_subgroup_arithmetic = cfg->has_subgroup_basic && (sg_props.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
 
     VkPhysicalDeviceFeatures2 f2 = {0};
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -449,17 +457,13 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
     if (has_sg_ctrl_ext) f2.pNext = &sg_ctrl_feat;
     vkGetPhysicalDeviceFeatures2(pdev, &f2);
     cfg->has_subgroup_size_control =
-        has_sg_ctrl_ext &&
-        (sg_ctrl_feat.subgroupSizeControl == VK_TRUE) &&
-        (sg_ctrl_props.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+        has_sg_ctrl_ext && (sg_ctrl_feat.subgroupSizeControl == VK_TRUE) && (sg_ctrl_props.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
 
     cfg->num_sub_group_sizes = 0;
-    if (cfg->has_subgroup_size_control && sg_ctrl_props.minSubgroupSize > 0 &&
-        sg_ctrl_props.maxSubgroupSize >= sg_ctrl_props.minSubgroupSize) {
+    if (cfg->has_subgroup_size_control && sg_ctrl_props.minSubgroupSize > 0 && sg_ctrl_props.maxSubgroupSize >= sg_ctrl_props.minSubgroupSize) {
         cfg->min_sub_group_size = sg_ctrl_props.minSubgroupSize;
         cfg->max_sub_group_size = sg_ctrl_props.maxSubgroupSize;
-        for (size_t s = cfg->min_sub_group_size;
-             s <= cfg->max_sub_group_size && cfg->num_sub_group_sizes < 8; s <<= 1) {
+        for (size_t s = cfg->min_sub_group_size; s <= cfg->max_sub_group_size && cfg->num_sub_group_sizes < 8; s <<= 1) {
             cfg->sub_group_sizes[cfg->num_sub_group_sizes++] = s;
         }
     } else {
@@ -488,11 +492,9 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
                 }
             }
         }
-        uint32_t chosen_qf = (chosen_dedicated >= 0) ? (uint32_t)chosen_dedicated
-                                                     : (uint32_t)(chosen_general >= 0 ? chosen_general : 0);
+        uint32_t chosen_qf = (chosen_dedicated >= 0) ? (uint32_t)chosen_dedicated : (uint32_t)(chosen_general >= 0 ? chosen_general : 0);
         cfg->compute_queue_family = chosen_qf;
-        cfg->compute_queue_count = (chosen_qf < qf_count && qfs[chosen_qf].queueCount > 0)
-            ? (size_t)qfs[chosen_qf].queueCount : 1u;
+        cfg->compute_queue_count = (chosen_qf < qf_count && qfs[chosen_qf].queueCount > 0) ? (size_t)qfs[chosen_qf].queueCount : 1u;
         free(qfs);
     } else {
         cfg->compute_queue_family = 0;
@@ -502,9 +504,7 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
 
     VkPhysicalDeviceMemoryProperties mem = {0};
     vkGetPhysicalDeviceMemoryProperties(pdev, &mem);
-    VkMemoryPropertyFlags uma_req = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkMemoryPropertyFlags uma_req = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     VkMemoryPropertyFlags uma_cached_req = uma_req | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
         VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
@@ -529,9 +529,7 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
 }
 
 void vk_device_identity_key(const VkDeviceFftConfig* cfg, char* out, size_t out_cap) {
-    snprintf(out, out_cap, "%s|0x%x_0x%x|sg%zu_smem%zu|%s|%s",
-             cfg->device_name, cfg->vendor_id, cfg->device_id,
-             cfg->sub_group_size, cfg->local_mem_size,
+    snprintf(out, out_cap, "%s|0x%x_0x%x|sg%zu_smem%zu|%s|%s", cfg->device_name, cfg->vendor_id, cfg->device_id, cfg->sub_group_size, cfg->local_mem_size,
              cfg->driver_version, cfg->backend_tag);
 }
 
@@ -586,8 +584,7 @@ size_t vk_device_effective_l2_bytes(const VkDeviceFftConfig* cfg) {
 size_t vk_device_safe_max_alloc_bytes(const VkDeviceFftConfig* cfg) {
     size_t cap = SIZE_MAX;
     if (cfg->global_mem_size > 0 && cfg->global_mem_size < cap) cap = cfg->global_mem_size;
-    if (cfg->max_mem_alloc_size > 0 && cfg->max_mem_alloc_size < (SIZE_MAX >> 2) &&
-        cfg->max_mem_alloc_size < cap) {
+    if (cfg->max_mem_alloc_size > 0 && cfg->max_mem_alloc_size < (SIZE_MAX >> 2) && cfg->max_mem_alloc_size < cap) {
         cap = cfg->max_mem_alloc_size;
     }
     if (cfg->max_storage_buffer_range > 0 && cfg->max_storage_buffer_range < cap) {
@@ -598,7 +595,7 @@ size_t vk_device_safe_max_alloc_bytes(const VkDeviceFftConfig* cfg) {
 
 size_t vk_device_recommended_stream_count(const VkDeviceFftConfig* cfg) {
     if (!cfg->is_gpu) return 1u;
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long ncpu = vk_os_cpu_count();
     size_t host_threads = (ncpu > 2) ? (size_t)ncpu : 2u;
     size_t hw_cap = cfg->is_discrete_gpu ? ((host_threads >= 12u) ? 16u : 8u) : 4u;
     size_t streams = (cfg->compute_queue_count > 2u) ? cfg->compute_queue_count : 2u;
@@ -629,14 +626,8 @@ size_t vk_device_per_stream_mem_budget(const VkDeviceFftConfig* cfg, size_t num_
     return (size_t)256 << 20;
 }
 
-size_t vk_device_compute_l2_chunk_bytes(
-    const VkDeviceFftConfig* cfg,
-    size_t fft_bytes,
-    size_t n1,
-    bool is_compute_heavy,
-    size_t l2_num,
-    size_t l2_den,
-    size_t min_waves_per_cu) {
+size_t vk_device_compute_l2_chunk_bytes(const VkDeviceFftConfig* cfg, size_t fft_bytes, size_t n1, bool is_compute_heavy, size_t l2_num, size_t l2_den,
+                                        size_t min_waves_per_cu) {
     size_t eff_l2 = vk_device_effective_l2_bytes(cfg);
     size_t den = (l2_den == 0) ? 4u : l2_den;
     size_t num = (l2_num == 0) ? 1u : l2_num;
@@ -644,9 +635,7 @@ size_t vk_device_compute_l2_chunk_bytes(
     if (base_budget < ((size_t)256 << 10)) base_budget = ((size_t)256 << 10);
     size_t max_l2_budget = (eff_l2 / 2u > base_budget) ? (eff_l2 / 2u) : base_budget;
 
-    size_t target_waves = (min_waves_per_cu > 0)
-        ? min_waves_per_cu
-        : (!cfg->is_gpu ? 1u : (is_compute_heavy ? 8u : 2u));
+    size_t target_waves = (min_waves_per_cu > 0) ? min_waves_per_cu : (!cfg->is_gpu ? 1u : (is_compute_heavy ? 8u : 2u));
     size_t est_cus = cfg->is_discrete_gpu ? 24u : 4u;
     size_t target_wgs = est_cus * target_waves;
     size_t occ_chunk_bs = (n1 > 0) ? ((target_wgs + n1 - 1u) / n1) : 1u;
@@ -666,36 +655,22 @@ size_t vk_device_compute_l2_chunk_bytes(
  * Persistent AutotuneCache (plain C23 dynamic table + atomic file rename)
  * ============================================================================ */
 typedef struct CacheRow {
-    char            key[384];
+    char key[384];
     VkAutotuneEntry val;
 } CacheRow;
 
 typedef struct CacheFileTable {
-    char      path[512];
+    char path[512];
     CacheRow* rows;
-    size_t    count;
-    size_t    cap;
+    size_t count;
+    size_t cap;
 } CacheFileTable;
 
-static pthread_mutex_t g_cache_mtx = PTHREAD_MUTEX_INITIALIZER;
-static CacheFileTable* g_tables    = nullptr;
-static size_t          g_ntables   = 0;
+static vk_mutex_t g_cache_mtx = VK_MUTEX_INITIALIZER;
+static CacheFileTable* g_tables = nullptr;
+static size_t g_ntables = 0;
 
-static void mkdir_p_parent(const char* filepath) {
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", filepath);
-    char* slash = strrchr(tmp, '/');
-    if (!slash || slash == tmp) return;
-    *slash = '\0';
-    for (char* p = tmp + 1; *p; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, 0755);
-            *p = '/';
-        }
-    }
-    mkdir(tmp, 0755);
-}
+static void mkdir_p_parent(const char* filepath) { vk_os_mkdir_p_parent(filepath); }
 
 static bool parse_cache_line(const char* line, char* key_out, size_t key_cap, VkAutotuneEntry* val) {
     if (!line || line[0] == '\0' || line[0] == '#') return false;
@@ -776,8 +751,7 @@ static CacheFileTable* get_or_load_table_unlocked(const char* path) {
 static void save_table_unlocked(const CacheFileTable* t) {
     mkdir_p_parent(t->path);
     char tmp[600];
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%llu",
-             t->path, (long)getpid(), (unsigned long long)(vk_now_ms() * 1e6));
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld.%llu", t->path, vk_os_getpid(), (unsigned long long)(vk_now_ms() * 1e6));
     FILE* fp = fopen(tmp, "w");
     if (!fp) return;
     fprintf(fp, "# toeplitz_ls vulkan autotune cache v1\n");
@@ -786,12 +760,11 @@ static void save_table_unlocked(const CacheFileTable* t) {
         char vbuf[64], rbuf[64];
         vk_sanitize_cache_token(r->val.variant_id, vbuf, sizeof(vbuf));
         vk_sanitize_cache_token(r->val.runner_up_id, rbuf, sizeof(rbuf));
-        fprintf(fp, "%s\t%d\t%s\t%d\t%zu\t%zu\t%.4f\t%s\n",
-                r->key, (int)r->val.mode, vbuf, r->val.log_n1,
-                r->val.pass0_wg, r->val.l2_chunk_bytes, r->val.margin_pct, rbuf);
+        fprintf(fp, "%s\t%d\t%s\t%d\t%zu\t%zu\t%.4f\t%s\n", r->key, (int)r->val.mode, vbuf, r->val.log_n1, r->val.pass0_wg, r->val.l2_chunk_bytes,
+                r->val.margin_pct, rbuf);
     }
     fclose(fp);
-    if (rename(tmp, t->path) != 0) unlink(tmp);
+    (void)vk_os_replace_file(tmp, t->path);
 }
 
 void vk_autotune_resolve_cache_path(const char* explicit_path, char* out, size_t out_cap) {
@@ -804,37 +777,20 @@ void vk_autotune_resolve_cache_path(const char* explicit_path, char* out, size_t
         snprintf(out, out_cap, "%s", env_p);
         return;
     }
-    const char* xdg = getenv("XDG_CACHE_HOME");
-    if (xdg && xdg[0] != '\0') {
-        snprintf(out, out_cap, "%s/toeplitz_ls/vulkan_autotune_v1.txt", xdg);
-        return;
-    }
-    const char* home = getenv("HOME");
-    if (home && home[0] != '\0') {
-        snprintf(out, out_cap, "%s/.cache/toeplitz_ls/vulkan_autotune_v1.txt", home);
-        return;
-    }
-    snprintf(out, out_cap, "/tmp/toeplitz_ls_vulkan_autotune_v1.txt");
+    char dir[384];
+    vk_os_default_cache_dir(dir, sizeof(dir));
+    snprintf(out, out_cap, "%s/vulkan_autotune_v1.txt", dir);
 }
 
-void vk_autotune_make_key(
-    const VkDeviceFftConfig* cfg,
-    const char* prec_tag_str,
-    int logN,
-    const char* slot_tag,
-    int sign,
-    char* out,
-    size_t out_cap) {
+void vk_autotune_make_key(const VkDeviceFftConfig* cfg, const char* prec_tag_str, int logN, const char* slot_tag, int sign, char* out, size_t out_cap) {
     char id_key[512];
     vk_device_identity_key(cfg, id_key, sizeof(id_key));
-    snprintf(out, out_cap, "v1|%s|%.220s|%s|s%d|%s|logN=%d",
-             vk_kernel_code_hash(), id_key,
-             prec_tag_str ? prec_tag_str : "f", sign,
+    snprintf(out, out_cap, "v1|%s|%.220s|%s|s%d|%s|logN=%d", vk_kernel_code_hash(), id_key, prec_tag_str ? prec_tag_str : "f", sign,
              slot_tag ? slot_tag : "any", logN);
 }
 
 bool vk_autotune_cache_get(const char* path, const char* key, VkAutotuneEntry* out) {
-    pthread_mutex_lock(&g_cache_mtx);
+    vk_mutex_lock(&g_cache_mtx);
     CacheFileTable* t = get_or_load_table_unlocked(path);
     bool found = false;
     if (t) {
@@ -846,27 +802,27 @@ bool vk_autotune_cache_get(const char* path, const char* key, VkAutotuneEntry* o
             }
         }
     }
-    pthread_mutex_unlock(&g_cache_mtx);
+    vk_mutex_unlock(&g_cache_mtx);
     return found;
 }
 
 void vk_autotune_cache_put(const char* path, const char* key, const VkAutotuneEntry* val) {
-    pthread_mutex_lock(&g_cache_mtx);
+    vk_mutex_lock(&g_cache_mtx);
     CacheFileTable* t = get_or_load_table_unlocked(path);
     if (t) {
         table_upsert(t, key, val);
         save_table_unlocked(t);
     }
-    pthread_mutex_unlock(&g_cache_mtx);
+    vk_mutex_unlock(&g_cache_mtx);
 }
 
 void vk_autotune_cache_clear_memory(void) {
-    pthread_mutex_lock(&g_cache_mtx);
+    vk_mutex_lock(&g_cache_mtx);
     for (size_t i = 0; i < g_ntables; ++i) free(g_tables[i].rows);
     free(g_tables);
     g_tables = nullptr;
     g_ntables = 0;
-    pthread_mutex_unlock(&g_cache_mtx);
+    vk_mutex_unlock(&g_cache_mtx);
 }
 
 /* ============================================================================
@@ -878,16 +834,8 @@ static int cmp_double(const void* a, const void* b) {
     return (x < y) ? -1 : (x > y ? 1 : 0);
 }
 
-VkInterleavedBenchResult vk_run_interleaved_bench(
-    size_t num_cands,
-    VkBenchRunFn run_fn,
-    VkBenchConservFn conserv_fn,
-    void* user_data,
-    int num_rounds,
-    double target_slice_ms,
-    int max_batch_reps,
-    double min_noise_frac,
-    double max_noise_frac) {
+VkInterleavedBenchResult vk_run_interleaved_bench(size_t num_cands, VkBenchRunFn run_fn, VkBenchConservFn conserv_fn, void* user_data, int num_rounds,
+                                                  double target_slice_ms, int max_batch_reps, double min_noise_frac, double max_noise_frac) {
     VkInterleavedBenchResult res = {0};
     if (num_cands == 0 || !run_fn) return res;
 
@@ -899,7 +847,12 @@ VkInterleavedBenchResult vk_run_interleaved_bench(
     double* med = (double*)malloc(num_cands * sizeof(double));
     double* iqr = (double*)calloc(num_cands, sizeof(double));
     if (!alive || !batch_reps || !samples || !sample_cnt || !med || !iqr) {
-        free(alive); free(batch_reps); free(samples); free(sample_cnt); free(med); free(iqr);
+        free(alive);
+        free(batch_reps);
+        free(samples);
+        free(sample_cnt);
+        free(med);
+        free(iqr);
         return res;
     }
 
@@ -955,8 +908,10 @@ VkInterleavedBenchResult vk_run_interleaved_bench(
         double* s = &samples[c * (size_t)rounds];
         qsort(s, n, sizeof(double), cmp_double);
         med[c] = s[n / 2];
-        if (n >= 4) iqr[c] = s[n - 2] - s[1];
-        else if (n >= 2) iqr[c] = s[n - 1] - s[0];
+        if (n >= 4)
+            iqr[c] = s[n - 2] - s[1];
+        else if (n >= 2)
+            iqr[c] = s[n - 1] - s[0];
         if (med[c] < fastest_ms) {
             fastest_ms = med[c];
             fastest = c;

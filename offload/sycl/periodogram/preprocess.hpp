@@ -12,37 +12,29 @@
 // All scratch vectors (including w_tmp) live inside the thread_local HostData
 // structs so steady-state lightcurve preprocessing performs zero heap allocations.
 
-#include "common/math.hpp"
-#include "linalg/levinson.hpp"
-
 #include <cmath>
 #include <cstdint>
 #include <vector>
 
+#include "common/math.hpp"
+#include "linalg/levinson.hpp"
+
 namespace sycl_periodogram {
 
 enum Status : int {
-    TLS_SYCL_OK             =  0,
-    TLS_SYCL_ERR_ARGUMENT   = -1,
-    TLS_SYCL_ERR_BACKEND    = -2,
-    TLS_SYCL_ERR_ALLOC      = -3,
+    TLS_SYCL_OK = 0,
+    TLS_SYCL_ERR_ARGUMENT = -1,
+    TLS_SYCL_ERR_BACKEND = -2,
+    TLS_SYCL_ERR_ALLOC = -3,
     TLS_SYCL_ERR_DEGENERATE = -4,
-    TLS_SYCL_ERR_SOLVER     = -5,
-    TLS_SYCL_ERR_DEVICE     = -6,
-    TLS_SYCL_ERR_RUNTIME    = -7
+    TLS_SYCL_ERR_SOLVER = -5,
+    TLS_SYCL_ERR_DEVICE = -6,
+    TLS_SYCL_ERR_RUNTIME = -7
 };
 
-enum Backend : int {
-    TLS_SYCL_BACKEND_PSWF43 = 1,
-    TLS_SYCL_BACKEND_PSWF21 = 2
-};
+enum Backend : int { TLS_SYCL_BACKEND_PSWF43 = 1, TLS_SYCL_BACKEND_PSWF21 = 2 };
 
-enum PrecKind : int {
-    TLS_SYCL_PREC_HALF   = 0,
-    TLS_SYCL_PREC_FLOAT  = 1,
-    TLS_SYCL_PREC_DF     = 2,
-    TLS_SYCL_PREC_DOUBLE = 3
-};
+enum PrecKind : int { TLS_SYCL_PREC_HALF = 0, TLS_SYCL_PREC_FLOAT = 1, TLS_SYCL_PREC_DF = 2, TLS_SYCL_PREC_DOUBLE = 3 };
 
 inline sycl_linalg::CybenkoModel init_cybenko_model(int d, double neff_w) {
     sycl_linalg::CybenkoModel m{};
@@ -72,13 +64,13 @@ struct FastChi2HostData {
     std::vector<XCoordT> x;
     std::vector<ScalarT> w;
     std::vector<ScalarT> yw;
-    std::vector<double>  w_tmp; // reusable scratch (zero per-call malloc)
-    double ws_fft    = 0.0;
-    double yws_fft   = 0.0;
-    double chi2_ref  = 0.0;
-    double neff_w    = 0.0;
-    double b_param   = 0.0;
-    double row_scale = 1.0; // Used only by FP16 fused-epilogue deconvolution
+    std::vector<double> w_tmp;  // reusable scratch (zero per-call malloc)
+    double ws_fft = 0.0;
+    double yws_fft = 0.0;
+    double chi2_ref = 0.0;
+    double neff_w = 0.0;
+    double b_param = 0.0;
+    double row_scale = 1.0;  // Used only by FP16 fused-epilogue deconvolution
     sycl_linalg::CybenkoModel cyb{};
 };
 
@@ -86,22 +78,16 @@ template <typename XCoordT, typename ScalarT>
 struct IhsHostData {
     std::vector<XCoordT> x;
     std::vector<ScalarT> wy;
-    std::vector<double>  w_tmp; // reusable scratch (zero per-call malloc)
+    std::vector<double> w_tmp;  // reusable scratch (zero per-call malloc)
     double standard_scale = 0.0;
-    double nll_scale      = 0.0;
-    double norm_neff      = 0.0;
+    double nll_scale = 0.0;
+    double norm_neff = 0.0;
 };
 
 // --- FP16 FastChi2 preprocessing (double precision, matching src/chi2per.c) ---
 template <typename InFloatT>
-inline int preprocess_fastchi2_half_typed(
-    const double* t,
-    const InFloatT* y,
-    const InFloatT* dy,
-    int M,
-    int degree,
-    int nfft,
-    FastChi2HostData<sycl_fft::df_t, sycl_fft::f16_scalar_t>& out) {
+inline int preprocess_fastchi2_half_typed(const double* t, const InFloatT* y, const InFloatT* dy, int M, int degree, int nfft,
+                                          FastChi2HostData<sycl_fft::df_t, sycl_fft::f16_scalar_t>& out) {
     const size_t M_sz = static_cast<size_t>(M);
     out.x.resize(M_sz);
     out.w.resize(M_sz);
@@ -167,34 +153,26 @@ inline int preprocess_fastchi2_half_typed(
         const double yc = ((static_cast<double>(y[m]) - y0_d) - dy_mean_d) * yc_scale_d;
         const double wm = w_d[m];
         const double ywm = yc * wm;
-        out.w[static_cast<size_t>(m)]  = static_cast<sycl_fft::f16_scalar_t>(static_cast<float>(wm));
+        out.w[static_cast<size_t>(m)] = static_cast<sycl_fft::f16_scalar_t>(static_cast<float>(wm));
         out.yw[static_cast<size_t>(m)] = static_cast<sycl_fft::f16_scalar_t>(static_cast<float>(ywm));
         yws_d += ywm;
         chi2_ref_d += yc * ywm;
     }
     if (chi2_ref_d == 0.0 || !std::isfinite(chi2_ref_d)) return TLS_SYCL_ERR_DEGENERATE;
 
-    out.neff_w    = (ws_d * ws_d) / sum_w2_d;
-    out.cyb       = init_cybenko_model(degree, out.neff_w);
-    out.b_param   = 0.5 * (out.neff_w - 1.0 - 2.0 * static_cast<double>(degree));
+    out.neff_w = (ws_d * ws_d) / sum_w2_d;
+    out.cyb = init_cybenko_model(degree, out.neff_w);
+    out.b_param = 0.5 * (out.neff_w - 1.0 - 2.0 * static_cast<double>(degree));
     const double inv_wt = 1.0 / w_target;
     out.row_scale = static_cast<double>(nfft) * inv_wt;
-    out.ws_fft    = ws_d * inv_wt;
-    out.yws_fft   = yws_d * inv_wt;
-    out.chi2_ref  = chi2_ref_d * inv_wt;
+    out.ws_fft = ws_d * inv_wt;
+    out.yws_fft = yws_d * inv_wt;
+    out.chi2_ref = chi2_ref_d * inv_wt;
     return TLS_SYCL_OK;
 }
 
-inline int preprocess_fastchi2_half(
-    const double* t,
-    const float* y_f,
-    const double* y_d,
-    const float* dy_f,
-    const double* dy_d,
-    int M,
-    int degree,
-    int nfft,
-    FastChi2HostData<sycl_fft::df_t, sycl_fft::f16_scalar_t>& out) {
+inline int preprocess_fastchi2_half(const double* t, const float* y_f, const double* y_d, const float* dy_f, const double* dy_d, int M, int degree, int nfft,
+                                    FastChi2HostData<sycl_fft::df_t, sycl_fft::f16_scalar_t>& out) {
     if (y_d && dy_d) {
         return preprocess_fastchi2_half_typed<double>(t, y_d, dy_d, M, degree, nfft, out);
     }
@@ -203,14 +181,8 @@ inline int preprocess_fastchi2_half(
 
 // --- FP32 / DF / FP64 FastChi2 preprocessing (matching src/chi2per.c) ---
 template <typename InFloatT, typename XCoordT, typename ScalarT>
-inline int preprocess_fastchi2_generic(
-    const double* t,
-    const InFloatT* y,
-    const InFloatT* dy,
-    int M,
-    int degree,
-    int nfft,
-    FastChi2HostData<XCoordT, ScalarT>& out) {
+inline int preprocess_fastchi2_generic(const double* t, const InFloatT* y, const InFloatT* dy, int M, int degree, int nfft,
+                                       FastChi2HostData<XCoordT, ScalarT>& out) {
     const size_t M_sz = static_cast<size_t>(M);
     out.x.resize(M_sz);
     out.w.resize(M_sz);
@@ -279,35 +251,29 @@ inline int preprocess_fastchi2_generic(
         yws += ywm;
         chi2_ref += yc * ywm;
         if constexpr (std::is_same_v<ScalarT, sycl_fft::df_t>) {
-            out.w[static_cast<size_t>(m)]  = sycl_fft::df_from_double(wm);
+            out.w[static_cast<size_t>(m)] = sycl_fft::df_from_double(wm);
             out.yw[static_cast<size_t>(m)] = sycl_fft::df_from_double(ywm);
         } else {
-            out.w[static_cast<size_t>(m)]  = static_cast<ScalarT>(wm);
+            out.w[static_cast<size_t>(m)] = static_cast<ScalarT>(wm);
             out.yw[static_cast<size_t>(m)] = static_cast<ScalarT>(ywm);
         }
     }
     if (chi2_ref == 0.0 || !std::isfinite(chi2_ref)) return TLS_SYCL_ERR_DEGENERATE;
 
     const double inv_nfft = 1.0 / static_cast<double>(nfft);
-    out.neff_w    = (ws * ws) / sum_w2;
-    out.cyb       = init_cybenko_model(degree, out.neff_w);
-    out.b_param   = 0.5 * (out.neff_w - 1.0 - 2.0 * static_cast<double>(degree));
+    out.neff_w = (ws * ws) / sum_w2;
+    out.cyb = init_cybenko_model(degree, out.neff_w);
+    out.b_param = 0.5 * (out.neff_w - 1.0 - 2.0 * static_cast<double>(degree));
     out.row_scale = 1.0;
-    out.ws_fft    = ws * inv_nfft;
-    out.yws_fft   = yws * inv_nfft;
-    out.chi2_ref  = chi2_ref * inv_nfft;
+    out.ws_fft = ws * inv_nfft;
+    out.yws_fft = yws * inv_nfft;
+    out.chi2_ref = chi2_ref * inv_nfft;
     return TLS_SYCL_OK;
 }
 
 // --- IHS preprocessing (all 4 precisions, matching src/chi2per.c) ---
 template <typename InFloatT, typename XCoordT, typename ScalarT, bool IsHalf>
-inline int preprocess_ihs_typed(
-    const double* t,
-    const InFloatT* y,
-    const InFloatT* dy,
-    int M,
-    int nfft,
-    IhsHostData<XCoordT, ScalarT>& out) {
+inline int preprocess_ihs_typed(const double* t, const InFloatT* y, const InFloatT* dy, int M, int nfft, IhsHostData<XCoordT, ScalarT>& out) {
     const size_t M_sz = static_cast<size_t>(M);
     out.x.resize(M_sz);
     out.wy.resize(M_sz);
@@ -406,19 +372,12 @@ inline int preprocess_ihs_typed(
 }
 
 template <typename XCoordT, typename ScalarT, bool IsHalf>
-inline int preprocess_ihs_impl(
-    const double* t,
-    const float* y_f,
-    const double* y_d,
-    const float* dy_f,
-    const double* dy_d,
-    int M,
-    int nfft,
-    IhsHostData<XCoordT, ScalarT>& out) {
+inline int preprocess_ihs_impl(const double* t, const float* y_f, const double* y_d, const float* dy_f, const double* dy_d, int M, int nfft,
+                               IhsHostData<XCoordT, ScalarT>& out) {
     if (y_d && dy_d) {
         return preprocess_ihs_typed<double, XCoordT, ScalarT, IsHalf>(t, y_d, dy_d, M, nfft, out);
     }
     return preprocess_ihs_typed<float, XCoordT, ScalarT, IsHalf>(t, y_f, dy_f, M, nfft, out);
 }
 
-} // namespace sycl_periodogram
+}  // namespace sycl_periodogram

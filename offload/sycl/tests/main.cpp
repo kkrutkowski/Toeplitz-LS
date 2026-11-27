@@ -1,5 +1,3 @@
-#include "nufft/nufft1.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,6 +9,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include "nufft/nufft1.hpp"
 
 namespace {
 
@@ -33,8 +33,7 @@ struct SplitMix64 {
 
 // 80-bit long double CPU reference implementation of Sande-Tukey (DIF) Radix-2 FFT
 // (64-bit significand ~19 digits -> exact gold reference for FP32, FP64, and DF).
-void cpu_dif_radix2_ref(
-    std::vector<long double>& re, std::vector<long double>& im, int logN, int sign, bool do_bitrev) {
+void cpu_dif_radix2_ref(std::vector<long double>& re, std::vector<long double>& im, int logN, int sign, bool do_bitrev) {
     const size_t N = size_t{1} << logN;
     constexpr long double kTwoPiLD = 6.28318530717958647692528676655900576839L;
 
@@ -72,114 +71,128 @@ void cpu_dif_radix2_ref(
 // Precision traits for templated verification and benchmarking
 struct HalfTraits {
     using ComplexT = sycl_fft::Complexh;
-    template <int Sign> using PlanT = sycl_fft::DifFftPlanh<Sign>;
-    template <int Sign> using NufftPlanSignT = sycl_nufft::Nufft1PlanhSign<Sign>;
+    template <int Sign>
+    using PlanT = sycl_fft::DifFftPlanh<Sign>;
+    template <int Sign>
+    using NufftPlanSignT = sycl_nufft::Nufft1PlanhSign<Sign>;
     using NufftPlanT = sycl_nufft::Nufft1Planh;
     using XCoordT = sycl_fft::df_t;
     static constexpr const char* kName = "FP16 (2xFP16)";
     static constexpr const char* kPrecTag = "h";
-    static constexpr int kDefaultLogTotal = 26;   // 256 MiB / buffer
+    static constexpr int kDefaultLogTotal = 26;  // 256 MiB / buffer
     static constexpr double kTolRel = 1.5e-2;
     static constexpr int kNufftWidths[2] = {4, 5};
     static constexpr double kNufftTolRel = 1.5e-2;
 
-    static ComplexT from_doubles(double r, double i) {
-        return sycl_fft::complexh_from_doubles(r, i);
-    }
-    static void to_long_doubles(const ComplexT& v, long double& r, long double& i) {
-        sycl_fft::complexh_to_long_doubles(v, r, i);
-    }
-    static XCoordT xcoord_from_double(double x) {
-        return sycl_fft::df_from_double(x);
-    }
+    static ComplexT from_doubles(double r, double i) { return sycl_fft::complexh_from_doubles(r, i); }
+    static void to_long_doubles(const ComplexT& v, long double& r, long double& i) { sycl_fft::complexh_to_long_doubles(v, r, i); }
+    static XCoordT xcoord_from_double(double x) { return sycl_fft::df_from_double(x); }
 };
 
 struct FloatTraits {
     using ComplexT = sycl_fft::Complexf;
-    template <int Sign> using PlanT = sycl_fft::DifFftPlanf<Sign>;
-    template <int Sign> using NufftPlanSignT = sycl_nufft::Nufft1PlanfSign<Sign>;
+    template <int Sign>
+    using PlanT = sycl_fft::DifFftPlanf<Sign>;
+    template <int Sign>
+    using NufftPlanSignT = sycl_nufft::Nufft1PlanfSign<Sign>;
     using NufftPlanT = sycl_nufft::Nufft1Planf;
     using XCoordT = sycl_fft::df_t;
     static constexpr const char* kName = "FP32";
     static constexpr const char* kPrecTag = "f";
-    static constexpr int kDefaultLogTotal = 25;   // 256 MiB / buffer
+    static constexpr int kDefaultLogTotal = 25;  // 256 MiB / buffer
     static constexpr double kTolRel = 2e-5;
     static constexpr int kNufftWidths[2] = {8, 9};
     static constexpr double kNufftTolRel = 1.5e-5;
 
-    static ComplexT from_doubles(double r, double i) {
-        return ComplexT{static_cast<float>(r), static_cast<float>(i)};
-    }
+    static ComplexT from_doubles(double r, double i) { return ComplexT{static_cast<float>(r), static_cast<float>(i)}; }
     static void to_long_doubles(const ComplexT& v, long double& r, long double& i) {
         r = static_cast<long double>(v.x());
         i = static_cast<long double>(v.y());
     }
-    static XCoordT xcoord_from_double(double x) {
-        return sycl_fft::df_from_double(x);
-    }
+    static XCoordT xcoord_from_double(double x) { return sycl_fft::df_from_double(x); }
 };
 
 struct DoubleTraits {
     using ComplexT = sycl_fft::Complex;
-    template <int Sign> using PlanT = sycl_fft::DifFftPlan<Sign>;
-    template <int Sign> using NufftPlanSignT = sycl_nufft::Nufft1PlanSign<Sign>;
+    template <int Sign>
+    using PlanT = sycl_fft::DifFftPlan<Sign>;
+    template <int Sign>
+    using NufftPlanSignT = sycl_nufft::Nufft1PlanSign<Sign>;
     using NufftPlanT = sycl_nufft::Nufft1Plan;
     using XCoordT = double;
     static constexpr const char* kName = "FP64";
     static constexpr const char* kPrecTag = "d";
-    static constexpr int kDefaultLogTotal = 24;   // 256 MiB / buffer
+    static constexpr int kDefaultLogTotal = 24;  // 256 MiB / buffer
     static constexpr double kTolRel = 5e-14;
     static constexpr int kNufftWidths[3] = {16, 17, 18};
     static constexpr double kNufftTolRel = 2e-11;
 
-    static ComplexT from_doubles(double r, double i) {
-        return ComplexT{r, i};
-    }
+    static ComplexT from_doubles(double r, double i) { return ComplexT{r, i}; }
     static void to_long_doubles(const ComplexT& v, long double& r, long double& i) {
         r = static_cast<long double>(v.x());
         i = static_cast<long double>(v.y());
     }
-    static XCoordT xcoord_from_double(double x) {
-        return x;
-    }
+    static XCoordT xcoord_from_double(double x) { return x; }
 };
 
 struct DfTraits {
     using ComplexT = sycl_fft::Complexdf;
-    template <int Sign> using PlanT = sycl_fft::DifFftPlandf<Sign>;
-    template <int Sign> using NufftPlanSignT = sycl_nufft::Nufft1PlandfSign<Sign>;
+    template <int Sign>
+    using PlanT = sycl_fft::DifFftPlandf<Sign>;
+    template <int Sign>
+    using NufftPlanSignT = sycl_nufft::Nufft1PlandfSign<Sign>;
     using NufftPlanT = sycl_nufft::Nufft1Plandf;
     using XCoordT = sycl_fft::df_t;
     static constexpr const char* kName = "DF (2xFP32)";
     static constexpr const char* kPrecTag = "df";
-    static constexpr int kDefaultLogTotal = 24;   // 256 MiB / buffer
+    static constexpr int kDefaultLogTotal = 24;  // 256 MiB / buffer
     static constexpr double kTolRel = 5e-12;
     static constexpr int kNufftWidths[3] = {14, 15, 16};
     static constexpr double kNufftTolRel = 5e-10;
 
-    static ComplexT from_doubles(double r, double i) {
-        return ComplexT{sycl_fft::df_from_double(r), sycl_fft::df_from_double(i)};
-    }
+    static ComplexT from_doubles(double r, double i) { return ComplexT{sycl_fft::df_from_double(r), sycl_fft::df_from_double(i)}; }
     static void to_long_doubles(const ComplexT& v, long double& r, long double& i) {
         r = static_cast<long double>(v.re.hi) + static_cast<long double>(v.re.lo);
         i = static_cast<long double>(v.im.hi) + static_cast<long double>(v.im.lo);
     }
-    static XCoordT xcoord_from_double(double x) {
-        return sycl_fft::df_from_double(x);
-    }
+    static XCoordT xcoord_from_double(double x) { return sycl_fft::df_from_double(x); }
 };
 // Standalone verification of branchless polynomial cos2pi / sin2pi across all 4 precisions
 // on negative, >1, quadrant, and octant boundary values (executed on the SYCL device).
 // FP64 trig runs in a separate kernel guarded by dev_cfg.has_fp64 for !fp64 GPUs.
 bool verify_standalone_trig(sycl::queue& q, const sycl_fft::DeviceFftConfig& dev_cfg) {
     constexpr long double kTwoPiLD = 6.28318530717958647692528676655900576839L;
-    std::vector<double> h_x = {
-        0.0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5,
-        0.625, 0.75, 0.875, 1.0, 1.125, 2.345678901234567,
-        -0.0625, -0.125, -0.25, -0.375, -0.5, -0.75, -1.0, -3.141592653589793,
-        0.125 - 1e-7, 0.125 + 1e-7, 0.25 - 1e-7, 0.25 + 1e-7, 0.5 - 1e-7, 0.5 + 1e-7,
-        -1e-12, 1.0 - 1e-12
-    };
+    std::vector<double> h_x = {0.0,
+                               0.0625,
+                               0.125,
+                               0.1875,
+                               0.25,
+                               0.3125,
+                               0.375,
+                               0.4375,
+                               0.5,
+                               0.625,
+                               0.75,
+                               0.875,
+                               1.0,
+                               1.125,
+                               2.345678901234567,
+                               -0.0625,
+                               -0.125,
+                               -0.25,
+                               -0.375,
+                               -0.5,
+                               -0.75,
+                               -1.0,
+                               -3.141592653589793,
+                               0.125 - 1e-7,
+                               0.125 + 1e-7,
+                               0.25 - 1e-7,
+                               0.25 + 1e-7,
+                               0.5 - 1e-7,
+                               0.5 + 1e-7,
+                               -1e-12,
+                               1.0 - 1e-12};
     SplitMix64 rng(777);
     for (int i = 0; i < 1000; ++i) {
         h_x.push_back(rng.next_double() * 8.0);
@@ -189,33 +202,33 @@ bool verify_standalone_trig(sycl::queue& q, const sycl_fft::DeviceFftConfig& dev
     std::vector<float> h_xf(M);
     std::vector<sycl_fft::df_t> h_xdf(M);
     for (size_t i = 0; i < M; ++i) {
-        h_xf[i]  = static_cast<float>(h_x[i]);
+        h_xf[i] = static_cast<float>(h_x[i]);
         h_xdf[i] = sycl_fft::df_from_double(h_x[i]);
     }
 
-    auto* d_xf  = sycl::malloc_device<float>(M, q);
+    auto* d_xf = sycl::malloc_device<float>(M, q);
     auto* d_xdf = sycl::malloc_device<sycl_fft::df_t>(M, q);
-    auto* d_ch  = sycl::malloc_device<sycl::half>(M, q);
-    auto* d_sh  = sycl::malloc_device<sycl::half>(M, q);
-    auto* d_cf  = sycl::malloc_device<float>(M, q);
-    auto* d_sf  = sycl::malloc_device<float>(M, q);
+    auto* d_ch = sycl::malloc_device<sycl::half>(M, q);
+    auto* d_sh = sycl::malloc_device<sycl::half>(M, q);
+    auto* d_cf = sycl::malloc_device<float>(M, q);
+    auto* d_sf = sycl::malloc_device<float>(M, q);
     auto* d_cdf = sycl::malloc_device<sycl_fft::df_t>(M, q);
     auto* d_sdf = sycl::malloc_device<sycl_fft::df_t>(M, q);
 
     q.memcpy(d_xf, h_xf.data(), M * sizeof(float));
     q.memcpy(d_xdf, h_xdf.data(), M * sizeof(sycl_fft::df_t));
     q.parallel_for(sycl::range<1>(M), [=](sycl::id<1> idx) {
-        const size_t i = idx[0];
-        const float xf = d_xf[i];
-        const sycl::half xh = static_cast<sycl::half>(xf);
-        const sycl_fft::df_t xdf = d_xdf[i];
-        d_ch[i]  = sycl_fft::cos2pih(xh);
-        d_sh[i]  = sycl_fft::sin2pih(xh);
-        d_cf[i]  = sycl_fft::cos2pif(xf);
-        d_sf[i]  = sycl_fft::sin2pif(xf);
-        d_cdf[i] = sycl_fft::cos2pidf(xdf);
-        d_sdf[i] = sycl_fft::sin2pidf(xdf);
-    }).wait();
+         const size_t i = idx[0];
+         const float xf = d_xf[i];
+         const sycl::half xh = static_cast<sycl::half>(xf);
+         const sycl_fft::df_t xdf = d_xdf[i];
+         d_ch[i] = sycl_fft::cos2pih(xh);
+         d_sh[i] = sycl_fft::sin2pih(xh);
+         d_cf[i] = sycl_fft::cos2pif(xf);
+         d_sf[i] = sycl_fft::sin2pif(xf);
+         d_cdf[i] = sycl_fft::cos2pidf(xdf);
+         d_sdf[i] = sycl_fft::sin2pidf(xdf);
+     }).wait();
 
     std::vector<sycl::half> h_ch(M), h_sh(M);
     std::vector<float> h_cf(M), h_sf(M);
@@ -244,11 +257,11 @@ bool verify_standalone_trig(sycl::queue& q, const sycl_fft::DeviceFftConfig& dev
         auto* d_sd = sycl::malloc_device<double>(M, q);
         q.memcpy(d_xd, h_x.data(), M * sizeof(double));
         q.parallel_for(sycl::range<1>(M), [=](sycl::id<1> idx) {
-            const size_t i = idx[0];
-            const double xd = d_xd[i];
-            d_cd[i] = sycl_fft::cos2pi(xd);
-            d_sd[i] = sycl_fft::sin2pi(xd);
-        }).wait();
+             const size_t i = idx[0];
+             const double xd = d_xd[i];
+             d_cd[i] = sycl_fft::cos2pi(xd);
+             d_sd[i] = sycl_fft::sin2pi(xd);
+         }).wait();
         h_cd.resize(M);
         h_sd.resize(M);
         q.memcpy(h_cd.data(), d_cd, M * sizeof(double));
@@ -286,23 +299,17 @@ bool verify_standalone_trig(sycl::queue& q, const sycl_fft::DeviceFftConfig& dev
     const bool ok = (err_h < 2e-3 && err_f < 2e-6 && (!dev_cfg.has_fp64 || err_d < 5e-15) && err_df < 1e-13);
     std::printf("=== Standalone Device Trig Verification (%zu pts incl. boundaries/neg/>1) ===\n", M);
     if (dev_cfg.has_fp64) {
-        std::printf("  FP16 max_err = %.3e | FP32 max_err = %.3e | FP64 max_err = %.3e | DF max_err = %.3e | %s\n",
-                    err_h, err_f, err_d, err_df, ok ? "PASS" : "FAIL");
+        std::printf("  FP16 max_err = %.3e | FP32 max_err = %.3e | FP64 max_err = %.3e | DF max_err = %.3e | %s\n", err_h, err_f, err_d, err_df,
+                    ok ? "PASS" : "FAIL");
     } else {
-        std::printf("  FP16 max_err = %.3e | FP32 max_err = %.3e | FP64 = skip(!fp64) | DF max_err = %.3e | %s\n",
-                    err_h, err_f, err_df, ok ? "PASS" : "FAIL");
+        std::printf("  FP16 max_err = %.3e | FP32 max_err = %.3e | FP64 = skip(!fp64) | DF max_err = %.3e | %s\n", err_h, err_f, err_df, ok ? "PASS" : "FAIL");
     }
     return ok;
 }
 
 template <typename Traits>
-void compute_errors_prec(
-    const typename Traits::ComplexT* got,
-    const std::vector<long double>& ref_re,
-    const std::vector<long double>& ref_im,
-    size_t N,
-    double& max_abs,
-    double& max_rel) {
+void compute_errors_prec(const typename Traits::ComplexT* got, const std::vector<long double>& ref_re, const std::vector<long double>& ref_im, size_t N,
+                         double& max_abs, double& max_rel) {
     long double m_abs = 0.0L;
     long double m_ref = 0.0L;
     for (size_t i = 0; i < N; ++i) {
@@ -320,15 +327,12 @@ void compute_errors_prec(
 }
 
 template <typename Traits, int Sign>
-bool run_verification_prec(
-    sycl::queue& q, int min_logN, int max_logN, const sycl_fft::FftLaunchConfig& cfg) {
+bool run_verification_prec(sycl::queue& q, int min_logN, int max_logN, const sycl_fft::FftLaunchConfig& cfg) {
     using ComplexT = typename Traits::ComplexT;
     using PlanT = typename Traits::template PlanT<Sign>;
 
-    std::printf("\n=== Correctness Verification (%s DIF Radix-2, Sign=%+d vs 80-bit long double Ref) ===\n",
-                Traits::kName, Sign);
-    std::printf("%-5s %-8s %-4s | %-12s %-12s %-12s | %-12s | %s\n",
-                "logN", "N", "bs", "Raw_MaxRel", "InPl_MaxRel", "BitRev_MaxRel", "Raw_MaxAbs", "Status");
+    std::printf("\n=== Correctness Verification (%s DIF Radix-2, Sign=%+d vs 80-bit long double Ref) ===\n", Traits::kName, Sign);
+    std::printf("%-5s %-8s %-4s | %-12s %-12s %-12s | %-12s | %s\n", "logN", "N", "bs", "Raw_MaxRel", "InPl_MaxRel", "BitRev_MaxRel", "Raw_MaxAbs", "Status");
 
     bool all_ok = true;
     for (int logN = min_logN; logN <= max_logN; ++logN) {
@@ -391,12 +395,9 @@ bool run_verification_prec(
             worst_nat_rel = std::max(worst_nat_rel, r);
         }
 
-        const bool ok = (worst_raw_rel < Traits::kTolRel &&
-                         worst_inpl_rel < Traits::kTolRel &&
-                         worst_nat_rel < Traits::kTolRel);
+        const bool ok = (worst_raw_rel < Traits::kTolRel && worst_inpl_rel < Traits::kTolRel && worst_nat_rel < Traits::kTolRel);
         if (!ok) all_ok = false;
-        std::printf("%-5d %-8zu %-4zu | %12.3e %12.3e %12.3e | %12.3e | %s\n",
-                    logN, N, bs, worst_raw_rel, worst_inpl_rel, worst_nat_rel, worst_raw_abs,
+        std::printf("%-5d %-8zu %-4zu | %12.3e %12.3e %12.3e | %12.3e | %s\n", logN, N, bs, worst_raw_rel, worst_inpl_rel, worst_nat_rel, worst_raw_abs,
                     ok ? "PASS" : "FAIL");
     }
     return all_ok;
@@ -410,14 +411,8 @@ struct BenchRow {
 };
 
 template <typename Traits, int Sign = SYCL_FFT_DEFAULT_SIGN>
-std::vector<BenchRow> run_benchmark_prec(
-    sycl::queue& q,
-    int log_total,
-    int min_logN,
-    int max_logN,
-    const sycl_fft::FftLaunchConfig& cfg,
-    int ntest,
-    bool in_place) {
+std::vector<BenchRow> run_benchmark_prec(sycl::queue& q, int log_total, int min_logN, int max_logN, const sycl_fft::FftLaunchConfig& cfg, int ntest,
+                                         bool in_place) {
     using ComplexT = typename Traits::ComplexT;
     using PlanT = typename Traits::template PlanT<Sign>;
     const size_t total = size_t{1} << log_total;
@@ -439,14 +434,10 @@ std::vector<BenchRow> run_benchmark_prec(
         q.wait();
     }
 
-    std::printf("\n=== Throughput Benchmark [%s]: Bit-Reversal-Free SYCL DIF Radix-2 (Sign=%+d, logTotal=%d, %.1f MiB/buf, %s) ===\n",
-                Traits::kName,
-                Sign,
-                log_total,
-                static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0),
-                in_place ? "in-place" : "out-of-place");
-    std::printf("%-5s %-8s %-7s | %-9s %-10s %-10s | %-34s %-7s %-8s\n",
-                "logN", "N", "bs", "Time(ms)", "GFLOP/s", "Eff_GB/s", "Dispatch", "ChunkBS", "ChunkMiB");
+    std::printf("\n=== Throughput Benchmark [%s]: Bit-Reversal-Free SYCL DIF Radix-2 (Sign=%+d, logTotal=%d, %.1f MiB/buf, %s) ===\n", Traits::kName, Sign,
+                log_total, static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0), in_place ? "in-place" : "out-of-place");
+    std::printf("%-5s %-8s %-7s | %-9s %-10s %-10s | %-34s %-7s %-8s\n", "logN", "N", "bs", "Time(ms)", "GFLOP/s", "Eff_GB/s", "Dispatch", "ChunkBS",
+                "ChunkMiB");
 
     std::vector<BenchRow> rows;
     for (int logN = min_logN; logN <= max_logN; ++logN) {
@@ -475,19 +466,15 @@ std::vector<BenchRow> run_benchmark_prec(
         char disp[64];
         const char* mark = (cfg.autotune != sycl_fft::AutotuneMode::Off && !plan.cache_hit()) ? "*" : "";
         if (plan.is_multistage()) {
-            std::snprintf(disp, sizeof(disp), "ms:%s/w%zu",
-                          plan.variant_name(), plan.pass0_wg_size());
+            std::snprintf(disp, sizeof(disp), "ms:%s/w%zu", plan.variant_name(), plan.pass0_wg_size());
         } else if (plan.is_two_pass()) {
-            std::snprintf(disp, sizeof(disp), "2p:%dx%d/%s/w%zu%s",
-                          1 << plan.log_n1(), 1 << plan.log_n2(),
-                          plan.variant_name(), plan.pass0_wg_size(), mark);
+            std::snprintf(disp, sizeof(disp), "2p:%dx%d/%s/w%zu%s", 1 << plan.log_n1(), 1 << plan.log_n2(), plan.variant_name(), plan.pass0_wg_size(), mark);
         } else {
             std::snprintf(disp, sizeof(disp), "1p:%s%s", plan.variant_name(), mark);
         }
         const double chunk_mib = static_cast<double>(plan.chunk_bytes()) / (1024.0 * 1024.0);
 
-        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %10.1f | %-34s %-7zu %7.1f\n",
-                    logN, N, bs, elapsed_ms, gflops, gbs, disp, plan.chunk_bs(), chunk_mib);
+        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %10.1f | %-34s %-7zu %7.1f\n", logN, N, bs, elapsed_ms, gflops, gbs, disp, plan.chunk_bs(), chunk_mib);
         rows.push_back(BenchRow{logN, elapsed_ms, gflops, gbs});
     }
 
@@ -498,15 +485,8 @@ std::vector<BenchRow> run_benchmark_prec(
 
 // Standalone bit-reversal benchmark timed strictly separately from FFT execution.
 template <typename Traits>
-void run_bitrev_benchmark_prec(
-    sycl::queue& q,
-    int log_total,
-    int min_logN,
-    int max_logN,
-    const sycl_fft::FftLaunchConfig& cfg,
-    int ntest,
-    bool bitrev_in_place,
-    const std::vector<BenchRow>& fft_rows) {
+void run_bitrev_benchmark_prec(sycl::queue& q, int log_total, int min_logN, int max_logN, const sycl_fft::FftLaunchConfig& cfg, int ntest, bool bitrev_in_place,
+                               const std::vector<BenchRow>& fft_rows) {
     using ComplexT = typename Traits::ComplexT;
 
     const auto dev_cfg = sycl_fft::DeviceFftConfig::query(q.get_device());
@@ -516,13 +496,9 @@ void run_bitrev_benchmark_prec(
     q.memset(d_src, 0, total * sizeof(ComplexT)).wait();
     if (!bitrev_in_place) q.memset(d_dst, 0, total * sizeof(ComplexT)).wait();
 
-    std::printf("\n=== Bit-Reversal Permutation Benchmark [%s] (logTotal=%d, %.1f MiB/buf, %s) ===\n",
-                Traits::kName,
-                log_total,
-                static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0),
-                bitrev_in_place ? "in-place" : "out-of-place");
-    std::printf("%-5s %-8s %-7s | %-9s %-10s %-9s | %-9s | %s\n",
-                "logN", "N", "bs", "Time(ms)", "Eff_GB/s", "ns/elem", "vs_FFT(%)", "Strategy");
+    std::printf("\n=== Bit-Reversal Permutation Benchmark [%s] (logTotal=%d, %.1f MiB/buf, %s) ===\n", Traits::kName, log_total,
+                static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0), bitrev_in_place ? "in-place" : "out-of-place");
+    std::printf("%-5s %-8s %-7s | %-9s %-10s %-9s | %-9s | %s\n", "logN", "N", "bs", "Time(ms)", "Eff_GB/s", "ns/elem", "vs_FFT(%)", "Strategy");
 
     for (int logN = min_logN; logN <= max_logN; ++logN) {
         const size_t N = size_t{1} << logN;
@@ -531,15 +507,19 @@ void run_bitrev_benchmark_prec(
         br_plan.resolve(bitrev_in_place);
 
         for (int w = 0; w < 6; ++w) {
-            if (bitrev_in_place) br_plan.execute_in_place(d_dst, bs);
-            else br_plan.execute(d_src, d_dst, bs);
+            if (bitrev_in_place)
+                br_plan.execute_in_place(d_dst, bs);
+            else
+                br_plan.execute(d_src, d_dst, bs);
         }
         q.wait();
 
         const auto t0 = std::chrono::steady_clock::now();
         for (int it = 0; it < ntest; ++it) {
-            if (bitrev_in_place) br_plan.execute_in_place(d_dst, bs);
-            else br_plan.execute(d_src, d_dst, bs);
+            if (bitrev_in_place)
+                br_plan.execute_in_place(d_dst, bs);
+            else
+                br_plan.execute(d_src, d_dst, bs);
         }
         q.wait();
         const auto t1 = std::chrono::steady_clock::now();
@@ -557,8 +537,7 @@ void run_bitrev_benchmark_prec(
             }
         }
         const char* mark = (cfg.autotune != sycl_fft::AutotuneMode::Off && !br_plan.cache_hit(bitrev_in_place)) ? "*" : "";
-        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %9.3f | %9s | %s%s\n",
-                    logN, N, bs, elapsed_ms, gbs, ns_per_elem, pct_str,
+        std::printf("%-5d %-8zu %-7zu | %9.3f %10.1f %9.3f | %9s | %s%s\n", logN, N, bs, elapsed_ms, gbs, ns_per_elem, pct_str,
                     br_plan.variant_name(bitrev_in_place), mark);
     }
 
@@ -568,14 +547,7 @@ void run_bitrev_benchmark_prec(
 
 // Head-to-head interleaved comparison of ALL valid bit-reversal strategies per logN.
 template <typename Traits>
-bool run_bitrev_compare_prec(
-    sycl::queue& q,
-    int log_total,
-    int min_logN,
-    int max_logN,
-    const sycl_fft::FftLaunchConfig& cfg,
-    int ntest,
-    bool bitrev_in_place) {
+bool run_bitrev_compare_prec(sycl::queue& q, int log_total, int min_logN, int max_logN, const sycl_fft::FftLaunchConfig& cfg, int ntest, bool bitrev_in_place) {
     using ComplexT = typename Traits::ComplexT;
 
     const auto dev_cfg = sycl_fft::DeviceFftConfig::query(q.get_device());
@@ -589,12 +561,8 @@ bool run_bitrev_compare_prec(
     cmp_cfg.autotune = sycl_fft::AutotuneMode::Off;
     cmp_cfg.bitrev_variant_override.clear();
 
-    std::printf("\n=== Bit-Reversal Strategy Comparison [%s] (logTotal=%d, %.1f MiB/buf, %s, %d interleaved rounds) ===\n",
-                Traits::kName,
-                log_total,
-                static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0),
-                bitrev_in_place ? "in-place" : "out-of-place",
-                ntest);
+    std::printf("\n=== Bit-Reversal Strategy Comparison [%s] (logTotal=%d, %.1f MiB/buf, %s, %d interleaved rounds) ===\n", Traits::kName, log_total,
+                static_cast<double>(total * sizeof(ComplexT)) / (1024.0 * 1024.0), bitrev_in_place ? "in-place" : "out-of-place", ntest);
 
     bool all_ok = true;
     for (int logN = min_logN; logN <= max_logN; ++logN) {
@@ -669,17 +637,14 @@ bool run_bitrev_compare_prec(
         if (naive_ms <= 0.0 && !med_ms.empty()) naive_ms = med_ms.back();
 
         std::printf("\n  -- logN=%d (N=%zu, bs=%zu) --\n", logN, N, bs);
-        std::printf("  %-24s | %-9s %-10s %-9s | %-9s | %s\n",
-                    "Strategy", "Time(ms)", "Eff_GB/s", "ns/elem", "vs_naive", "Exact");
+        std::printf("  %-24s | %-9s %-10s %-9s | %-9s | %s\n", "Strategy", "Time(ms)", "Eff_GB/s", "ns/elem", "vs_naive", "Exact");
         const double bytes = static_cast<double>(total) * sizeof(ComplexT) * 2.0;
         for (size_t ci = 0; ci < cands.size(); ++ci) {
             const double ms = med_ms[ci];
             const double gbs = bytes / (ms * 1e6);
             const double ns_e = (ms * 1e6) / static_cast<double>(total);
             const double spd = naive_ms / ms;
-            std::printf("  %-24s | %9.3f %10.1f %9.3f | %8.2fx | %s%s\n",
-                        cands[ci].variant_id, ms, gbs, ns_e, spd,
-                        cand_ok[ci] ? "PASS" : "FAIL",
+            std::printf("  %-24s | %9.3f %10.1f %9.3f | %8.2fx | %s%s\n", cands[ci].variant_id, ms, gbs, ns_e, spd, cand_ok[ci] ? "PASS" : "FAIL",
                         (ci == best_ci) ? "  <-- BEST" : "");
         }
     }
@@ -690,11 +655,7 @@ bool run_bitrev_compare_prec(
 }
 
 template <typename Traits>
-bool verify_bitrev_all_strategies(
-    sycl::queue& q,
-    const sycl_fft::DeviceFftConfig& dev_cfg,
-    int min_logN,
-    int max_logN) {
+bool verify_bitrev_all_strategies(sycl::queue& q, const sycl_fft::DeviceFftConfig& dev_cfg, int min_logN, int max_logN) {
     using ComplexT = typename Traits::ComplexT;
     sycl_fft::FftLaunchConfig cfg{};
     cfg.autotune = sycl_fft::AutotuneMode::Off;
@@ -703,7 +664,7 @@ bool verify_bitrev_all_strategies(
     size_t checked = 0;
     for (int logN = min_logN; logN <= top_logN; ++logN) {
         const size_t N = size_t{1} << logN;
-        const size_t bs = 5; // odd batch
+        const size_t bs = 5;  // odd batch
         const size_t total = bs * N;
         std::vector<ComplexT> h_in(total), h_ref(total), h_got(total);
         SplitMix64 rng(0x5E1F0000ULL + static_cast<uint64_t>(logN) * 31ULL);
@@ -731,8 +692,7 @@ bool verify_bitrev_all_strategies(
                 }
                 q.memcpy(h_got.data(), d_out, total * sizeof(ComplexT)).wait();
                 if (std::memcmp(h_got.data(), h_ref.data(), total * sizeof(ComplexT)) != 0) {
-                    std::printf("    FAIL [%s] logN=%d %s strategy=%s mismatch!\n",
-                                Traits::kName, logN, ip ? "in-place" : "out-of-place", c.variant_id);
+                    std::printf("    FAIL [%s] logN=%d %s strategy=%s mismatch!\n", Traits::kName, logN, ip ? "in-place" : "out-of-place", c.variant_id);
                     sycl::free(d_in, q);
                     sycl::free(d_out, q);
                     return false;
@@ -743,8 +703,7 @@ bool verify_bitrev_all_strategies(
         sycl::free(d_in, q);
         sycl::free(d_out, q);
     }
-    std::printf("    [%s] %zu (logN x mode x strategy) bit-reversal checks bit-exact -> PASS\n",
-                Traits::kName, checked);
+    std::printf("    [%s] %zu (logN x mode x strategy) bit-reversal checks bit-exact -> PASS\n", Traits::kName, checked);
     return true;
 }
 
@@ -753,10 +712,9 @@ void list_sycl_devices() {
     std::printf("Available SYCL devices (%zu):\n", devs.size());
     for (size_t i = 0; i < devs.size(); ++i) {
         const auto cfg = sycl_fft::DeviceFftConfig::query(devs[i]);
-        std::printf("  [%zu] backend=%-10s type=%-3s name=%s (vendor=0x%x CUs=%zu NativeLocal=%d FP64=%d)\n",
-                    i, cfg.backend_tag.c_str(), cfg.is_gpu ? "GPU" : "CPU",
-                    cfg.device_name.c_str(), cfg.vendor_id, cfg.max_compute_units,
-                    cfg.has_native_local_mem ? 1 : 0, cfg.has_fp64 ? 1 : 0);
+        std::printf("  [%zu] backend=%-10s type=%-3s name=%s (vendor=0x%x CUs=%zu NativeLocal=%d FP64=%d)\n", i, cfg.backend_tag.c_str(),
+                    cfg.is_gpu ? "GPU" : "CPU", cfg.device_name.c_str(), cfg.vendor_id, cfg.max_compute_units, cfg.has_native_local_mem ? 1 : 0,
+                    cfg.has_fp64 ? 1 : 0);
     }
 }
 
@@ -768,14 +726,9 @@ bool select_sycl_device(const std::string& spec, sycl::device& out_dev) {
     const auto devs = sycl::device::get_devices();
     for (const auto& d : devs) {
         const std::string tag = sycl_fft::backend_to_tag(d);
-        if ((spec == "gpu" && d.is_gpu()) ||
-            (spec == "cpu" && d.is_cpu()) ||
-            (spec == "cuda" && tag == "cuda") ||
-            (spec == "hip" && tag == "hip") ||
-            ((spec == "ocl" || spec == "opencl") && tag == "opencl") ||
-            ((spec == "l0" || spec == "level_zero") && tag == "level_zero") ||
-            (spec == "omp" && tag == "omp") ||
-            (spec == "metal" && tag == "metal")) {
+        if ((spec == "gpu" && d.is_gpu()) || (spec == "cpu" && d.is_cpu()) || (spec == "cuda" && tag == "cuda") || (spec == "hip" && tag == "hip") ||
+            ((spec == "ocl" || spec == "opencl") && tag == "opencl") || ((spec == "l0" || spec == "level_zero") && tag == "level_zero") ||
+            (spec == "omp" && tag == "omp") || (spec == "metal" && tag == "metal")) {
             out_dev = d;
             return true;
         }
@@ -783,35 +736,22 @@ bool select_sycl_device(const std::string& spec, sycl::device& out_dev) {
     return false;
 }
 
-bool run_self_tests(
-    sycl::queue& q,
-    const sycl_fft::DeviceFftConfig& dev_cfg,
-    int min_logN,
-    int max_logN,
-    bool run_h,
-    bool run_f,
-    bool run_d,
-    bool run_df) {
+bool run_self_tests(sycl::queue& q, const sycl_fft::DeviceFftConfig& dev_cfg, int min_logN, int max_logN, bool run_h, bool run_f, bool run_d, bool run_df) {
     std::printf("\n=== Hardware Generalization Self-Tests ===\n");
 
     const auto sg_probe = sycl_fft::probe_subgroup_topology(q, dev_cfg);
-    std::printf("  [1] Sub-group topology probe: raw=%zu eff=%zu linear=%d xor=%d -> PASS\n",
-                sg_probe.raw_sg_size, sg_probe.effective_sg_size,
+    std::printf("  [1] Sub-group topology probe: raw=%zu eff=%zu linear=%d xor=%d -> PASS\n", sg_probe.raw_sg_size, sg_probe.effective_sg_size,
                 sg_probe.sg_linear_ok ? 1 : 0, sg_probe.sg_xor_ok ? 1 : 0);
 
     if (run_df) {
         const auto kat = sycl_fft::probe_df_kat(q, dev_cfg);
-        std::printf("  [2a] Double-Float KAT: %s%s\n",
-                    kat.df_kat_passed ? "PASS" : "FAIL: ",
-                    kat.df_kat_passed ? "" : kat.df_kat_error.c_str());
+        std::printf("  [2a] Double-Float KAT: %s%s\n", kat.df_kat_passed ? "PASS" : "FAIL: ", kat.df_kat_passed ? "" : kat.df_kat_error.c_str());
         if (!kat.df_kat_passed) return false;
     }
 
     if (run_h) {
         const auto hkat = sycl_fft::probe_fp16_kat(q, dev_cfg);
-        std::printf("  [2b] FP16 (2xFP16) KAT: %s%s\n",
-                    hkat.fp16_kat_passed ? "PASS" : "FAIL: ",
-                    hkat.fp16_kat_passed ? "" : hkat.fp16_kat_error.c_str());
+        std::printf("  [2b] FP16 (2xFP16) KAT: %s%s\n", hkat.fp16_kat_passed ? "PASS" : "FAIL: ", hkat.fp16_kat_passed ? "" : hkat.fp16_kat_error.c_str());
         if (!hkat.fp16_kat_passed) return false;
     }
 
@@ -823,8 +763,7 @@ bool run_self_tests(
         std::printf("  [3] Forced zero-smem multi-stage fallback (logN=%d..%d):\n", min_logN, max_logN);
         if (run_h && !run_verification_prec<HalfTraits, SYCL_FFT_DEFAULT_SIGN>(q, min_logN, max_logN, ms_cfg)) return false;
         if (run_f && !run_verification_prec<FloatTraits, SYCL_FFT_DEFAULT_SIGN>(q, min_logN, max_logN, ms_cfg)) return false;
-        if (run_d && dev_cfg.has_fp64 &&
-            !run_verification_prec<DoubleTraits, SYCL_FFT_DEFAULT_SIGN>(q, min_logN, max_logN, ms_cfg)) return false;
+        if (run_d && dev_cfg.has_fp64 && !run_verification_prec<DoubleTraits, SYCL_FFT_DEFAULT_SIGN>(q, min_logN, max_logN, ms_cfg)) return false;
         if (run_df && !run_verification_prec<DfTraits, SYCL_FFT_DEFAULT_SIGN>(q, min_logN, max_logN, ms_cfg)) return false;
     }
 
@@ -852,10 +791,8 @@ bool run_self_tests(
 
         std::filesystem::remove(tmp_cache, ec);
         const bool ok = p2.cache_hit() && (v1 == v2) && p2.bitrev_cache_hit(true) && (br1 == br2);
-        std::printf("  [4] Disk autotune cache round-trip: fft=%s/%s(hit=%d) bitrev=%s/%s(hit=%d) -> %s\n",
-                    v1.c_str(), v2.c_str(), p2.cache_hit() ? 1 : 0,
-                    br1.c_str(), br2.c_str(), p2.bitrev_cache_hit(true) ? 1 : 0,
-                    ok ? "PASS" : "FAIL");
+        std::printf("  [4] Disk autotune cache round-trip: fft=%s/%s(hit=%d) bitrev=%s/%s(hit=%d) -> %s\n", v1.c_str(), v2.c_str(), p2.cache_hit() ? 1 : 0,
+                    br1.c_str(), br2.c_str(), p2.bitrev_cache_hit(true) ? 1 : 0, ok ? "PASS" : "FAIL");
         if (!ok) return false;
     } else {
         sycl_fft::FftLaunchConfig c_refuse{};
@@ -868,23 +805,20 @@ bool run_self_tests(
         } catch (const std::runtime_error&) {
             threw = true;
         }
-        std::printf("  [4] Non-native local-mem refusal when fallback disabled: threw=%d -> %s\n",
-                    threw ? 1 : 0, threw ? "PASS" : "FAIL");
+        std::printf("  [4] Non-native local-mem refusal when fallback disabled: threw=%d -> %s\n", threw ? 1 : 0, threw ? "PASS" : "FAIL");
         if (!threw) return false;
     }
 
     // [5] Exact bit-for-bit cross-strategy bit-reversal equivalence (in-place & out-of-place, odd bs=5)
-    std::printf("  [5] Bit-reversal cross-strategy bit-exact equivalence (logN=%d..%d, bs=5):\n",
-                min_logN, std::min(max_logN, 14));
+    std::printf("  [5] Bit-reversal cross-strategy bit-exact equivalence (logN=%d..%d, bs=5):\n", min_logN, std::min(max_logN, 14));
     if (run_h && !verify_bitrev_all_strategies<HalfTraits>(q, dev_cfg, min_logN, max_logN)) return false;
     if (run_f && !verify_bitrev_all_strategies<FloatTraits>(q, dev_cfg, min_logN, max_logN)) return false;
-    if (run_d && dev_cfg.has_fp64 &&
-        !verify_bitrev_all_strategies<DoubleTraits>(q, dev_cfg, min_logN, max_logN)) return false;
+    if (run_d && dev_cfg.has_fp64 && !verify_bitrev_all_strategies<DoubleTraits>(q, dev_cfg, min_logN, max_logN)) return false;
     if (run_df && !verify_bitrev_all_strategies<DfTraits>(q, dev_cfg, min_logN, max_logN)) return false;
 
     // [6] Runtime contract validation (out-of-order queue, non-power-of-2 N, N < 512)
     {
-        sycl::queue ooo_q{q.get_device()}; // default out-of-order SYCL queue
+        sycl::queue ooo_q{q.get_device()};  // default out-of-order SYCL queue
         auto expect_invalid = [](auto&& fn) -> bool {
             try {
                 fn();
@@ -916,8 +850,7 @@ bool run_self_tests(
             (void)p;
         });
         const bool ok6 = rej_fft_ooo && rej_br_ooo && rej_nufft_ooo && rej_nonpow2 && rej_smallN;
-        std::printf("  [6] Contract checks (OoO queue=%d/%d/%d, N=600=%d, N=256=%d) -> %s\n",
-                    rej_fft_ooo ? 1 : 0, rej_br_ooo ? 1 : 0, rej_nufft_ooo ? 1 : 0,
+        std::printf("  [6] Contract checks (OoO queue=%d/%d/%d, N=600=%d, N=256=%d) -> %s\n", rej_fft_ooo ? 1 : 0, rej_br_ooo ? 1 : 0, rej_nufft_ooo ? 1 : 0,
                     rej_nonpow2 ? 1 : 0, rej_smallN ? 1 : 0, ok6 ? "PASS" : "FAIL");
         if (!ok6) return false;
     }
@@ -930,19 +863,9 @@ bool run_self_tests(
 // Matches src/nufft1.c + src/nanofft.c (1 / N_fft scaled Type-1 transform, Sign = +/-1):
 //   F[b, k] = (1 / N_fft) * sum_{m=0}^{M-1} y[b, m] * exp(sign * 2*pi*i * x[m] * df * q * k)
 // ============================================================================
-void cpu_nufft1_ref(
-    const std::vector<long double>& x_ld,
-    const std::vector<long double>& y_re,
-    const std::vector<long double>& y_im,
-    int M,
-    int N,
-    sycl_nufft::PswfMode mode,
-    long double df_ld,
-    int freq_factor,
-    int sign,
-    size_t bs,
-    std::vector<long double>& out_re,
-    std::vector<long double>& out_im) {
+void cpu_nufft1_ref(const std::vector<long double>& x_ld, const std::vector<long double>& y_re, const std::vector<long double>& y_im, int M, int N,
+                    sycl_nufft::PswfMode mode, long double df_ld, int freq_factor, int sign, size_t bs, std::vector<long double>& out_re,
+                    std::vector<long double>& out_im) {
     constexpr long double kTwoPiLD = 6.28318530717958647692528676655900576839L;
     const int nfft = sycl_nufft::next_pow2_int(2 * N);
     const int nout = sycl_nufft::nufft1_nout(N, mode);
@@ -968,8 +891,7 @@ void cpu_nufft1_ref(
             if ((k & 15) == 0) {
                 // Periodic exact trig refresh to eliminate recurrence drift
                 for (int m = 0; m < M; ++m) {
-                    const long double ang =
-                        kTwoPiLD * (x_ld[static_cast<size_t>(m)] * df_q * static_cast<long double>(k));
+                    const long double ang = kTwoPiLD * (x_ld[static_cast<size_t>(m)] * df_q * static_cast<long double>(k));
                     cur_c[static_cast<size_t>(m)] = std::cos(ang);
                     cur_s[static_cast<size_t>(m)] = std::sin(ang);
                 }
@@ -992,8 +914,8 @@ void cpu_nufft1_ref(
             for (int m = 0; m < M; ++m) {
                 const long double yr = y_re[y_base + static_cast<size_t>(m)];
                 const long double yi = y_im[y_base + static_cast<size_t>(m)];
-                const long double c  = cur_c[static_cast<size_t>(m)];
-                const long double s  = cur_s[static_cast<size_t>(m)];
+                const long double c = cur_c[static_cast<size_t>(m)];
+                const long double s = cur_s[static_cast<size_t>(m)];
                 const long double tr = yr * c - yi * s;
                 const long double ti = yr * s + yi * c;
 
@@ -1018,26 +940,24 @@ inline double ic_to_double_or_df(double v) { return v; }
 inline double ic_to_double_or_df(sycl_fft::df_t v) { return sycl_fft::df_to_double(v); }
 
 template <typename Traits, int Sign = SYCL_FFT_DEFAULT_SIGN>
-bool run_nufft1_verification_prec(
-    sycl::queue& q,
-    const sycl_nufft::Nufft1LaunchConfig& ncfg) {
-    using ComplexT   = typename Traits::ComplexT;
-    using XCoordT    = typename Traits::XCoordT;
+bool run_nufft1_verification_prec(sycl::queue& q, const sycl_nufft::Nufft1LaunchConfig& ncfg) {
+    using ComplexT = typename Traits::ComplexT;
+    using XCoordT = typename Traits::XCoordT;
     using NufftPlanT = typename Traits::template NufftPlanSignT<Sign>;
 
     const int M = 256;
-    const int N = 512; // N % 4 == 0, N_fft = 1024 (log2(N_fft) = 10), N_out = 512 (PSWF21) or 768 (PSWF43)
-    const size_t bs = 5; // Odd batch size to verify FP16 f16x2_t tail handling
+    const int N = 512;    // N % 4 == 0, N_fft = 1024 (log2(N_fft) = 10), N_out = 512 (PSWF21) or 768 (PSWF43)
+    const size_t bs = 5;  // Odd batch size to verify FP16 f16x2_t tail handling
     // Use a large time span [-500, 500] with non-dyadic df so x_m * df * N_fft spans thousands
     // of cycles, exercising high-precision df_t / FP64 x-axis gridding cancellation resistance.
     const double df_val = 0.0137;
     const XCoordT df_xc = Traits::xcoord_from_double(df_val);
     const long double df_ld = static_cast<long double>(ic_to_double_or_df(df_xc));
 
-    std::printf("\n=== [%s] NuFFT-1 Accuracy Verification (Sign=%+d, M=%d, N=%d, bs=%zu, x in [-500,500], df=%.4f) ===\n",
-                Traits::kName, Sign, M, N, bs, df_val);
-    std::printf("%-7s %-3s %-3s | %-12s %-12s | %-12s | %-20s %-18s | %-6s\n",
-                "Mode", "w", "ff", "SlotRelL2", "SlotMaxRel", "SlotVsNatDiff", "Spread", "Deconv", "Status");
+    std::printf("\n=== [%s] NuFFT-1 Accuracy Verification (Sign=%+d, M=%d, N=%d, bs=%zu, x in [-500,500], df=%.4f) ===\n", Traits::kName, Sign, M, N, bs,
+                df_val);
+    std::printf("%-7s %-3s %-3s | %-12s %-12s | %-12s | %-20s %-18s | %-6s\n", "Mode", "w", "ff", "SlotRelL2", "SlotMaxRel", "SlotVsNatDiff", "Spread",
+                "Deconv", "Status");
 
     SplitMix64 rng(20261125ULL);
     std::vector<XCoordT> h_x(static_cast<size_t>(M));
@@ -1049,8 +969,7 @@ bool run_nufft1_verification_prec(
             h_x_ld[static_cast<size_t>(m)] = static_cast<long double>(h_x[static_cast<size_t>(m)]);
         } else {
             h_x_ld[static_cast<size_t>(m)] =
-                static_cast<long double>(h_x[static_cast<size_t>(m)].hi) +
-                static_cast<long double>(h_x[static_cast<size_t>(m)].lo);
+                static_cast<long double>(h_x[static_cast<size_t>(m)].hi) + static_cast<long double>(h_x[static_cast<size_t>(m)].lo);
         }
     }
 
@@ -1071,16 +990,13 @@ bool run_nufft1_verification_prec(
     q.wait();
 
     bool all_ok = true;
-    const sycl_nufft::PswfMode modes[2] = {
-        sycl_nufft::PswfMode::PSWF21,
-        sycl_nufft::PswfMode::PSWF43
-    };
+    const sycl_nufft::PswfMode modes[2] = {sycl_nufft::PswfMode::PSWF21, sycl_nufft::PswfMode::PSWF43};
 
     for (sycl_nufft::PswfMode mode : modes) {
         const char* mode_str = (mode == sycl_nufft::PswfMode::PSWF43) ? "PSWF43" : "PSWF21";
         const int nout = sycl_nufft::nufft1_nout(N, mode);
         auto* d_out_slot = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(nout), q);
-        auto* d_out_nat  = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(nout), q);
+        auto* d_out_nat = sycl::malloc_device<ComplexT>(bs * static_cast<size_t>(nout), q);
         std::vector<ComplexT> h_out_slot(bs * static_cast<size_t>(nout));
         std::vector<ComplexT> h_out_unperm(bs * static_cast<size_t>(nout));
         std::vector<ComplexT> h_out_nat(bs * static_cast<size_t>(nout));
@@ -1102,13 +1018,12 @@ bool run_nufft1_verification_prec(
                 q.wait();
 
                 // Un-permute SlotBitReversed on host for accuracy testing
-                sycl_nufft::unpermute_slots_to_natural_host(
-                    h_out_slot.data(), h_out_unperm.data(), N, mode, bs);
+                sycl_nufft::unpermute_slots_to_natural_host(h_out_slot.data(), h_out_unperm.data(), N, mode, bs);
 
                 long double err_norm2 = 0.0L;
                 long double ref_norm2 = 0.0L;
-                long double max_err2  = 0.0L;
-                long double max_ref2  = 0.0L;
+                long double max_err2 = 0.0L;
+                long double max_ref2 = 0.0L;
                 long double max_slot_vs_nat = 0.0L;
 
                 for (size_t idx = 0; idx < bs * static_cast<size_t>(nout); ++idx) {
@@ -1170,7 +1085,7 @@ bool run_nufft1_verification_prec(
                     }
                     const long double gmean = std::sqrt(phi_dc * phi_edge);
                     if constexpr (std::is_same_v<ComplexT, sycl_fft::Complexh>) {
-                        if (!(phi_dc > 2.0L)) aux_ok = false; // FP16 preserves subnormal-safe 2^e scale
+                        if (!(phi_dc > 2.0L)) aux_ok = false;  // FP16 preserves subnormal-safe 2^e scale
                     } else if constexpr (std::is_same_v<ComplexT, sycl_fft::Complexf>) {
                         if (std::fabsl(gmean - 1.0L) > 2e-6L) aux_ok = false;
                     } else if constexpr (std::is_same_v<ComplexT, sycl_fft::Complexdf>) {
@@ -1186,8 +1101,8 @@ bool run_nufft1_verification_prec(
                     plan.execute(d_y, d_out_raw, bs, sycl_nufft::NufftOutOrder::SlotBitReversedRaw);
                     q.memcpy(h_out_raw.data(), d_out_raw, bs * static_cast<size_t>(nout) * sizeof(ComplexT)).wait();
 
-                    const long double raw_tol = std::is_same_v<ComplexT, sycl_fft::Complexh> ? 2e-2L
-                        : (std::is_same_v<ComplexT, sycl_fft::Complexf> ? 1e-5L : 1e-11L);
+                    const long double raw_tol =
+                        std::is_same_v<ComplexT, sycl_fft::Complexh> ? 2e-2L : (std::is_same_v<ComplexT, sycl_fft::Complexf> ? 1e-5L : 1e-11L);
                     long double raw_diff_max = 0.0L;
                     long double slot_norm_max = 1e-30L;
                     for (size_t b = 0; b < bs; ++b) {
@@ -1207,8 +1122,7 @@ bool run_nufft1_verification_prec(
 
                     // Also check Natural unpermute(raw) * d_deconv() == Natural
                     std::vector<ComplexT> h_raw_unperm(bs * static_cast<size_t>(nout));
-                    sycl_nufft::unpermute_slots_to_natural_host(
-                        h_out_raw.data(), h_raw_unperm.data(), N, mode, bs);
+                    sycl_nufft::unpermute_slots_to_natural_host(h_out_raw.data(), h_raw_unperm.data(), N, mode, bs);
                     long double nat_raw_diff = 0.0L;
                     for (size_t b = 0; b < bs; ++b) {
                         for (int k = 0; k < nout; ++k) {
@@ -1235,8 +1149,7 @@ bool run_nufft1_verification_prec(
                             long double sr, si, tr, ti;
                             Traits::to_long_doubles(h_out_slot[idx], sr, si);
                             Traits::to_long_doubles(h_out_raw[idx], tr, ti);
-                            const long double d = std::hypot(tr - sr * static_cast<long double>(kTestScale),
-                                                             ti - si * static_cast<long double>(kTestScale));
+                            const long double d = std::hypot(tr - sr * static_cast<long double>(kTestScale), ti - si * static_cast<long double>(kTestScale));
                             if (d > sc_diff) sc_diff = d;
                         }
                         if (sc_diff / (slot_norm_max * static_cast<long double>(kTestScale)) > raw_tol) {
@@ -1247,17 +1160,13 @@ bool run_nufft1_verification_prec(
                     sycl::free(d_out_raw, q);
                 }
 
-                const double rel_l2  = static_cast<double>(std::sqrt(err_norm2 / ref_norm2));
+                const double rel_l2 = static_cast<double>(std::sqrt(err_norm2 / ref_norm2));
                 const double max_rel = static_cast<double>(std::sqrt(max_err2 / max_ref2));
                 const bool pass = (rel_l2 <= Traits::kNufftTolRel) && (max_slot_vs_nat == 0.0L) && aux_ok;
                 if (!pass) all_ok = false;
 
-                std::printf("%-7s %-3d %-3d | %12.3e %12.3e | %12.3e | %-20s %-18s | %-6s\n",
-                            mode_str, w, ff, rel_l2, max_rel,
-                            static_cast<double>(max_slot_vs_nat),
-                            plan.spread_variant_name(),
-                            plan.deconv_variant_name(),
-                            pass ? "PASS" : "FAIL");
+                std::printf("%-7s %-3d %-3d | %12.3e %12.3e | %12.3e | %-20s %-18s | %-6s\n", mode_str, w, ff, rel_l2, max_rel,
+                            static_cast<double>(max_slot_vs_nat), plan.spread_variant_name(), plan.deconv_variant_name(), pass ? "PASS" : "FAIL");
             }
         }
 
@@ -1271,7 +1180,7 @@ bool run_nufft1_verification_prec(
             NufftPlanT tp_plan(q, M_tp, N_tp, w_tp, mode, bs_tp, ncfg);
             tp_plan.set_points(d_x, df_xc, 1);
             auto* d_tp_slot = sycl::malloc_device<ComplexT>(bs_tp * static_cast<size_t>(nout_tp), q);
-            auto* d_tp_nat  = sycl::malloc_device<ComplexT>(bs_tp * static_cast<size_t>(nout_tp), q);
+            auto* d_tp_nat = sycl::malloc_device<ComplexT>(bs_tp * static_cast<size_t>(nout_tp), q);
             tp_plan.execute(d_y, d_tp_slot, bs_tp, sycl_nufft::NufftOutOrder::SlotBitReversed);
             tp_plan.execute(d_y, d_tp_nat, bs_tp, sycl_nufft::NufftOutOrder::Natural);
             std::vector<ComplexT> h_tp_slot(bs_tp * static_cast<size_t>(nout_tp));
@@ -1280,8 +1189,7 @@ bool run_nufft1_verification_prec(
             q.memcpy(h_tp_slot.data(), d_tp_slot, bs_tp * static_cast<size_t>(nout_tp) * sizeof(ComplexT));
             q.memcpy(h_tp_nat.data(), d_tp_nat, bs_tp * static_cast<size_t>(nout_tp) * sizeof(ComplexT));
             q.wait();
-            sycl_nufft::unpermute_slots_to_natural_host(
-                h_tp_slot.data(), h_tp_unperm.data(), N_tp, mode, bs_tp);
+            sycl_nufft::unpermute_slots_to_natural_host(h_tp_slot.data(), h_tp_unperm.data(), N_tp, mode, bs_tp);
             long double tp_diff = 0.0L;
             for (size_t idx = 0; idx < bs_tp * static_cast<size_t>(nout_tp); ++idx) {
                 long double sr, si, nr, ni;
@@ -1292,9 +1200,8 @@ bool run_nufft1_verification_prec(
             }
             const bool tp_ok = (tp_diff == 0.0L);
             if (!tp_ok) all_ok = false;
-            std::printf("  [%s N=%d %s] TwoPass fused epilogue SlotVsNatDiff=%.3e -> %s\n",
-                        mode_str, N_tp, tp_plan.fft_plan().is_two_pass() ? "TwoPass" : "Single/MS",
-                        static_cast<double>(tp_diff), tp_ok ? "PASS" : "FAIL");
+            std::printf("  [%s N=%d %s] TwoPass fused epilogue SlotVsNatDiff=%.3e -> %s\n", mode_str, N_tp,
+                        tp_plan.fft_plan().is_two_pass() ? "TwoPass" : "Single/MS", static_cast<double>(tp_diff), tp_ok ? "PASS" : "FAIL");
             sycl::free(d_tp_slot, q);
             sycl::free(d_tp_nat, q);
         }
@@ -1315,39 +1222,25 @@ bool run_nufft1_verification_prec(
 // on deterministic non-zero pseudo-random inputs without per-iter q.wait() stalls.
 // ============================================================================
 template <typename Traits, int Sign = SYCL_FFT_DEFAULT_SIGN>
-void run_nufft1_benchmark_prec(
-    sycl::queue& q,
-    int M,
-    int min_logN,
-    int max_logN,
-    int nufft_max_logN,
-    const sycl_nufft::Nufft1LaunchConfig& ncfg,
-    int ntest,
-    bool raw_order = false) {
-    using ComplexT   = typename Traits::ComplexT;
-    using XCoordT    = typename Traits::XCoordT;
+void run_nufft1_benchmark_prec(sycl::queue& q, int M, int min_logN, int max_logN, int nufft_max_logN, const sycl_nufft::Nufft1LaunchConfig& ncfg, int ntest,
+                               bool raw_order = false) {
+    using ComplexT = typename Traits::ComplexT;
+    using XCoordT = typename Traits::XCoordT;
     using NufftPlanT = typename Traits::template NufftPlanSignT<Sign>;
-    const sycl_nufft::NufftOutOrder bench_order =
-        raw_order ? sycl_nufft::NufftOutOrder::SlotBitReversedRaw
-                  : sycl_nufft::NufftOutOrder::SlotBitReversed;
+    const sycl_nufft::NufftOutOrder bench_order = raw_order ? sycl_nufft::NufftOutOrder::SlotBitReversedRaw : sycl_nufft::NufftOutOrder::SlotBitReversed;
 
     const auto dev_cfg = sycl_fft::DeviceFftConfig::query(q.get_device());
-    const size_t dram_target_bytes = std::max<size_t>(
-        size_t{64} * 1024 * 1024,
-        dev_cfg.effective_l2_bytes() * size_t{4});
+    const size_t dram_target_bytes = std::max<size_t>(size_t{64} * 1024 * 1024, dev_cfg.effective_l2_bytes() * size_t{4});
 
     // Practical periodogram block sizes logN in [9..nufft_max_logN] (default 9..11 -> Nfft = 1024..4096)
     const int cap_logN = std::clamp(nufft_max_logN, 9, 17);
     const int lo_logN = std::max(9, std::min(min_logN - 1, cap_logN));
     const int hi_logN = std::max(lo_logN, std::min(max_logN - 1, cap_logN));
 
-    std::printf("\n=== [%s] NuFFT-1 %s Throughput Benchmark (Sign=%+d, M=%d, ntest=%d, NO BitRev, Batched, Non-Zero) ===\n",
-                Traits::kName, raw_order ? "SlotBitReversedRaw" : "SlotBitReversed", Sign, M, ntest);
-    std::printf("%-7s %-3s %-5s %-6s | %-7s %-8s %-9s | %-7s %-8s %-9s | %-20s %-7s\n",
-                "Mode", "w", "N", "Nfft",
-                "L2_BS", "L2(ms)", "L2_GF/s",
-                "DRAM_BS", "DRAM(ms)", "DRAM_GF/s",
-                "Spread", "ChunkBS");
+    std::printf("\n=== [%s] NuFFT-1 %s Throughput Benchmark (Sign=%+d, M=%d, ntest=%d, NO BitRev, Batched, Non-Zero) ===\n", Traits::kName,
+                raw_order ? "SlotBitReversedRaw" : "SlotBitReversed", Sign, M, ntest);
+    std::printf("%-7s %-3s %-5s %-6s | %-7s %-8s %-9s | %-7s %-8s %-9s | %-20s %-7s\n", "Mode", "w", "N", "Nfft", "L2_BS", "L2(ms)", "L2_GF/s", "DRAM_BS",
+                "DRAM(ms)", "DRAM_GF/s", "Spread", "ChunkBS");
 
     SplitMix64 rng(99991ULL);
     std::vector<XCoordT> h_x(static_cast<size_t>(M));
@@ -1359,10 +1252,7 @@ void run_nufft1_benchmark_prec(
     q.wait();
 
     const XCoordT df_xc = Traits::xcoord_from_double(0.0137);
-    const sycl_nufft::PswfMode modes[2] = {
-        sycl_nufft::PswfMode::PSWF21,
-        sycl_nufft::PswfMode::PSWF43
-    };
+    const sycl_nufft::PswfMode modes[2] = {sycl_nufft::PswfMode::PSWF21, sycl_nufft::PswfMode::PSWF43};
 
     auto time_batched = [&](NufftPlanT& plan, const ComplexT* d_y, ComplexT* d_out, size_t bs) -> double {
         // Warmup + estimate per-call time
@@ -1371,9 +1261,7 @@ void run_nufft1_benchmark_prec(
         const auto w0 = std::chrono::steady_clock::now();
         plan.execute(d_y, d_out, bs, bench_order);
         q.wait();
-        const double est_ms = std::max(
-            0.01,
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
+        const double est_ms = std::max(0.01, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
 
         // Batch enough back-to-back launches per sample (>= 10 ms) to eliminate host sync overhead
         const int batch_iters = std::clamp(static_cast<int>(std::ceil(10.0 / est_ms)), 1, 64);
@@ -1385,8 +1273,7 @@ void run_nufft1_benchmark_prec(
                 plan.execute(d_y, d_out, bs, bench_order);
             }
             q.wait();
-            const double total_ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             per_call_ms[static_cast<size_t>(s)] = total_ms / static_cast<double>(batch_iters);
         }
         std::sort(per_call_ms.begin(), per_call_ms.end());
@@ -1405,20 +1292,17 @@ void run_nufft1_benchmark_prec(
                 // 1x batch (~2^21 grid pts, L2-resident on modern GPUs)
                 const size_t bs_l2 = std::max<size_t>(64, (size_t{1} << 21) / static_cast<size_t>(nfft));
                 // DRAM-streaming batch (>= 4x L2 total external I/O footprint, capped safely for VRAM)
-                const size_t ext_bytes_per_tx =
-                    (static_cast<size_t>(M) + static_cast<size_t>(nout)) * sizeof(ComplexT);
-                size_t bs_dram = std::max(bs_l2 * size_t{4},
-                                          (dram_target_bytes + ext_bytes_per_tx - 1) / std::max<size_t>(1, ext_bytes_per_tx));
+                const size_t ext_bytes_per_tx = (static_cast<size_t>(M) + static_cast<size_t>(nout)) * sizeof(ComplexT);
+                size_t bs_dram = std::max(bs_l2 * size_t{4}, (dram_target_bytes + ext_bytes_per_tx - 1) / std::max<size_t>(1, ext_bytes_per_tx));
                 bs_dram = (bs_dram + 63) & ~size_t{63};
                 if (dev_cfg.global_mem_size > 0) {
-                    const size_t max_bs_vram = std::max<size_t>(
-                        bs_l2, (dev_cfg.global_mem_size / 8) / std::max<size_t>(1, ext_bytes_per_tx));
+                    const size_t max_bs_vram = std::max<size_t>(bs_l2, (dev_cfg.global_mem_size / 8) / std::max<size_t>(1, ext_bytes_per_tx));
                     bs_dram = std::min(bs_dram, max_bs_vram);
                 }
 
                 // Allocate once at max(bs_l2, bs_dram) and fill with non-zero pseudo-random data
                 const size_t max_bs = std::max(bs_l2, bs_dram);
-                auto* d_y   = sycl::malloc_device<ComplexT>(max_bs * static_cast<size_t>(M), q);
+                auto* d_y = sycl::malloc_device<ComplexT>(max_bs * static_cast<size_t>(M), q);
                 auto* d_out = sycl::malloc_device<ComplexT>(max_bs * static_cast<size_t>(nout), q);
 
                 // Tile a non-zero 4096-element pseudo-random pattern across d_y (fast host fill, zero-page immune)
@@ -1438,26 +1322,20 @@ void run_nufft1_benchmark_prec(
                 plan.set_points(d_x, df_xc, 1);
                 q.wait();
 
-                const double med_l2_ms   = time_batched(plan, d_y, d_out, bs_l2);
+                const double med_l2_ms = time_batched(plan, d_y, d_out, bs_l2);
                 const double med_dram_ms = time_batched(plan, d_y, d_out, bs_dram);
 
                 // Effective algorithmic FLOPs per transform (NO bit-reversal):
                 //   6 + 4*w FLOPs/point (phase shift + complex spread)
                 // + 5 * N_fft * log2(N_fft) (DIF FFT)
                 // + 2 * N_out (deconvolution complex scale)
-                const double flops_per_tx =
-                    static_cast<double>(M) * (6.0 + 4.0 * static_cast<double>(w)) +
-                    5.0 * static_cast<double>(nfft) * static_cast<double>(log_nfft) +
-                    2.0 * static_cast<double>(nout);
-                const double gf_l2   = (static_cast<double>(bs_l2)   * flops_per_tx / (med_l2_ms   * 1e-3)) * 1e-9;
+                const double flops_per_tx = static_cast<double>(M) * (6.0 + 4.0 * static_cast<double>(w)) +
+                                            5.0 * static_cast<double>(nfft) * static_cast<double>(log_nfft) + 2.0 * static_cast<double>(nout);
+                const double gf_l2 = (static_cast<double>(bs_l2) * flops_per_tx / (med_l2_ms * 1e-3)) * 1e-9;
                 const double gf_dram = (static_cast<double>(bs_dram) * flops_per_tx / (med_dram_ms * 1e-3)) * 1e-9;
 
-                std::printf("%-7s %-3d %-5d %-6d | %-7zu %8.3f %9.1f | %-7zu %8.3f %9.1f | %-20s %-7zu\n",
-                            mode_str, w, N, nfft,
-                            bs_l2, med_l2_ms, gf_l2,
-                            bs_dram, med_dram_ms, gf_dram,
-                            plan.spread_variant_name(),
-                            plan.chunk_bs());
+                std::printf("%-7s %-3d %-5d %-6d | %-7zu %8.3f %9.1f | %-7zu %8.3f %9.1f | %-20s %-7zu\n", mode_str, w, N, nfft, bs_l2, med_l2_ms, gf_l2,
+                            bs_dram, med_dram_ms, gf_dram, plan.spread_variant_name(), plan.chunk_bs());
 
                 sycl::free(d_y, q);
                 sycl::free(d_out, q);
@@ -1468,7 +1346,7 @@ void run_nufft1_benchmark_prec(
     sycl::free(d_x, q);
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -1585,8 +1463,7 @@ int main(int argc, char** argv) {
             nufft_cfg.deconv_variant_override = argv[++i];
         } else if (std::strcmp(argv[i], "--force-collab-spread") == 0) {
             nufft_cfg.force_collab_spread = true;
-        } else if (std::strcmp(argv[i], "--verify-both-signs") == 0 ||
-                   std::strcmp(argv[i], "--verify-pos-sign") == 0 ||
+        } else if (std::strcmp(argv[i], "--verify-both-signs") == 0 || std::strcmp(argv[i], "--verify-pos-sign") == 0 ||
                    std::strcmp(argv[i], "--verify-neg-sign") == 0) {
             verify_both_signs = true;
         } else if (std::strcmp(argv[i], "--sign") == 0 && i + 1 < argc) {
@@ -1621,10 +1498,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if ((active_sign == +1 && !SYCL_FFT_ENABLE_POS_SIGN) ||
-        (active_sign == -1 && !SYCL_FFT_ENABLE_NEG_SIGN)) {
-        std::cerr << "Requested Sign=" << active_sign
-                  << " is not compiled in this binary (rebuild with SIGN=pos|neg|both).\n";
+    if ((active_sign == +1 && !SYCL_FFT_ENABLE_POS_SIGN) || (active_sign == -1 && !SYCL_FFT_ENABLE_NEG_SIGN)) {
+        std::cerr << "Requested Sign=" << active_sign << " is not compiled in this binary (rebuild with SIGN=pos|neg|both).\n";
         return 1;
     }
 
@@ -1664,28 +1539,12 @@ int main(int argc, char** argv) {
         "Device: %s | Backend=%s | Vendor=0x%x | Driver=%s\n"
         "  CUs=%zu | L2=%.1f MiB | LocalMem=%.0f KiB (native=%d) | BankModel=%s | MaxWG=%zu\n"
         "  SG: reported=%zu..%zu verified=%zu (lin=%d xor=%d) | FP64=%d (ratio=%.3f heavy=%d) | FP16_KAT=%s | DF_KAT=%s | Signs=%s (active=%+d)\n",
-        dev_cfg.device_name.c_str(),
-        dev_cfg.backend_tag.c_str(),
-        dev_cfg.vendor_id,
-        dev_cfg.driver_version.c_str(),
-        dev_cfg.max_compute_units,
-        static_cast<double>(dev_cfg.l2_cache_size) / (1024.0 * 1024.0),
-        static_cast<double>(dev_cfg.local_mem_size) / 1024.0,
-        dev_cfg.has_native_local_mem ? 1 : 0,
-        sycl_fft::bank_model_name(dev_cfg.bank_model),
-        dev_cfg.max_work_group_size,
-        dev_cfg.min_sub_group_size,
-        dev_cfg.sub_group_size,
-        sg_probe.effective_sg_size,
-        sg_probe.sg_linear_ok ? 1 : 0,
-        sg_probe.sg_xor_ok ? 1 : 0,
-        dev_cfg.has_fp64 ? 1 : 0,
-        fp64_probe.fp64_to_fp32_ratio,
-        fp64_probe.fp64_compute_heavy ? 1 : 0,
-        run_h ? (fp16_probe.fp16_kat_passed ? "PASS" : "FAIL") : "skip",
-        run_df ? (df_probe.df_kat_passed ? "PASS" : "FAIL") : "skip",
-        compiled_signs,
-        active_sign);
+        dev_cfg.device_name.c_str(), dev_cfg.backend_tag.c_str(), dev_cfg.vendor_id, dev_cfg.driver_version.c_str(), dev_cfg.max_compute_units,
+        static_cast<double>(dev_cfg.l2_cache_size) / (1024.0 * 1024.0), static_cast<double>(dev_cfg.local_mem_size) / 1024.0,
+        dev_cfg.has_native_local_mem ? 1 : 0, sycl_fft::bank_model_name(dev_cfg.bank_model), dev_cfg.max_work_group_size, dev_cfg.min_sub_group_size,
+        dev_cfg.sub_group_size, sg_probe.effective_sg_size, sg_probe.sg_linear_ok ? 1 : 0, sg_probe.sg_xor_ok ? 1 : 0, dev_cfg.has_fp64 ? 1 : 0,
+        fp64_probe.fp64_to_fp32_ratio, fp64_probe.fp64_compute_heavy ? 1 : 0, run_h ? (fp16_probe.fp16_kat_passed ? "PASS" : "FAIL") : "skip",
+        run_df ? (df_probe.df_kat_passed ? "PASS" : "FAIL") : "skip", compiled_signs, active_sign);
 
     if (do_verify && !nufft_only) {
         if (!verify_standalone_trig(q, dev_cfg)) {
@@ -1799,8 +1658,7 @@ int main(int argc, char** argv) {
             std::printf("%-5s | %-10s %-10s | %-10s\n", "logN", "FP32 GF/s", "FP16 GF/s", "FP16/FP32");
             for (size_t i = 0; i < rows_f.size(); ++i) {
                 const double ratio = rows_h[i].gflops / rows_f[i].gflops;
-                std::printf("%-5d | %10.1f %10.1f | %9.2fx\n",
-                            rows_f[i].logN, rows_f[i].gflops, rows_h[i].gflops, ratio);
+                std::printf("%-5d | %10.1f %10.1f | %9.2fx\n", rows_f[i].logN, rows_f[i].gflops, rows_h[i].gflops, ratio);
             }
         }
         if (!rows_d.empty() && rows_d.size() == rows_df.size()) {
@@ -1808,8 +1666,7 @@ int main(int argc, char** argv) {
             std::printf("%-5s | %-10s %-10s | %-10s\n", "logN", "FP64 GF/s", "DF GF/s", "DF/FP64");
             for (size_t i = 0; i < rows_d.size(); ++i) {
                 const double ratio = rows_df[i].gflops / rows_d[i].gflops;
-                std::printf("%-5d | %10.1f %10.1f | %9.2fx\n",
-                            rows_d[i].logN, rows_d[i].gflops, rows_df[i].gflops, ratio);
+                std::printf("%-5d | %10.1f %10.1f | %9.2fx\n", rows_d[i].logN, rows_d[i].gflops, rows_df[i].gflops, ratio);
             }
         }
     }

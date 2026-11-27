@@ -28,7 +28,9 @@ LDFLAGS_SHARED ?= -shared
 LDLIBS := -lm
 CLANG_FORMAT ?= clang-format
 RUFF ?= ruff
-C_SOURCES := $(wildcard $(SRC_DIR)/*.c) $(wildcard $(INC_DIR)/*.h) $(wildcard tests/*.c) $(wildcard tests/*.h)
+OFFLOAD_VULKAN_SOURCES := $(filter-out offload/vulkan/nufft/pswf_coeffs.h,$(wildcard offload/vulkan/*.c offload/vulkan/*/*.c offload/vulkan/*/*.h))
+OFFLOAD_SYCL_SOURCES := $(wildcard offload/sycl/*.cpp offload/sycl/*/*.cpp offload/sycl/*/*.hpp)
+C_SOURCES := $(wildcard $(SRC_DIR)/*.c) $(wildcard $(INC_DIR)/*.h) $(wildcard tests/*.c) $(wildcard tests/*.h) $(OFFLOAD_VULKAN_SOURCES) $(OFFLOAD_SYCL_SOURCES)
 
 MAX_TWIDDLE_REUSE ?= 16
 TWIDDLE_CFLAGS := -DMAX_TWIDDLE_REUSE=$(MAX_TWIDDLE_REUSE)
@@ -161,15 +163,22 @@ NATIVE_HALF_DISPATCH_FLAG := -DTLS_HALF_HAS_NATIVE_EMBED
 else
 NATIVE_HALF_DISPATCH_FLAG :=
 endif
-.PHONY: all generic native clean wheels wheels-check sdist tune dispatch-list toolchains format format-check
+.PHONY: all generic native clean wheels wheels-check sdist tune dispatch-list toolchains moltenvk format format-check
 
 # --- release wheels ------------------------------------------------------
-# Every target the 1.0 release ships.  Each one is built and ABI-checked
+# Every target the release ships.  Each one is built and ABI-checked
 # independently, so `make wheels` can be pointed at a subset on a smaller
 # machine (see dispatch/README.md).
 WHEEL_TARGETS ?= linux-x86_64-glibc linux-x86_64-musl linux-aarch64-glibc linux-aarch64-musl win-amd64 win-arm64 macos-x86_64 macos-arm64
 
 wheels: $(addprefix wheel-,$(WHEEL_TARGETS))
+
+moltenvk:
+	python3 -m dispatch.toolchains --fetch-moltenvk
+
+wheel-macos-%: moltenvk
+	python3 -m dispatch.build --target macos-$*
+	python3 -m dispatch.wheel --target macos-$*
 
 wheel-%:
 	python3 -m dispatch.build --target $*
@@ -413,10 +422,10 @@ clean:
 # (Python) share the 160-column budget and 4-space indentation.
 format:
 	$(CLANG_FORMAT) -i $(C_SOURCES)
-	$(RUFF) format $(PY_DIST_DIR) dispatch
-	$(RUFF) check --fix $(PY_DIST_DIR) dispatch
+	$(RUFF) format $(PY_DIST_DIR) dispatch offload
+	$(RUFF) check --fix $(PY_DIST_DIR) dispatch offload
 
 format-check:
 	$(CLANG_FORMAT) --dry-run --Werror $(C_SOURCES)
-	$(RUFF) format --check $(PY_DIST_DIR) dispatch
-	$(RUFF) check $(PY_DIST_DIR) dispatch
+	$(RUFF) format --check $(PY_DIST_DIR) dispatch offload
+	$(RUFF) check $(PY_DIST_DIR) dispatch offload

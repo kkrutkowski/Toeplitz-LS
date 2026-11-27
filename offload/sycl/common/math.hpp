@@ -1,40 +1,40 @@
 #pragma once
 
-#include <sycl/sycl.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sycl/sycl.hpp>
 #include <type_traits>
 #include <utility>
-#include <algorithm>
 #include <vector>
 
 namespace sycl_fft {
 
 #if defined(__GNUC__) || defined(__clang__)
-#define SYCL_FFT_FORCE_INLINE __attribute__((always_inline)) inline
-#define SYCL_FFT_LAMBDA_INLINE __attribute__((always_inline))
+#    define SYCL_FFT_FORCE_INLINE __attribute__((always_inline)) inline
+#    define SYCL_FFT_LAMBDA_INLINE __attribute__((always_inline))
 #else
-#define SYCL_FFT_FORCE_INLINE inline
-#define SYCL_FFT_LAMBDA_INLINE
+#    define SYCL_FFT_FORCE_INLINE inline
+#    define SYCL_FFT_LAMBDA_INLINE
 #endif
 
 // Under AdaptiveCpp SSCP, bitcode is extracted before mem2reg/SROA after AlwaysInliner.
 // Keeping multi-op DF arithmetic helpers plain `inline` prevents pre-mem2reg alloca/IR
 // explosion in HCF while LLVM's JIT -O3 still inlines them completely into target PTX/ISA.
 #if defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL)
-#define SYCL_FFT_DF_INLINE inline
+#    define SYCL_FFT_DF_INLINE inline
 #else
-#define SYCL_FFT_DF_INLINE SYCL_FFT_FORCE_INLINE
+#    define SYCL_FFT_DF_INLINE SYCL_FFT_FORCE_INLINE
 #endif
 
 #if defined(__has_builtin)
-#if __has_builtin(__builtin_bit_cast)
-#define SYCL_FFT_BIT_CAST(Dst, src) __builtin_bit_cast(Dst, (src))
+#    if __has_builtin(__builtin_bit_cast)
+#        define SYCL_FFT_BIT_CAST(Dst, src) __builtin_bit_cast(Dst, (src))
+#    else
+#        define SYCL_FFT_BIT_CAST(Dst, src) ::sycl::bit_cast<Dst>(src)
+#    endif
 #else
-#define SYCL_FFT_BIT_CAST(Dst, src) ::sycl::bit_cast<Dst>(src)
-#endif
-#else
-#define SYCL_FFT_BIT_CAST(Dst, src) ::sycl::bit_cast<Dst>(src)
+#    define SYCL_FFT_BIT_CAST(Dst, src) ::sycl::bit_cast<Dst>(src)
 #endif
 
 template <typename Dst, typename Src>
@@ -46,18 +46,15 @@ SYCL_FFT_FORCE_INLINE constexpr Dst sycl_fft_bit_cast(const Src& src) noexcept {
 // Prevents -O3 reassociation and implicit FMA contraction from collapsing
 // error-free transformations (explicit sycl::fma calls still emit FFMA).
 #if defined(__clang__)
-#define SYCL_FFT_DF_EXACT_FP \
-    _Pragma("clang fp reassociate(off)") \
-    _Pragma("clang fp contract(off)")
+#    define SYCL_FFT_DF_EXACT_FP _Pragma("clang fp reassociate(off)") _Pragma("clang fp contract(off)")
 #else
-#define SYCL_FFT_DF_EXACT_FP \
-    _Pragma("STDC FP_CONTRACT OFF")
+#    define SYCL_FFT_DF_EXACT_FP _Pragma("STDC FP_CONTRACT OFF")
 #endif
 
 #if defined(__ACPP_ENABLE_CUDA_TARGET__)
-#define SYCL_FFT_HOST_DEVICE __host__ __device__
+#    define SYCL_FFT_HOST_DEVICE __host__ __device__
 #else
-#define SYCL_FFT_HOST_DEVICE
+#    define SYCL_FFT_HOST_DEVICE
 #endif
 
 // Exact round-to-nearest-even FP32 ops that neither LLVM NVPTX ISel nor ptxas --fmad
@@ -131,16 +128,16 @@ SYCL_FFT_FORCE_INLINE uint32_t bit_reverse(uint32_t x, int bits) {
 // ============================================================================
 using Complexh = sycl::half2;
 using Complexf = sycl::float2;
-using Complex  = sycl::double2;
+using Complex = sycl::double2;
 
 static_assert(sizeof(Complexh) == 4 && alignof(Complexh) == 4 && std::is_trivially_copyable_v<Complexh>,
               "Complexh must be 4-byte aligned trivially copyable pair of binary16");
 
 #if !defined(SYCL_FFT_DISABLE_NATIVE_F16X2) && defined(__clang__) && defined(__FLT16_MANT_DIG__) && \
     (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL))
-#define SYCL_FFT_USE_CLANG_F16X2 1
+#    define SYCL_FFT_USE_CLANG_F16X2 1
 #else
-#define SYCL_FFT_USE_CLANG_F16X2 0
+#    define SYCL_FFT_USE_CLANG_F16X2 0
 #endif
 
 #if SYCL_FFT_USE_CLANG_F16X2
@@ -154,18 +151,14 @@ using f16x2_t = sycl::half2;
 static_assert(sizeof(f16x2_t) == 4 && alignof(f16x2_t) == 4 && std::is_trivially_copyable_v<f16x2_t>,
               "f16x2_t must be 4-byte trivially copyable for 32-bit SMEM & shuffle");
 
-SYCL_FFT_FORCE_INLINE constexpr uint32_t f16x2_to_u32(f16x2_t v) {
-    return SYCL_FFT_BIT_CAST(uint32_t, v);
-}
+SYCL_FFT_FORCE_INLINE constexpr uint32_t f16x2_to_u32(f16x2_t v) { return SYCL_FFT_BIT_CAST(uint32_t, v); }
 
-SYCL_FFT_FORCE_INLINE constexpr f16x2_t u32_to_f16x2(uint32_t u) {
-    return SYCL_FFT_BIT_CAST(f16x2_t, u);
-}
+SYCL_FFT_FORCE_INLINE constexpr f16x2_t u32_to_f16x2(uint32_t u) { return SYCL_FFT_BIT_CAST(f16x2_t, u); }
 
 #if SYCL_FFT_USE_CLANG_F16X2
-#define SYCL_FFT_F16X2_CONSTEXPR constexpr
+#    define SYCL_FFT_F16X2_CONSTEXPR constexpr
 #else
-#define SYCL_FFT_F16X2_CONSTEXPR
+#    define SYCL_FFT_F16X2_CONSTEXPR
 #endif
 
 SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_make(f16_scalar_t lo, f16_scalar_t hi) {
@@ -195,9 +188,7 @@ SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16_scalar_t f16x2_hi(f16x2_t v) 
 #endif
 }
 
-SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_splat(f16_scalar_t v) {
-    return f16x2_make(v, v);
-}
+SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_splat(f16_scalar_t v) { return f16x2_make(v, v); }
 
 SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_splat_f(float v) {
     const f16_scalar_t h = static_cast<f16_scalar_t>(v);
@@ -205,28 +196,27 @@ SYCL_FFT_FORCE_INLINE SYCL_FFT_F16X2_CONSTEXPR f16x2_t f16x2_splat_f(float v) {
 }
 
 #if SYCL_FFT_USE_CLANG_F16X2
-#define SYCL_FFT_F16X2_SPLAT_H(h) (f16x2_t{(h), (h)})
-#define SYCL_FFT_F16X2_SPLAT_F(v) \
-    (f16x2_t{static_cast<f16_scalar_t>(v), static_cast<f16_scalar_t>(v)})
-#if defined(__has_builtin)
-#if __has_builtin(__builtin_elementwise_fma)
-#define SYCL_FFT_F16X2_FMA(a, b, c) __builtin_elementwise_fma((a), (b), (c))
+#    define SYCL_FFT_F16X2_SPLAT_H(h) (f16x2_t{(h), (h)})
+#    define SYCL_FFT_F16X2_SPLAT_F(v) (f16x2_t{static_cast<f16_scalar_t>(v), static_cast<f16_scalar_t>(v)})
+#    if defined(__has_builtin)
+#        if __has_builtin(__builtin_elementwise_fma)
+#            define SYCL_FFT_F16X2_FMA(a, b, c) __builtin_elementwise_fma((a), (b), (c))
+#        else
+#            define SYCL_FFT_F16X2_FMA(a, b, c) ((a) * (b) + (c))
+#        endif
+#    else
+#        define SYCL_FFT_F16X2_FMA(a, b, c) ((a) * (b) + (c))
+#    endif
 #else
-#define SYCL_FFT_F16X2_FMA(a, b, c) ((a) * (b) + (c))
-#endif
-#else
-#define SYCL_FFT_F16X2_FMA(a, b, c) ((a) * (b) + (c))
-#endif
-#else
-#define SYCL_FFT_F16X2_SPLAT_H(h) f16x2_splat((h))
-#define SYCL_FFT_F16X2_SPLAT_F(v) f16x2_splat_f((v))
-#define SYCL_FFT_F16X2_FMA(a, b, c) sycl::fma((a), (b), (c))
+#    define SYCL_FFT_F16X2_SPLAT_H(h) f16x2_splat((h))
+#    define SYCL_FFT_F16X2_SPLAT_F(v) f16x2_splat_f((v))
+#    define SYCL_FFT_F16X2_FMA(a, b, c) sycl::fma((a), (b), (c))
 #endif
 
 constexpr uint16_t f32_to_f16_bits_const(float f) noexcept {
     const uint32_t u = SYCL_FFT_BIT_CAST(uint32_t, f);
     const uint32_t sign = (u >> 16) & 0x8000u;
-    const uint32_t exp  = (u >> 23) & 0xFFu;
+    const uint32_t exp = (u >> 23) & 0xFFu;
     const uint32_t mant = u & 0x007FFFFFu;
     if (exp == 0u) return static_cast<uint16_t>(sign);
     if (exp == 255u) return static_cast<uint16_t>(sign | 0x7C00u | (mant ? 0x0200u : 0u));
@@ -253,10 +243,10 @@ SYCL_FFT_FORCE_INLINE constexpr f16x2_t f16x2_splat_const(float v) noexcept {
     return u32_to_f16x2(b | (b << 16));
 }
 
-constexpr f16x2_t kZero_f16x2    = f16x2_splat_const(0.0f);
-constexpr f16x2_t kOne_f16x2     = f16x2_splat_const(1.0f);
-constexpr f16x2_t kHalf_f16x2    = f16x2_splat_const(0.5f);
-constexpr f16x2_t kTwo_f16x2     = f16x2_splat_const(2.0f);
+constexpr f16x2_t kZero_f16x2 = f16x2_splat_const(0.0f);
+constexpr f16x2_t kOne_f16x2 = f16x2_splat_const(1.0f);
+constexpr f16x2_t kHalf_f16x2 = f16x2_splat_const(0.5f);
+constexpr f16x2_t kTwo_f16x2 = f16x2_splat_const(2.0f);
 constexpr f16x2_t kSqrt1_2_f16x2 = f16x2_splat_const(0.7071067811865475244f);
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_add(f16x2_t a, f16x2_t b) { return a + b; }
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_sub(f16x2_t a, f16x2_t b) { return a - b; }
@@ -277,67 +267,59 @@ SYCL_FFT_FORCE_INLINE f16x2_t f16x2_sqrt(f16x2_t a) {
 
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_fma(f16x2_t a, f16x2_t b, f16x2_t c) {
 #if SYCL_FFT_USE_CLANG_F16X2
-#if defined(__has_builtin)
-#if __has_builtin(__builtin_elementwise_fma)
+#    if defined(__has_builtin)
+#        if __has_builtin(__builtin_elementwise_fma)
     return __builtin_elementwise_fma(a, b, c);
-#else
+#        else
     return a * b + c;
-#endif
-#else
+#        endif
+#    else
     return a * b + c;
-#endif
+#    endif
 #else
     return sycl::fma(a, b, c);
 #endif
 }
 
-SYCL_FFT_FORCE_INLINE f16x2_t f16x2_scale_half(f16x2_t a) {
-    return a * kHalf_f16x2;
-}
+SYCL_FFT_FORCE_INLINE f16x2_t f16x2_scale_half(f16x2_t a) { return a * kHalf_f16x2; }
 
 SYCL_FFT_FORCE_INLINE f16x2_t f16x2_cond_neg(f16x2_t v, bool cond) {
     const uint32_t mask = cond ? 0x80008000u : 0u;
     return SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, v) ^ mask);
 }
 
-SYCL_FFT_FORCE_INLINE void f16x2_cmul(
-    f16x2_t ar, f16x2_t ai, f16x2_t br, f16x2_t bi, f16x2_t& or_, f16x2_t& oi) {
+SYCL_FFT_FORCE_INLINE void f16x2_cmul(f16x2_t ar, f16x2_t ai, f16x2_t br, f16x2_t bi, f16x2_t& or_, f16x2_t& oi) {
     or_ = f16x2_fma(ar, br, -(ai * bi));
-    oi  = f16x2_fma(ar, bi,   ai * br);
+    oi = f16x2_fma(ar, bi, ai * br);
 }
 
-SYCL_FFT_FORCE_INLINE void f16x2_csqr(
-    f16x2_t ar, f16x2_t ai, f16x2_t& or_, f16x2_t& oi) {
+SYCL_FFT_FORCE_INLINE void f16x2_csqr(f16x2_t ar, f16x2_t ai, f16x2_t& or_, f16x2_t& oi) {
     or_ = f16x2_fma(ar, ar, -(ai * ai));
-    oi  = (kTwo_f16x2 * ar) * ai;
+    oi = (kTwo_f16x2 * ar) * ai;
 }
 
 template <bool NegRe>
-SYCL_FFT_FORCE_INLINE void f16x2_cmul_sqrt1_2_rt(
-    f16x2_t dr, f16x2_t di, bool pos_sign, f16x2_t& or_, f16x2_t& oi) {
+SYCL_FFT_FORCE_INLINE void f16x2_cmul_sqrt1_2_rt(f16x2_t dr, f16x2_t di, bool pos_sign, f16x2_t& or_, f16x2_t& oi) {
     const uint32_t mask = pos_sign ? 0x80008000u : 0u;
     const f16x2_t s_dr = SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, dr) ^ mask);
     const f16x2_t s_di = SYCL_FFT_BIT_CAST(f16x2_t, SYCL_FFT_BIT_CAST(uint32_t, di) ^ mask);
     if constexpr (!NegRe) {
         or_ = (dr + s_di) * kSqrt1_2_f16x2;
-        oi  = (di - s_dr) * kSqrt1_2_f16x2;
+        oi = (di - s_dr) * kSqrt1_2_f16x2;
     } else {
         or_ = (s_di - dr) * kSqrt1_2_f16x2;
-        oi  = -(s_dr + di) * kSqrt1_2_f16x2;
+        oi = -(s_dr + di) * kSqrt1_2_f16x2;
     }
 }
 
 template <bool NegRe, bool NegIm>
-SYCL_FFT_FORCE_INLINE void f16x2_cmul_sqrt1_2(
-    f16x2_t dr, f16x2_t di, f16x2_t& or_, f16x2_t& oi) {
+SYCL_FFT_FORCE_INLINE void f16x2_cmul_sqrt1_2(f16x2_t dr, f16x2_t di, f16x2_t& or_, f16x2_t& oi) {
     f16x2_cmul_sqrt1_2_rt<NegRe>(dr, di, !NegIm, or_, oi);
 }
 
 // Pack 2 independent complex binary16 values (batch 0 and batch 1) into SoA f16x2_t registers:
 //   re = {g0.re, g1.re}, im = {g0.im, g1.im}.
-SYCL_FFT_FORCE_INLINE void f16x2_load_pair(
-    const Complexh* g0, const Complexh* g1, int idx, bool valid0, bool valid1,
-    f16x2_t& re_out, f16x2_t& im_out) {
+SYCL_FFT_FORCE_INLINE void f16x2_load_pair(const Complexh* g0, const Complexh* g1, int idx, bool valid0, bool valid1, f16x2_t& re_out, f16x2_t& im_out) {
     const uint32_t u0 = valid0 ? sycl_fft_bit_cast<uint32_t>(g0[idx]) : 0u;
     const uint32_t u1 = valid1 ? sycl_fft_bit_cast<uint32_t>(g1[idx]) : 0u;
     const uint32_t re_u32 = (u0 & 0xFFFFu) | ((u1 & 0xFFFFu) << 16);
@@ -346,9 +328,7 @@ SYCL_FFT_FORCE_INLINE void f16x2_load_pair(
     im_out = SYCL_FFT_BIT_CAST(f16x2_t, im_u32);
 }
 
-SYCL_FFT_FORCE_INLINE void f16x2_store_pair(
-    Complexh* g0, Complexh* g1, int idx, bool valid0, bool valid1,
-    f16x2_t re_in, f16x2_t im_in) {
+SYCL_FFT_FORCE_INLINE void f16x2_store_pair(Complexh* g0, Complexh* g1, int idx, bool valid0, bool valid1, f16x2_t re_in, f16x2_t im_in) {
     const uint32_t re_u32 = SYCL_FFT_BIT_CAST(uint32_t, re_in);
     const uint32_t im_u32 = SYCL_FFT_BIT_CAST(uint32_t, im_in);
     if (valid0) {
@@ -379,17 +359,14 @@ struct alignas(16) Complexdf {
     df_t im;
 };
 
-static_assert(sizeof(df_t) == 8 && alignof(df_t) == 8 && std::is_trivially_copyable_v<df_t>,
-              "df_t must be 8-byte aligned trivially copyable pair of floats");
+static_assert(sizeof(df_t) == 8 && alignof(df_t) == 8 && std::is_trivially_copyable_v<df_t>, "df_t must be 8-byte aligned trivially copyable pair of floats");
 static_assert(sizeof(Complexdf) == 16 && alignof(Complexdf) == 16 && std::is_trivially_copyable_v<Complexdf>,
               "Complexdf must be 16-byte aligned trivially copyable for 128-bit LDG/STG");
 
 // ============================================================================
 // Dekker / Knuth Double-Float (df_t) Arithmetic Primitives
 // ============================================================================
-constexpr df_t df_make(float hi, float lo) {
-    return df_t{hi, lo};
-}
+constexpr df_t df_make(float hi, float lo) { return df_t{hi, lo}; }
 
 constexpr df_t df_from_double(double d) {
     const float hi = static_cast<float>(d);
@@ -397,9 +374,7 @@ constexpr df_t df_from_double(double d) {
     return df_t{hi, lo};
 }
 
-SYCL_FFT_FORCE_INLINE double df_to_double(df_t a) {
-    return static_cast<double>(a.hi) + static_cast<double>(a.lo);
-}
+SYCL_FFT_FORCE_INLINE double df_to_double(df_t a) { return static_cast<double>(a.hi) + static_cast<double>(a.lo); }
 
 // Use exact 0.0f - x rather than unary -x (xor.b32 sign flip) to avoid an NVIDIA CUDA 13
 // ptxas sm_120 codegen bug where sign-modifier folding across FMUL + FFMA in df_two_product
@@ -415,18 +390,13 @@ SYCL_FFT_FORCE_INLINE df_t df_scale_pow2(df_t a, float s) {
 }
 
 SYCL_FFT_FORCE_INLINE df_t df_select(df_t a, df_t b, uint32_t mask) {
-    const uint32_t hi = (SYCL_FFT_BIT_CAST(uint32_t, a.hi) & mask) |
-                        (SYCL_FFT_BIT_CAST(uint32_t, b.hi) & ~mask);
-    const uint32_t lo = (SYCL_FFT_BIT_CAST(uint32_t, a.lo) & mask) |
-                        (SYCL_FFT_BIT_CAST(uint32_t, b.lo) & ~mask);
+    const uint32_t hi = (SYCL_FFT_BIT_CAST(uint32_t, a.hi) & mask) | (SYCL_FFT_BIT_CAST(uint32_t, b.hi) & ~mask);
+    const uint32_t lo = (SYCL_FFT_BIT_CAST(uint32_t, a.lo) & mask) | (SYCL_FFT_BIT_CAST(uint32_t, b.lo) & ~mask);
     return df_t{SYCL_FFT_BIT_CAST(float, hi), SYCL_FFT_BIT_CAST(float, lo)};
 }
 
 SYCL_FFT_FORCE_INLINE df_t df_xor_sign(df_t a, uint32_t sign_bit) {
-    return df_t{
-        SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, a.hi) ^ sign_bit),
-        SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, a.lo) ^ sign_bit)
-    };
+    return df_t{SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, a.hi) ^ sign_bit), SYCL_FFT_BIT_CAST(float, SYCL_FFT_BIT_CAST(uint32_t, a.lo) ^ sign_bit)};
 }
 
 // Knuth TwoSum (6 FP32 ops): a + b = r + e exactly
@@ -542,9 +512,7 @@ SYCL_FFT_DF_INLINE df_t df_sqrt(df_t a) {
     return out;
 }
 
-SYCL_FFT_FORCE_INLINE df_t df_abs(df_t a) {
-    return (a.hi < 0.0f || (a.hi == 0.0f && a.lo < 0.0f)) ? df_neg(a) : a;
-}
+SYCL_FFT_FORCE_INLINE df_t df_abs(df_t a) { return (a.hi < 0.0f || (a.hi == 0.0f && a.lo < 0.0f)) ? df_neg(a) : a; }
 
 SYCL_FFT_DF_INLINE df_t df_floor(df_t a) {
     SYCL_FFT_DF_EXACT_FP
@@ -566,8 +534,7 @@ SYCL_FFT_DF_INLINE df_t df_ceil(df_t a) {
 
 // Fused DF complex multiply (38 FP32 ops vs 50 unfused):
 // Feeds un-renormalized two-product pairs directly into two_diff/two_sum + quick_two_sum.
-SYCL_FFT_DF_INLINE void df_cmul_fused(
-    df_t ar, df_t ai, df_t br, df_t bi, df_t& out_r, df_t& out_i) {
+SYCL_FFT_DF_INLINE void df_cmul_fused(df_t ar, df_t ai, df_t br, df_t bi, df_t& out_r, df_t& out_i) {
     SYCL_FFT_DF_EXACT_FP
     float p1h, p1l, p2h, p2l;
     df_two_product(ar.hi, br.hi, p1h, p1l);
@@ -624,8 +591,7 @@ constexpr df_t kSqrt1_2df = df_from_double(kSqrt1_2);
 //   NegRe=false: W_8^{\pm 1} = (1 \pm i)/sqrt(2)
 //   NegRe=true:  W_8^{\pm 3} = (-1 \pm i)/sqrt(2)
 template <bool NegRe>
-SYCL_FFT_DF_INLINE void df_cmul_sqrt1_2_rt(
-    df_t dr, df_t di, bool pos_sign, df_t& out_r, df_t& out_i) {
+SYCL_FFT_DF_INLINE void df_cmul_sqrt1_2_rt(df_t dr, df_t di, bool pos_sign, df_t& out_r, df_t& out_i) {
     const uint32_t sbit = static_cast<uint32_t>(pos_sign) << 31;
     const df_t s_dr = df_xor_sign(dr, sbit);
     const df_t s_di = df_xor_sign(di, sbit);
@@ -672,9 +638,7 @@ SYCL_FFT_FORCE_INLINE void sincos2pif_half(float f, float& c_out, float& s_out) 
     const uint32_t gt_qtr_bit = static_cast<uint32_t>(f > 0.25f);
     const uint32_t gt_qtr_mask = 0u - gt_qtr_bit;
     const float f_fold = 0.5f - f;
-    f = SYCL_FFT_BIT_CAST(float,
-        (SYCL_FFT_BIT_CAST(uint32_t, f_fold) & gt_qtr_mask) |
-        (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_qtr_mask));
+    f = SYCL_FFT_BIT_CAST(float, (SYCL_FFT_BIT_CAST(uint32_t, f_fold) & gt_qtr_mask) | (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_qtr_mask));
 
     float c_mag, s_signed;
     sincos2pif_q1<Sign>(f, c_mag, s_signed);
@@ -692,9 +656,7 @@ SYCL_FFT_FORCE_INLINE void sincos2pif_branchless(float x, float& c_out, float& s
     const uint32_t gt_qtr_bit = static_cast<uint32_t>(f > 0.25f);
     const uint32_t gt_qtr_mask = 0u - gt_qtr_bit;
     const float f_fold = 0.5f - f;
-    f = SYCL_FFT_BIT_CAST(float,
-        (SYCL_FFT_BIT_CAST(uint32_t, f_fold) & gt_qtr_mask) |
-        (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_qtr_mask));
+    f = SYCL_FFT_BIT_CAST(float, (SYCL_FFT_BIT_CAST(uint32_t, f_fold) & gt_qtr_mask) | (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_qtr_mask));
 
     float c_mag, s_base;
     sincos2pif_q1<1>(f, c_mag, s_base);
@@ -730,13 +692,9 @@ SYCL_FFT_FORCE_INLINE void sincos2pih_branchless(sycl::half x, sycl::half& c_out
     s_out = static_cast<sycl::half>(s);
 }
 
-SYCL_FFT_FORCE_INLINE sycl::half cos2pih(sycl::half x) {
-    return static_cast<sycl::half>(cos2pif_branchless(static_cast<float>(x)));
-}
+SYCL_FFT_FORCE_INLINE sycl::half cos2pih(sycl::half x) { return static_cast<sycl::half>(cos2pif_branchless(static_cast<float>(x))); }
 
-SYCL_FFT_FORCE_INLINE sycl::half sin2pih(sycl::half x) {
-    return static_cast<sycl::half>(sin2pif_branchless(static_cast<float>(x)));
-}
+SYCL_FFT_FORCE_INLINE sycl::half sin2pih(sycl::half x) { return static_cast<sycl::half>(sin2pif_branchless(static_cast<float>(x))); }
 
 // ============================================================================
 // FP64 Branchless Polynomial Trig (raw unsuffixed, minimax on [0, 0.125])
@@ -748,20 +706,20 @@ SYCL_FFT_FORCE_INLINE void sincos2pi_oct1(double f, double& c_out, double& s_out
     const double f2 = f * f;
 
     double ps = sycl::fma(f2, 3.78086895930229572e+00, -1.50938042099871144e+01);
-    ps = sycl::fma(ps, f2,  4.20586850201608939e+01);
+    ps = sycl::fma(ps, f2, 4.20586850201608939e+01);
     ps = sycl::fma(ps, f2, -7.67058597042745447e+01);
-    ps = sycl::fma(ps, f2,  8.16052492759480401e+01);
+    ps = sycl::fma(ps, f2, 8.16052492759480401e+01);
     ps = sycl::fma(ps, f2, -4.13417022403996341e+01);
-    ps = sycl::fma(ps, f2,  6.28318530717958623e+00);
+    ps = sycl::fma(ps, f2, 6.28318530717958623e+00);
     const double s_mag = ps * f;
 
-    double pc = sycl::fma(f2, -1.69684947029188260e+00,  7.90309168775169724e+00);
+    double pc = sycl::fma(f2, -1.69684947029188260e+00, 7.90309168775169724e+00);
     pc = sycl::fma(pc, f2, -2.64262509086221371e+01);
-    pc = sycl::fma(pc, f2,  6.02446413288672957e+01);
+    pc = sycl::fma(pc, f2, 6.02446413288672957e+01);
     pc = sycl::fma(pc, f2, -8.54568172065227145e+01);
-    pc = sycl::fma(pc, f2,  6.49393940226679547e+01);
+    pc = sycl::fma(pc, f2, 6.49393940226679547e+01);
     pc = sycl::fma(pc, f2, -1.97392088021787160e+01);
-    pc = sycl::fma(pc, f2,  1.00000000000000000e+00);
+    pc = sycl::fma(pc, f2, 1.00000000000000000e+00);
 
     c_out = pc;
     s_out = (Sign < 0) ? -s_mag : s_mag;
@@ -773,16 +731,12 @@ SYCL_FFT_FORCE_INLINE void sincos2pi_half(double f, double& c_out, double& s_out
     const uint64_t gt_qtr_bit = static_cast<uint64_t>(f > 0.25);
     const uint64_t gt_qtr_mask = 0ull - gt_qtr_bit;
     const double f_qtr = 0.5 - f;
-    f = SYCL_FFT_BIT_CAST(double,
-        (SYCL_FFT_BIT_CAST(uint64_t, f_qtr) & gt_qtr_mask) |
-        (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_qtr_mask));
+    f = SYCL_FFT_BIT_CAST(double, (SYCL_FFT_BIT_CAST(uint64_t, f_qtr) & gt_qtr_mask) | (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_qtr_mask));
 
     const uint64_t gt_oct_bit = static_cast<uint64_t>(f > 0.125);
     const uint64_t gt_oct_mask = 0ull - gt_oct_bit;
     const double f_oct = 0.25 - f;
-    f = SYCL_FFT_BIT_CAST(double,
-        (SYCL_FFT_BIT_CAST(uint64_t, f_oct) & gt_oct_mask) |
-        (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_oct_mask));
+    f = SYCL_FFT_BIT_CAST(double, (SYCL_FFT_BIT_CAST(uint64_t, f_oct) & gt_oct_mask) | (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_oct_mask));
 
     double c_oct, s_oct;
     sincos2pi_oct1<1>(f, c_oct, s_oct);
@@ -807,16 +761,12 @@ SYCL_FFT_FORCE_INLINE void sincos2pi_branchless(double x, double& c_out, double&
     const uint64_t gt_qtr_bit = static_cast<uint64_t>(f > 0.25);
     const uint64_t gt_qtr_mask = 0ull - gt_qtr_bit;
     const double f_qtr = 0.5 - f;
-    f = SYCL_FFT_BIT_CAST(double,
-        (SYCL_FFT_BIT_CAST(uint64_t, f_qtr) & gt_qtr_mask) |
-        (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_qtr_mask));
+    f = SYCL_FFT_BIT_CAST(double, (SYCL_FFT_BIT_CAST(uint64_t, f_qtr) & gt_qtr_mask) | (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_qtr_mask));
 
     const uint64_t gt_oct_bit = static_cast<uint64_t>(f > 0.125);
     const uint64_t gt_oct_mask = 0ull - gt_oct_bit;
     const double f_oct = 0.25 - f;
-    f = SYCL_FFT_BIT_CAST(double,
-        (SYCL_FFT_BIT_CAST(uint64_t, f_oct) & gt_oct_mask) |
-        (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_oct_mask));
+    f = SYCL_FFT_BIT_CAST(double, (SYCL_FFT_BIT_CAST(uint64_t, f_oct) & gt_oct_mask) | (SYCL_FFT_BIT_CAST(uint64_t, f) & ~gt_oct_mask));
 
     double c_oct, s_oct;
     sincos2pi_oct1<1>(f, c_oct, s_oct);
@@ -856,22 +806,22 @@ SYCL_FFT_FORCE_INLINE double sin2pi(double x) { return sin2pi_branchless(x); }
 // ============================================================================
 namespace detail {
 
-constexpr df_t kSinDf0 = df_from_double( 6.28318530717955959e+00);
+constexpr df_t kSinDf0 = df_from_double(6.28318530717955959e+00);
 constexpr df_t kSinDf1 = df_from_double(-4.13417022402757794e+01);
-constexpr df_t kSinDf2 = df_from_double( 8.16052491834839344e+01);
+constexpr df_t kSinDf2 = df_from_double(8.16052491834839344e+01);
 constexpr df_t kSinDf3 = df_from_double(-7.67058344584512923e+01);
-constexpr df_t kSinDf4 = df_from_double( 4.20555692559449881e+01);
+constexpr df_t kSinDf4 = df_from_double(4.20555692559449881e+01);
 constexpr float kSinDf5 = static_cast<float>(-1.49165651188191184e+01);
 
-constexpr df_t kCosDf0 = df_from_double( 1.00000000000000000e+00);
+constexpr df_t kCosDf0 = df_from_double(1.00000000000000000e+00);
 constexpr df_t kCosDf1 = df_from_double(-1.97392088021784211e+01);
-constexpr df_t kCosDf2 = df_from_double( 6.49393940223653772e+01);
+constexpr df_t kCosDf2 = df_from_double(6.49393940223653772e+01);
 constexpr df_t kCosDf3 = df_from_double(-8.54568170903411470e+01);
-constexpr df_t kCosDf4 = df_from_double( 6.02446200859302934e+01);
+constexpr df_t kCosDf4 = df_from_double(6.02446200859302934e+01);
 constexpr float kCosDf5 = static_cast<float>(-2.64242570348826895e+01);
-constexpr float kCosDf6 = static_cast<float>( 7.81029096814419077e+00);
+constexpr float kCosDf6 = static_cast<float>(7.81029096814419077e+00);
 
-} // namespace detail
+}  // namespace detail
 
 // Fast path for exact dyadic float angles f = j / 2^k in [0, 0.125] (lo == 0)
 template <int Sign = -1>
@@ -906,16 +856,12 @@ SYCL_FFT_FORCE_INLINE void sincos2pidf_half_f(float f, df_t& c_out, df_t& s_out)
     const uint32_t gt_qtr_bit = static_cast<uint32_t>(f > 0.25f);
     const uint32_t gt_qtr_mask = 0u - gt_qtr_bit;
     const float f_qtr = 0.5f - f;
-    f = SYCL_FFT_BIT_CAST(float,
-        (SYCL_FFT_BIT_CAST(uint32_t, f_qtr) & gt_qtr_mask) |
-        (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_qtr_mask));
+    f = SYCL_FFT_BIT_CAST(float, (SYCL_FFT_BIT_CAST(uint32_t, f_qtr) & gt_qtr_mask) | (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_qtr_mask));
 
     const uint32_t gt_oct_bit = static_cast<uint32_t>(f > 0.125f);
     const uint32_t gt_oct_mask = 0u - gt_oct_bit;
     const float f_oct = 0.25f - f;
-    f = SYCL_FFT_BIT_CAST(float,
-        (SYCL_FFT_BIT_CAST(uint32_t, f_oct) & gt_oct_mask) |
-        (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_oct_mask));
+    f = SYCL_FFT_BIT_CAST(float, (SYCL_FFT_BIT_CAST(uint32_t, f_oct) & gt_oct_mask) | (SYCL_FFT_BIT_CAST(uint32_t, f) & ~gt_oct_mask));
 
     df_t c_oct, s_oct;
     sincos2pidf_oct1_f<1>(f, c_oct, s_oct);
@@ -999,4 +945,4 @@ SYCL_FFT_FORCE_INLINE df_t sin2pidf_branchless(df_t x) {
 SYCL_FFT_FORCE_INLINE df_t cos2pidf(df_t x) { return cos2pidf_branchless(x); }
 SYCL_FFT_FORCE_INLINE df_t sin2pidf(df_t x) { return sin2pidf_branchless(x); }
 
-} // namespace sycl_fft
+}  // namespace sycl_fft

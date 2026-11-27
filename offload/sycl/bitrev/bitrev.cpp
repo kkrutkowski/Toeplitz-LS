@@ -7,16 +7,16 @@
 //   4. scalar_cobra_w4                : zero-smem private L1-tile COBRA (CPU fallback)
 //   5. lut_pairs_w256 / lut_idx_w256  : precomputed compact pair/index device LUT
 //   6. naive_w256 / naive_w128        : direct global swap / gather baseline
-#include "bitrev/bitrev.hpp"
-#include "common/math.hpp"
-#include "common/layout.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
+
+#include "bitrev/bitrev.hpp"
+#include "common/layout.hpp"
+#include "common/math.hpp"
 
 namespace sycl_fft {
 
@@ -42,10 +42,7 @@ struct BitRevLutState {
     BitRevLutState& operator=(const BitRevLutState&) = delete;
 
     void release() {
-        const bool any_alloc =
-            pairs16 || pairs32 || idx16 || idx32 ||
-            rev_w[0] || rev_w[1] || b_pairs[0] || b_pairs[1] ||
-            b_all_rev[0] || b_all_rev[1];
+        const bool any_alloc = pairs16 || pairs32 || idx16 || idx32 || rev_w[0] || rev_w[1] || b_pairs[0] || b_pairs[1] || b_all_rev[0] || b_all_rev[1];
         if (any_alloc) {
             try {
                 q.wait();
@@ -272,7 +269,7 @@ struct BitRevWholeSmemFunctor {
         const int shift = logN - xor_k;
         const int mask = (xor_k > 0) ? ((1 << xor_k) - 1) : 0;
 
-        #pragma unroll 4
+#pragma unroll 4
         for (int idx = tid; idx < n; idx += wg) {
             const int slot = idx ^ ((idx >> shift) & mask);
             smem[slot] = g_src[idx];
@@ -280,7 +277,7 @@ struct BitRevWholeSmemFunctor {
 
         sycl::group_barrier(item.get_group());
 
-        #pragma unroll 4
+#pragma unroll 4
         for (int idx = tid; idx < n; idx += wg) {
             const int r = static_cast<int>(bit_reverse(static_cast<uint32_t>(idx), logN));
             const int slot = r ^ ((r >> shift) & mask);
@@ -339,53 +336,41 @@ struct BitRevCobraSmemFunctor {
         const size_t off_brev = base + (static_cast<size_t>(b_rev) << WBits);
         const RawT* g_src = in_place ? dst : src;
 
-        #pragma unroll 4
+#pragma unroll 4
         for (int lin = tid; lin < kTileElems; lin += wg) {
             const int a = lin >> WBits;
             const int c = lin & kMask;
-            smem[cobra_tile_xor_slot(a, c, WBits)] =
-                g_src[off_b + (static_cast<size_t>(a) << a_shift) + c];
+            smem[cobra_tile_xor_slot(a, c, WBits)] = g_src[off_b + (static_cast<size_t>(a) << a_shift) + c];
         }
 
         if (in_place && b != b_rev) {
-            #pragma unroll 4
+#pragma unroll 4
             for (int lin = tid; lin < kTileElems; lin += wg) {
                 const int a = lin >> WBits;
                 const int c = lin & kMask;
-                smem[kTileElems + cobra_tile_xor_slot(a, c, WBits)] =
-                    g_src[off_brev + (static_cast<size_t>(a) << a_shift) + c];
+                smem[kTileElems + cobra_tile_xor_slot(a, c, WBits)] = g_src[off_brev + (static_cast<size_t>(a) << a_shift) + c];
             }
         }
 
         sycl::group_barrier(item.get_group());
 
-        #pragma unroll 4
+#pragma unroll 4
         for (int lin = tid; lin < kTileElems; lin += wg) {
             const int a_out = lin >> WBits;
             const int c_out = lin & kMask;
-            const int a_src = use_lut
-                ? static_cast<int>(rev_w[c_out])
-                : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
-            const int c_src = use_lut
-                ? static_cast<int>(rev_w[a_out])
-                : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
-            dst[off_brev + (static_cast<size_t>(a_out) << a_shift) + c_out] =
-                smem[cobra_tile_xor_slot(a_src, c_src, WBits)];
+            const int a_src = use_lut ? static_cast<int>(rev_w[c_out]) : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
+            const int c_src = use_lut ? static_cast<int>(rev_w[a_out]) : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
+            dst[off_brev + (static_cast<size_t>(a_out) << a_shift) + c_out] = smem[cobra_tile_xor_slot(a_src, c_src, WBits)];
         }
 
         if (in_place && b != b_rev) {
-            #pragma unroll 4
+#pragma unroll 4
             for (int lin = tid; lin < kTileElems; lin += wg) {
                 const int a_out = lin >> WBits;
                 const int c_out = lin & kMask;
-                const int a_src = use_lut
-                    ? static_cast<int>(rev_w[c_out])
-                    : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
-                const int c_src = use_lut
-                    ? static_cast<int>(rev_w[a_out])
-                    : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
-                dst[off_b + (static_cast<size_t>(a_out) << a_shift) + c_out] =
-                    smem[kTileElems + cobra_tile_xor_slot(a_src, c_src, WBits)];
+                const int a_src = use_lut ? static_cast<int>(rev_w[c_out]) : static_cast<int>(bit_reverse(static_cast<uint32_t>(c_out), WBits));
+                const int c_src = use_lut ? static_cast<int>(rev_w[a_out]) : static_cast<int>(bit_reverse(static_cast<uint32_t>(a_out), WBits));
+                dst[off_b + (static_cast<size_t>(a_out) << a_shift) + c_out] = smem[kTileElems + cobra_tile_xor_slot(a_src, c_src, WBits)];
             }
         }
     }
@@ -474,24 +459,18 @@ struct BitRevScalarCobraFunctor {
 namespace detail {
 
 template <typename RawT, bool InPlace, size_t DefaultWG>
-void launch_bitrev_naive(
-    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN,
-    BitRevLutState&, size_t wg_override, int) {
+void launch_bitrev_naive(sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN, BitRevLutState&, size_t wg_override, int) {
     const size_t total = bs << logN;
     if (total == 0) return;
     const size_t wg = (wg_override > 0) ? wg_override : DefaultWG;
     const size_t global = ((total + wg - 1) / wg) * wg;
     q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-            BitRevNaiveFunctor<RawT>{src, dst, total, logN, InPlace});
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)), BitRevNaiveFunctor<RawT>{src, dst, total, logN, InPlace});
     });
 }
 
 template <typename RawT, size_t DefaultWG>
-void launch_bitrev_lut_pairs(
-    sycl::queue& q, const RawT*, RawT* dst, size_t bs, int logN,
-    BitRevLutState& lut, size_t wg_override, int) {
+void launch_bitrev_lut_pairs(sycl::queue& q, const RawT*, RawT* dst, size_t bs, int logN, BitRevLutState& lut, size_t wg_override, int) {
     lut.ensure(BitRevLutKind::Pairs);
     const size_t total_pairs = bs * lut.npairs;
     if (total_pairs == 0) return;
@@ -499,23 +478,19 @@ void launch_bitrev_lut_pairs(
     const size_t global = ((total_pairs + wg - 1) / wg) * wg;
     if (lut.pairs16) {
         q.submit([&](sycl::handler& h) {
-            h.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-                BitRevLutPairsFunctor<RawT, uint16_t>{dst, lut.pairs16, lut.npairs, total_pairs, logN});
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                           BitRevLutPairsFunctor<RawT, uint16_t>{dst, lut.pairs16, lut.npairs, total_pairs, logN});
         });
     } else {
         q.submit([&](sycl::handler& h) {
-            h.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-                BitRevLutPairsFunctor<RawT, uint32_t>{dst, lut.pairs32, lut.npairs, total_pairs, logN});
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                           BitRevLutPairsFunctor<RawT, uint32_t>{dst, lut.pairs32, lut.npairs, total_pairs, logN});
         });
     }
 }
 
 template <typename RawT, size_t DefaultWG>
-void launch_bitrev_lut_idx(
-    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN,
-    BitRevLutState& lut, size_t wg_override, int) {
+void launch_bitrev_lut_idx(sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN, BitRevLutState& lut, size_t wg_override, int) {
     lut.ensure(BitRevLutKind::Idx);
     const size_t total = bs << logN;
     if (total == 0) return;
@@ -523,36 +498,28 @@ void launch_bitrev_lut_idx(
     const size_t global = ((total + wg - 1) / wg) * wg;
     if (lut.idx16) {
         q.submit([&](sycl::handler& h) {
-            h.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-                BitRevLutIdxFunctor<RawT, uint16_t>{src, dst, lut.idx16, total, logN});
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                           BitRevLutIdxFunctor<RawT, uint16_t>{src, dst, lut.idx16, total, logN});
         });
     } else {
         q.submit([&](sycl::handler& h) {
-            h.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-                BitRevLutIdxFunctor<RawT, uint32_t>{src, dst, lut.idx32, total, logN});
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                           BitRevLutIdxFunctor<RawT, uint32_t>{src, dst, lut.idx32, total, logN});
         });
     }
 }
 
 template <typename RawT, int WG>
-void launch_bitrev_whole_smem(
-    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN,
-    BitRevLutState&, size_t, int xor_k) {
+void launch_bitrev_whole_smem(sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN, BitRevLutState&, size_t, int xor_k) {
     if (bs == 0) return;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<RawT, 1> smem(sycl::range<1>(size_t{1} << logN), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(bs * WG), sycl::range<1>(WG)),
-            BitRevWholeSmemFunctor<RawT>{src, dst, logN, WG, xor_k, smem});
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(bs * WG), sycl::range<1>(WG)), BitRevWholeSmemFunctor<RawT>{src, dst, logN, WG, xor_k, smem});
     });
 }
 
 template <typename RawT, int WBits, int WG, bool InPlace, bool UseLut>
-void launch_bitrev_cobra_smem(
-    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN,
-    BitRevLutState& lut, size_t, int) {
+void launch_bitrev_cobra_smem(sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN, BitRevLutState& lut, size_t, int) {
     if (bs == 0) return;
     const int m = logN - 2 * WBits;
     const uint16_t* rev_w_ptr = nullptr;
@@ -577,17 +544,13 @@ void launch_bitrev_cobra_smem(
     const size_t smem_elems = (size_t{1} << (2 * WBits)) * (InPlace ? 2 : 1);
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<RawT, 1> smem(sycl::range<1>(smem_elems), h);
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(total_wg * WG), sycl::range<1>(WG)),
-            BitRevCobraSmemFunctor<RawT, WBits>{
-                src, dst, rev_w_ptr, b_lut_ptr, work_per_batch, logN, WG, InPlace, UseLut, smem});
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(total_wg * WG), sycl::range<1>(WG)),
+                       BitRevCobraSmemFunctor<RawT, WBits>{src, dst, rev_w_ptr, b_lut_ptr, work_per_batch, logN, WG, InPlace, UseLut, smem});
     });
 }
 
 template <typename RawT, bool InPlace>
-void launch_bitrev_scalar_cobra(
-    sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN,
-    BitRevLutState& lut, size_t wg_override, int) {
+void launch_bitrev_scalar_cobra(sycl::queue& q, const RawT* src, RawT* dst, size_t bs, int logN, BitRevLutState& lut, size_t wg_override, int) {
     if (bs == 0) return;
     lut.ensure(BitRevLutKind::CobraW4);
     const int m = logN - 8;
@@ -598,19 +561,15 @@ void launch_bitrev_scalar_cobra(
     const size_t wg = (wg_override > 0) ? wg_override : size_t{32};
     const size_t global = ((total_work + wg - 1) / wg) * wg;
     q.submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
-            BitRevScalarCobraFunctor<RawT>{
-                src, dst, lut.rev_w[0], b_lut_ptr, work_per_batch, total_work, logN, InPlace});
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
+                       BitRevScalarCobraFunctor<RawT>{src, dst, lut.rev_w[0], b_lut_ptr, work_per_batch, total_work, logN, InPlace});
     });
 }
 
 template <typename RawT>
 void append_whole_smem_candidates(int logN, std::vector<BitRevCandidate<RawT>>& out) {
-    auto add = [&](const char* name, size_t wg, size_t smem_b,
-                   typename BitRevCandidate<RawT>::LaunchFn fn) {
-        out.push_back(BitRevCandidate<RawT>{
-            name, wg, smem_b, true, false, BitRevLutKind::None, fn});
+    auto add = [&](const char* name, size_t wg, size_t smem_b, typename BitRevCandidate<RawT>::LaunchFn fn) {
+        out.push_back(BitRevCandidate<RawT>{name, wg, smem_b, true, false, BitRevLutKind::None, fn});
     };
     const int max_whole_logN = (sizeof(RawT) <= 4) ? 14 : (sizeof(RawT) <= 8 ? 13 : 12);
     if (logN >= 10 && logN <= max_whole_logN) {
@@ -630,61 +589,45 @@ std::vector<BitRevCandidate<RawT>> build_bitrev_candidates(int logN) {
     // 2. Shared-memory COBRA w=5 (32x32 tiles) + LUT variant
     if (logN >= 10) {
         const size_t smem_w5 = (size_t{1} << 10) * (InPlace ? 2 : 1) * sizeof(RawT);
-        out.push_back(BitRevCandidate<RawT>{
-            "cobra_w5_lut_wg256", 256, smem_w5, true, false, BitRevLutKind::CobraW5,
-            &launch_bitrev_cobra_smem<RawT, 5, 256, InPlace, true>});
-        out.push_back(BitRevCandidate<RawT>{
-            "cobra_w5_wg256", 256, smem_w5, true, false, BitRevLutKind::None,
-            &launch_bitrev_cobra_smem<RawT, 5, 256, InPlace, false>});
-        out.push_back(BitRevCandidate<RawT>{
-            "cobra_w5_wg128", 128, smem_w5, true, false, BitRevLutKind::None,
-            &launch_bitrev_cobra_smem<RawT, 5, 128, InPlace, false>});
+        out.push_back(BitRevCandidate<RawT>{"cobra_w5_lut_wg256", 256, smem_w5, true, false, BitRevLutKind::CobraW5,
+                                            &launch_bitrev_cobra_smem<RawT, 5, 256, InPlace, true>});
+        out.push_back(
+            BitRevCandidate<RawT>{"cobra_w5_wg256", 256, smem_w5, true, false, BitRevLutKind::None, &launch_bitrev_cobra_smem<RawT, 5, 256, InPlace, false>});
+        out.push_back(
+            BitRevCandidate<RawT>{"cobra_w5_wg128", 128, smem_w5, true, false, BitRevLutKind::None, &launch_bitrev_cobra_smem<RawT, 5, 128, InPlace, false>});
     }
 
     // 3. Shared-memory COBRA w=4 (16x16 tiles) + LUT variant
     if (logN >= 8) {
         const size_t smem_w4 = (size_t{1} << 8) * (InPlace ? 2 : 1) * sizeof(RawT);
-        out.push_back(BitRevCandidate<RawT>{
-            "cobra_w4_lut_wg256", 256, smem_w4, true, false, BitRevLutKind::CobraW4,
-            &launch_bitrev_cobra_smem<RawT, 4, 256, InPlace, true>});
-        out.push_back(BitRevCandidate<RawT>{
-            "cobra_w4_wg256", 256, smem_w4, true, false, BitRevLutKind::None,
-            &launch_bitrev_cobra_smem<RawT, 4, 256, InPlace, false>});
-        out.push_back(BitRevCandidate<RawT>{
-            "cobra_w4_wg128", 128, smem_w4, true, false, BitRevLutKind::None,
-            &launch_bitrev_cobra_smem<RawT, 4, 128, InPlace, false>});
+        out.push_back(BitRevCandidate<RawT>{"cobra_w4_lut_wg256", 256, smem_w4, true, false, BitRevLutKind::CobraW4,
+                                            &launch_bitrev_cobra_smem<RawT, 4, 256, InPlace, true>});
+        out.push_back(
+            BitRevCandidate<RawT>{"cobra_w4_wg256", 256, smem_w4, true, false, BitRevLutKind::None, &launch_bitrev_cobra_smem<RawT, 4, 256, InPlace, false>});
+        out.push_back(
+            BitRevCandidate<RawT>{"cobra_w4_wg128", 128, smem_w4, true, false, BitRevLutKind::None, &launch_bitrev_cobra_smem<RawT, 4, 128, InPlace, false>});
     }
 
     // 4. Zero-smem scalar COBRA w=4 (CPU / non-native-local-mem fast path)
     if (logN >= 8) {
-        out.push_back(BitRevCandidate<RawT>{
-            "scalar_cobra_w4", 32, 0, false, true, BitRevLutKind::CobraW4,
-            &launch_bitrev_scalar_cobra<RawT, InPlace>});
+        out.push_back(BitRevCandidate<RawT>{"scalar_cobra_w4", 32, 0, false, true, BitRevLutKind::CobraW4, &launch_bitrev_scalar_cobra<RawT, InPlace>});
     }
 
     // 5. Precomputed device LUT (pairs for in-place, rev index for out-of-place)
     if constexpr (InPlace) {
-        out.push_back(BitRevCandidate<RawT>{
-            "lut_pairs_w256", 256, 0, false, false, BitRevLutKind::Pairs,
-            &launch_bitrev_lut_pairs<RawT, 256>});
+        out.push_back(BitRevCandidate<RawT>{"lut_pairs_w256", 256, 0, false, false, BitRevLutKind::Pairs, &launch_bitrev_lut_pairs<RawT, 256>});
     } else {
-        out.push_back(BitRevCandidate<RawT>{
-            "lut_idx_w256", 256, 0, false, false, BitRevLutKind::Idx,
-            &launch_bitrev_lut_idx<RawT, 256>});
+        out.push_back(BitRevCandidate<RawT>{"lut_idx_w256", 256, 0, false, false, BitRevLutKind::Idx, &launch_bitrev_lut_idx<RawT, 256>});
     }
 
     // 6. Naive global scatter/gather baseline
-    out.push_back(BitRevCandidate<RawT>{
-        "naive_w256", 256, 0, false, false, BitRevLutKind::None,
-        &launch_bitrev_naive<RawT, InPlace, 256>});
-    out.push_back(BitRevCandidate<RawT>{
-        "naive_w128", 128, 0, false, false, BitRevLutKind::None,
-        &launch_bitrev_naive<RawT, InPlace, 128>});
+    out.push_back(BitRevCandidate<RawT>{"naive_w256", 256, 0, false, false, BitRevLutKind::None, &launch_bitrev_naive<RawT, InPlace, 256>});
+    out.push_back(BitRevCandidate<RawT>{"naive_w128", 128, 0, false, false, BitRevLutKind::None, &launch_bitrev_naive<RawT, InPlace, 128>});
 
     return out;
 }
 
-} // namespace detail
+}  // namespace detail
 
 // ============================================================================
 // BitRevEngine<RawT> Member Implementations
@@ -693,9 +636,7 @@ template <typename RawT>
 BitRevEngine<RawT>::BitRevEngine() = default;
 
 template <typename RawT>
-BitRevEngine<RawT>::BitRevEngine(
-    sycl::queue q, int logN, const char* prec_tag,
-    const DeviceFftConfig& dev_cfg, const FftLaunchConfig& launch_cfg)
+BitRevEngine<RawT>::BitRevEngine(sycl::queue q, int logN, const char* prec_tag, const DeviceFftConfig& dev_cfg, const FftLaunchConfig& launch_cfg)
     : q_(std::move(q)),
       logN_(logN),
       prec_tag_(prec_tag ? prec_tag : "f"),
@@ -743,10 +684,8 @@ void BitRevEngine<RawT>::resolve(bool in_place) {
             }
         }
         if (!found) {
-            throw std::runtime_error(
-                std::string("BitRevEngine: requested --bitrev-variant '") +
-                launch_cfg_.bitrev_variant_override + "' is not valid for logN=" +
-                std::to_string(logN_) + " (" + slot_tag + ")");
+            throw std::runtime_error(std::string("BitRevEngine: requested --bitrev-variant '") + launch_cfg_.bitrev_variant_override +
+                                     "' is not valid for logN=" + std::to_string(logN_) + " (" + slot_tag + ")");
         }
         set_resolved(in_place, chosen, false);
         return;
@@ -758,8 +697,7 @@ void BitRevEngine<RawT>::resolve(bool in_place) {
 
     if (allow_cache && !launch_cfg_.has_bitrev_overrides()) {
         AutotuneEntry cached{};
-        if (AutotuneCache::get(cache_path_, cache_key, cached) &&
-            cached.mode == PlanExecMode::SinglePass) {
+        if (AutotuneCache::get(cache_path_, cache_key, cached) && cached.mode == PlanExecMode::SinglePass) {
             for (size_t i = 0; i < cands.size(); ++i) {
                 if (cached.variant_id == cands[i].variant_id) {
                     set_resolved(in_place, static_cast<int>(i), true);
@@ -797,8 +735,7 @@ void BitRevEngine<RawT>::execute(const RawT* src, RawT* dst, size_t bs) {
 }
 
 template <typename RawT>
-void BitRevEngine<RawT>::execute_candidate(
-    const BitRevCandidate<RawT>& cand, const RawT* src, RawT* dst, size_t bs) {
+void BitRevEngine<RawT>::execute_candidate(const BitRevCandidate<RawT>& cand, const RawT* src, RawT* dst, size_t bs) {
     if (bs == 0 || logN_ <= 0) return;
     cand.launch(q_, src, dst, bs, logN_, *lut_, effective_wg_override(cand), xor_k_);
 }
@@ -828,13 +765,10 @@ size_t BitRevEngine<RawT>::effective_wg_override(const BitRevCandidate<RawT>& ca
 }
 
 template <typename RawT>
-std::vector<BitRevCandidate<RawT>> BitRevEngine<RawT>::filter_candidates(
-    const std::vector<BitRevCandidate<RawT>>& all) const {
+std::vector<BitRevCandidate<RawT>> BitRevEngine<RawT>::filter_candidates(const std::vector<BitRevCandidate<RawT>>& all) const {
     std::vector<BitRevCandidate<RawT>> out;
     for (const auto& c : all) {
-        if (c.requires_native_local_mem &&
-            !dev_cfg_.has_native_local_mem &&
-            !launch_cfg_.allow_emulated_local_mem) {
+        if (c.requires_native_local_mem && !dev_cfg_.has_native_local_mem && !launch_cfg_.allow_emulated_local_mem) {
             continue;
         }
         if (c.cpu_only && dev_cfg_.has_native_local_mem && dev_cfg_.is_gpu) {
@@ -865,8 +799,7 @@ void BitRevEngine<RawT>::set_resolved(bool in_place, int idx, bool hit) {
 }
 
 template <typename RawT>
-std::vector<size_t> BitRevEngine<RawT>::shortlist_for_tuning(
-    bool in_place, const std::vector<BitRevCandidate<RawT>>& cands) const {
+std::vector<size_t> BitRevEngine<RawT>::shortlist_for_tuning(bool in_place, const std::vector<BitRevCandidate<RawT>>& cands) const {
     std::vector<size_t> picks;
     auto add_by_name = [&](const char* name) {
         for (size_t i = 0; i < cands.size(); ++i) {
@@ -925,8 +858,7 @@ std::vector<size_t> BitRevEngine<RawT>::shortlist_for_tuning(
 template <typename RawT>
 size_t BitRevEngine<RawT>::representative_tune_bs() const {
     const size_t fft_bytes = (size_t{1} << logN_) * sizeof(RawT);
-    const size_t target_bytes = dev_cfg_.is_gpu ? (size_t{16} * 1024 * 1024)
-                                                : (size_t{2} * 1024 * 1024);
+    const size_t target_bytes = dev_cfg_.is_gpu ? (size_t{16} * 1024 * 1024) : (size_t{2} * 1024 * 1024);
     size_t bs = std::max<size_t>(4, target_bytes / std::max<size_t>(1, fft_bytes));
     if (dev_cfg_.max_mem_alloc_size > 0) {
         const size_t max_bs = std::max<size_t>(2, (dev_cfg_.max_mem_alloc_size / 8) / fft_bytes);
@@ -936,9 +868,7 @@ size_t BitRevEngine<RawT>::representative_tune_bs() const {
 }
 
 template <typename RawT>
-int BitRevEngine<RawT>::tune_candidates(
-    bool in_place, const std::vector<BitRevCandidate<RawT>>& cands,
-    bool persist_cache, const std::string& cache_key) {
+int BitRevEngine<RawT>::tune_candidates(bool in_place, const std::vector<BitRevCandidate<RawT>>& cands, bool persist_cache, const std::string& cache_key) {
     const auto shortlist = shortlist_for_tuning(in_place, cands);
     if (shortlist.size() == 1) {
         const int idx = static_cast<int>(shortlist[0]);
@@ -976,8 +906,10 @@ int BitRevEngine<RawT>::tune_candidates(
         try {
             const auto& c0 = cands[shortlist[0]];
             const size_t wg0 = effective_wg_override(c0);
-            if (in_place) c0.launch(q_, buf_a, buf_a, tune_bs, logN_, *lut_, wg0, xor_k_);
-            else c0.launch(q_, buf_a, buf_b, tune_bs, logN_, *lut_, wg0, xor_k_);
+            if (in_place)
+                c0.launch(q_, buf_a, buf_a, tune_bs, logN_, *lut_, wg0, xor_k_);
+            else
+                c0.launch(q_, buf_a, buf_b, tune_bs, logN_, *lut_, wg0, xor_k_);
             q_.wait_and_throw();
         } catch (...) {
         }
@@ -987,15 +919,19 @@ int BitRevEngine<RawT>::tune_candidates(
             try {
                 const auto& cand = cands[idx];
                 const size_t wg_ov = effective_wg_override(cand);
-                if (in_place) cand.launch(q_, buf_a, buf_a, tune_bs, logN_, *lut_, wg_ov, xor_k_);
-                else cand.launch(q_, buf_a, buf_b, tune_bs, logN_, *lut_, wg_ov, xor_k_);
+                if (in_place)
+                    cand.launch(q_, buf_a, buf_a, tune_bs, logN_, *lut_, wg_ov, xor_k_);
+                else
+                    cand.launch(q_, buf_a, buf_b, tune_bs, logN_, *lut_, wg_ov, xor_k_);
                 q_.wait_and_throw();
 
                 double samples[kTimedRuns];
                 for (int r = 0; r < kTimedRuns; ++r) {
                     const auto t0 = std::chrono::steady_clock::now();
-                    if (in_place) cand.launch(q_, buf_a, buf_a, tune_bs, logN_, *lut_, wg_ov, xor_k_);
-                    else cand.launch(q_, buf_a, buf_b, tune_bs, logN_, *lut_, wg_ov, xor_k_);
+                    if (in_place)
+                        cand.launch(q_, buf_a, buf_a, tune_bs, logN_, *lut_, wg_ov, xor_k_);
+                    else
+                        cand.launch(q_, buf_a, buf_b, tune_bs, logN_, *lut_, wg_ov, xor_k_);
                     q_.wait_and_throw();
                     const auto t1 = std::chrono::steady_clock::now();
                     samples[r] = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1016,8 +952,7 @@ int BitRevEngine<RawT>::tune_candidates(
     if (buf_a) sycl::free(buf_a, q_);
     if (buf_b) sycl::free(buf_b, q_);
 
-    if (persist_cache && !launch_cfg_.has_bitrev_overrides() &&
-        best_ms < std::numeric_limits<double>::max()) {
+    if (persist_cache && !launch_cfg_.has_bitrev_overrides() && best_ms < std::numeric_limits<double>::max()) {
         AutotuneEntry ent{};
         ent.mode = PlanExecMode::SinglePass;
         ent.variant_id = cands[static_cast<size_t>(best_idx)].variant_id;
@@ -1031,4 +966,4 @@ template class BitRevEngine<uint32_t>;
 template class BitRevEngine<uint64_t>;
 template class BitRevEngine<sycl::uint4>;
 
-} // namespace sycl_fft
+}  // namespace sycl_fft
