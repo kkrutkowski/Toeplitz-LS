@@ -1053,6 +1053,7 @@ struct PFX(pswf_plan) {
     FLOAT *deconv, *shift_r, *shift_i;
     NANOFFT_PLAN *nanofft_p;
     FLOAT *fft_real, *fft_imag;
+    FLOAT *fft_real2, *fft_imag2;
     /* Slot-order (deferred bit reversal) support.  `slot_deconv` is the
      * deconvolution table indexed by FFT position, with the NuFFT oversampling
      * padding zeroed; `period`/`nvalid`/`slot_offsets` describe the periodic
@@ -1063,6 +1064,7 @@ struct PFX(pswf_plan) {
     FLOAT *slot_deconv;
     FLOAT *perm_scratch;
     BREADTH_VEC *bfft_real, *bfft_imag;
+    BREADTH_VEC *bfft_real2, *bfft_imag2;
     BREADTH_VEC *bperm_scratch;
 #if defined(HALF)
     double output_scale;
@@ -1878,6 +1880,147 @@ static inline void PFX(ppoly_spread_point)(FLOAT *NANOFFT_RESTRICT fr, FLOAT *NA
         for (int k = 3; k < nc; k += 2) ke = ADD(MUL(ke, u2), coeffs[(size_t)k * (size_t)stride + (size_t)col]);
         fr[first + col] = ADD(fr[first + col], MUL(sy_r, ke));
         fi[first + col] = ADD(fi[first + col], MUL(sy_i, ke));
+    }
+}
+
+/* Paired symmetric even/odd Horner evaluation fused with dual-grid scatter-add
+ * for (w, yw) at the same time point, evaluating the polynomial once. */
+static inline void PFX(ppoly_spread_point_pair)(FLOAT *NANOFFT_RESTRICT fr1, FLOAT *NANOFFT_RESTRICT fi1, FLOAT *NANOFFT_RESTRICT fr2,
+                                                FLOAT *NANOFFT_RESTRICT fi2, const FLOAT *NANOFFT_RESTRICT coeffs, int first, FLOAT u, FLOAT sy1_r, FLOAT sy1_i,
+                                                FLOAT sy2_r, FLOAT sy2_i, int w, int nc, int stride) {
+    const INTERNAL_VEC v_u = IVEC_SPLAT(u);
+    const INTERNAL_VEC v_u2 = MUL(v_u, v_u);
+    const INTERNAL_VEC v_sy1_r = IVEC_SPLAT(sy1_r);
+    const INTERNAL_VEC v_sy1_i = IVEC_SPLAT(sy1_i);
+    const INTERNAL_VEC v_sy2_r = IVEC_SPLAT(sy2_r);
+    const INTERNAL_VEC v_sy2_i = IVEC_SPLAT(sy2_i);
+    const int V = INTERNAL_VEC_LEN;
+
+    if (w <= V) {
+        INTERNAL_VEC k_odd = LOAD_VEC(&coeffs[0]);
+        INTERNAL_VEC k_even = LOAD_VEC(&coeffs[stride]);
+        for (int k = 2; k < nc; k += 2) {
+            k_odd = ADD(MUL(k_odd, v_u2), LOAD_VEC(&coeffs[(size_t)k * (size_t)stride]));
+            k_even = ADD(MUL(k_even, v_u2), LOAD_VEC(&coeffs[(size_t)(k + 1) * (size_t)stride]));
+        }
+        INTERNAL_VEC kv = ADD(k_even, MUL(v_u, k_odd));
+        PFX(scatter_vec_u)(fr1, fi1, first, v_sy1_r, v_sy1_i, kv);
+        PFX(scatter_vec_u)(fr2, fi2, first, v_sy2_r, v_sy2_i, kv);
+        return;
+    }
+
+    const int n_sym = (w / 2) / V;
+    const int mid = n_sym * V;
+    const int rem = w - 2 * mid;
+
+    for (int ii = 0; ii < mid; ii += V) {
+        INTERNAL_VEC k_odd = LOAD_VEC(&coeffs[ii]);
+        INTERNAL_VEC k_even = LOAD_VEC(&coeffs[(size_t)stride + (size_t)ii]);
+        for (int k = 2; k < nc; k += 2) {
+            k_odd = ADD(MUL(k_odd, v_u2), LOAD_VEC(&coeffs[(size_t)k * (size_t)stride + (size_t)ii]));
+            k_even = ADD(MUL(k_even, v_u2), LOAD_VEC(&coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)ii]));
+        }
+        INTERNAL_VEC u_odd = MUL(v_u, k_odd);
+        INTERNAL_VEC kl = ADD(k_even, u_odd);
+        INTERNAL_VEC kr = PFX(rev_vec)(SUB(k_even, u_odd));
+        PFX(scatter_vec_u)(fr1, fi1, first + ii, v_sy1_r, v_sy1_i, kl);
+        PFX(scatter_vec_u)(fr2, fi2, first + ii, v_sy2_r, v_sy2_i, kl);
+        PFX(scatter_vec_u)(fr1, fi1, first + (w - ii - V), v_sy1_r, v_sy1_i, kr);
+        PFX(scatter_vec_u)(fr2, fi2, first + (w - ii - V), v_sy2_r, v_sy2_i, kr);
+    }
+
+    if (rem == 0) return;
+
+    if (rem == 1) {
+        FLOAT u2 = MUL(u, u);
+        FLOAT ke = coeffs[(size_t)stride + (size_t)mid];
+        for (int k = 3; k < nc; k += 2) ke = ADD(MUL(ke, u2), coeffs[(size_t)k * (size_t)stride + (size_t)mid]);
+        fr1[first + mid] = ADD(fr1[first + mid], MUL(sy1_r, ke));
+        fi1[first + mid] = ADD(fi1[first + mid], MUL(sy1_i, ke));
+        fr2[first + mid] = ADD(fr2[first + mid], MUL(sy2_r, ke));
+        fi2[first + mid] = ADD(fi2[first + mid], MUL(sy2_i, ke));
+        return;
+    }
+
+    if (rem == 2) {
+        FLOAT u2 = MUL(u, u);
+        FLOAT ko = coeffs[mid];
+        FLOAT ke = coeffs[(size_t)stride + (size_t)mid];
+        for (int k = 2; k < nc; k += 2) {
+            ko = ADD(MUL(ko, u2), coeffs[(size_t)k * (size_t)stride + (size_t)mid]);
+            ke = ADD(MUL(ke, u2), coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)mid]);
+        }
+        FLOAT uo = MUL(u, ko);
+        FLOAT kl = ADD(ke, uo);
+        FLOAT kr = SUB(ke, uo);
+        fr1[first + mid] = ADD(fr1[first + mid], MUL(sy1_r, kl));
+        fi1[first + mid] = ADD(fi1[first + mid], MUL(sy1_i, kl));
+        fr2[first + mid] = ADD(fr2[first + mid], MUL(sy2_r, kl));
+        fi2[first + mid] = ADD(fi2[first + mid], MUL(sy2_i, kl));
+        fr1[first + mid + 1] = ADD(fr1[first + mid + 1], MUL(sy1_r, kr));
+        fi1[first + mid + 1] = ADD(fi1[first + mid + 1], MUL(sy1_i, kr));
+        fr2[first + mid + 1] = ADD(fr2[first + mid + 1], MUL(sy2_r, kr));
+        fi2[first + mid + 1] = ADD(fi2[first + mid + 1], MUL(sy2_i, kr));
+        return;
+    }
+
+    if (rem >= V) {
+        INTERNAL_VEC k_odd = LOAD_VEC(&coeffs[mid]);
+        INTERNAL_VEC k_even = LOAD_VEC(&coeffs[(size_t)stride + (size_t)mid]);
+        for (int k = 2; k < nc; k += 2) {
+            k_odd = ADD(MUL(k_odd, v_u2), LOAD_VEC(&coeffs[(size_t)k * (size_t)stride + (size_t)mid]));
+            k_even = ADD(MUL(k_even, v_u2), LOAD_VEC(&coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)mid]));
+        }
+        INTERNAL_VEC u_odd = MUL(v_u, k_odd);
+        INTERNAL_VEC kl = ADD(k_even, u_odd);
+        PFX(scatter_vec_u)(fr1, fi1, first + mid, v_sy1_r, v_sy1_i, kl);
+        PFX(scatter_vec_u)(fr2, fi2, first + mid, v_sy2_r, v_sy2_i, kl);
+        if (rem > V) {
+            INTERNAL_VEC v_sym = SUB(k_even, u_odd);
+            int tail = rem - V;
+            for (int t = 0; t < tail; ++t) {
+                FLOAT kt = FCAST(v_sym[t]);
+                int idx = first + w - mid - 1 - t;
+                fr1[idx] = ADD(fr1[idx], MUL(sy1_r, kt));
+                fi1[idx] = ADD(fi1[idx], MUL(sy1_i, kt));
+                fr2[idx] = ADD(fr2[idx], MUL(sy2_r, kt));
+                fi2[idx] = ADD(fi2[idx], MUL(sy2_i, kt));
+            }
+        }
+        return;
+    }
+
+    FLOAT u2 = MUL(u, u);
+    for (int j = 0; j < rem / 2; ++j) {
+        int col = mid + j;
+        FLOAT ko = coeffs[col];
+        FLOAT ke = coeffs[(size_t)stride + (size_t)col];
+        for (int k = 2; k < nc; k += 2) {
+            ko = ADD(MUL(ko, u2), coeffs[(size_t)k * (size_t)stride + (size_t)col]);
+            ke = ADD(MUL(ke, u2), coeffs[(size_t)(k + 1) * (size_t)stride + (size_t)col]);
+        }
+        FLOAT uo = MUL(u, ko);
+        FLOAT kl = ADD(ke, uo);
+        FLOAT kr = SUB(ke, uo);
+        int idx_l = first + col;
+        int idx_r = first + w - 1 - col;
+        fr1[idx_l] = ADD(fr1[idx_l], MUL(sy1_r, kl));
+        fi1[idx_l] = ADD(fi1[idx_l], MUL(sy1_i, kl));
+        fr2[idx_l] = ADD(fr2[idx_l], MUL(sy2_r, kl));
+        fi2[idx_l] = ADD(fi2[idx_l], MUL(sy2_i, kl));
+        fr1[idx_r] = ADD(fr1[idx_r], MUL(sy1_r, kr));
+        fi1[idx_r] = ADD(fi1[idx_r], MUL(sy1_i, kr));
+        fr2[idx_r] = ADD(fr2[idx_r], MUL(sy2_r, kr));
+        fi2[idx_r] = ADD(fi2[idx_r], MUL(sy2_i, kr));
+    }
+    if (rem & 1) {
+        int col = mid + rem / 2;
+        FLOAT ke = coeffs[(size_t)stride + (size_t)col];
+        for (int k = 3; k < nc; k += 2) ke = ADD(MUL(ke, u2), coeffs[(size_t)k * (size_t)stride + (size_t)col]);
+        fr1[first + col] = ADD(fr1[first + col], MUL(sy1_r, ke));
+        fi1[first + col] = ADD(fi1[first + col], MUL(sy1_i, ke));
+        fr2[first + col] = ADD(fr2[first + col], MUL(sy2_r, ke));
+        fi2[first + col] = ADD(fi2[first + col], MUL(sy2_i, ke));
     }
 }
 
@@ -2836,6 +2979,34 @@ const float *PFX(pswf_slot_deconv_f32)(struct PFX(pswf_plan) * plan) {
 }
 #endif
 
+static void PFX(pswf_finish_fft_mode)(struct PFX(pswf_plan) * plan, FLOAT *fr, FLOAT *fi, FLOAT *out_real, FLOAT *out_imag, int mode) {
+    for (int i = 0; i < plan->spread_pad; ++i) {
+        int src = plan->Nfft + i;
+        int dst = i % plan->Nfft;
+        fr[dst] = ADD(fr[dst], fr[src]);
+        fi[dst] = ADD(fi[dst], fi[src]);
+    }
+
+    if (mode == TLS_NUFFT_OUT_SLOTS || mode == TLS_NUFFT_OUT_SLOTS_RAW) PFX(pswf_ensure_slot_tables)(plan);
+    if ((mode == TLS_NUFFT_OUT_SLOTS || mode == TLS_NUFFT_OUT_SLOTS_RAW) && plan->period > 0) {
+        NANOFFT_EXECUTE_RAW(plan->nanofft_p, fr, fi);
+        if (mode == TLS_NUFFT_OUT_SLOTS_RAW)
+            PFX(pswf_emit_slots_raw)(plan, fr, fi, out_real, out_imag);
+        else
+            PFX(pswf_emit_slots)(plan, fr, fi, out_real, out_imag);
+        return;
+    }
+
+    NANOFFT_EXECUTE(plan->nanofft_p, fr, fi);
+
+    for (int k = 0; k < plan->Nout; ++k) {
+        int k_prime = k - plan->output_shift;
+        int fft_idx = k_prime >= 0 ? k_prime : plan->Nfft + k_prime;
+        out_real[k] = MUL(fr[fft_idx], plan->deconv[k]);
+        out_imag[k] = MUL(fi[fft_idx], plan->deconv[k]);
+    }
+}
+
 void PFX(pswf_execute_mode)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const FLOAT *y_imag, FLOAT *out_real, FLOAT *out_imag, int freq_factor,
                             int mode) {
     int f_idx = freq_factor - 1;
@@ -2905,30 +3076,133 @@ void PFX(pswf_execute_mode)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, c
         }
     }
 
+    PFX(pswf_finish_fft_mode)(plan, plan->fft_real, plan->fft_imag, out_real, out_imag, mode);
+}
+
+void PFX(pswf_execute_mode_pair)(struct PFX(pswf_plan) * plan, const FLOAT *y1_real, const FLOAT *y1_imag, const FLOAT *y2_real, const FLOAT *y2_imag,
+                                 FLOAT *out1_real, FLOAT *out1_imag, FLOAT *out2_real, FLOAT *out2_imag, int freq_factor, int mode) {
+    int f_idx = freq_factor - 1;
+    if (f_idx < 0 || f_idx >= plan->num_factors) return;
+
+    if (!plan->fft_real2 || !plan->fft_imag2) {
+        if (!plan->fft_real2) plan->fft_real2 = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
+        if (!plan->fft_imag2) plan->fft_imag2 = PFX(allocate_aligned)((size_t)plan->fft_alloc_len);
+        if (!plan->fft_real2 || !plan->fft_imag2) {
+            PFX(pswf_execute_mode)(plan, y1_real, y1_imag, out1_real, out1_imag, freq_factor, mode);
+            PFX(pswf_execute_mode)(plan, y2_real, y2_imag, out2_real, out2_imag, freq_factor, mode);
+            return;
+        }
+    }
+
+    size_t offset_shift = (size_t)f_idx * plan->Mpoints;
+    size_t offset_base = (size_t)f_idx * plan->Mpoints;
+    const FLOAT *current_shift_r = plan->shift_r + offset_shift;
+    const FLOAT *current_shift_i = plan->shift_i + offset_shift;
+
+    FLOAT *NANOFFT_RESTRICT fr1 = plan->fft_real;
+    FLOAT *NANOFFT_RESTRICT fi1 = plan->fft_imag;
+    FLOAT *NANOFFT_RESTRICT fr2 = plan->fft_real2;
+    FLOAT *NANOFFT_RESTRICT fi2 = plan->fft_imag2;
+    memset(fr1, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
+    memset(fi1, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
+    memset(fr2, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
+    memset(fi2, 0, (size_t)plan->fft_alloc_len * sizeof(FLOAT));
+
+#if !defined(DOUBLE_DOUBLE)
+    if (plan->use_ppoly) {
+        const int *current_first_idx = plan->spread_first_idx + offset_base;
+        const FLOAT *current_z = plan->spread_z + offset_base;
+        const FLOAT *coeffs = plan->ppoly_coeffs;
+        const int w = plan->w;
+        const int nc = plan->ppoly_nc;
+        const int stride = plan->ppoly_stride;
+
+        for (int m = 0; m < plan->Mpoints; ++m) {
+            FLOAT sr = current_shift_r[m], si = current_shift_i[m];
+            FLOAT y1r = y1_real[m], y1i = y1_imag[m];
+            FLOAT y2r = y2_real[m], y2i = y2_imag[m];
+            FLOAT sy1_r = SUB(MUL(y1r, sr), MUL(y1i, si));
+            FLOAT sy1_i = ADD(MUL(y1r, si), MUL(y1i, sr));
+            FLOAT sy2_r = SUB(MUL(y2r, sr), MUL(y2i, si));
+            FLOAT sy2_i = ADD(MUL(y2r, si), MUL(y2i, sr));
+            PFX(ppoly_spread_point_pair)(fr1, fi1, fr2, fi2, coeffs, current_first_idx[m], current_z[m], sy1_r, sy1_i, sy2_r, sy2_i, w, nc, stride);
+        }
+    } else
+#endif
+    {
+        size_t offset_spread = offset_base * plan->spread_stride;
+        const int *current_spread_base_idx = plan->spread_base_idx + offset_base;
+        const FLOAT *current_spread_weight = plan->spread_weight + offset_spread;
+
+        for (int m = 0; m < plan->Mpoints; ++m) {
+            FLOAT sr = current_shift_r[m], si = current_shift_i[m];
+            FLOAT y1r = y1_real[m], y1i = y1_imag[m];
+            FLOAT y2r = y2_real[m], y2i = y2_imag[m];
+            FLOAT sy1_r = SUB(MUL(y1r, sr), MUL(y1i, si));
+            FLOAT sy1_i = ADD(MUL(y1r, si), MUL(y1i, sr));
+            FLOAT sy2_r = SUB(MUL(y2r, sr), MUL(y2i, si));
+            FLOAT sy2_i = ADD(MUL(y2r, si), MUL(y2i, sr));
+            int base = current_spread_base_idx[m];
+            size_t w_base = (size_t)m * plan->spread_stride;
+
+#if INTERNAL_VEC_LEN > 1
+            INTERNAL_VEC v_sy1_r = IVEC_SPLAT(sy1_r);
+            INTERNAL_VEC v_sy1_i = IVEC_SPLAT(sy1_i);
+            INTERNAL_VEC v_sy2_r = IVEC_SPLAT(sy2_r);
+            INTERNAL_VEC v_sy2_i = IVEC_SPLAT(sy2_i);
+
+            for (int l = 0; l < plan->spread_stride; l += INTERNAL_VEC_LEN) {
+                int idx = base + l;
+                INTERNAL_VEC kval = LOAD_VEC(&current_spread_weight[w_base + l]);
+                STORE_VEC(&fr1[idx], ADD(LOAD_VEC(&fr1[idx]), MUL(v_sy1_r, kval)));
+                STORE_VEC(&fi1[idx], ADD(LOAD_VEC(&fi1[idx]), MUL(v_sy1_i, kval)));
+                STORE_VEC(&fr2[idx], ADD(LOAD_VEC(&fr2[idx]), MUL(v_sy2_r, kval)));
+                STORE_VEC(&fi2[idx], ADD(LOAD_VEC(&fi2[idx]), MUL(v_sy2_i, kval)));
+            }
+#else
+            for (int l = 0; l < plan->spread_stride; ++l) {
+                int idx = base + l;
+                FLOAT kval = current_spread_weight[w_base + l];
+                fr1[idx] = ADD(fr1[idx], MUL(sy1_r, kval));
+                fi1[idx] = ADD(fi1[idx], MUL(sy1_i, kval));
+                fr2[idx] = ADD(fr2[idx], MUL(sy2_r, kval));
+                fi2[idx] = ADD(fi2[idx], MUL(sy2_i, kval));
+            }
+#endif
+        }
+    }
+
+    PFX(pswf_finish_fft_mode)(plan, fr1, fi1, out1_real, out1_imag, mode);
+    PFX(pswf_finish_fft_mode)(plan, fr2, fi2, out2_real, out2_imag, mode);
+}
+
+static void PFX(pswf_finish_fft_breadth)(struct PFX(pswf_plan) * plan, BREADTH_VEC *fr, BREADTH_VEC *fi, BREADTH_VEC *out_real, BREADTH_VEC *out_imag,
+                                         int mode) {
     for (int i = 0; i < plan->spread_pad; ++i) {
-        int src = plan->Nfft + i;
-        int dst = i % plan->Nfft;
-        plan->fft_real[dst] = ADD(plan->fft_real[dst], plan->fft_real[src]);
-        plan->fft_imag[dst] = ADD(plan->fft_imag[dst], plan->fft_imag[src]);
+        const int src = plan->Nfft + i;
+        const int dst = i % plan->Nfft;
+        STORE_BVEC(&fr[dst], BREADTH_ADD(LOAD_BVEC(&fr[dst]), LOAD_BVEC(&fr[src])));
+        STORE_BVEC(&fi[dst], BREADTH_ADD(LOAD_BVEC(&fi[dst]), LOAD_BVEC(&fi[src])));
     }
 
     if (mode == TLS_NUFFT_OUT_SLOTS || mode == TLS_NUFFT_OUT_SLOTS_RAW) PFX(pswf_ensure_slot_tables)(plan);
     if ((mode == TLS_NUFFT_OUT_SLOTS || mode == TLS_NUFFT_OUT_SLOTS_RAW) && plan->period > 0) {
-        NANOFFT_EXECUTE_RAW(plan->nanofft_p, plan->fft_real, plan->fft_imag);
+        NANOFFT_EXECUTE_RAW_BREADTH(plan->nanofft_p, fr, fi);
         if (mode == TLS_NUFFT_OUT_SLOTS_RAW)
-            PFX(pswf_emit_slots_raw)(plan, plan->fft_real, plan->fft_imag, out_real, out_imag);
+            PFX(pswf_emit_slots_raw_breadth)(plan, fr, fi, out_real, out_imag);
         else
-            PFX(pswf_emit_slots)(plan, plan->fft_real, plan->fft_imag, out_real, out_imag);
+            PFX(pswf_emit_slots_breadth)(plan, fr, fi, out_real, out_imag);
         return;
     }
 
-    NANOFFT_EXECUTE(plan->nanofft_p, plan->fft_real, plan->fft_imag);
+    NANOFFT_EXECUTE_BREADTH(plan->nanofft_p, fr, fi);
 
     for (int k = 0; k < plan->Nout; ++k) {
-        int k_prime = k - plan->output_shift;
-        int fft_idx = k_prime >= 0 ? k_prime : plan->Nfft + k_prime;
-        out_real[k] = MUL(plan->fft_real[fft_idx], plan->deconv[k]);
-        out_imag[k] = MUL(plan->fft_imag[fft_idx], plan->deconv[k]);
+        const int k_prime = k - plan->output_shift;
+        const int fft_idx = k_prime >= 0 ? k_prime : plan->Nfft + k_prime;
+        const FLOAT d = plan->deconv[k];
+        STORE_BVEC(&out_real[k], BREADTH_MUL_S(LOAD_BVEC(&fr[fft_idx]), d));
+        STORE_BVEC(&out_imag[k], BREADTH_MUL_S(LOAD_BVEC(&fi[fft_idx]), d));
     }
 }
 
@@ -3044,32 +3318,145 @@ void PFX(pswf_execute_breadth)(struct PFX(pswf_plan) * plan, const nufft_input_t
         }
     }
 
-    for (int i = 0; i < plan->spread_pad; ++i) {
-        const int src = plan->Nfft + i;
-        const int dst = i % plan->Nfft;
-        STORE_BVEC(&fr[dst], BREADTH_ADD(LOAD_BVEC(&fr[dst]), LOAD_BVEC(&fr[src])));
-        STORE_BVEC(&fi[dst], BREADTH_ADD(LOAD_BVEC(&fi[dst]), LOAD_BVEC(&fi[src])));
+    PFX(pswf_finish_fft_breadth)(plan, fr, fi, out_real, out_imag, mode);
+}
+
+void PFX(pswf_execute_breadth_pair)(struct PFX(pswf_plan) * plan, const nufft_input_t *x, const FLOAT *val1, const FLOAT *val2, double f0, int block,
+                                    int block_base, int freq_factor, int mode, BREADTH_VEC *out1_real, BREADTH_VEC *out1_imag, BREADTH_VEC *out2_real,
+                                    BREADTH_VEC *out2_imag) {
+    int f_idx = freq_factor - 1;
+    if (!plan || !plan->is_breadth || f_idx < 0 || f_idx >= plan->num_factors) return;
+
+    if (!plan->bfft_real2 || !plan->bfft_imag2) {
+        if (!plan->bfft_real2) plan->bfft_real2 = PFX(allocate_aligned_bvec)((size_t)plan->fft_alloc_len);
+        if (!plan->bfft_imag2) plan->bfft_imag2 = PFX(allocate_aligned_bvec)((size_t)plan->fft_alloc_len);
+        if (!plan->bfft_real2 || !plan->bfft_imag2) {
+            PFX(pswf_execute_breadth)(plan, x, val1, f0, block, block_base, freq_factor, mode, out1_real, out1_imag);
+            PFX(pswf_execute_breadth)(plan, x, val2, f0, block, block_base, freq_factor, mode, out2_real, out2_imag);
+            return;
+        }
     }
 
-    if (mode == TLS_NUFFT_OUT_SLOTS || mode == TLS_NUFFT_OUT_SLOTS_RAW) PFX(pswf_ensure_slot_tables)(plan);
-    if ((mode == TLS_NUFFT_OUT_SLOTS || mode == TLS_NUFFT_OUT_SLOTS_RAW) && plan->period > 0) {
-        NANOFFT_EXECUTE_RAW_BREADTH(plan->nanofft_p, fr, fi);
-        if (mode == TLS_NUFFT_OUT_SLOTS_RAW)
-            PFX(pswf_emit_slots_raw_breadth)(plan, fr, fi, out_real, out_imag);
-        else
-            PFX(pswf_emit_slots_breadth)(plan, fr, fi, out_real, out_imag);
-        return;
+    const size_t offset_base = (size_t)f_idx * (size_t)plan->Mpoints;
+    BREADTH_VEC *NANOFFT_RESTRICT fr1 = plan->bfft_real;
+    BREADTH_VEC *NANOFFT_RESTRICT fi1 = plan->bfft_imag;
+    BREADTH_VEC *NANOFFT_RESTRICT fr2 = plan->bfft_real2;
+    BREADTH_VEC *NANOFFT_RESTRICT fi2 = plan->bfft_imag2;
+    memset(fr1, 0, (size_t)plan->fft_alloc_len * sizeof(BREADTH_VEC));
+    memset(fi1, 0, (size_t)plan->fft_alloc_len * sizeof(BREADTH_VEC));
+    memset(fr2, 0, (size_t)plan->fft_alloc_len * sizeof(BREADTH_VEC));
+    memset(fi2, 0, (size_t)plan->fft_alloc_len * sizeof(BREADTH_VEC));
+
+#if defined(DOUBLE_DOUBLE)
+    VEC f_hi, f_lo;
+    const dd_t d_f0 = dd_make(f0, 0.0);
+    const dd_t d_df = dd_make(plan->df, 0.0);
+    const dd_t d_q = dd_make((double)freq_factor, 0.0);
+    const dd_t d_shift = dd_make((double)plan->output_shift, 0.0);
+    for (int v = 0; v < VECDD_LEN; ++v) {
+        dd_t k_idx = dd_add(dd_mul(dd_make((double)(block_base + v), 0.0), dd_make((double)block, 0.0)), d_shift);
+        dd_t fv = dd_mul(d_q, dd_add(d_f0, dd_mul(k_idx, d_df)));
+        f_hi[v] = fv.hi;
+        f_lo[v] = fv.lo;
+    }
+    const VECDD v_freq = vecdd_make(f_hi, f_lo);
+#elif defined(DOUBLE)
+    VEC v_freq;
+    for (int v = 0; v < VEC_LEN; ++v) {
+        v_freq[v] = (double)freq_factor * (f0 + ((double)(block_base + v) * (double)block + (double)plan->output_shift) * plan->df);
+    }
+#elif defined(HALF) && NANOFFT_NATIVE_FP16
+    VEC v_freq[VECH_LEN / VEC_LEN];
+    for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) {
+        for (int v = 0; v < VEC_LEN; ++v) {
+            v_freq[ch][v] = (double)freq_factor * (f0 + ((double)(block_base + ch * VEC_LEN + v) * (double)block + (double)plan->output_shift) * plan->df);
+        }
+    }
+#else
+    VEC v_freq_lo, v_freq_hi;
+    for (int v = 0; v < VEC_LEN; ++v) {
+        v_freq_lo[v] = (double)freq_factor * (f0 + ((double)(block_base + v) * (double)block + (double)plan->output_shift) * plan->df);
+        v_freq_hi[v] = (double)freq_factor * (f0 + ((double)(block_base + VEC_LEN + v) * (double)block + (double)plan->output_shift) * plan->df);
+    }
+#endif
+
+    const int w = plan->w;
+    const int *current_first_idx = plan->spread_first_idx + offset_base;
+
+#if !defined(DOUBLE_DOUBLE)
+    if (plan->use_ppoly) {
+        const FLOAT *current_z = plan->spread_z + offset_base;
+        const FLOAT *coeffs = plan->ppoly_coeffs;
+        const int nc = plan->ppoly_nc;
+        const int stride = plan->ppoly_stride;
+        FLOAT kval[64] __attribute__((aligned(64)));
+
+        for (int m = 0; m < plan->Mpoints; ++m) {
+            BREADTH_COMPUTE_VEC c, s;
+#    if defined(DOUBLE)
+            vec_sincos2pi(((VEC){} + x[m]) * v_freq, &c, &s);
+#    elif defined(HALF) && NANOFFT_NATIVE_FP16
+            const VEC xm_v = (VEC){} + x[m];
+            VEC ang[VECH_LEN / VEC_LEN];
+            for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) ang[ch] = xm_v * v_freq[ch];
+            vech_sincos2pi_d(ang, &c, &s);
+#    else
+            const VEC xm_v = (VEC){} + x[m];
+            vecf_sincos2pi_d(xm_v * v_freq_lo, xm_v * v_freq_hi, &c, &s);
+#    endif
+            const BREADTH_COMPUTE_VEC sy1_r = BREADTH_MUL_S(c, val1[m]);
+            const BREADTH_COMPUTE_VEC sy1_i = BREADTH_MUL_S(s, val1[m]);
+            const BREADTH_COMPUTE_VEC sy2_r = BREADTH_MUL_S(c, val2[m]);
+            const BREADTH_COMPUTE_VEC sy2_i = BREADTH_MUL_S(s, val2[m]);
+            const int first = current_first_idx[m];
+            PFX(ppoly_eval_weights)(kval, coeffs, current_z[m], w, nc, stride);
+            for (int l = 0; l < w; ++l) {
+                const int idx = first + l;
+                const FLOAT kv = kval[l];
+                STORE_BVEC(&fr1[idx], BREADTH_ADD(LOAD_BVEC(&fr1[idx]), BREADTH_MUL_S(sy1_r, kv)));
+                STORE_BVEC(&fi1[idx], BREADTH_ADD(LOAD_BVEC(&fi1[idx]), BREADTH_MUL_S(sy1_i, kv)));
+                STORE_BVEC(&fr2[idx], BREADTH_ADD(LOAD_BVEC(&fr2[idx]), BREADTH_MUL_S(sy2_r, kv)));
+                STORE_BVEC(&fi2[idx], BREADTH_ADD(LOAD_BVEC(&fi2[idx]), BREADTH_MUL_S(sy2_i, kv)));
+            }
+        }
+    } else
+#endif
+    {
+        const FLOAT *current_spread_weight = plan->spread_weight + offset_base * (size_t)w;
+        for (int m = 0; m < plan->Mpoints; ++m) {
+            BREADTH_COMPUTE_VEC c, s;
+#if defined(DOUBLE_DOUBLE)
+            vecdd_sincos2pi(vecdd_mul(vecdd_splat(x[m]), v_freq), &c, &s);
+#elif defined(DOUBLE)
+            vec_sincos2pi(((VEC){} + x[m]) * v_freq, &c, &s);
+#elif defined(HALF) && NANOFFT_NATIVE_FP16
+            const VEC xm_v = (VEC){} + x[m];
+            VEC ang[VECH_LEN / VEC_LEN];
+            for (int ch = 0; ch < (VECH_LEN / VEC_LEN); ++ch) ang[ch] = xm_v * v_freq[ch];
+            vech_sincos2pi_d(ang, &c, &s);
+#else
+            const VEC xm_v = (VEC){} + x[m];
+            vecf_sincos2pi_d(xm_v * v_freq_lo, xm_v * v_freq_hi, &c, &s);
+#endif
+            const BREADTH_COMPUTE_VEC sy1_r = BREADTH_MUL_S(c, val1[m]);
+            const BREADTH_COMPUTE_VEC sy1_i = BREADTH_MUL_S(s, val1[m]);
+            const BREADTH_COMPUTE_VEC sy2_r = BREADTH_MUL_S(c, val2[m]);
+            const BREADTH_COMPUTE_VEC sy2_i = BREADTH_MUL_S(s, val2[m]);
+            const int first = current_first_idx[m];
+            const FLOAT *kw = current_spread_weight + (size_t)m * (size_t)w;
+            for (int l = 0; l < w; ++l) {
+                const int idx = first + l;
+                const FLOAT kv = kw[l];
+                STORE_BVEC(&fr1[idx], BREADTH_ADD(LOAD_BVEC(&fr1[idx]), BREADTH_MUL_S(sy1_r, kv)));
+                STORE_BVEC(&fi1[idx], BREADTH_ADD(LOAD_BVEC(&fi1[idx]), BREADTH_MUL_S(sy1_i, kv)));
+                STORE_BVEC(&fr2[idx], BREADTH_ADD(LOAD_BVEC(&fr2[idx]), BREADTH_MUL_S(sy2_r, kv)));
+                STORE_BVEC(&fi2[idx], BREADTH_ADD(LOAD_BVEC(&fi2[idx]), BREADTH_MUL_S(sy2_i, kv)));
+            }
+        }
     }
 
-    NANOFFT_EXECUTE_BREADTH(plan->nanofft_p, fr, fi);
-
-    for (int k = 0; k < plan->Nout; ++k) {
-        const int k_prime = k - plan->output_shift;
-        const int fft_idx = k_prime >= 0 ? k_prime : plan->Nfft + k_prime;
-        const FLOAT d = plan->deconv[k];
-        STORE_BVEC(&out_real[k], BREADTH_MUL_S(LOAD_BVEC(&fr[fft_idx]), d));
-        STORE_BVEC(&out_imag[k], BREADTH_MUL_S(LOAD_BVEC(&fi[fft_idx]), d));
-    }
+    PFX(pswf_finish_fft_breadth)(plan, fr1, fi1, out1_real, out1_imag, mode);
+    PFX(pswf_finish_fft_breadth)(plan, fr2, fi2, out2_real, out2_imag, mode);
 }
 
 void PFX(pswf_execute)(struct PFX(pswf_plan) * plan, const FLOAT *y_real, const FLOAT *y_imag, FLOAT *out_real, FLOAT *out_imag, int freq_factor) {
@@ -3088,6 +3475,8 @@ void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     nanofft_aligned_free(plan->shift_i);
     nanofft_aligned_free(plan->fft_real);
     nanofft_aligned_free(plan->fft_imag);
+    nanofft_aligned_free(plan->fft_real2);
+    nanofft_aligned_free(plan->fft_imag2);
     nanofft_aligned_free(plan->slot_deconv);
 #if defined(HALF)
     nanofft_aligned_free(plan->deconv_f32);
@@ -3102,6 +3491,8 @@ void PFX(free_pswf_plan)(struct PFX(pswf_plan) * plan) {
     nanofft_aligned_free(plan->perm_scratch);
     nanofft_aligned_free(plan->bfft_real);
     nanofft_aligned_free(plan->bfft_imag);
+    nanofft_aligned_free(plan->bfft_real2);
+    nanofft_aligned_free(plan->bfft_imag2);
     nanofft_aligned_free(plan->bperm_scratch);
     if (plan->nanofft_p) NANOFFT_DESTROY_PLAN(plan->nanofft_p);
     nanofft_aligned_free(plan);

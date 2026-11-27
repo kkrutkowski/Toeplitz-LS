@@ -36,8 +36,14 @@ enum {
                                                                int vec_mode);                                                                                  \
     export_attr void prefix##_nufft_pswf_execute_mode(plan_type *plan, const type *y_real, const type *y_imag, type *out_real, type *out_imag,                 \
                                                       int freq_factor, int mode);                                                                              \
+    export_attr void prefix##_nufft_pswf_execute_mode_pair(plan_type *plan, const type *y1_real, const type *y1_imag, const type *y2_real,                     \
+                                                           const type *y2_imag, type *out1_real, type *out1_imag, type *out2_real, type *out2_imag,            \
+                                                           int freq_factor, int mode);                                                                         \
     export_attr void prefix##_nufft_pswf_execute_breadth(plan_type *plan, const input_type *x, const type *val, double f0, int block, int block_base,          \
                                                          int freq_factor, int mode, bvec_type *out_real, bvec_type *out_imag);                                 \
+    export_attr void prefix##_nufft_pswf_execute_breadth_pair(plan_type *plan, const input_type *x, const type *val1, const type *val2, double f0, int block,  \
+                                                              int block_base, int freq_factor, int mode, bvec_type *out1_real, bvec_type *out1_imag,           \
+                                                              bvec_type *out2_real, bvec_type *out2_imag);                                                     \
     export_attr int prefix##_nufft_pswf_slots_available(plan_type *plan);                                                                                      \
     export_attr const type *prefix##_nufft_pswf_slot_phi_hat(plan_type *plan);                                                                                 \
     export_attr const type *prefix##_nufft_pswf_slot_deconv(plan_type *plan);                                                                                  \

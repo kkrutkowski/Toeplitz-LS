@@ -340,6 +340,8 @@ typedef BREADTH_VEC OUT_BVEC;
 /* Slot-order NuFFT output (deferred bit reversal) and the tuning switch,
  * both resolved through the precision prefix. */
 #define NUFFT_PSWF_EXEC_MODE CHI2_PREFIX(nufft_pswf_execute_mode)
+#define NUFFT_PSWF_EXEC_MODE_PAIR CHI2_PREFIX(nufft_pswf_execute_mode_pair)
+#define NUFFT_PSWF_EXEC_BREADTH_PAIR CHI2_PREFIX(nufft_pswf_execute_breadth_pair)
 #define NUFFT_PSWF_FINISH_SLOTS CHI2_PREFIX(nufft_pswf_finish_slots)
 #define NUFFT_PSWF_SLOTS_AVAILABLE CHI2_PREFIX(nufft_pswf_slots_available)
 #define NUFFT_PSWF_SLOT_PHI_HAT CHI2_PREFIX(nufft_pswf_slot_phi_hat)
@@ -956,6 +958,20 @@ static int execute_nufft_block(void *plan, int backend, const FLOAT *src_r, cons
     return CHI2PER_OK;
 }
 
+static int execute_nufft_block_pair(void *plan, int backend, const FLOAT *src1_r, const FLOAT *src1_i, const FLOAT *src2_r, const FLOAT *src2_i, FLOAT *out1_r,
+                                    FLOAT *out1_i, FLOAT *out2_r, FLOAT *out2_i, int freq_factor, int mode) {
+    if (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21) {
+        NUFFT_PSWF_EXEC_MODE_PAIR((PSWF_PLAN_T *)plan, src1_r, src1_i, src2_r, src2_i, out1_r, out1_i, out2_r, out2_i, freq_factor, mode);
+    } else if (backend == CHI2PER_BACKEND_LRA) {
+        (void)mode;
+        NUFFT_LRA_EXEC((const LRA_PLAN_T *)plan, src1_r, src1_i, out1_r, out1_i, freq_factor);
+        NUFFT_LRA_EXEC((const LRA_PLAN_T *)plan, src2_r, src2_i, out2_r, out2_i, freq_factor);
+    } else {
+        return CHI2PER_ERR_BACKEND;
+    }
+    return CHI2PER_OK;
+}
+
 static int execute_nufft_breadth(void *plan, int backend, const NUFFT_INPUT_T *x, const FLOAT *val, double f0, int block, int block_base, int freq_factor,
                                  int mode, BREADTH_VEC *out_r, BREADTH_VEC *out_i) {
     if (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21) {
@@ -963,6 +979,21 @@ static int execute_nufft_breadth(void *plan, int backend, const NUFFT_INPUT_T *x
     } else if (backend == CHI2PER_BACKEND_LRA) {
         (void)mode;
         NUFFT_LRA_EXEC_BREADTH((const LRA_PLAN_T *)plan, x, val, f0, block, block_base, freq_factor, out_r, out_i);
+    } else {
+        return CHI2PER_ERR_BACKEND;
+    }
+    return CHI2PER_OK;
+}
+
+static int execute_nufft_breadth_pair(void *plan, int backend, const NUFFT_INPUT_T *x, const FLOAT *val1, const FLOAT *val2, double f0, int block,
+                                      int block_base, int freq_factor, int mode, BREADTH_VEC *out1_r, BREADTH_VEC *out1_i, BREADTH_VEC *out2_r,
+                                      BREADTH_VEC *out2_i) {
+    if (backend == CHI2PER_BACKEND_PSWF43 || backend == CHI2PER_BACKEND_PSWF21) {
+        NUFFT_PSWF_EXEC_BREADTH_PAIR((PSWF_PLAN_T *)plan, x, val1, val2, f0, block, block_base, freq_factor, mode, out1_r, out1_i, out2_r, out2_i);
+    } else if (backend == CHI2PER_BACKEND_LRA) {
+        (void)mode;
+        NUFFT_LRA_EXEC_BREADTH((const LRA_PLAN_T *)plan, x, val1, f0, block, block_base, freq_factor, out1_r, out1_i);
+        NUFFT_LRA_EXEC_BREADTH((const LRA_PLAN_T *)plan, x, val2, f0, block, block_base, freq_factor, out2_r, out2_i);
     } else {
         return CHI2PER_ERR_BACKEND;
     }
@@ -2782,26 +2813,29 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
             for (int q = 1; q <= max_factor; ++q) {
                 BREADTH_VEC *cw_q = rows_b.Cw + (size_t)q * (size_t)block;
                 BREADTH_VEC *sw_q = rows_b.Sw + (size_t)q * (size_t)block;
-                status = execute_nufft_breadth(plan, backend, x, w, f0, block, (int)block_base, q, mode, cw_q, sw_q);
-                if (status != CHI2PER_OK) goto cleanup;
-#if defined(HALF)
-                if (!merge_row_scale) {
-                    for (int k = 0; k < block; ++k) {
-                        STORE_BVEC(&cw_q[k], BREADTH_MUL(LOAD_BVEC(&cw_q[k]), v_rscale));
-                        STORE_BVEC(&sw_q[k], BREADTH_MUL(LOAD_BVEC(&sw_q[k]), v_rscale));
-                    }
-                }
-#endif
                 if (q <= degree) {
                     BREADTH_VEC *cyw_q = rows_b.Cyw + (size_t)q * (size_t)block;
                     BREADTH_VEC *syw_q = rows_b.Syw + (size_t)q * (size_t)block;
-                    status = execute_nufft_breadth(plan, backend, x, yw, f0, block, (int)block_base, q, mode, cyw_q, syw_q);
+                    status = execute_nufft_breadth_pair(plan, backend, x, w, yw, f0, block, (int)block_base, q, mode, cw_q, sw_q, cyw_q, syw_q);
                     if (status != CHI2PER_OK) goto cleanup;
 #if defined(HALF)
                     if (!merge_row_scale) {
                         for (int k = 0; k < block; ++k) {
+                            STORE_BVEC(&cw_q[k], BREADTH_MUL(LOAD_BVEC(&cw_q[k]), v_rscale));
+                            STORE_BVEC(&sw_q[k], BREADTH_MUL(LOAD_BVEC(&sw_q[k]), v_rscale));
                             STORE_BVEC(&cyw_q[k], BREADTH_MUL(LOAD_BVEC(&cyw_q[k]), v_rscale));
                             STORE_BVEC(&syw_q[k], BREADTH_MUL(LOAD_BVEC(&syw_q[k]), v_rscale));
+                        }
+                    }
+#endif
+                } else {
+                    status = execute_nufft_breadth(plan, backend, x, w, f0, block, (int)block_base, q, mode, cw_q, sw_q);
+                    if (status != CHI2PER_OK) goto cleanup;
+#if defined(HALF)
+                    if (!merge_row_scale) {
+                        for (int k = 0; k < block; ++k) {
+                            STORE_BVEC(&cw_q[k], BREADTH_MUL(LOAD_BVEC(&cw_q[k]), v_rscale));
+                            STORE_BVEC(&sw_q[k], BREADTH_MUL(LOAD_BVEC(&sw_q[k]), v_rscale));
                         }
                     }
 #endif
@@ -2895,42 +2929,34 @@ int CHI2_PREFIX(fastchi2_opts)(const TIME_INPUT_T *t, const FLOAT *y, const FLOA
 
         for (int q = 1; q <= max_factor; ++q) {
             const size_t src_off = (size_t)(q - 1) * (size_t)ladder_levels * (size_t)M;
-            status = execute_nufft_block(plan, backend, ladder.srcw_r + src_off, ladder.srcw_i + src_off, out_r, out_i, q, mode);
-            if (status != CHI2PER_OK) goto cleanup;
-#if defined(HALF)
-            if (merge_row_scale) {
-                memcpy(rows.Cw + (size_t)q * (size_t)rows.stride, out_r, (size_t)count * sizeof(FLOAT));
-                memcpy(rows.Sw + (size_t)q * (size_t)rows.stride, out_i, (size_t)count * sizeof(FLOAT));
-            } else {
-                FLOAT *cw_q = rows.Cw + (size_t)q * (size_t)rows.stride;
-                FLOAT *sw_q = rows.Sw + (size_t)q * (size_t)rows.stride;
-                for (int k = 0; k < count; ++k) {
-                    cw_q[k] = MUL(out_r[k], row_scale);
-                    sw_q[k] = MUL(out_i[k], row_scale);
-                }
-            }
-#else
-            memcpy(rows.Cw + (size_t)q * (size_t)rows.stride, out_r, (size_t)count * sizeof(FLOAT));
-            memcpy(rows.Sw + (size_t)q * (size_t)rows.stride, out_i, (size_t)count * sizeof(FLOAT));
-#endif
+            FLOAT *cw_q = rows.Cw + (size_t)q * (size_t)rows.stride;
+            FLOAT *sw_q = rows.Sw + (size_t)q * (size_t)rows.stride;
             if (q <= degree && ladder.srcy_r) {
-                status = execute_nufft_block(plan, backend, ladder.srcy_r + src_off, ladder.srcy_i + src_off, out_r, out_i, q, mode);
+                FLOAT *cyw_q = rows.Cyw + (size_t)q * (size_t)rows.stride;
+                FLOAT *syw_q = rows.Syw + (size_t)q * (size_t)rows.stride;
+                status = execute_nufft_block_pair(plan, backend, ladder.srcw_r + src_off, ladder.srcw_i + src_off, ladder.srcy_r + src_off,
+                                                  ladder.srcy_i + src_off, cw_q, sw_q, cyw_q, syw_q, q, mode);
                 if (status != CHI2PER_OK) goto cleanup;
 #if defined(HALF)
-                if (merge_row_scale) {
-                    memcpy(rows.Cyw + (size_t)q * (size_t)rows.stride, out_r, (size_t)count * sizeof(FLOAT));
-                    memcpy(rows.Syw + (size_t)q * (size_t)rows.stride, out_i, (size_t)count * sizeof(FLOAT));
-                } else {
-                    FLOAT *cyw_q = rows.Cyw + (size_t)q * (size_t)rows.stride;
-                    FLOAT *syw_q = rows.Syw + (size_t)q * (size_t)rows.stride;
+                if (!merge_row_scale) {
                     for (int k = 0; k < count; ++k) {
-                        cyw_q[k] = MUL(out_r[k], row_scale);
-                        syw_q[k] = MUL(out_i[k], row_scale);
+                        cw_q[k] = MUL(cw_q[k], row_scale);
+                        sw_q[k] = MUL(sw_q[k], row_scale);
+                        cyw_q[k] = MUL(cyw_q[k], row_scale);
+                        syw_q[k] = MUL(syw_q[k], row_scale);
                     }
                 }
-#else
-                memcpy(rows.Cyw + (size_t)q * (size_t)rows.stride, out_r, (size_t)count * sizeof(FLOAT));
-                memcpy(rows.Syw + (size_t)q * (size_t)rows.stride, out_i, (size_t)count * sizeof(FLOAT));
+#endif
+            } else {
+                status = execute_nufft_block(plan, backend, ladder.srcw_r + src_off, ladder.srcw_i + src_off, cw_q, sw_q, q, mode);
+                if (status != CHI2PER_OK) goto cleanup;
+#if defined(HALF)
+                if (!merge_row_scale) {
+                    for (int k = 0; k < count; ++k) {
+                        cw_q[k] = MUL(cw_q[k], row_scale);
+                        sw_q[k] = MUL(sw_q[k], row_scale);
+                    }
+                }
 #endif
             }
         }
