@@ -30,10 +30,10 @@ typedef struct VkPipeKey {
 } VkPipeKey;
 
 typedef struct PipeCacheEntry {
-    uint64_t           hash;
-    VkPipeKey          key;
-    VkCompiledPipeline pipe;
-    bool               occupied;
+    uint64_t            hash;
+    VkPipeKey           key;
+    VkCompiledPipeline* pipe;
+    bool                occupied;
 } PipeCacheEntry;
 
 static uint64_t pipe_key_hash(const VkPipeKey* k) {
@@ -76,6 +76,7 @@ struct VkDeviceContext {
     VkDeviceDescriptor               desc;
     VkDeviceFftConfig                cfg;
     VkDevice                         device;
+    PFN_vkCmdPushDescriptorSetKHR    pfn_push_desc;
     VkPipelineCache                  pipeline_cache;
     char                             pipeline_cache_path[512];
     VkPhysicalDeviceMemoryProperties mem_props;
@@ -258,16 +259,18 @@ bool vk_batch_init(VkCmdBatch* b, VkDeviceContext* ctx, uint32_t queue_index) {
         return false;
     }
 
-    b->ds_cap = 2048;
-    VkDescriptorPoolSize psz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b->ds_cap * 12u};
-    VkDescriptorPoolCreateInfo dpci = {0};
-    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = b->ds_cap;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &psz;
-    if (vkCreateDescriptorPool(ctx->device, &dpci, nullptr, &b->ds_pool) != VK_SUCCESS) {
-        vk_batch_destroy(b);
-        return false;
+    if (!ctx->pfn_push_desc) {
+        b->ds_cap = 2048;
+        VkDescriptorPoolSize psz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b->ds_cap * 12u};
+        VkDescriptorPoolCreateInfo dpci = {0};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = b->ds_cap;
+        dpci.poolSizeCount = 1;
+        dpci.pPoolSizes = &psz;
+        if (vkCreateDescriptorPool(ctx->device, &dpci, nullptr, &b->ds_pool) != VK_SUCCESS) {
+            vk_batch_destroy(b);
+            return false;
+        }
     }
     return true;
 }
@@ -286,8 +289,11 @@ void vk_batch_destroy(VkCmdBatch* b) {
 
 bool vk_batch_begin(VkCmdBatch* b) {
     if (vkResetCommandBuffer(b->cmd_buf, 0) != VK_SUCCESS) return false;
-    if (vkResetDescriptorPool(b->ctx->device, b->ds_pool, 0) != VK_SUCCESS) return false;
+    if (b->ds_pool != VK_NULL_HANDLE) {
+        if (vkResetDescriptorPool(b->ctx->device, b->ds_pool, 0) != VK_SUCCESS) return false;
+    }
     b->ds_used = 0;
+    b->last_pipeline = VK_NULL_HANDLE;
 
     VkCommandBufferBeginInfo bi = {0};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -334,6 +340,14 @@ void vk_batch_barrier_c2c(VkCmdBatch* b) {
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
+void vk_batch_barrier_tc2c(VkCmdBatch* b) {
+    emit_mem_barrier(b->cmd_buf,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+}
+
 void vk_batch_barrier_c2t(VkCmdBatch* b) {
     emit_mem_barrier(b->cmd_buf,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -359,43 +373,58 @@ bool vk_batch_dispatch(
     uint32_t gy,
     uint32_t gz) {
     if (!pipe || gx == 0 || gy == 0 || gz == 0) return true;
-    if (b->ds_used >= b->ds_cap) {
+    const bool use_push = (b->ctx->pfn_push_desc != nullptr);
+    if (!use_push && b->ds_used >= b->ds_cap) {
         if (!vk_batch_submit_and_wait(b)) return false;
         if (!vk_batch_begin(b)) return false;
     }
 
-    VkDescriptorSet dset = VK_NULL_HANDLE;
     uint32_t nb = (num_bindings <= 16u) ? num_bindings : 16u;
+    VkDescriptorBufferInfo binfos[16];
+    VkWriteDescriptorSet writes[16];
     if (nb > 0) {
-        VkDescriptorSetAllocateInfo dsai = {0};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = b->ds_pool;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &pipe->ds_layout;
-        if (vkAllocateDescriptorSets(b->ctx->device, &dsai, &dset) != VK_SUCCESS) return false;
-        ++b->ds_used;
-
-        VkDescriptorBufferInfo binfos[16];
-        VkWriteDescriptorSet writes[16];
         VkBufferSlice dummy = vk_ctx_dummy_buffer(b->ctx);
         for (uint32_t i = 0; i < nb; ++i) {
             VkBufferSlice s = (bindings && vk_slice_valid(bindings[i])) ? bindings[i] : dummy;
             binfos[i] = (VkDescriptorBufferInfo){s.buffer, s.offset, s.range};
-            memset(&writes[i], 0, sizeof(writes[i]));
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = dset;
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &binfos[i];
+            writes[i] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = VK_NULL_HANDLE,
+                .dstBinding = i,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pImageInfo = nullptr,
+                .pBufferInfo = &binfos[i],
+                .pTexelBufferView = nullptr,
+            };
         }
-        vkUpdateDescriptorSets(b->ctx->device, nb, writes, 0, nullptr);
     }
 
-    vkCmdBindPipeline(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
+    if (b->last_pipeline != pipe->pipeline) {
+        vkCmdBindPipeline(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipeline);
+        b->last_pipeline = pipe->pipeline;
+    }
+
     if (nb > 0) {
-        vkCmdBindDescriptorSets(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                pipe->layout, 0, 1, &dset, 0, nullptr);
+        if (use_push) {
+            b->ctx->pfn_push_desc(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  pipe->layout, 0, nb, writes);
+        } else {
+            VkDescriptorSet dset = VK_NULL_HANDLE;
+            VkDescriptorSetAllocateInfo dsai = {0};
+            dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            dsai.descriptorPool = b->ds_pool;
+            dsai.descriptorSetCount = 1;
+            dsai.pSetLayouts = &pipe->ds_layout;
+            if (vkAllocateDescriptorSets(b->ctx->device, &dsai, &dset) != VK_SUCCESS) return false;
+            ++b->ds_used;
+            for (uint32_t i = 0; i < nb; ++i) writes[i].dstSet = dset;
+            vkUpdateDescriptorSets(b->ctx->device, nb, writes, 0, nullptr);
+            vkCmdBindDescriptorSets(b->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipe->layout, 0, 1, &dset, 0, nullptr);
+        }
     }
     if (push_data && push_bytes > 0) {
         vkCmdPushConstants(b->cmd_buf, pipe->layout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -560,6 +589,9 @@ static VkDeviceContext* create_vk_context(int device_id, char* err_out, size_t e
         sg_ctrl.computeFullSubgroups = VK_TRUE;
         *tail = &sg_ctrl; tail = &sg_ctrl.pNext;
     }
+    if (ctx->cfg.has_push_descriptor) {
+        exts[nexts++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+    }
 
     VkDeviceCreateInfo dci = {0};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -576,6 +608,11 @@ static VkDeviceContext* create_vk_context(int device_id, char* err_out, size_t e
         }
         free(ctx);
         return nullptr;
+    }
+
+    if (ctx->cfg.has_push_descriptor) {
+        ctx->pfn_push_desc = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(
+            ctx->device, "vkCmdPushDescriptorSetKHR");
     }
 
     ctx->num_queues = nq;
@@ -635,6 +672,18 @@ int vk_ctx_find_memory_type(const VkDeviceContext* ctx, uint32_t type_bits, VkBu
         req_list[n_tries] = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         avoid_list[n_tries++] = 0;
         req_list[n_tries] = 0;
+        avoid_list[n_tries++] = 0;
+    } else if (kind == VK_MEM_UMA_UPLOAD) {
+        req_list[n_tries] = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        avoid_list[n_tries++] = 0;
+        req_list[n_tries] = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        avoid_list[n_tries++] = 0;
+    } else if (kind == VK_MEM_UMA_READBACK) {
+        req_list[n_tries] = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        avoid_list[n_tries++] = 0;
+        req_list[n_tries] = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        avoid_list[n_tries++] = 0;
+        req_list[n_tries] = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         avoid_list[n_tries++] = 0;
     } else if (kind == VK_MEM_HOST_READBACK) {
         req_list[n_tries] = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -702,6 +751,9 @@ static VkDescriptorSetLayout get_or_create_dsl_unlocked(VkDeviceContext* ctx, ui
     }
     VkDescriptorSetLayoutCreateInfo ci = {0};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    if (ctx->pfn_push_desc) {
+        ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    }
     ci.bindingCount = n;
     ci.pBindings = (n > 0) ? binds : nullptr;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
@@ -739,7 +791,7 @@ static const VkCompiledPipeline* pipe_table_find(const VkDeviceContext* ctx, uin
     for (;;) {
         const PipeCacheEntry* e = &ctx->pipe_buckets[idx];
         if (!e->occupied) return nullptr;
-        if (e->hash == h && pipe_key_eq(&e->key, k)) return &e->pipe;
+        if (e->hash == h && pipe_key_eq(&e->key, k)) return e->pipe;
         idx = (idx + 1u) & ctx->pipe_mask;
     }
 }
@@ -844,9 +896,18 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
         return nullptr;
     }
 
+    VkCompiledPipeline* cp = (VkCompiledPipeline*)malloc(sizeof(VkCompiledPipeline));
+    if (!cp) {
+        vkDestroyPipeline(ctx->device, pipe, nullptr);
+        pthread_rwlock_unlock(&ctx->pipe_rwlock);
+        return nullptr;
+    }
+    *cp = (VkCompiledPipeline){pipe, pl, dsl, num_bindings, push_const_bytes};
+
     size_t cap = ctx->pipe_buckets ? (ctx->pipe_mask + 1u) : 0u;
     if (cap == 0u || (ctx->num_pipes + 1u) * 2u > cap) {
         if (!pipe_table_grow_unlocked(ctx)) {
+            free(cp);
             vkDestroyPipeline(ctx->device, pipe, nullptr);
             pthread_rwlock_unlock(&ctx->pipe_rwlock);
             return nullptr;
@@ -858,11 +919,11 @@ const VkCompiledPipeline* vk_ctx_get_pipeline(
     PipeCacheEntry* slot = &ctx->pipe_buckets[idx];
     slot->hash = h;
     slot->key = key;
-    slot->pipe = (VkCompiledPipeline){pipe, pl, dsl, num_bindings, push_const_bytes};
+    slot->pipe = cp;
     slot->occupied = true;
     ctx->num_pipes++;
     bool should_save = ((ctx->num_pipes % 16u) == 1u);
-    const VkCompiledPipeline* out = &slot->pipe;
+    const VkCompiledPipeline* out = cp;
 
     pthread_rwlock_unlock(&ctx->pipe_rwlock);
     if (should_save) save_pipe_cache(ctx);
@@ -1065,7 +1126,7 @@ VkDeviceProbeResult vk_ctx_probe_fp64_ratio(VkDeviceContext* ctx) {
         return r;
     }
     ctx->probe_res.fp64_probed = true;
-    ctx->probe_res.fp64_to_fp32_ratio = 16.0;
+    ctx->probe_res.fp64_to_fp32_ratio = 1.0 / 16.0;
     ctx->probe_res.fp64_compute_heavy = true;
     if (!ctx->cfg.has_fp64) {
         VkDeviceProbeResult r = ctx->probe_res;
@@ -1113,8 +1174,8 @@ VkDeviceProbeResult vk_ctx_probe_fp64_ratio(VkDeviceContext* ctx) {
             double t64 = vk_now_ms() - t0;
             if (t64 < 1e-4) t64 = 1e-4;
 
-            ctx->probe_res.fp64_to_fp32_ratio = t64 / t32;
-            ctx->probe_res.fp64_compute_heavy = (ctx->probe_res.fp64_to_fp32_ratio >= 4.0);
+            ctx->probe_res.fp64_to_fp32_ratio = t32 / t64;
+            ctx->probe_res.fp64_compute_heavy = (ctx->probe_res.fp64_to_fp32_ratio < 0.25);
         }
     }
     vk_batch_destroy(&batch);

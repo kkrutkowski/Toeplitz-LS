@@ -704,9 +704,10 @@ int execute_fastchi2_common(
     const size_t trig_bytes = static_cast<size_t>(3 * degree) * chunk_bins_max * sizeof(ComplexT);
     const size_t out_bytes = static_cast<size_t>(Nf) * sizeof(DevOutT);
     const size_t cond_bytes = has_cond ? out_bytes : size_t{0};
+    const size_t chunk_items_max = kIsHalf ? (chunk_bins_max >> 1) : chunk_bins_max;
+    const size_t chunk_items_pad = (chunk_items_max + 31u) & ~size_t{31u};
     const size_t scr_bytes = (degree > 12)
-        ? (size_t{2} * static_cast<size_t>(2 * degree + 1) *
-           (kIsHalf ? (chunk_bins_max >> 1) : chunk_bins_max) * sizeof(SolveRealT))
+        ? (size_t{2} * static_cast<size_t>(2 * degree - 1) * chunk_items_pad * sizeof(SolveRealT))
         : size_t{0};
     const size_t max_alloc = rt.dev_cfg.safe_max_alloc_bytes();
 

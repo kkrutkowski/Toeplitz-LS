@@ -119,7 +119,6 @@ typedef struct VkNufft1Plan {
     VkBufferAlloc        d_nat_deconv;
     VkBufferAlloc        d_slot_deconv_f32;
     VkBufferAlloc        d_first;
-    VkBufferAlloc        d_u;
     VkBufferAlloc        d_shift;
     VkBufferAlloc        d_bucket_counts;
     VkBufferAlloc        d_bucket_off;
@@ -128,6 +127,7 @@ typedef struct VkNufft1Plan {
     VkBufferAlloc        d_b_shift;
     VkBufferAlloc        d_b_weights;
     VkBufferAlloc        d_fft_buf;
+    VkBufferAlloc        d_spread_partials;
 } VkNufft1Plan;
 
 bool vk_nufft1_plan_init(

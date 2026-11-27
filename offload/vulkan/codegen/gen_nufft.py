@@ -71,29 +71,143 @@ int nufft1_slot_to_k_prime(int slot_p, int log_nfft, int nfft, int output_shift)
     )
 
 
-def _gen_precompute_points(prec: str) -> dict:
+def _emit_weight_eval_body(prec: str, w: int, n_even: int, n_odd: int) -> list[str]:
+    """Emit Horner weight evaluation writing d_weights[m*w .. (m+1)*w-1] from local register `u`."""
+    n_left = w // 2
+    odd_base = 4 + ((w + 1) // 2) * n_even
+    if prec == "h":
+        lines = [
+            "    f16vec2 u_v = f16vec2(u, u);",
+            "    f16vec2 t_v = u_v * u_v;",
+            f"    uint base = uint(m) * {w}u;",
+        ]
+        for j in range(n_left):
+            lines.append(
+                f"    f16vec2 eo_{j} = f16vec2(float16_t(d_tbl[{4 + j * n_even + (n_even - 1)}]), "
+                f"float16_t(d_tbl[{odd_base + j * n_odd + (n_odd - 1)}]));"
+            )
+            max_terms = max(n_even, n_odd)
+            for k in range(max_terms - 2, -1, -1):
+                e_idx = 4 + j * n_even + k
+                o_idx = odd_base + j * n_odd + k
+                if k < n_odd:
+                    lines.append(
+                        f"    eo_{j} = fma(eo_{j}, t_v, f16vec2(float16_t(d_tbl[{e_idx}]), float16_t(d_tbl[{o_idx}])));"
+                    )
+                else:
+                    lines.append(
+                        f"    eo_{j}.x = fma(eo_{j}.x, t_v.x, float16_t(d_tbl[{e_idx}]));"
+                    )
+            lines.append(f"    float16_t uo_{j} = u * eo_{j}.y;")
+            lines.append(f"    d_weights[base + {j}u] = eo_{j}.x + uo_{j};")
+            lines.append(f"    d_weights[base + {w - 1 - j}u] = eo_{j}.x - uo_{j};")
+        if w & 1:
+            j_mid = w // 2
+            lines.append(
+                f"    float16_t em_acc = float16_t(d_tbl[{4 + j_mid * n_even + (n_even - 1)}]);"
+            )
+            for k in range(n_even - 2, -1, -1):
+                lines.append(
+                    f"    em_acc = fma(em_acc, t_v.x, float16_t(d_tbl[{4 + j_mid * n_even + k}]));"
+                )
+            lines.append(f"    d_weights[base + {j_mid}u] = em_acc;")
+        return lines
+
+    if prec in ("f", "d"):
+        t = "float" if prec == "f" else "double"
+        lines = [
+            f"    {t} t = u * u;",
+            f"    uint base = uint(m) * {w}u;",
+        ]
+        for j in range(n_left):
+            lines.append("    {")
+            lines.append(f"        {t} e_acc = d_tbl[{4 + j * n_even + (n_even - 1)}];")
+            for k in range(n_even - 2, -1, -1):
+                lines.append(f"        e_acc = fma(e_acc, t, d_tbl[{4 + j * n_even + k}]);")
+            lines.append(f"        {t} o_acc = d_tbl[{odd_base + j * n_odd + (n_odd - 1)}];")
+            for k in range(n_odd - 2, -1, -1):
+                lines.append(f"        o_acc = fma(o_acc, t, d_tbl[{odd_base + j * n_odd + k}]);")
+            lines.append(f"        {t} uo = u * o_acc;")
+            lines.append(f"        d_weights[base + {j}u] = e_acc + uo;")
+            lines.append(f"        d_weights[base + {w - 1 - j}u] = e_acc - uo;")
+            lines.append("    }")
+        if w & 1:
+            j_mid = w // 2
+            lines.append("    {")
+            lines.append(f"        {t} e_acc = d_tbl[{4 + j_mid * n_even + (n_even - 1)}];")
+            for k in range(n_even - 2, -1, -1):
+                lines.append(f"        e_acc = fma(e_acc, t, d_tbl[{4 + j_mid * n_even + k}]);")
+            lines.append(f"        d_weights[base + {j_mid}u] = e_acc;")
+            lines.append("    }")
+        return lines
+
+    # DF with mixed-precision float tail
+    e_tail = 4 if n_even > 5 else n_even
+    o_tail = 4 if n_odd > 5 else n_odd
+    lines = [
+        "    df_t t = df_sqr(u);",
+        "    float tf = t.x;",
+        f"    uint base = uint(m) * {w}u;",
+    ]
+
+    def emit_horner_df(acc_name: str, row_off: int, n_terms: int, tail: int) -> list[str]:
+        out_l = []
+        if tail < n_terms:
+            out_l.append(f"        float {acc_name}_f = d_tbl[{row_off + n_terms - 1}].x;")
+            for k in range(n_terms - 2, tail - 1, -1):
+                out_l.append(f"        {acc_name}_f = fma({acc_name}_f, tf, d_tbl[{row_off + k}].x);")
+            out_l.append(f"        df_t {acc_name} = vec2({acc_name}_f, 0.0f);")
+            for k in range(tail - 1, -1, -1):
+                out_l.append(f"        {acc_name} = df_add(df_mul({acc_name}, t), d_tbl[{row_off + k}]);")
+        else:
+            out_l.append(f"        df_t {acc_name} = d_tbl[{row_off + n_terms - 1}];")
+            for k in range(n_terms - 2, -1, -1):
+                out_l.append(f"        {acc_name} = df_add(df_mul({acc_name}, t), d_tbl[{row_off + k}]);")
+        return out_l
+
+    for j in range(n_left):
+        lines.append("    {")
+        lines.extend(emit_horner_df("e_acc", 4 + j * n_even, n_even, e_tail))
+        lines.extend(emit_horner_df("o_acc", odd_base + j * n_odd, n_odd, o_tail))
+        lines.append("        df_t uo = df_mul(u, o_acc);")
+        lines.append(f"        d_weights[base + {j}u] = df_add(e_acc, uo);")
+        lines.append(f"        d_weights[base + {w - 1 - j}u] = df_sub(e_acc, uo);")
+        lines.append("    }")
+    if w & 1:
+        j_mid = w // 2
+        lines.append("    {")
+        lines.extend(emit_horner_df("e_acc", 4 + j_mid * n_even, n_even, e_tail))
+        lines.append(f"        d_weights[base + {j_mid}u] = e_acc;")
+        lines.append("    }")
+    return lines
+
+
+def _gen_precompute_points_weights(prec: str, w: int, n_even: int, n_odd: int) -> dict:
+    """Fused x-axis gridding + phase shift + PSWF weight evaluation (keeps u in register; removes d_u)."""
+    w_body = "\n".join(_emit_weight_eval_body(prec, w, n_even, n_odd))
     if prec == "d":
         src = (
             glsl_header("d")
             + glsl_sincos2pi_f64()
-            + """
+            + f"""
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout(std430, binding = 0) readonly  buffer XBuf     { double d_x[]; };
-layout(std430, binding = 1) writeonly buffer FirstBuf { int    d_first[]; };
-layout(std430, binding = 2) writeonly buffer UBuf     { double d_u[]; };
-layout(std430, binding = 3) writeonly buffer ShiftBuf { dvec2  d_shift[]; };
+layout(std430, binding = 0) readonly  buffer XBuf     {{ double d_x[]; }};
+layout(std430, binding = 1) readonly  buffer TblBuf   {{ double d_tbl[]; }};
+layout(std430, binding = 2) writeonly buffer FirstBuf {{ int    d_first[]; }};
+layout(std430, binding = 3) writeonly buffer ShiftBuf {{ dvec2  d_shift[]; }};
+layout(std430, binding = 4) writeonly buffer WBuf     {{ double d_weights[]; }};
 
-layout(push_constant) uniform Push {
+layout(push_constant) uniform Push {{
     double df_scaled;
     int    M;
     int    nfft;
     int    w;
     int    phase_shift;
     uint   flags;
-} pc;
+}} pc;
 
-void main() {
+void main() {{
     int m = int(gl_GlobalInvocationID.x);
     if (m >= pc.M) return;
 
@@ -116,73 +230,71 @@ void main() {
     double c, s;
     sincos2pi_branchless(phase, false, c, s);
     double sr = c, si = s;
-    if (mode43) {
+    if (mode43) {{
         sr = c * fma(4.0lf, c * c, -3.0lf);
         si = s * fma(-4.0lf, s * s, 3.0lf);
-    }
+    }}
     if (!pos_sign) si = -si;
 
     d_first[m] = first;
-    d_u[m]     = u;
     d_shift[m] = dvec2(sr, si);
-}
+{w_body}
+}}
 """
         )
         return {"source": src, "check_nocontract": False}
 
-    # DF x-axis gridding for h, f, df
     if prec == "h":
         hdr = glsl_header("h", fp16_storage=True) + glsl_df_math() + glsl_sincos2pi_f32() + glsl_f16x2_math()
-        u_type = "float16_t"
-        shift_type = "uint"
-        emit_tail = """
+        tbl_t, w_t, shift_t = "float", "float16_t", "uint"
+        emit_tail = f"""
     float frac_f = frac_df.x + frac_df.y;
     float c, s;
     sincos2pif_branchless(frac_f, false, c, s);
     float sr = c, si = s;
-    if (mode43) {
+    if (mode43) {{
         sr = c * fma(4.0f, c * c, -3.0f);
         si = s * fma(-4.0f, s * s, 3.0f);
-    }
+    }}
     if (!pos_sign) si = -si;
-    float u_f = u_df.x + u_df.y;
-    d_u[m] = float16_t(u_f);
     d_shift[m] = packHalf2x16(vec2(sr, si));
+    float16_t u = float16_t(u_df.x + u_df.y);
+{w_body}
 """
     elif prec == "f":
         hdr = glsl_header("f") + glsl_df_math() + glsl_sincos2pi_f32()
-        u_type = "float"
-        shift_type = "vec2"
-        emit_tail = """
+        tbl_t, w_t, shift_t = "float", "float", "vec2"
+        emit_tail = f"""
     float frac_f = frac_df.x + frac_df.y;
     float c, s;
     sincos2pif_branchless(frac_f, false, c, s);
     float sr = c, si = s;
-    if (mode43) {
+    if (mode43) {{
         sr = c * fma(4.0f, c * c, -3.0f);
         si = s * fma(-4.0f, s * s, 3.0f);
-    }
+    }}
     if (!pos_sign) si = -si;
-    d_u[m] = u_df.x + u_df.y;
     d_shift[m] = vec2(sr, si);
+    float u = u_df.x + u_df.y;
+{w_body}
 """
     else:  # df
         hdr = glsl_header("df") + glsl_df_math() + glsl_sincos2pi_df()
-        u_type = "vec2"
-        shift_type = "vec4"
-        emit_tail = """
+        tbl_t, w_t, shift_t = "vec2", "vec2", "vec4"
+        emit_tail = f"""
     df_t c, s;
     sincos2pidf_branchless(frac_df, false, c, s);
     df_t sr = c, si = s;
-    if (mode43) {
+    if (mode43) {{
         df_t c2 = df_sqr(c);
         df_t s2 = df_sqr(s);
         sr = df_mul(c, df_sub(df_scale_pow2(c2, 4.0f), vec2(3.0f, 0.0f)));
         si = df_mul(s, df_sub(vec2(3.0f, 0.0f), df_scale_pow2(s2, 4.0f)));
-    }
+    }}
     if (!pos_sign) si = df_neg(si);
-    d_u[m] = u_df;
     d_shift[m] = vec4(sr.x, sr.y, si.x, si.y);
+    df_t u = u_df;
+{w_body}
 """
 
     src = (
@@ -191,9 +303,10 @@ void main() {
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly  buffer XBuf     {{ vec2       d_x[]; }};
-layout(std430, binding = 1) writeonly buffer FirstBuf {{ int        d_first[]; }};
-layout(std430, binding = 2) writeonly buffer UBuf     {{ {u_type}   d_u[]; }};
-layout(std430, binding = 3) writeonly buffer ShiftBuf {{ {shift_type} d_shift[]; }};
+layout(std430, binding = 1) readonly  buffer TblBuf   {{ {tbl_t}    d_tbl[]; }};
+layout(std430, binding = 2) writeonly buffer FirstBuf {{ int        d_first[]; }};
+layout(std430, binding = 3) writeonly buffer ShiftBuf {{ {shift_t}  d_shift[]; }};
+layout(std430, binding = 4) writeonly buffer WBuf     {{ {w_t}      d_weights[]; }};
 
 layout(push_constant) uniform Push {{
     vec2 df_scaled;
@@ -248,6 +361,9 @@ def _gen_bucket_shaders() -> dict[str, dict]:
     out["nufft_bucket_count"] = {
         "source": glsl_header()
         + """
+layout(constant_id = 0) const uint WG_SIZE       = 128u;
+layout(constant_id = 1) const uint USE_SMEM_HIST = 0u;
+layout(constant_id = 2) const uint HIST_BINS     = 1u;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer FirstBuf { int d_first[]; };
@@ -261,15 +377,39 @@ layout(push_constant) uniform Push {
     int nw_mask;
 } pc;
 
+shared int l_hist[HIST_BINS];
+
 void main() {
     int m = int(gl_GlobalInvocationID.x);
-    if (m >= pc.M) return;
-    int first = d_first[m];
-    int w0 = first >> pc.log2_win;
-    atomicAdd(d_bucket_counts[w0], 1);
-    if ((first & pc.win_mask) + pc.w > (pc.win_mask + 1)) {
-        int w1 = (w0 + 1) & pc.nw_mask;
-        atomicAdd(d_bucket_counts[w1], 1);
+    if (USE_SMEM_HIST != 0u) {
+        int tid = int(gl_LocalInvocationID.x);
+        for (int i = tid; i < int(HIST_BINS); i += int(WG_SIZE)) {
+            l_hist[i] = 0;
+        }
+        barrier();
+        if (m < pc.M) {
+            int first = d_first[m];
+            int w0 = first >> pc.log2_win;
+            atomicAdd(l_hist[w0], 1);
+            if ((first & pc.win_mask) + pc.w > (pc.win_mask + 1)) {
+                int w1 = (w0 + 1) & pc.nw_mask;
+                atomicAdd(l_hist[w1], 1);
+            }
+        }
+        barrier();
+        for (int i = tid; i < int(HIST_BINS); i += int(WG_SIZE)) {
+            int c = l_hist[i];
+            if (c != 0) atomicAdd(d_bucket_counts[i], c);
+        }
+    } else {
+        if (m >= pc.M) return;
+        int first = d_first[m];
+        int w0 = first >> pc.log2_win;
+        atomicAdd(d_bucket_counts[w0], 1);
+        if ((first & pc.win_mask) + pc.w > (pc.win_mask + 1)) {
+            int w1 = (w0 + 1) & pc.nw_mask;
+            atomicAdd(d_bucket_counts[w1], 1);
+        }
     }
 }
 """,
@@ -289,6 +429,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 shared int l_scan[256];
+shared int l_running;
 
 void main() {
     int tid = int(gl_LocalInvocationID.x);
@@ -311,15 +452,37 @@ void main() {
         if (tid == pc.num_wins - 1) {
             d_bucket_off[pc.num_wins] = incl;
         }
-    } else if (tid == 0) {
-        int sum = 0;
-        for (int wi = 0; wi < pc.num_wins; ++wi) {
-            int cnt = d_bucket_counts[wi];
-            d_bucket_off[wi] = sum;
-            d_bucket_counts[wi] = sum;
-            sum += cnt;
+    } else {
+        if (tid == 0) l_running = 0;
+        barrier();
+        for (int base = 0; base < pc.num_wins; base += 256) {
+            int wi = base + tid;
+            int val = (wi < pc.num_wins) ? d_bucket_counts[wi] : 0;
+            l_scan[tid] = val;
+            barrier();
+            for (int off = 1; off < 256; off <<= 1) {
+                int add = (tid >= off) ? l_scan[tid - off] : 0;
+                barrier();
+                l_scan[tid] += add;
+                barrier();
+            }
+            int incl = l_scan[tid];
+            int pref = incl - val;
+            int run = l_running;
+            if (wi < pc.num_wins) {
+                d_bucket_off[wi] = run + pref;
+                d_bucket_counts[wi] = run + pref;
+            }
+            int last_tid = min(256, pc.num_wins - base) - 1;
+            barrier();
+            if (tid == last_tid) {
+                l_running = run + incl;
+            }
+            barrier();
         }
-        d_bucket_off[pc.num_wins] = sum;
+        if (tid == 0) {
+            d_bucket_off[pc.num_wins] = l_running;
+        }
     }
 }
 """,
@@ -413,179 +576,6 @@ void main() {
     }
 
     return out
-
-
-def _gen_precompute_weights(prec: str, w: int, n_even: int, n_odd: int) -> dict:
-    n_half = (w + 1) // 2
-    n_left = w // 2
-    odd_base = 4 + n_half * n_even
-
-    if prec == "h":
-        body_lines = [
-            "    f16vec2 u_v = f16vec2(u, u);",
-            "    f16vec2 t_v = u_v * u_v;",
-            "    f16vec2 neg_u_v = -u_v;",
-            f"    f16vec2 e_acc = f16vec2(float16_t(d_tbl[{4 + 0 * n_even + (n_even - 1)}]), float16_t(d_tbl[{4 + 1 * n_even + (n_even - 1)}]));",
-        ]
-        for m in range(n_even - 2, -1, -1):
-            body_lines.append(
-                f"    e_acc = fma(e_acc, t_v, f16vec2(float16_t(d_tbl[{4 + 0 * n_even + m}]), float16_t(d_tbl[{4 + 1 * n_even + m}])));"
-            )
-        body_lines.append(
-            f"    f16vec2 o_acc = f16vec2(float16_t(d_tbl[{odd_base + 0 * n_odd + (n_odd - 1)}]), float16_t(d_tbl[{odd_base + 1 * n_odd + (n_odd - 1)}]));"
-        )
-        for m in range(n_odd - 2, -1, -1):
-            body_lines.append(
-                f"    o_acc = fma(o_acc, t_v, f16vec2(float16_t(d_tbl[{odd_base + 0 * n_odd + m}]), float16_t(d_tbl[{odd_base + 1 * n_odd + m}])));"
-            )
-        body_lines.extend([
-            "    f16vec2 w_left  = fma(u_v, o_acc, e_acc);",
-            "    f16vec2 w_right = fma(neg_u_v, o_acc, e_acc);",
-            f"    uint base = uint(m) * {w}u;",
-            "    d_weights[base + 0u] = w_left.x;",
-            "    d_weights[base + 1u] = w_left.y;",
-            f"    d_weights[base + {w - 2}u] = w_right.y;",
-            f"    d_weights[base + {w - 1}u] = w_right.x;",
-        ])
-        if w & 1:
-            j_mid = w // 2
-            body_lines.append(
-                f"    float16_t em_acc = float16_t(d_tbl[{4 + j_mid * n_even + (n_even - 1)}]);"
-            )
-            for m in range(n_even - 2, -1, -1):
-                body_lines.append(
-                    f"    em_acc = fma(em_acc, t_v.x, float16_t(d_tbl[{4 + j_mid * n_even + m}]));"
-                )
-            body_lines.append(f"    d_weights[base + {j_mid}u] = em_acc;")
-
-        src = (
-            glsl_header("h", fp16_storage=True)
-            + f"""
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
-
-layout(std430, binding = 0) readonly  buffer TblBuf {{ float     d_tbl[]; }};
-layout(std430, binding = 1) readonly  buffer UBuf   {{ float16_t d_u[]; }};
-layout(std430, binding = 2) writeonly buffer WBuf   {{ float16_t d_weights[]; }};
-
-layout(push_constant) uniform Push {{ int M; }} pc;
-
-void main() {{
-    int m = int(gl_GlobalInvocationID.x);
-    if (m >= pc.M) return;
-    float16_t u = d_u[m];
-{chr(10).join(body_lines)}
-}}
-"""
-        )
-        return {"source": src, "check_nocontract": False}
-
-    if prec in ("f", "d"):
-        t = "float" if prec == "f" else "double"
-        body_lines = [
-            f"    {t} t = u * u;",
-            f"    uint base = uint(m) * {w}u;",
-        ]
-        for j in range(n_left):
-            body_lines.append(f"    {{")
-            body_lines.append(f"        {t} e_acc = d_tbl[{4 + j * n_even + (n_even - 1)}];")
-            for k in range(n_even - 2, -1, -1):
-                body_lines.append(f"        e_acc = fma(e_acc, t, d_tbl[{4 + j * n_even + k}]);")
-            body_lines.append(f"        {t} o_acc = d_tbl[{odd_base + j * n_odd + (n_odd - 1)}];")
-            for k in range(n_odd - 2, -1, -1):
-                body_lines.append(f"        o_acc = fma(o_acc, t, d_tbl[{odd_base + j * n_odd + k}]);")
-            body_lines.append(f"        {t} uo = u * o_acc;")
-            body_lines.append(f"        d_weights[base + {j}u] = e_acc + uo;")
-            body_lines.append(f"        d_weights[base + {w - 1 - j}u] = e_acc - uo;")
-            body_lines.append(f"    }}")
-        if w & 1:
-            j_mid = w // 2
-            body_lines.append(f"    {{")
-            body_lines.append(f"        {t} e_acc = d_tbl[{4 + j_mid * n_even + (n_even - 1)}];")
-            for k in range(n_even - 2, -1, -1):
-                body_lines.append(f"        e_acc = fma(e_acc, t, d_tbl[{4 + j_mid * n_even + k}]);")
-            body_lines.append(f"        d_weights[base + {j_mid}u] = e_acc;")
-            body_lines.append(f"    }}")
-        src = (
-            glsl_header(prec)
-            + f"""
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
-
-layout(std430, binding = 0) readonly  buffer TblBuf {{ {t} d_tbl[]; }};
-layout(std430, binding = 1) readonly  buffer UBuf   {{ {t} d_u[]; }};
-layout(std430, binding = 2) writeonly buffer WBuf   {{ {t} d_weights[]; }};
-
-layout(push_constant) uniform Push {{ int M; }} pc;
-
-void main() {{
-    int m = int(gl_GlobalInvocationID.x);
-    if (m >= pc.M) return;
-    {t} u = d_u[m];
-{chr(10).join(body_lines)}
-}}
-"""
-        )
-        return {"source": src, "check_nocontract": False}
-
-    # DF with mixed-precision float tail (matching eval_pswf_spread_weights_df)
-    e_tail = 4 if n_even > 5 else n_even
-    o_tail = 4 if n_odd > 5 else n_odd
-    body_lines = [
-        "    df_t t = df_sqr(u);",
-        "    float tf = t.x;",
-        f"    uint base = uint(m) * {w}u;",
-    ]
-
-    def emit_horner_df(acc_name: str, row_off: int, n_terms: int, tail: int) -> list[str]:
-        out_l = []
-        if tail < n_terms:
-            out_l.append(f"        float {acc_name}_f = d_tbl[{row_off + n_terms - 1}].x;")
-            for k in range(n_terms - 2, tail - 1, -1):
-                out_l.append(f"        {acc_name}_f = fma({acc_name}_f, tf, d_tbl[{row_off + k}].x);")
-            out_l.append(f"        df_t {acc_name} = vec2({acc_name}_f, 0.0f);")
-            for k in range(tail - 1, -1, -1):
-                out_l.append(f"        {acc_name} = df_add(df_mul({acc_name}, t), d_tbl[{row_off + k}]);")
-        else:
-            out_l.append(f"        df_t {acc_name} = d_tbl[{row_off + n_terms - 1}];")
-            for k in range(n_terms - 2, -1, -1):
-                out_l.append(f"        {acc_name} = df_add(df_mul({acc_name}, t), d_tbl[{row_off + k}]);")
-        return out_l
-
-    for j in range(n_left):
-        body_lines.append("    {")
-        body_lines.extend(emit_horner_df("e_acc", 4 + j * n_even, n_even, e_tail))
-        body_lines.extend(emit_horner_df("o_acc", odd_base + j * n_odd, n_odd, o_tail))
-        body_lines.append("        df_t uo = df_mul(u, o_acc);")
-        body_lines.append(f"        d_weights[base + {j}u] = df_add(e_acc, uo);")
-        body_lines.append(f"        d_weights[base + {w - 1 - j}u] = df_sub(e_acc, uo);")
-        body_lines.append("    }")
-    if w & 1:
-        j_mid = w // 2
-        body_lines.append("    {")
-        body_lines.extend(emit_horner_df("e_acc", 4 + j_mid * n_even, n_even, e_tail))
-        body_lines.append(f"        d_weights[base + {j_mid}u] = e_acc;")
-        body_lines.append("    }")
-
-    src = (
-        glsl_header("df")
-        + glsl_df_math()
-        + f"""
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
-
-layout(std430, binding = 0) readonly  buffer TblBuf {{ vec2 d_tbl[]; }};
-layout(std430, binding = 1) readonly  buffer UBuf   {{ vec2 d_u[]; }};
-layout(std430, binding = 2) writeonly buffer WBuf   {{ vec2 d_weights[]; }};
-
-layout(push_constant) uniform Push {{ int M; }} pc;
-
-void main() {{
-    int m = int(gl_GlobalInvocationID.x);
-    if (m >= pc.M) return;
-    df_t u = d_u[m];
-{chr(10).join(body_lines)}
-}}
-"""
-    )
-    return {"source": src, "check_nocontract": True}
 
 
 def _gen_pack_bucket_geom(prec: str) -> dict:
@@ -756,7 +746,7 @@ shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];
         zero_body = f"        l_grid[idx] = {d['zero_pair']};"
         if prec == "h":
             store_sy = "                    l_sy[sy_slot] = uvec2(f16x2_to_u32(sy_re), f16x2_to_u32(sy_im));"
-            load_sy = """                uvec2 sy_p = l_sy[k * sy_stride + lane_b];
+            load_sy = """                uvec2 sy_p = l_sy[k * sy_stride + eff_lane_b];
                 f16vec2 sy_re = u32_to_f16x2(sy_p.x);
                 f16vec2 sy_im = u32_to_f16x2(sy_p.y);"""
             accum_code = """
@@ -767,13 +757,19 @@ shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];
                     f16vec2 gr = fma(sy_re, wv, u32_to_f16x2(gp.x));
                     f16vec2 gi = fma(sy_im, wv, u32_to_f16x2(gp.y));
                     l_grid[g_idx] = uvec2(f16x2_to_u32(gr), f16x2_to_u32(gi));"""
+            red_pair_code = """
+                        uvec2 ga = l_grid[dst_off + n];
+                        uvec2 gb = l_grid[src_off + n];
+                        f16vec2 sr = u32_to_f16x2(ga.x) + u32_to_f16x2(gb.x);
+                        f16vec2 si = u32_to_f16x2(ga.y) + u32_to_f16x2(gb.y);
+                        l_grid[dst_off + n] = uvec2(f16x2_to_u32(sr), f16x2_to_u32(si));"""
             wb_code = """
         uint b0_out = 2u * bp_out;
         uint b1_out = b0_out + 1u;
         bool v0 = (b0_out < pc.chunk_bs);
         bool v1 = (b1_out < pc.chunk_bs);
-        uint dst0 = b0_out * uint(pc.nfft) + uint(win_lo);
-        uint dst1 = b1_out * uint(pc.nfft) + uint(win_lo);
+        uint dst0 = km_off + b0_out * uint(pc.nfft) + uint(win_lo);
+        uint dst1 = km_off + b1_out * uint(pc.nfft) + uint(win_lo);
         for (int n = tid; n < pc.win_elems; n += int(WG_SIZE)) {
             uvec2 gp = l_grid[g_off + n];
             uint u0, u1;
@@ -783,7 +779,7 @@ shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];
         }"""
         else:  # f
             store_sy = "                    l_sy[sy_slot] = vec2(sy_re, sy_im);"
-            load_sy = """                vec2 sy_p = l_sy[k * sy_stride + lane_b];
+            load_sy = """                vec2 sy_p = l_sy[k * sy_stride + eff_lane_b];
                 float sy_re = sy_p.x;
                 float sy_im = sy_p.y;"""
             accum_code = """
@@ -793,8 +789,10 @@ shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];
                     gp.x = fma(sy_re, wv, gp.x);
                     gp.y = fma(sy_im, wv, gp.y);
                     l_grid[g_idx] = gp;"""
+            red_pair_code = """
+                        l_grid[dst_off + n] += l_grid[src_off + n];"""
             wb_code = """
-        uint dst = bp_out * uint(pc.nfft) + uint(win_lo);
+        uint dst = km_off + bp_out * uint(pc.nfft) + uint(win_lo);
         for (int n = tid; n < pc.win_elems; n += int(WG_SIZE)) {
             d_fft_buf[dst + uint(n)] = l_grid[g_off + n];
         }"""
@@ -807,16 +805,19 @@ shared {d['real_t']} l_sy_im[SMEM_SY_ELEMS];
 """
         zero_body = f"        l_re[idx] = {d['zero_expr']};\n        l_im[idx] = {d['zero_expr']};"
         store_sy = "                    l_sy_re[sy_slot] = sy_re;\n                    l_sy_im[sy_slot] = sy_im;"
-        load_sy = f"""                {d['real_t']} sy_re = l_sy_re[k * sy_stride + lane_b];
-                {d['real_t']} sy_im = l_sy_im[k * sy_stride + lane_b];"""
+        load_sy = f"""                {d['real_t']} sy_re = l_sy_re[k * sy_stride + eff_lane_b];
+                {d['real_t']} sy_im = l_sy_im[k * sy_stride + eff_lane_b];"""
         if prec == "df":
             accum_code = """
                     int g_idx = grid_base + bin;
                     df_t wv = l_w[w_base + j_val];
                     l_re[g_idx] = df_add(df_mul(sy_re, wv), l_re[g_idx]);
                     l_im[g_idx] = df_add(df_mul(sy_im, wv), l_im[g_idx]);"""
+            red_pair_code = """
+                        l_re[dst_off + n] = df_add(l_re[dst_off + n], l_re[src_off + n]);
+                        l_im[dst_off + n] = df_add(l_im[dst_off + n], l_im[src_off + n]);"""
             wb_code = """
-        uint dst = bp_out * uint(pc.nfft) + uint(win_lo);
+        uint dst = km_off + bp_out * uint(pc.nfft) + uint(win_lo);
         for (int n = tid; n < pc.win_elems; n += int(WG_SIZE)) {
             df_t gr = l_re[g_off + n];
             df_t gi = l_im[g_off + n];
@@ -828,8 +829,11 @@ shared {d['real_t']} l_sy_im[SMEM_SY_ELEMS];
                     double wv = l_w[w_base + j_val];
                     l_re[g_idx] = fma(sy_re, wv, l_re[g_idx]);
                     l_im[g_idx] = fma(sy_im, wv, l_im[g_idx]);"""
+            red_pair_code = """
+                        l_re[dst_off + n] += l_re[src_off + n];
+                        l_im[dst_off + n] += l_im[src_off + n];"""
             wb_code = """
-        uint dst = bp_out * uint(pc.nfft) + uint(win_lo);
+        uint dst = km_off + bp_out * uint(pc.nfft) + uint(win_lo);
         for (int n = tid; n < pc.win_elems; n += int(WG_SIZE)) {
             d_fft_buf[dst + uint(n)] = dvec2(l_re[g_off + n], l_im[g_off + n]);
         }"""
@@ -849,6 +853,7 @@ layout(constant_id = 8)  const uint SMEM_GRID_ELEMS = 2048u;
 layout(constant_id = 9)  const uint SMEM_SY_ELEMS   = 288u;
 layout(constant_id = 10) const uint SMEM_W_ELEMS    = 256u;
 layout(constant_id = 11) const uint MULTIPASS       = 0u;
+layout(constant_id = 12) const uint SPLIT_M         = 1u;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -869,6 +874,8 @@ layout(push_constant) uniform Push {{
     uint total_M_stride;
     uint chunk_bs;
     uint y_offset_elems;
+    uint k_m_splits;
+    uint dst_km_stride;
 }} pc;
 {smem_decl}
 shared int l_first[TILE_M];
@@ -884,9 +891,12 @@ void main() {{
 
     int lane_b = tid >> int(LOG2_TJ);
     int lane_t = tid & int(T_J - 1u);
+    int eff_b_slots = int(B_PER_WG / SPLIT_M);
+    int eff_lane_b  = (SPLIT_M > 1u) ? (lane_b & (eff_b_slots - 1)) : lane_b;
+    int m_slice     = (SPLIT_M > 1u) ? (lane_b / eff_b_slots) : 0;
     int sy_stride = int(B_PER_WG) + 1;
     uint bp_base = b_group * B_PER_WG;
-    uint my_bp   = bp_base + uint(lane_b);
+    uint my_bp   = bp_base + uint(eff_lane_b);
     int grid_base = lane_b * int(GRID_STRIDE);
     int nfft_mask = pc.nfft - 1;
     uint bs_packed = (pc.chunk_bs + {d['lanes'] - 1}u) / {d['lanes']}u;
@@ -898,6 +908,15 @@ void main() {{
 
     int p_start = (pc.num_wins == 1) ? 0 : d_bucket_off[win];
     int p_end   = (pc.num_wins == 1) ? pc.M : d_bucket_off[win + 1];
+    uint km = gl_WorkGroupID.y;
+    if (pc.k_m_splits > 1u) {{
+        int total_p = p_end - p_start;
+        int chunk_p = (total_p + int(pc.k_m_splits) - 1) / int(pc.k_m_splits);
+        int my_lo = p_start + int(km) * chunk_p;
+        p_end = min(p_end, my_lo + chunk_p);
+        p_start = min(my_lo, p_end);
+    }}
+    uint km_off = km * pc.dst_km_stride;
 
     for (int p_base = p_start; p_base < p_end; p_base += int(TILE_M)) {{
         int cur_tile = min(int(TILE_M), p_end - p_base);
@@ -918,7 +937,7 @@ void main() {{
             --log2_k;
         }}
         int k_mask = k_pow2 - 1;
-        int total_sy = int(B_PER_WG) * k_pow2;
+        int total_sy = eff_b_slots * k_pow2;
         for (int idx = tid; idx < total_sy; idx += int(WG_SIZE)) {{
             int b_sub = idx >> log2_k;
             int k = idx & k_mask;
@@ -938,7 +957,7 @@ void main() {{
         barrier();
 
         if (my_bp < bs_packed) {{
-            for (int k = 0; k < cur_tile; ++k) {{
+            for (int k = m_slice; k < cur_tile; k += int(SPLIT_M)) {{
                 int first = l_first[k];
                 int j0 = (lane_t - first) & int(T_J - 1u);
 {load_sy}
@@ -973,7 +992,23 @@ void main() {{
         barrier();
     }}
 
-    for (int b_sub = 0; b_sub < int(B_PER_WG); ++b_sub) {{
+    if (SPLIT_M > 1u) {{
+        for (int s = int(SPLIT_M >> 1); s >= 1; s >>= 1) {{
+            for (int b_sub = 0; b_sub < eff_b_slots; ++b_sub) {{
+                uint bp_out = bp_base + uint(b_sub);
+                if (bp_out >= bs_packed) break;
+                for (int ms = 0; ms < s; ++ms) {{
+                    int dst_off = (ms * eff_b_slots + b_sub) * int(GRID_STRIDE);
+                    int src_off = ((ms + s) * eff_b_slots + b_sub) * int(GRID_STRIDE);
+                    for (int n = tid; n < pc.win_elems; n += int(WG_SIZE)) {{{red_pair_code}
+                    }}
+                }}
+            }}
+            barrier();
+        }}
+    }}
+
+    for (int b_sub = 0; b_sub < eff_b_slots; ++b_sub) {{
         uint bp_out = bp_base + uint(b_sub);
         if (bp_out >= bs_packed) break;
         int g_off = b_sub * int(GRID_STRIDE);
@@ -1001,23 +1036,37 @@ def _gen_spread_reg(prec: str, q_val: int) -> dict:
     d = _spread_prec_defs(prec)
 
     if d["pack_smem"]:
-        smem_decl = f"shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];"
+        smem_decl = (
+            f"shared {d['smem_pair_t']} l_sy[SMEM_SY_ELEMS];\n"
+            f"shared {d['smem_pair_t']} l_red[SMEM_RED_ELEMS];"
+        )
         if prec == "h":
             store_sy = "                    l_sy[sy_slot] = uvec2(f16x2_to_u32(sy_re), f16x2_to_u32(sy_im));"
-            load_sy = """                uvec2 sy_p = l_sy[k * sy_stride + lane_b];
+            load_sy = """                uvec2 sy_p = l_sy[k * sy_stride + eff_lane_b];
                 f16vec2 sy_re = u32_to_f16x2(sy_p.x);
                 f16vec2 sy_im = u32_to_f16x2(sy_p.y);"""
+            red_store = lambda qi: f"        l_red[tid] = uvec2(f16x2_to_u32(acc_re[{qi}]), f16x2_to_u32(acc_im[{qi}]));"
+            red_add   = lambda qi: f"            {{ uvec2 rp = l_red[ridx]; acc_re[{qi}] += u32_to_f16x2(rp.x); acc_im[{qi}] += u32_to_f16x2(rp.y); }}"
         else:
             store_sy = "                    l_sy[sy_slot] = vec2(sy_re, sy_im);"
-            load_sy = """                vec2 sy_p = l_sy[k * sy_stride + lane_b];
+            load_sy = """                vec2 sy_p = l_sy[k * sy_stride + eff_lane_b];
                 float sy_re = sy_p.x;
                 float sy_im = sy_p.y;"""
+            red_store = lambda qi: f"        l_red[tid] = vec2(acc_re[{qi}], acc_im[{qi}]);"
+            red_add   = lambda qi: f"            {{ vec2 rp = l_red[ridx]; acc_re[{qi}] += rp.x; acc_im[{qi}] += rp.y; }}"
     else:
         smem_decl = f"""shared {d['real_t']} l_sy_re[SMEM_SY_ELEMS];
-shared {d['real_t']} l_sy_im[SMEM_SY_ELEMS];"""
+shared {d['real_t']} l_sy_im[SMEM_SY_ELEMS];
+shared {d['real_t']} l_red_re[SMEM_RED_ELEMS];
+shared {d['real_t']} l_red_im[SMEM_RED_ELEMS];"""
         store_sy = "                    l_sy_re[sy_slot] = sy_re;\n                    l_sy_im[sy_slot] = sy_im;"
-        load_sy = f"""                {d['real_t']} sy_re = l_sy_re[k * sy_stride + lane_b];
-                {d['real_t']} sy_im = l_sy_im[k * sy_stride + lane_b];"""
+        load_sy = f"""                {d['real_t']} sy_re = l_sy_re[k * sy_stride + eff_lane_b];
+                {d['real_t']} sy_im = l_sy_im[k * sy_stride + eff_lane_b];"""
+        red_store = lambda qi: f"        l_red_re[tid] = acc_re[{qi}]; l_red_im[tid] = acc_im[{qi}];"
+        if prec == "df":
+            red_add = lambda qi: f"            acc_re[{qi}] = df_add(acc_re[{qi}], l_red_re[ridx]); acc_im[{qi}] = df_add(acc_im[{qi}], l_red_im[ridx]);"
+        else:
+            red_add = lambda qi: f"            acc_re[{qi}] += l_red_re[ridx]; acc_im[{qi}] += l_red_im[ridx];"
 
     # Register accumulator update helper using compile-time binary search (0 local spills)
     if prec == "df":
@@ -1060,17 +1109,19 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
                     {d['real_t']} wv = {wv_expr};
                     reg_acc_update(q_idx, acc_re, acc_im, sy_re, sy_im, wv);"""
 
-    # Unrolled direct register-to-global writeback
+    # Unrolled direct register-to-global writeback (and optional SPLIT_M SMEM reduction)
     wb_lines = []
+    red_wb_lines = []
     if prec == "h":
-        wb_lines.extend([
+        hdr_wb = [
             "        uint b0_out = 2u * my_bp;",
             "        uint b1_out = b0_out + 1u;",
             "        bool v0 = (b0_out < pc.chunk_bs);",
             "        bool v1 = (b1_out < pc.chunk_bs);",
-            "        uint dst0 = b0_out * uint(pc.nfft) + uint(win_lo);",
-            "        uint dst1 = b1_out * uint(pc.nfft) + uint(win_lo);",
-        ])
+            "        uint dst0 = km_off + b0_out * uint(pc.nfft) + uint(win_lo);",
+            "        uint dst1 = km_off + b1_out * uint(pc.nfft) + uint(win_lo);",
+        ]
+        wb_lines.extend(hdr_wb)
         for qi in range(q_val):
             wb_lines.extend([
                 f"        {{ uint u0, u1; f16x2_pack_pair_u32(acc_re[{qi}], acc_im[{qi}], u0, u1);",
@@ -1078,24 +1129,48 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
                 f"          if (v0) d_fft_buf[dst0 + off_n] = u0;",
                 f"          if (v1) d_fft_buf[dst1 + off_n] = u1; }}",
             ])
-    elif prec == "df":
-        wb_lines.append("        uint dst = my_bp * uint(pc.nfft) + uint(win_lo);")
         for qi in range(q_val):
-            wb_lines.append(
-                f"        d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = vec4(acc_re[{qi}].x, acc_re[{qi}].y, acc_im[{qi}].x, acc_im[{qi}].y);"
-            )
-    elif prec == "f":
-        wb_lines.append("        uint dst = my_bp * uint(pc.nfft) + uint(win_lo);")
-        for qi in range(q_val):
-            wb_lines.append(
-                f"        d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = vec2(acc_re[{qi}], acc_im[{qi}]);"
-            )
+            red_wb_lines.append(red_store(qi))
+            red_wb_lines.append("        barrier();")
+            red_wb_lines.append("        if (m_slice == 0 && my_bp < bs_packed) {")
+            red_wb_lines.append("            for (int ms = 1; ms < int(SPLIT_M); ++ms) {")
+            red_wb_lines.append("                int ridx = (ms * eff_b_slots + eff_lane_b) * int(T_J) + lane_t;")
+            red_wb_lines.append(red_add(qi))
+            red_wb_lines.append("            }")
+            red_wb_lines.append("            uint b0_out = 2u * my_bp; uint b1_out = b0_out + 1u;")
+            red_wb_lines.append("            uint u0, u1;")
+            red_wb_lines.append(f"            f16x2_pack_pair_u32(acc_re[{qi}], acc_im[{qi}], u0, u1);")
+            red_wb_lines.append(f"            uint off_n = uint({qi}) * T_J + uint(lane_t);")
+            red_wb_lines.append("            if (b0_out < pc.chunk_bs) d_fft_buf[km_off + b0_out * uint(pc.nfft) + uint(win_lo) + off_n] = u0;")
+            red_wb_lines.append("            if (b1_out < pc.chunk_bs) d_fft_buf[km_off + b1_out * uint(pc.nfft) + uint(win_lo) + off_n] = u1;")
+            red_wb_lines.append("        }")
+            if qi + 1 < q_val:
+                red_wb_lines.append("        barrier();")
     else:
-        wb_lines.append("        uint dst = my_bp * uint(pc.nfft) + uint(win_lo);")
+        if prec == "df":
+            pack_expr = lambda qi: f"vec4(acc_re[{qi}].x, acc_re[{qi}].y, acc_im[{qi}].x, acc_im[{qi}].y)"
+        elif prec == "f":
+            pack_expr = lambda qi: f"vec2(acc_re[{qi}], acc_im[{qi}])"
+        else:
+            pack_expr = lambda qi: f"dvec2(acc_re[{qi}], acc_im[{qi}])"
+        wb_lines.append("        uint dst = km_off + my_bp * uint(pc.nfft) + uint(win_lo);")
         for qi in range(q_val):
             wb_lines.append(
-                f"        d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = dvec2(acc_re[{qi}], acc_im[{qi}]);"
+                f"        d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = {pack_expr(qi)};"
             )
+        for qi in range(q_val):
+            red_wb_lines.append(red_store(qi))
+            red_wb_lines.append("        barrier();")
+            red_wb_lines.append("        if (m_slice == 0 && my_bp < bs_packed) {")
+            red_wb_lines.append("            for (int ms = 1; ms < int(SPLIT_M); ++ms) {")
+            red_wb_lines.append("                int ridx = (ms * eff_b_slots + eff_lane_b) * int(T_J) + lane_t;")
+            red_wb_lines.append(red_add(qi))
+            red_wb_lines.append("            }")
+            red_wb_lines.append("            uint dst = km_off + my_bp * uint(pc.nfft) + uint(win_lo);")
+            red_wb_lines.append(f"            d_fft_buf[dst + uint({qi}) * T_J + uint(lane_t)] = {pack_expr(qi)};")
+            red_wb_lines.append("        }")
+            if qi + 1 < q_val:
+                red_wb_lines.append("        barrier();")
 
     init_acc = "\n".join(
         f"    acc_re[{qi}] = {d['zero_expr']}; acc_im[{qi}] = {d['zero_expr']};"
@@ -1105,16 +1180,18 @@ void reg_acc_update(int q_idx, inout {d['real_t']} acc_re[{q_val}], inout {d['re
     src = (
         d["hdr"]
         + f"""
-layout(constant_id = 0)  const uint WG_SIZE       = 64u;
-layout(constant_id = 1)  const uint W_CONST       = 8u;
-layout(constant_id = 2)  const uint T_J           = 8u;
-layout(constant_id = 3)  const uint LOG2_TJ       = 3u;
-layout(constant_id = 4)  const uint B_PER_WG      = 8u;
-layout(constant_id = 5)  const uint TILE_M        = 32u;
-layout(constant_id = 6)  const uint LOG2_TILE_M   = 5u;
-layout(constant_id = 9)  const uint SMEM_SY_ELEMS = 288u;
-layout(constant_id = 10) const uint SMEM_W_ELEMS  = 256u;
-layout(constant_id = 11) const uint MULTIPASS     = 0u;
+layout(constant_id = 0)  const uint WG_SIZE        = 64u;
+layout(constant_id = 1)  const uint W_CONST        = 8u;
+layout(constant_id = 2)  const uint T_J            = 8u;
+layout(constant_id = 3)  const uint LOG2_TJ        = 3u;
+layout(constant_id = 4)  const uint B_PER_WG       = 8u;
+layout(constant_id = 5)  const uint TILE_M         = 32u;
+layout(constant_id = 6)  const uint LOG2_TILE_M    = 5u;
+layout(constant_id = 9)  const uint SMEM_SY_ELEMS  = 288u;
+layout(constant_id = 10) const uint SMEM_W_ELEMS   = 256u;
+layout(constant_id = 11) const uint MULTIPASS      = 0u;
+layout(constant_id = 12) const uint SPLIT_M        = 1u;
+layout(constant_id = 13) const uint SMEM_RED_ELEMS = 1u;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -1135,6 +1212,8 @@ layout(push_constant) uniform Push {{
     uint total_M_stride;
     uint chunk_bs;
     uint y_offset_elems;
+    uint k_m_splits;
+    uint dst_km_stride;
 }} pc;
 
 {smem_decl}
@@ -1152,9 +1231,12 @@ void main() {{
 
     int lane_b = tid >> int(LOG2_TJ);
     int lane_t = tid & int(T_J - 1u);
+    int eff_b_slots = int(B_PER_WG / SPLIT_M);
+    int eff_lane_b  = (SPLIT_M > 1u) ? (lane_b & (eff_b_slots - 1)) : lane_b;
+    int m_slice     = (SPLIT_M > 1u) ? (lane_b / eff_b_slots) : 0;
     int sy_stride = int(B_PER_WG) + 1;
     uint bp_base = b_group * B_PER_WG;
-    uint my_bp   = bp_base + uint(lane_b);
+    uint my_bp   = bp_base + uint(eff_lane_b);
     int nfft_mask = pc.nfft - 1;
     uint bs_packed = (pc.chunk_bs + {d['lanes'] - 1}u) / {d['lanes']}u;
 
@@ -1164,6 +1246,15 @@ void main() {{
 
     int p_start = (pc.num_wins == 1) ? 0 : d_bucket_off[win];
     int p_end   = (pc.num_wins == 1) ? pc.M : d_bucket_off[win + 1];
+    uint km = gl_WorkGroupID.y;
+    if (pc.k_m_splits > 1u) {{
+        int total_p = p_end - p_start;
+        int chunk_p = (total_p + int(pc.k_m_splits) - 1) / int(pc.k_m_splits);
+        int my_lo = p_start + int(km) * chunk_p;
+        p_end = min(p_end, my_lo + chunk_p);
+        p_start = min(my_lo, p_end);
+    }}
+    uint km_off = km * pc.dst_km_stride;
 
     for (int p_base = p_start; p_base < p_end; p_base += int(TILE_M)) {{
         int cur_tile = min(int(TILE_M), p_end - p_base);
@@ -1184,7 +1275,7 @@ void main() {{
             --log2_k;
         }}
         int k_mask = k_pow2 - 1;
-        int total_sy = int(B_PER_WG) * k_pow2;
+        int total_sy = eff_b_slots * k_pow2;
         for (int idx = tid; idx < total_sy; idx += int(WG_SIZE)) {{
             int b_sub = idx >> log2_k;
             int k = idx & k_mask;
@@ -1204,7 +1295,7 @@ void main() {{
         barrier();
 
         if (my_bp < bs_packed) {{
-            for (int k = 0; k < cur_tile; ++k) {{
+            for (int k = m_slice; k < cur_tile; k += int(SPLIT_M)) {{
                 int first = l_first[k];
                 int j0 = (lane_t - first) & int(T_J - 1u);
 {load_sy}
@@ -1241,7 +1332,9 @@ void main() {{
         }}
     }}
 
-    if (my_bp < bs_packed) {{
+    if (SPLIT_M > 1u) {{
+{chr(10).join(red_wb_lines)}
+    }} else if (my_bp < bs_packed) {{
 {chr(10).join(wb_lines)}
     }}
 }}
@@ -1702,21 +1795,86 @@ void main() {{
     return {"source": src, "check_nocontract": check_nc}
 
 
+def _gen_reduce_grid(prec: str) -> dict:
+    """Sum K_m inter-WG partial spreading grids [K_m][chunk_bs * nfft] -> d_fft_buf[chunk_bs * nfft]."""
+    if prec == "h":
+        hdr = glsl_header("f")
+        buf_t, check_nc = "uint", False
+        body = """
+    vec2 acc = unpackHalf2x16(d_partials[idx]);
+    for (uint k = 1u; k < pc.k_m_splits; ++k) {
+        acc += unpackHalf2x16(d_partials[k * pc.total_elems + idx]);
+    }
+    d_out[idx] = packHalf2x16(acc);"""
+    elif prec == "f":
+        hdr = glsl_header("f")
+        buf_t, check_nc = "vec2", False
+        body = """
+    vec2 acc = d_partials[idx];
+    for (uint k = 1u; k < pc.k_m_splits; ++k) {
+        acc += d_partials[k * pc.total_elems + idx];
+    }
+    d_out[idx] = acc;"""
+    elif prec == "df":
+        hdr = glsl_header("df") + glsl_df_math()
+        buf_t, check_nc = "vec4", True
+        body = """
+    vec4 first = d_partials[idx];
+    df_t ar = first.xy, ai = first.zw;
+    for (uint k = 1u; k < pc.k_m_splits; ++k) {
+        vec4 v = d_partials[k * pc.total_elems + idx];
+        ar = df_add(ar, v.xy);
+        ai = df_add(ai, v.zw);
+    }
+    d_out[idx] = vec4(ar.x, ar.y, ai.x, ai.y);"""
+    else:
+        hdr = glsl_header("d")
+        buf_t, check_nc = "dvec2", False
+        body = """
+    dvec2 acc = d_partials[idx];
+    for (uint k = 1u; k < pc.k_m_splits; ++k) {
+        acc += d_partials[k * pc.total_elems + idx];
+    }
+    d_out[idx] = acc;"""
+
+    src = (
+        hdr
+        + f"""
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly  buffer PartBuf {{ {buf_t} d_partials[]; }};
+layout(std430, binding = 1) writeonly buffer OutBuf  {{ {buf_t} d_out[]; }};
+
+layout(push_constant) uniform Push {{
+    uint total_elems;
+    uint k_m_splits;
+}} pc;
+
+void main() {{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elems) return;
+{body}
+}}
+"""
+    )
+    return {"source": src, "check_nocontract": check_nc}
+
+
 def generate_nufft_shaders() -> dict[str, dict]:
     shaders: dict[str, dict] = {}
 
     for prec in ("h", "f", "df", "d"):
-        shaders[f"nufft_precompute_points_{prec}"] = _gen_precompute_points(prec)
         shaders[f"nufft_pack_bucket_geom_{prec}"] = _gen_pack_bucket_geom(prec)
         shaders[f"nufft_spread_smem_{prec}"] = _gen_spread_smem(prec)
         shaders[f"nufft_spread_cpu_direct_{prec}"] = _gen_spread_cpu_direct(prec)
+        shaders[f"nufft_reduce_grid_{prec}"] = _gen_reduce_grid(prec)
         for q_val in REG_Q_BY_PREC[prec]:
             shaders[f"nufft_spread_reg_{prec}_q{q_val}"] = _gen_spread_reg(prec, q_val)
 
     shaders.update(_gen_bucket_shaders())
 
     for prec, w, n_even, n_odd in PSWF_WIDTH_SPECS:
-        shaders[f"nufft_precompute_weights_{prec}_w{w}"] = _gen_precompute_weights(prec, w, n_even, n_odd)
+        shaders[f"nufft_precompute_points_weights_{prec}_w{w}"] = _gen_precompute_points_weights(prec, w, n_even, n_odd)
         shaders[f"nufft_deconv_table_{prec}_w{w}"] = _gen_deconv_table(prec, w, n_even, n_odd, f32_out=False)
         shaders[f"nufft_deconv_emit_{prec}_w{w}"] = _gen_deconv_emit(prec, w, n_even, n_odd)
         if prec == "h":

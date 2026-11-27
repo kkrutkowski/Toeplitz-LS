@@ -390,13 +390,19 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
     m3_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
     VkPhysicalDeviceSubgroupSizeControlProperties sg_ctrl_props = {0};
     sg_ctrl_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+    VkPhysicalDevicePushDescriptorPropertiesKHR push_desc_props = {0};
+    push_desc_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR;
 
     p2.pNext = &sg_props;
     sg_props.pNext = &m3_props;
+    void** ptail = &m3_props.pNext;
     bool has_sg_ctrl_ext = (desc->api_version >= VK_API_VERSION_1_3) ||
         has_device_ext(pdev, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
-    if (has_sg_ctrl_ext) m3_props.pNext = &sg_ctrl_props;
+    if (has_sg_ctrl_ext) { *ptail = &sg_ctrl_props; ptail = &sg_ctrl_props.pNext; }
+    bool has_push_desc_ext = has_device_ext(pdev, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    if (has_push_desc_ext) { *ptail = &push_desc_props; ptail = &push_desc_props.pNext; }
     vkGetPhysicalDeviceProperties2(pdev, &p2);
+    cfg->has_push_descriptor = has_push_desc_ext && (push_desc_props.maxPushDescriptors >= 16u);
 
     const VkPhysicalDeviceProperties* props = &p2.properties;
     cfg->api_version = props->apiVersion;
@@ -499,11 +505,16 @@ void vk_device_fft_config_query(const VkDeviceDescriptor* desc, VkDeviceFftConfi
     VkMemoryPropertyFlags uma_req = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkMemoryPropertyFlags uma_cached_req = uma_req | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
-        if ((mem.memoryTypes[i].propertyFlags & uma_req) == uma_req) {
-            uint32_t hi = mem.memoryTypes[i].heapIndex;
-            if (hi < mem.memoryHeapCount && mem.memoryHeaps[hi].size >= cfg->global_mem_size / 2) {
+        VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
+        uint32_t hi = mem.memoryTypes[i].heapIndex;
+        if (hi < mem.memoryHeapCount && mem.memoryHeaps[hi].size >= cfg->global_mem_size / 2) {
+            if ((f & uma_req) == uma_req) {
                 cfg->has_host_unified_memory = true;
+            }
+            if ((f & uma_cached_req) == uma_cached_req) {
+                cfg->has_uma_cached = true;
             }
         }
     }
@@ -589,14 +600,18 @@ size_t vk_device_recommended_stream_count(const VkDeviceFftConfig* cfg) {
     if (!cfg->is_gpu) return 1u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     size_t host_threads = (ncpu > 2) ? (size_t)ncpu : 2u;
-    size_t hw_cap = cfg->is_discrete_gpu ? 8u : 4u;
+    size_t hw_cap = cfg->is_discrete_gpu ? ((host_threads >= 12u) ? 16u : 8u) : 4u;
     size_t streams = (cfg->compute_queue_count > 2u) ? cfg->compute_queue_count : 2u;
+    if (cfg->is_discrete_gpu && host_threads >= 12u && streams < hw_cap) {
+        streams = host_threads;
+    }
     if (host_threads < streams) streams = host_threads;
     if (hw_cap < streams) streams = hw_cap;
     if (cfg->global_mem_size > 0) {
         size_t usable_mem = (cfg->global_mem_size / 4u) * 3u;
         size_t min_slice = vk_device_effective_l2_bytes(cfg) * 4u;
-        if (min_slice < ((size_t)64 << 20)) min_slice = ((size_t)64 << 20);
+        size_t floor_slice = (streams > 8u) ? ((size_t)256 << 20) : ((size_t)64 << 20);
+        if (min_slice < floor_slice) min_slice = floor_slice;
         size_t mem_cap = usable_mem / (min_slice > 0 ? min_slice : 1u);
         if (mem_cap < 1u) mem_cap = 1u;
         if (mem_cap < streams) streams = mem_cap;

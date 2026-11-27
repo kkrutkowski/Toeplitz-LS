@@ -272,19 +272,21 @@ static VkDeviceRuntime* get_device_runtime(int device_id) {
     }
 
     uint32_t nqueues = vk_ctx_queue_count(ctx);
+    const VkBufferMemKind in_kind  = dev_cfg->has_host_unified_memory ? VK_MEM_UMA_UPLOAD   : VK_MEM_DEVICE_LOCAL;
+    const VkBufferMemKind out_kind = dev_cfg->has_uma_cached          ? VK_MEM_UMA_READBACK : VK_MEM_DEVICE_LOCAL;
     for (int i = 0; i < rt->num_slots; ++i) {
         VkStreamSlot* s = &rt->slots[i];
         s->ctx = ctx;
         s->h_in.kind = VK_MEM_HOST_UPLOAD;
         s->h_power.kind = VK_MEM_HOST_READBACK;
         s->h_cond.kind = VK_MEM_HOST_READBACK;
-        s->d_in.kind = VK_MEM_DEVICE_LOCAL;
+        s->d_in.kind = in_kind;
         s->d_src.kind = VK_MEM_DEVICE_LOCAL;
         s->d_trig.kind = VK_MEM_DEVICE_LOCAL;
         s->d_ihs_acc.kind = VK_MEM_DEVICE_LOCAL;
         s->d_a_scratch.kind = VK_MEM_DEVICE_LOCAL;
-        s->d_power.kind = VK_MEM_DEVICE_LOCAL;
-        s->d_cond.kind = VK_MEM_DEVICE_LOCAL;
+        s->d_power.kind = out_kind;
+        s->d_cond.kind = out_kind;
         if (!vk_batch_init(&s->batch, ctx, (uint32_t)i % (nqueues > 0u ? nqueues : 1u))) {
             for (int j = 0; j < i; ++j) vk_batch_destroy(&rt->slots[j].batch);
             free(rt->slots); free(rt->idle_stack); free(rt);
@@ -355,14 +357,14 @@ static int parse_backend(int backend, VkPswfMode* out_mode) {
     return TLS_VK_ERR_BACKEND;
 }
 
-static void copy_dev_out_to_host(VkPrecKind prec, const void* src, void* dst, int Nf) {
+static void copy_dev_out_to_host(VkPrecKind prec, const void* restrict src, void* restrict dst, int Nf) {
     if (prec == VK_PREC_HALF || prec == VK_PREC_FLOAT) {
         memcpy(dst, src, (size_t)Nf * sizeof(float));
     } else if (prec == VK_PREC_DOUBLE) {
         memcpy(dst, src, (size_t)Nf * sizeof(double));
     } else {
-        const VkDf* s = (const VkDf*)src;
-        double* d = (double*)dst;
+        const VkDf* restrict s = (const VkDf*)src;
+        double* restrict d = (double*)dst;
         for (int i = 0; i < Nf; ++i) {
             d[i] = (double)s[i].hi + (double)s[i].lo;
         }
@@ -454,8 +456,8 @@ static int execute_fastchi2_common(
     const size_t out_bytes = (size_t)Nf * obytes;
     const size_t cond_bytes = has_cond ? out_bytes : 0u;
     const size_t chunk_items_max = is_half ? (chunk_bins_max >> 1) : chunk_bins_max;
-    const size_t chunk_items_pad = (chunk_items_max + 31u) & ~(size_t)31u;
-    const size_t scr_bytes = (degree > 5)
+    const size_t chunk_items_pad = (chunk_items_max + 63u) & ~(size_t)63u;
+    const size_t scr_bytes = vk_fastchi2_needs_scratch(dev_cfg, prec, degree)
         ? (2u * (size_t)(2 * degree - 1) * chunk_items_pad * vk_solve_real_bytes_for(prec))
         : 0u;
     const size_t max_alloc = vk_device_safe_max_alloc_bytes(dev_cfg);
@@ -472,9 +474,11 @@ static int execute_fastchi2_common(
         goto cleanup;
     }
 
-    if (!grow_buf_ensure(&slot->h_in, rt->ctx, in_bytes, 0u) ||
-        !grow_buf_ensure(&slot->h_power, rt->ctx, out_bytes, 0u) ||
-        (has_cond && !grow_buf_ensure(&slot->h_cond, rt->ctx, cond_bytes, 0u)) ||
+    const bool uma_up = (slot->d_in.kind == VK_MEM_UMA_UPLOAD);
+    const bool uma_dn = (slot->d_power.kind == VK_MEM_UMA_READBACK);
+    if ((!uma_up && !grow_buf_ensure(&slot->h_in, rt->ctx, in_bytes, 0u)) ||
+        (!uma_dn && !grow_buf_ensure(&slot->h_power, rt->ctx, out_bytes, 0u)) ||
+        (!uma_dn && has_cond && !grow_buf_ensure(&slot->h_cond, rt->ctx, cond_bytes, 0u)) ||
         !grow_buf_ensure(&slot->d_in, rt->ctx, in_bytes, cap_limit) ||
         !grow_buf_ensure(&slot->d_src, rt->ctx, src_bytes, cap_limit) ||
         !grow_buf_ensure(&slot->d_trig, rt->ctx, trig_bytes, cap_limit) ||
@@ -486,8 +490,8 @@ static int execute_fastchi2_common(
         goto cleanup;
     }
 
-    /* Pack (x, w, yw) into mapped upload staging slab -> single H2D copy! */
-    uint8_t* h_in_ptr = (uint8_t*)slot->h_in.buf.mapped;
+    /* Pack (x, w, yw) directly into UMA d_in (zero-copy) or mapped upload slab -> single H2D copy */
+    uint8_t* h_in_ptr = (uint8_t*)(uma_up ? slot->d_in.buf.mapped : slot->h_in.buf.mapped);
     memcpy(h_in_ptr,          g_tls_fc2_host.x,  xbytes);
     memcpy(h_in_ptr + off_w,  g_tls_fc2_host.w,  wbytes);
     memcpy(h_in_ptr + off_yw, g_tls_fc2_host.yw, wbytes);
@@ -512,8 +516,10 @@ static int execute_fastchi2_common(
     /* Single batched command submission across all super-chunks (zero inter-chunk CPU stalls;
      * vk_batch_dispatch auto-flushes only if ds_cap is exceeded). */
     if (!vk_batch_begin(&slot->batch)) { ret = TLS_VK_ERR_RUNTIME; goto cleanup; }
-    vk_batch_copy(&slot->batch, vk_buf_slice(&slot->h_in.buf, 0, in_bytes), d_in_s, in_bytes);
-    vk_batch_barrier_t2c(&slot->batch);
+    if (!uma_up) {
+        vk_batch_copy(&slot->batch, vk_buf_slice(&slot->h_in.buf, 0, in_bytes), d_in_s, in_bytes);
+        vk_batch_barrier_t2c(&slot->batch);
+    }
     if (is_half) {
         if (!vk_nufft1_record_set_output_scale(plan, &slot->batch, g_tls_fc2_host.row_scale)) {
             ret = TLS_VK_ERR_RUNTIME; goto cleanup;
@@ -572,12 +578,14 @@ static int execute_fastchi2_common(
         }
     }
 
-    vk_batch_barrier_c2t(&slot->batch);
-    vk_batch_copy(&slot->batch, vk_buf_slice(&slot->d_power.buf, 0, out_bytes),
-                  vk_buf_slice(&slot->h_power.buf, 0, out_bytes), out_bytes);
-    if (has_cond) {
-        vk_batch_copy(&slot->batch, vk_buf_slice(&slot->d_cond.buf, 0, cond_bytes),
-                      vk_buf_slice(&slot->h_cond.buf, 0, cond_bytes), cond_bytes);
+    if (!uma_dn) {
+        vk_batch_barrier_c2t(&slot->batch);
+        vk_batch_copy(&slot->batch, vk_buf_slice(&slot->d_power.buf, 0, out_bytes),
+                      vk_buf_slice(&slot->h_power.buf, 0, out_bytes), out_bytes);
+        if (has_cond) {
+            vk_batch_copy(&slot->batch, vk_buf_slice(&slot->d_cond.buf, 0, cond_bytes),
+                          vk_buf_slice(&slot->h_cond.buf, 0, cond_bytes), cond_bytes);
+        }
     }
     if (!vk_batch_submit_and_wait(&slot->batch)) {
         set_last_error("Vulkan command submission failed during FastChi2 execution");
@@ -585,9 +593,9 @@ static int execute_fastchi2_common(
         goto cleanup;
     }
 
-    copy_dev_out_to_host(prec, slot->h_power.buf.mapped, power_out, Nf);
+    copy_dev_out_to_host(prec, uma_dn ? slot->d_power.buf.mapped : slot->h_power.buf.mapped, power_out, Nf);
     if (has_cond) {
-        copy_dev_out_to_host(prec, slot->h_cond.buf.mapped, cond_out, Nf);
+        copy_dev_out_to_host(prec, uma_dn ? slot->d_cond.buf.mapped : slot->h_cond.buf.mapped, cond_out, Nf);
     }
 
 cleanup:
@@ -689,8 +697,10 @@ static int execute_ihs_common(
         goto cleanup;
     }
 
-    if (!grow_buf_ensure(&slot->h_in, rt->ctx, in_bytes, 0u) ||
-        !grow_buf_ensure(&slot->h_power, rt->ctx, out_bytes, 0u) ||
+    const bool uma_up = (slot->d_in.kind == VK_MEM_UMA_UPLOAD);
+    const bool uma_dn = (slot->d_power.kind == VK_MEM_UMA_READBACK);
+    if ((!uma_up && !grow_buf_ensure(&slot->h_in, rt->ctx, in_bytes, 0u)) ||
+        (!uma_dn && !grow_buf_ensure(&slot->h_power, rt->ctx, out_bytes, 0u)) ||
         !grow_buf_ensure(&slot->d_in, rt->ctx, in_bytes, cap_limit) ||
         !grow_buf_ensure(&slot->d_src, rt->ctx, src_bytes, cap_limit) ||
         !grow_buf_ensure(&slot->d_trig, rt->ctx, z_bytes, cap_limit) ||
@@ -701,7 +711,7 @@ static int execute_ihs_common(
         goto cleanup;
     }
 
-    uint8_t* h_in_ptr = (uint8_t*)slot->h_in.buf.mapped;
+    uint8_t* h_in_ptr = (uint8_t*)(uma_up ? slot->d_in.buf.mapped : slot->h_in.buf.mapped);
     memcpy(h_in_ptr,          g_tls_ihs_host.x,  xbytes);
     memcpy(h_in_ptr + off_wy, g_tls_ihs_host.wy, wbytes);
 
@@ -719,8 +729,10 @@ static int execute_ihs_common(
     bool df_vk        = plan->fft_plan.df_use_veltkamp;
 
     if (!vk_batch_begin(&slot->batch)) { ret = TLS_VK_ERR_RUNTIME; goto cleanup; }
-    vk_batch_copy(&slot->batch, vk_buf_slice(&slot->h_in.buf, 0, in_bytes), d_in_s, in_bytes);
-    vk_batch_barrier_t2c(&slot->batch);
+    if (!uma_up) {
+        vk_batch_copy(&slot->batch, vk_buf_slice(&slot->h_in.buf, 0, in_bytes), d_in_s, in_bytes);
+        vk_batch_barrier_t2c(&slot->batch);
+    }
     if (degree == 1) {
         if (!vk_nufft1_record_set_points(plan, &slot->batch, d_x_s, M, df, 1)) {
             ret = TLS_VK_ERR_RUNTIME; goto cleanup;
@@ -796,16 +808,18 @@ static int execute_ihs_common(
         }
     }
 
-    vk_batch_barrier_c2t(&slot->batch);
-    vk_batch_copy(&slot->batch, vk_buf_slice(&slot->d_power.buf, 0, out_bytes),
-                  vk_buf_slice(&slot->h_power.buf, 0, out_bytes), out_bytes);
+    if (!uma_dn) {
+        vk_batch_barrier_c2t(&slot->batch);
+        vk_batch_copy(&slot->batch, vk_buf_slice(&slot->d_power.buf, 0, out_bytes),
+                      vk_buf_slice(&slot->h_power.buf, 0, out_bytes), out_bytes);
+    }
     if (!vk_batch_submit_and_wait(&slot->batch)) {
         set_last_error("Vulkan command submission failed during IHS execution");
         ret = TLS_VK_ERR_RUNTIME;
         goto cleanup;
     }
 
-    copy_dev_out_to_host(prec, slot->h_power.buf.mapped, power_out, Nf);
+    copy_dev_out_to_host(prec, uma_dn ? slot->d_power.buf.mapped : slot->h_power.buf.mapped, power_out, Nf);
 
 cleanup:
     rt_release_slot(rt, slot_idx);

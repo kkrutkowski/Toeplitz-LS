@@ -198,9 +198,10 @@ static inline double vk_eval_gpu_block_cost(
     size_t smem_usable = dev_cfg->local_mem_size - (dev_cfg->local_mem_size / 16u);
     size_t sp_nfft = 2048u;
     if (dev_cfg->has_native_local_mem && smem_usable >= 4096u) {
+        size_t sp_cap = (smem_elem_bytes <= 8u && smem_usable >= 32768u) ? 16384u : 8192u;
         sp_nfft = vk_pow2_floor_sz(smem_usable / smem_elem_bytes) * 2u;
         if (sp_nfft < 1024u) sp_nfft = 1024u;
-        if (sp_nfft > 8192u) sp_nfft = 8192u;
+        if (sp_nfft > sp_cap) sp_nfft = sp_cap;
     }
 
     double fp64_alu_mult = 1.0;
@@ -211,9 +212,11 @@ static inline double vk_eval_gpu_block_cost(
     }
 
     double fft_pass_mult = 1.0;
-    if ((size_t)nfft > sp_nfft) fft_pass_mult = 2.25;
+    if ((size_t)nfft > 65536u) fft_pass_mult = 4.0;
+    else if ((size_t)nfft > 4u * sp_nfft) fft_pass_mult = 2.8;
+    else if ((size_t)nfft > sp_nfft) fft_pass_mult = 2.25;
     else if ((size_t)nfft == sp_nfft && sp_nfft >= 4096u) fft_pass_mult = 1.25;
-    double fft_cost = n_exec * B * (double)nfft * (0.35 + 0.065 * (double)log_nfft) * fft_pass_mult * (prec_bytes / 8.0);
+    double fft_cost = n_exec * B * (double)nfft * (0.35 + 0.065 * (double)log_nfft) * fft_pass_mult * (prec_bytes / 8.0) * fp64_alu_mult;
 
     size_t win_cap = (size_t)nfft;
     if (dev_cfg->has_native_local_mem && smem_usable >= 4096u) {
@@ -223,19 +226,25 @@ static inline double vk_eval_gpu_block_cost(
     }
     double num_wins = (double)nfft / (double)win_cap;
     if (num_wins < 1.0) num_wins = 1.0;
-    double win_pen = (num_wins <= 1.0) ? 1.0 : (1.0 + 0.12 * log2(num_wins));
-    double spread_cost = n_exec * B * (double)M * (double)w * (0.55 * fp64_alu_mult) * win_pen;
+    double win_pen = (num_wins <= 1.0) ? 1.0 : (1.0 + 0.14 * log2(num_wins));
+    /* Account for per-window grid zero/flush & fragmentation when num_wins grows large */
+    double win_flush_cost = (num_wins > 1.0)
+        ? (n_exec * B * num_wins * (double)win_cap * 0.18 * (prec_bytes / 8.0))
+        : 0.0;
+    double spread_cost = n_exec * B * (double)M * (double)w * (0.55 * fp64_alu_mult) * win_pen + win_flush_cost;
 
     double phase_beta = (prec == VK_PREC_DF) ? 2.2 : ((prec == VK_PREC_DOUBLE) ? (1.2 * fp64_alu_mult) : 0.75);
     double phase_cost = n_factors * B * (double)M * phase_beta;
-    double pre_cost = n_factors * (double)M * (2.0 + 0.5 * num_wins);
+    double pre_cost = n_factors * ((double)M * (2.0 + 0.5 * num_wins) + num_wins * 32.0);
 
-    double cus_per_slot = (double)dev_cfg->max_compute_units / (double)(num_slots > 0 ? num_slots : 1);
-    if (cus_per_slot < 2.0) cus_per_slot = 2.0;
+    int slot_div = (num_slots > 0) ? num_slots : 1;
+    if (slot_div > 4) slot_div = 4;
+    double cus_per_slot = (double)dev_cfg->max_compute_units / (double)slot_div;
+    if (cus_per_slot < 4.0) cus_per_slot = 4.0;
     double eff_bs = B * (is_ihs ? 1.0 : 1.5);
     double occ_pen = 1.0;
     if (dev_cfg->is_gpu && eff_bs < cus_per_slot) {
-        occ_pen = 1.0 + 0.30 * ((cus_per_slot - eff_bs) / cus_per_slot);
+        occ_pen = 1.0 + 0.45 * ((cus_per_slot - eff_bs) / cus_per_slot);
     }
 
     double launch_overhead = n_exec * 400.0;

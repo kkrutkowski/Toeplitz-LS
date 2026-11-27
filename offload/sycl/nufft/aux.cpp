@@ -301,18 +301,37 @@ void launch_build_window_buckets(
                 });
         });
     } else {
+        size_t scan_wg = 256;
+        while (scan_wg > wg && scan_wg > 1) scan_wg >>= 1;
         q.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<int, 1> l_total(sycl::range<1>(1), cgh);
             cgh.parallel_for(
-                sycl::range<1>(1),
-                [=](sycl::id<1>) {
-                    int sum = 0;
-                    for (int wi = 0; wi < num_wins; ++wi) {
-                        const int cnt = d_bucket_counts[wi];
-                        d_bucket_off[wi] = sum;
-                        d_bucket_counts[wi] = sum;
-                        sum += cnt;
+                sycl::nd_range<1>(scan_wg, scan_wg),
+                [=](sycl::nd_item<1> item) {
+                    const int tid = static_cast<int>(item.get_local_linear_id());
+                    const int wg_sz = static_cast<int>(scan_wg);
+                    if (tid == 0) l_total[0] = 0;
+                    sycl::group_barrier(item.get_group());
+                    for (int base = 0; base < num_wins; base += wg_sz) {
+                        const int wi = base + tid;
+                        const int val = (wi < num_wins) ? d_bucket_counts[wi] : 0;
+                        const int pref = sycl::exclusive_scan_over_group(
+                            item.get_group(), val, sycl::plus<int>());
+                        const int running = l_total[0];
+                        if (wi < num_wins) {
+                            d_bucket_off[wi] = running + pref;
+                            d_bucket_counts[wi] = running + pref;
+                        }
+                        const int last_in_chunk = (base + wg_sz <= num_wins) ? (wg_sz - 1) : (num_wins - 1 - base);
+                        sycl::group_barrier(item.get_group());
+                        if (tid == last_in_chunk) {
+                            l_total[0] = running + pref + val;
+                        }
+                        sycl::group_barrier(item.get_group());
                     }
-                    d_bucket_off[num_wins] = sum;
+                    if (tid == 0) {
+                        d_bucket_off[num_wins] = l_total[0];
+                    }
                 });
         });
     }

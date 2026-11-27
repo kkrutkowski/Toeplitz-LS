@@ -19,6 +19,10 @@ from .._fastchi2 import (
 from .._ihs import _check_ihs_normalization, _raw_neff, _warn_if_ihs_undersampled
 
 OFFLOAD_BACKENDS = {"pswf43": 1, "pswf21": 2}
+_DBL_PTR = ctypes.POINTER(ctypes.c_double)
+_FLT_PTR = ctypes.POINTER(ctypes.c_float)
+_NULL_DBL_PTR = _DBL_PTR()
+_NULL_FLT_PTR = _FLT_PTR()
 
 
 class CDeviceInfo(ctypes.Structure):
@@ -154,17 +158,24 @@ def make_fastchi2_classes(
     fn_f = f"{prefix}_f_fastchi2"
     fn_df = f"{prefix}_df_fastchi2"
     fn_d = f"{prefix}_d_fastchi2"
+    _fn_cache: dict[str, object] = {}
+
+    def _get_fn(name: str):
+        fn = _fn_cache.get(name)
+        if fn is None:
+            fn = getattr(load_library(), name)
+            _fn_cache[name] = fn
+        return fn
 
     def _run_half_prepared(device, Nf, df, f0, t_arr, y_arr, dy_arr, use_double, backend_id, nterms, normalization, autonan):
         out = np.empty(Nf, dtype=np.float32)
         cond = None if autonan else np.empty(Nf, dtype=np.float32)
-        cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        lib = load_library()
+        cond_ptr = _NULL_FLT_PTR if cond is None else cond.ctypes.data_as(_FLT_PTR)
         if use_double:
-            status = getattr(lib, fn_hd)(
-                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            status = _get_fn(fn_hd)(
+                t_arr.ctypes.data_as(_DBL_PTR),
+                y_arr.ctypes.data_as(_DBL_PTR),
+                dy_arr.ctypes.data_as(_DBL_PTR),
                 t_arr.size,
                 f0,
                 df,
@@ -173,15 +184,15 @@ def make_fastchi2_classes(
                 backend_id,
                 normalization,
                 device,
-                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                out.ctypes.data_as(_FLT_PTR),
                 cond_ptr,
             )
             raise_status(fn_hd, status)
         else:
-            status = getattr(lib, fn_h)(
-                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            status = _get_fn(fn_h)(
+                t_arr.ctypes.data_as(_DBL_PTR),
+                y_arr.ctypes.data_as(_FLT_PTR),
+                dy_arr.ctypes.data_as(_FLT_PTR),
                 t_arr.size,
                 f0,
                 df,
@@ -190,7 +201,7 @@ def make_fastchi2_classes(
                 backend_id,
                 normalization,
                 device,
-                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                out.ctypes.data_as(_FLT_PTR),
                 cond_ptr,
             )
             raise_status(fn_h, status)
@@ -201,11 +212,11 @@ def make_fastchi2_classes(
     def _run_float_prepared(device, Nf, df, f0, t_arr, y_arr, dy_arr, backend_id, nterms, normalization, autonan):
         out = np.empty(Nf, dtype=np.float32)
         cond = None if autonan else np.empty(Nf, dtype=np.float32)
-        cond_ptr = ctypes.POINTER(ctypes.c_float)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        status = getattr(load_library(), fn_f)(
-            t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        cond_ptr = _NULL_FLT_PTR if cond is None else cond.ctypes.data_as(_FLT_PTR)
+        status = _get_fn(fn_f)(
+            t_arr.ctypes.data_as(_DBL_PTR),
+            y_arr.ctypes.data_as(_FLT_PTR),
+            dy_arr.ctypes.data_as(_FLT_PTR),
             t_arr.size,
             f0,
             df,
@@ -214,7 +225,7 @@ def make_fastchi2_classes(
             backend_id,
             normalization,
             device,
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out.ctypes.data_as(_FLT_PTR),
             cond_ptr,
         )
         raise_status(fn_f, status)
@@ -225,11 +236,11 @@ def make_fastchi2_classes(
     def _run_double_prepared(fn_name, device, Nf, df, f0, t_arr, y_arr, dy_arr, backend_id, nterms, normalization, autonan):
         out = np.empty(Nf, dtype=np.float64)
         cond = None if autonan else np.empty(Nf, dtype=np.float64)
-        cond_ptr = ctypes.POINTER(ctypes.c_double)() if cond is None else cond.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
-        status = getattr(load_library(), fn_name)(
-            t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        cond_ptr = _NULL_DBL_PTR if cond is None else cond.ctypes.data_as(_DBL_PTR)
+        status = _get_fn(fn_name)(
+            t_arr.ctypes.data_as(_DBL_PTR),
+            y_arr.ctypes.data_as(_DBL_PTR),
+            dy_arr.ctypes.data_as(_DBL_PTR),
             t_arr.size,
             f0,
             df,
@@ -238,7 +249,7 @@ def make_fastchi2_classes(
             backend_id,
             normalization,
             device,
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            out.ctypes.data_as(_DBL_PTR),
             cond_ptr,
         )
         raise_status(fn_name, status)
@@ -503,16 +514,23 @@ def make_ihs_classes(
     fn_f = f"{prefix}_f_ihs"
     fn_df = f"{prefix}_df_ihs"
     fn_d = f"{prefix}_d_ihs"
+    _fn_cache: dict[str, object] = {}
+
+    def _get_fn(name: str):
+        fn = _fn_cache.get(name)
+        if fn is None:
+            fn = getattr(load_library(), name)
+            _fn_cache[name] = fn
+        return fn
 
     def _run_ihs_half_prepared(device, Nf, df, f0, t_arr, y_arr, dy_arr, use_double, backend_id, nterms, normalization):
         _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float32)
-        lib = load_library()
         if use_double:
-            status = getattr(lib, fn_hd)(
-                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            status = _get_fn(fn_hd)(
+                t_arr.ctypes.data_as(_DBL_PTR),
+                y_arr.ctypes.data_as(_DBL_PTR),
+                dy_arr.ctypes.data_as(_DBL_PTR),
                 t_arr.size,
                 f0,
                 df,
@@ -521,14 +539,14 @@ def make_ihs_classes(
                 backend_id,
                 normalization,
                 device,
-                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                out.ctypes.data_as(_FLT_PTR),
             )
             raise_status(fn_hd, status)
         else:
-            status = getattr(lib, fn_h)(
-                t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            status = _get_fn(fn_h)(
+                t_arr.ctypes.data_as(_DBL_PTR),
+                y_arr.ctypes.data_as(_FLT_PTR),
+                dy_arr.ctypes.data_as(_FLT_PTR),
                 t_arr.size,
                 f0,
                 df,
@@ -537,7 +555,7 @@ def make_ihs_classes(
                 backend_id,
                 normalization,
                 device,
-                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                out.ctypes.data_as(_FLT_PTR),
             )
             raise_status(fn_h, status)
         return out
@@ -545,10 +563,10 @@ def make_ihs_classes(
     def _run_ihs_float_prepared(device, Nf, df, f0, t_arr, y_arr, dy_arr, backend_id, nterms, normalization):
         _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float32)
-        status = getattr(load_library(), fn_f)(
-            t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        status = _get_fn(fn_f)(
+            t_arr.ctypes.data_as(_DBL_PTR),
+            y_arr.ctypes.data_as(_FLT_PTR),
+            dy_arr.ctypes.data_as(_FLT_PTR),
             t_arr.size,
             f0,
             df,
@@ -557,7 +575,7 @@ def make_ihs_classes(
             backend_id,
             normalization,
             device,
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out.ctypes.data_as(_FLT_PTR),
         )
         raise_status(fn_f, status)
         return out
@@ -565,10 +583,10 @@ def make_ihs_classes(
     def _run_ihs_double_prepared(fn_name, device, Nf, df, f0, t_arr, y_arr, dy_arr, backend_id, nterms, normalization):
         _warn_if_ihs_undersampled(_raw_neff(dy_arr), nterms)
         out = np.empty(Nf, dtype=np.float64)
-        status = getattr(load_library(), fn_name)(
-            t_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            y_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            dy_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        status = _get_fn(fn_name)(
+            t_arr.ctypes.data_as(_DBL_PTR),
+            y_arr.ctypes.data_as(_DBL_PTR),
+            dy_arr.ctypes.data_as(_DBL_PTR),
             t_arr.size,
             f0,
             df,
@@ -577,7 +595,7 @@ def make_ihs_classes(
             backend_id,
             normalization,
             device,
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            out.ctypes.data_as(_DBL_PTR),
         )
         raise_status(fn_name, status)
         return out

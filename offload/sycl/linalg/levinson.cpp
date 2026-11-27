@@ -90,6 +90,42 @@ SYCL_FFT_FORCE_INLINE SolveRealT l_fma(SolveRealT a, SolveRealT b, SolveRealT c)
 #endif
 }
 
+SYCL_FFT_FORCE_INLINE SolveRealT l_abs2(SolveRealT r, SolveRealT i) {
+#if defined(SYCL_FFT_DF)
+    return df_add(df_sqr(r), df_sqr(i));
+#else
+    return l_fma(r, r, SYCL_FFT_MUL(i, i));
+#endif
+}
+
+SYCL_FFT_FORCE_INLINE void l_cmac(
+    SolveRealT ar, SolveRealT ai, SolveRealT br, SolveRealT bi,
+    SolveRealT& acc_r, SolveRealT& acc_i) {
+#if defined(SYCL_FFT_DF)
+    df_t pr, pi;
+    df_cmul_fused(ar, ai, br, bi, pr, pi);
+    acc_r = df_add(acc_r, pr);
+    acc_i = df_add(acc_i, pi);
+#else
+    acc_r = l_fma(ar, br, l_fma(SYCL_FFT_NEG(ai), bi, acc_r));
+    acc_i = l_fma(ar, bi, l_fma(ai, br, acc_i));
+#endif
+}
+
+SYCL_FFT_FORCE_INLINE void l_cmac_conj(
+    SolveRealT gr, SolveRealT gi, SolveRealT ar, SolveRealT ai,
+    SolveRealT base_r, SolveRealT base_i, SolveRealT& nr, SolveRealT& ni) {
+#if defined(SYCL_FFT_DF)
+    df_t pr, pi;
+    df_cmul_fused(gr, gi, ar, df_neg(ai), pr, pi);
+    nr = df_add(base_r, pr);
+    ni = df_add(base_i, pi);
+#else
+    nr = l_fma(gr, ar, l_fma(gi, ai, base_r));
+    ni = l_fma(gi, ar, l_fma(SYCL_FFT_NEG(gr), ai, base_i));
+#endif
+}
+
 SYCL_FFT_FORCE_INLINE size_t trig_w_row(int q, int degree) {
     return (q <= degree) ? static_cast<size_t>(2 * (q - 1)) : static_cast<size_t>(degree + q - 1);
 }
@@ -204,20 +240,20 @@ SYCL_FFT_FORCE_INLINE double compute_bayes_laplace_d(double delta) {
 }
 
 SYCL_FFT_FORCE_INLINE double normalize_power_d(
-    double dot, double chi2_ref, double cond_bound,
+    double dot, double inv_chi2_ref, double cond_bound,
     NormKind norm, int degree, int M, const CybenkoModel& cyb, double b) {
-    if (!d_is_finite(dot) || dot >= chi2_ref) return d_nan();
+    if (!d_is_finite(dot)) return d_nan();
     if (dot <= 0.0) return 0.0;
-    const double r2 = dot / chi2_ref;
+    const double r2 = dot * inv_chi2_ref;
     if (!d_is_finite(r2) || r2 >= 1.0) return d_nan();
     if (norm == NormKind::Standard) {
         return r2;
     } else if (norm == NormKind::Anova) {
         const double d1 = 2.0 * static_cast<double>(degree) + 1.0;
         const double d2 = static_cast<double>(M) - 1.0 - d1;
-        double residual = chi2_ref - dot;
+        double residual = 1.0 - r2;
         if (residual < 1e-32) residual = 1e-32;
-        return (d2 * dot) / (d1 * residual);
+        return (d2 * r2) / (d1 * residual);
     } else if (norm == NormKind::Nll) {
         return nll_exact_pochhammer_d(degree, r2, b);
     } else {
@@ -228,16 +264,13 @@ SYCL_FFT_FORCE_INLINE double normalize_power_d(
     }
 }
 
-SYCL_FFT_FORCE_INLINE double ihs_wilkie_d(double z, double n_eff) {
-    if (!(n_eff > 0.0) || !d_is_finite(n_eff)) return z;
+SYCL_FFT_FORCE_INLINE double ihs_wilkie_d(double z, double inv_n, double inv_n2_288) {
+    if (!(inv_n > 0.0)) return z;
     if (!(z > 0.0) || !d_is_finite(z)) return 0.0;
-    const double inv_n = 1.0 / n_eff;
-    const double inv_n2 = inv_n * inv_n;
-    const double z2 = z * z;
-    const double z3 = z2 * z;
-    const double z4 = z3 * z;
-    double delta = (2.0 * z - z2) * 0.25 * inv_n;
-    delta -= (24.0 * z - 132.0 * z2 + 76.0 * z3 - 9.0 * z4) * inv_n2 / 288.0;
+    double p2 = sycl::fma(-9.0, z, 76.0);
+    p2 = sycl::fma(p2, z, -132.0);
+    p2 = sycl::fma(p2, z, 24.0);
+    const double delta = sycl::fma(z * (2.0 - z), 0.25 * inv_n, -(z * p2) * inv_n2_288);
     if (!(delta > -1.0) || !d_is_finite(delta)) return z;
     const double corr = z - sycl::log1p(delta);
     return (corr > 0.0 && d_is_finite(corr)) ? corr : z;
@@ -392,6 +425,22 @@ SYCL_FFT_DF_INLINE df_t df_log(df_t x) {
     return df_add(ln_m, df_mul_f(kLn2Df, static_cast<float>(e)));
 }
 
+SYCL_FFT_DF_INLINE df_t df_log1p(df_t x) {
+    SYCL_FFT_DF_EXACT_FP
+    if (sycl::fabs(x.hi) < 0.15f) {
+        const df_t t = df_div(x, df_add(df_make(2.0f, 0.0f), x));
+        const df_t t2 = df_sqr(t);
+        df_t poly = df_from_double(1.0 / 11.0);
+        poly = df_add(df_mul(poly, t2), df_from_double(1.0 / 9.0));
+        poly = df_add(df_mul(poly, t2), df_from_double(1.0 / 7.0));
+        poly = df_add(df_mul(poly, t2), df_from_double(1.0 / 5.0));
+        poly = df_add(df_mul(poly, t2), df_from_double(1.0 / 3.0));
+        poly = df_add(df_mul(poly, t2), df_make(1.0f, 0.0f));
+        return df_scale_pow2(df_mul(t, poly), 2.0f);
+    }
+    return df_log(df_add(df_make(1.0f, 0.0f), x));
+}
+
 // ~46-47 bit DF exponential exp(x) via range reduction x = k*ln(2) + r, |r| <= ln(2)/2 (zero FP64 ops!)
 SYCL_FFT_DF_INLINE df_t df_exp(df_t x) {
     SYCL_FFT_DF_EXACT_FP
@@ -500,30 +549,26 @@ SYCL_FFT_DF_INLINE df_t nll_exact_pochhammer_df(int d, df_t r2, df_t b) {
     constexpr df_t kMaxR2 = df_from_double(0.999999999999);
     if (r2.hi > kMaxR2.hi || (r2.hi == kMaxR2.hi && r2.lo > kMaxR2.lo)) r2 = kMaxR2;
     const df_t one = df_make(1.0f, 0.0f);
-    const df_t one_minus_r2 = df_sub(one, r2);
-    const df_t term0 = df_mul(df_neg(b), df_log(one_minus_r2));
+    const df_t term0 = df_mul(df_neg(b), df_log1p(df_neg(r2)));
     if (d <= 1) return (term0.hi > 0.0f && f_is_finite(term0.hi)) ? term0 : df_make(0.0f, 0.0f);
     df_t c = one;
-    df_t s = one;
+    df_t s_minus_1 = df_make(0.0f, 0.0f);
     for (int k = 1; k < d; ++k) {
         const df_t factor = df_div(df_add(b, df_make(static_cast<float>(k - 1), 0.0f)),
                                    df_make(static_cast<float>(k), 0.0f));
         c = df_mul(df_mul(c, factor), r2);
-        s = df_add(s, c);
+        s_minus_1 = df_add(s_minus_1, c);
     }
-    const df_t nll = df_sub(term0, df_log(s));
+    const df_t nll = df_sub(term0, df_log1p(s_minus_1));
     return (nll.hi > 0.0f && f_is_finite(nll.hi)) ? nll : df_make(0.0f, 0.0f);
 }
 
 SYCL_FFT_DF_INLINE df_t normalize_power_df(
-    df_t dot, df_t chi2_ref, df_t cond_bound,
+    df_t dot, df_t inv_chi2_ref, df_t cond_bound,
     NormKind norm, int degree, int M, const CybenkoModelDf& cyb, df_t b) {
     if (!f_is_finite(dot.hi) || !f_is_finite(dot.lo)) return df_make(f_nan(), f_nan());
-    if (dot.hi > chi2_ref.hi || (dot.hi == chi2_ref.hi && dot.lo >= chi2_ref.lo)) {
-        return df_make(f_nan(), f_nan());
-    }
     if (dot.hi < 0.0f || (dot.hi == 0.0f && dot.lo <= 0.0f)) return df_make(0.0f, 0.0f);
-    const df_t r2 = df_div(dot, chi2_ref);
+    const df_t r2 = df_mul(dot, inv_chi2_ref);
     if (!f_is_finite(r2.hi) || !f_is_finite(r2.lo) || r2.hi > 1.0f || (r2.hi == 1.0f && r2.lo >= 0.0f)) {
         return df_make(f_nan(), f_nan());
     }
@@ -532,9 +577,9 @@ SYCL_FFT_DF_INLINE df_t normalize_power_df(
     } else if (norm == NormKind::Anova) {
         const df_t d1 = df_make(static_cast<float>(2 * degree + 1), 0.0f);
         const df_t d2 = df_make(static_cast<float>(M - 1 - (2 * degree + 1)), 0.0f);
-        df_t residual = df_sub(chi2_ref, dot);
+        df_t residual = df_sub(df_make(1.0f, 0.0f), r2);
         if (residual.hi < 1e-32f) residual = df_make(1e-32f, 0.0f);
-        return df_div(df_mul(d2, dot), df_mul(d1, residual));
+        return df_div(df_mul(d2, r2), df_mul(d1, residual));
     } else if (norm == NormKind::Nll) {
         return nll_exact_pochhammer_df(degree, r2, b);
     } else {
@@ -545,23 +590,16 @@ SYCL_FFT_DF_INLINE df_t normalize_power_df(
     }
 }
 
-SYCL_FFT_DF_INLINE df_t ihs_wilkie_df(df_t z, df_t n_eff) {
-    if (!(n_eff.hi > 0.0f) || !f_is_finite(n_eff.hi)) return z;
+SYCL_FFT_DF_INLINE df_t ihs_wilkie_df(df_t z, df_t inv_n, df_t inv_n2_288) {
+    if (!(inv_n.hi > 0.0f)) return z;
     if (!(z.hi > 0.0f) || !f_is_finite(z.hi)) return df_make(0.0f, 0.0f);
-    const df_t one = df_make(1.0f, 0.0f);
-    const df_t inv_n = df_div(one, n_eff);
-    const df_t inv_n2 = df_sqr(inv_n);
-    const df_t z2 = df_sqr(z);
-    const df_t z3 = df_mul(z2, z);
-    const df_t z4 = df_sqr(z2);
-    const df_t t1 = df_mul(df_sub(df_scale_pow2(z, 2.0f), z2), df_scale_pow2(inv_n, 0.25f));
-    const df_t num = df_add(
-        df_sub(df_mul_f(z, 24.0f), df_mul_f(z2, 132.0f)),
-        df_sub(df_mul_f(z3, 76.0f), df_mul_f(z4, 9.0f)));
-    const df_t delta = df_sub(t1, df_mul(num, df_div(inv_n2, df_make(288.0f, 0.0f))));
-    const df_t one_plus = df_add(one, delta);
-    if (!(one_plus.hi > 0.0f) || !f_is_finite(one_plus.hi)) return z;
-    const df_t corr = df_sub(z, df_log(one_plus));
+    df_t p2 = df_add(df_mul_f(z, -9.0f), df_make(76.0f, 0.0f));
+    p2 = df_add(df_mul(p2, z), df_make(-132.0f, 0.0f));
+    p2 = df_add(df_mul(p2, z), df_make(24.0f, 0.0f));
+    const df_t t1 = df_mul(df_mul(z, df_sub(df_make(2.0f, 0.0f), z)), df_scale_pow2(inv_n, 0.25f));
+    const df_t delta = df_sub(t1, df_mul(df_mul(z, p2), inv_n2_288));
+    if (!(delta.hi > -1.0f) || !f_is_finite(delta.hi)) return z;
+    const df_t corr = df_sub(z, df_log1p(delta));
     return (corr.hi > 0.0f && f_is_finite(corr.hi)) ? corr : z;
 }
 
@@ -596,20 +634,20 @@ SYCL_FFT_FORCE_INLINE float nll_exact_pochhammer_f(int d, float r2, float b) {
 }
 
 SYCL_FFT_FORCE_INLINE float normalize_power_f(
-    float dot, float chi2_ref, float cond_bound,
+    float dot, float inv_chi2_ref, float cond_bound,
     NormKind norm, int degree, int M, const CybenkoModelF& cyb, float b) {
-    if (!f_is_finite(dot) || dot >= chi2_ref) return f_nan();
+    if (!f_is_finite(dot)) return f_nan();
     if (dot <= 0.0f) return 0.0f;
-    const float r2 = dot / chi2_ref;
+    const float r2 = dot * inv_chi2_ref;
     if (!f_is_finite(r2) || r2 >= 1.0f) return f_nan();
     if (norm == NormKind::Standard) {
         return r2;
     } else if (norm == NormKind::Anova) {
         const float d1 = 2.0f * static_cast<float>(degree) + 1.0f;
         const float d2 = static_cast<float>(M) - 1.0f - d1;
-        float residual = chi2_ref - dot;
+        float residual = 1.0f - r2;
         if (residual < 1e-32f) residual = 1e-32f;
-        return (d2 * dot) / (d1 * residual);
+        return (d2 * r2) / (d1 * residual);
     } else if (norm == NormKind::Nll) {
         return nll_exact_pochhammer_f(degree, r2, b);
     } else {
@@ -620,16 +658,13 @@ SYCL_FFT_FORCE_INLINE float normalize_power_f(
     }
 }
 
-SYCL_FFT_FORCE_INLINE float ihs_wilkie_f(float z, float n_eff) {
-    if (!(n_eff > 0.0f) || !f_is_finite(n_eff)) return z;
+SYCL_FFT_FORCE_INLINE float ihs_wilkie_f(float z, float inv_n, float inv_n2_288) {
+    if (!(inv_n > 0.0f)) return z;
     if (!(z > 0.0f) || !f_is_finite(z)) return 0.0f;
-    const float inv_n = 1.0f / n_eff;
-    const float inv_n2 = inv_n * inv_n;
-    const float z2 = z * z;
-    const float z3 = z2 * z;
-    const float z4 = z3 * z;
-    float delta = (2.0f * z - z2) * 0.25f * inv_n;
-    delta -= (24.0f * z - 132.0f * z2 + 76.0f * z3 - 9.0f * z4) * inv_n2 / 288.0f;
+    float p2 = sycl::fma(-9.0f, z, 76.0f);
+    p2 = sycl::fma(p2, z, -132.0f);
+    p2 = sycl::fma(p2, z, 24.0f);
+    const float delta = sycl::fma(z * (2.0f - z), 0.25f * inv_n, -(z * p2) * inv_n2_288);
     if (!(delta > -1.0f) || !f_is_finite(delta)) return z;
     const float corr = z - sycl::log1p(delta);
     return (corr > 0.0f && f_is_finite(corr)) ? corr : z;
@@ -745,15 +780,15 @@ inline void SYCL_FFT_SUFFIX(launch_gls_kernel)(
     const SolveRealT three_v     = splat_from_double(3.0);
 
 #if defined(SYCL_FFT_DOUBLE)
-    const double chi2_ref_out = p.chi2_ref;
+    const double chi2_ref_out = 1.0 / p.chi2_ref;
     const double b_out = p.b_param;
     const CybenkoModel cyb = p.cyb;
 #elif defined(SYCL_FFT_DF)
-    const df_t chi2_ref_df = df_from_double(p.chi2_ref);
+    const df_t chi2_ref_df = df_from_double(1.0 / p.chi2_ref);
     const df_t b_df = df_from_double(p.b_param);
     const CybenkoModelDf cyb = to_cybenko_df(p.cyb);
 #else
-    const float chi2_ref_f = static_cast<float>(p.chi2_ref);
+    const float chi2_ref_f = static_cast<float>(1.0 / p.chi2_ref);
     const float b_f = static_cast<float>(p.b_param);
     const CybenkoModelF cyb = to_cybenko_f(p.cyb);
 #endif
@@ -1027,15 +1062,15 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
     const SolveRealT norder_val  = splat_from_double(static_cast<double>(norder_rt));
 
 #if defined(SYCL_FFT_DOUBLE)
-    const double chi2_ref_out = p.chi2_ref;
+    const double chi2_ref_out = 1.0 / p.chi2_ref;
     const double b_out = p.b_param;
     const CybenkoModel cyb = p.cyb;
 #elif defined(SYCL_FFT_DF)
-    const df_t chi2_ref_df = df_from_double(p.chi2_ref);
+    const df_t chi2_ref_df = df_from_double(1.0 / p.chi2_ref);
     const df_t b_df = df_from_double(p.b_param);
     const CybenkoModelDf cyb = to_cybenko_df(p.cyb);
 #else
-    const float chi2_ref_f = static_cast<float>(p.chi2_ref);
+    const float chi2_ref_f = static_cast<float>(1.0 / p.chi2_ref);
     const float b_f = static_cast<float>(p.b_param);
     const CybenkoModelF cyb = to_cybenko_f(p.cyb);
 #endif
@@ -1097,19 +1132,22 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                     }
                 };
 
-                // Predictor storage: register array for specialized MaxOrder > 0, global scratch otherwise
+                // Predictor storage: register array for specialized MaxOrder > 0, 32-lane warp-tiled scratch otherwise
                 constexpr int kRegLen = (MaxOrder > 0) ? MaxOrder : 1;
                 SolveRealT a_r_reg[kRegLen];
                 SolveRealT a_i_reg[kRegLen];
+                const size_t scr_base = (MaxOrder == 0)
+                    ? ((((gid >> 5) * static_cast<size_t>(2 * (norder - 2))) << 5) | (gid & size_t{31}))
+                    : size_t{0};
 
                 auto load_a = [&](int idx, SolveRealT& ar, SolveRealT& ai) {
                     if constexpr (MaxOrder > 0) {
                         ar = a_r_reg[idx];
                         ai = a_i_reg[idx];
                     } else {
-                        const size_t base = static_cast<size_t>(idx) * total_items + gid;
-                        ar = d_a_scratch[base];
-                        ai = d_a_scratch[static_cast<size_t>(norder) * total_items + base];
+                        const size_t off = scr_base + (static_cast<size_t>(2 * (idx - 1)) << 5);
+                        ar = d_a_scratch[off];
+                        ai = d_a_scratch[off + 32];
                     }
                 };
                 auto store_a = [&](int idx, SolveRealT ar, SolveRealT ai) {
@@ -1117,9 +1155,9 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                         a_r_reg[idx] = ar;
                         a_i_reg[idx] = ai;
                     } else {
-                        const size_t base = static_cast<size_t>(idx) * total_items + gid;
-                        d_a_scratch[base] = ar;
-                        d_a_scratch[static_cast<size_t>(norder) * total_items + base] = ai;
+                        const size_t off = scr_base + (static_cast<size_t>(2 * (idx - 1)) << 5);
+                        d_a_scratch[off] = ar;
+                        d_a_scratch[off + 32] = ai;
                     }
                 };
 
@@ -1127,11 +1165,9 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                 SolveRealT E = ws_k;
                 SolveRealT y0r, y0i;
                 get_Y(0, y0r, y0i);
-                SolveRealT r2 = SYCL_FFT_MUL(SYCL_FFT_ADD(SYCL_FFT_MUL(y0r, y0r), SYCL_FFT_MUL(y0i, y0i)), inv_E);
+                SolveRealT r2 = SYCL_FFT_MUL(l_abs2(y0r, y0i), inv_E);
                 SolveRealT cond_num = norder_val;
                 SolveRealT cond_den = SYCL_FFT_ONE;
-
-                store_a(0, SYCL_FFT_ONE, SYCL_FFT_ZERO);
 
                 auto levinson_step = [&](int k) {
                     // lambda = R[k] + sum_{i=1}^{k-1} R[k - i] * a[i]
@@ -1141,24 +1177,23 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                         SolveRealT rr, ri, ar, ai;
                         get_R(k - i, rr, ri);
                         load_a(i, ar, ai);
-                        lam_r = l_fma(rr, ar, SYCL_FFT_SUB(lam_r, SYCL_FFT_MUL(ri, ai)));
-                        lam_i = l_fma(rr, ai, l_fma(ri, ar, lam_i));
+                        l_cmac(rr, ri, ar, ai, lam_r, lam_i);
                     }
 
                     const SolveRealT gamma_r = SYCL_FFT_NEG(SYCL_FFT_MUL(lam_r, inv_E));
                     const SolveRealT gamma_i = SYCL_FFT_NEG(SYCL_FFT_MUL(lam_i, inv_E));
 
-                    const SolveRealT abs2_gamma = SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, gamma_r), SYCL_FFT_MUL(gamma_i, gamma_i));
+                    const SolveRealT abs2_gamma = l_abs2(gamma_r, gamma_i);
                     const SolveRealT abs_gamma  = l_sqrt(abs2_gamma);
                     E = SYCL_FFT_MUL(E, SYCL_FFT_SUB(SYCL_FFT_ONE, abs2_gamma));
                     inv_E = l_div(SYCL_FFT_ONE, E);
 
-                    store_a(k, gamma_r, gamma_i);
+                    const bool save_a = (k + 1 < norder);
+                    if (save_a) store_a(k, gamma_r, gamma_i);
 
-                    SolveRealT ykr, yki;
-                    get_Y(k, ykr, yki);
-                    SolveRealT xr = SYCL_FFT_ADD(ykr, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_r, y0r), SYCL_FFT_MUL(gamma_i, y0i)));
-                    SolveRealT xi = SYCL_FFT_ADD(yki, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, y0i), SYCL_FFT_MUL(gamma_i, y0r)));
+                    SolveRealT xr, xi;
+                    get_Y(k, xr, xi);
+                    l_cmac(gamma_r, gamma_i, y0r, y0i, xr, xi);
 
                     // Paired in-place symmetric update of (a[lo], a[hi]) fused with xi accumulation
                     int lo = 1, hi = k - 1;
@@ -1167,50 +1202,43 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                         load_a(lo, alr, ali);
                         load_a(hi, ahr, ahi);
 
-                        const SolveRealT nlr = SYCL_FFT_ADD(alr, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, ahr), SYCL_FFT_MUL(gamma_i, ahi)));
-                        const SolveRealT nli = SYCL_FFT_ADD(ali, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_i, ahr), SYCL_FFT_MUL(gamma_r, ahi)));
-                        const SolveRealT nhr = SYCL_FFT_ADD(ahr, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, alr), SYCL_FFT_MUL(gamma_i, ali)));
-                        const SolveRealT nhi = SYCL_FFT_ADD(ahi, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_i, alr), SYCL_FFT_MUL(gamma_r, ali)));
+                        SolveRealT nlr, nli, nhr, nhi;
+                        l_cmac_conj(gamma_r, gamma_i, ahr, ahi, alr, ali, nlr, nli);
+                        l_cmac_conj(gamma_r, gamma_i, alr, ali, ahr, ahi, nhr, nhi);
 
-                        store_a(lo, nlr, nli);
-                        store_a(hi, nhr, nhi);
+                        if (save_a) {
+                            store_a(lo, nlr, nli);
+                            store_a(hi, nhr, nhi);
+                        }
 
                         SolveRealT yhr, yhi, ylr, yli;
                         get_Y(hi, yhr, yhi);
                         get_Y(lo, ylr, yli);
 
-                        xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nlr, yhr), SYCL_FFT_MUL(nli, yhi)));
-                        xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nlr, yhi), SYCL_FFT_MUL(nli, yhr)));
-                        xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nhr, ylr), SYCL_FFT_MUL(nhi, yli)));
-                        xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nhr, yli), SYCL_FFT_MUL(nhi, ylr)));
+                        l_cmac(nlr, nli, yhr, yhi, xr, xi);
+                        l_cmac(nhr, nhi, ylr, yli, xr, xi);
                     }
                     if (lo == hi) {
-                        SolveRealT alr, ali;
+                        SolveRealT alr, ali, nlr, nli;
                         load_a(lo, alr, ali);
-                        const SolveRealT nlr = SYCL_FFT_ADD(alr, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, alr), SYCL_FFT_MUL(gamma_i, ali)));
-                        const SolveRealT nli = SYCL_FFT_ADD(ali, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_i, alr), SYCL_FFT_MUL(gamma_r, ali)));
-                        store_a(lo, nlr, nli);
+                        l_cmac_conj(gamma_r, gamma_i, alr, ali, alr, ali, nlr, nli);
+                        if (save_a) store_a(lo, nlr, nli);
 
                         SolveRealT ylr, yli;
                         get_Y(lo, ylr, yli);
-                        xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nlr, ylr), SYCL_FFT_MUL(nli, yli)));
-                        xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nlr, yli), SYCL_FFT_MUL(nli, ylr)));
+                        l_cmac(nlr, nli, ylr, yli, xr, xi);
                     }
 
                     cond_num = SYCL_FFT_MUL(cond_num, SYCL_FFT_ADD(SYCL_FFT_ONE, abs_gamma));
                     cond_den = SYCL_FFT_MUL(cond_den, SYCL_FFT_SUB(SYCL_FFT_ONE, abs_gamma));
 
-                    const SolveRealT abs2_xi = SYCL_FFT_ADD(SYCL_FFT_MUL(xr, xr), SYCL_FFT_MUL(xi, xi));
-                    r2 = SYCL_FFT_ADD(r2, SYCL_FFT_MUL(abs2_xi, inv_E));
+                    const SolveRealT abs2_xi = l_abs2(xr, xi);
+                    r2 = l_fma(abs2_xi, inv_E, r2);
                 };
 
                 if constexpr (ExactDeg > 0) {
-                    // Fully compile-time unrolled outer & inner loops -> SROA keeps a_r_reg/a_i_reg
-                    // 100% in hardware registers with 0 bytes stack / 0 ld.local / 0 st.local!
-                    // Preload R[1..2*d] and Y[1..d] once into registers for d<=3 (all precisions)
-                    // and d<=5 (narrow FP16/FP32) to eliminate O(d^2) redundant strided d_trig loads.
 #if defined(SYCL_FFT_HALF) || defined(SYCL_FFT_FLOAT)
-                    constexpr bool kPreloadRY = (ExactDeg <= 5);
+                    constexpr bool kPreloadRY = (ExactDeg <= 6);
 #else
                     constexpr bool kPreloadRY = (ExactDeg <= 3);
 #endif
@@ -1254,33 +1282,32 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
 
                     unroll_for<2 * ExactDeg>([&](auto k_ic) {
                         constexpr int k = decltype(k_ic)::value + 1;
+                        constexpr bool kSaveA = (k < 2 * ExactDeg);
                         SolveRealT lam_r, lam_i;
                         fast_R(std::integral_constant<int, k>{}, lam_r, lam_i);
                         unroll_for<k - 1>([&](auto i_ic) {
                             constexpr int i = decltype(i_ic)::value + 1;
                             SolveRealT rr, ri;
                             fast_R(std::integral_constant<int, k - i>{}, rr, ri);
-                            const SolveRealT ar = a_r_reg[i];
-                            const SolveRealT ai = a_i_reg[i];
-                            lam_r = l_fma(rr, ar, SYCL_FFT_SUB(lam_r, SYCL_FFT_MUL(ri, ai)));
-                            lam_i = l_fma(rr, ai, l_fma(ri, ar, lam_i));
+                            l_cmac(rr, ri, a_r_reg[i], a_i_reg[i], lam_r, lam_i);
                         });
 
                         const SolveRealT gamma_r = SYCL_FFT_NEG(SYCL_FFT_MUL(lam_r, inv_E));
                         const SolveRealT gamma_i = SYCL_FFT_NEG(SYCL_FFT_MUL(lam_i, inv_E));
 
-                        const SolveRealT abs2_gamma = SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, gamma_r), SYCL_FFT_MUL(gamma_i, gamma_i));
+                        const SolveRealT abs2_gamma = l_abs2(gamma_r, gamma_i);
                         const SolveRealT abs_gamma  = l_sqrt(abs2_gamma);
                         E = SYCL_FFT_MUL(E, SYCL_FFT_SUB(SYCL_FFT_ONE, abs2_gamma));
                         inv_E = l_div(SYCL_FFT_ONE, E);
 
-                        a_r_reg[k] = gamma_r;
-                        a_i_reg[k] = gamma_i;
+                        if constexpr (kSaveA) {
+                            a_r_reg[k] = gamma_r;
+                            a_i_reg[k] = gamma_i;
+                        }
 
-                        SolveRealT ykr, yki;
-                        fast_Y(std::integral_constant<int, k>{}, ykr, yki);
-                        SolveRealT xr = SYCL_FFT_ADD(ykr, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_r, y0r), SYCL_FFT_MUL(gamma_i, y0i)));
-                        SolveRealT xi = SYCL_FFT_ADD(yki, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, y0i), SYCL_FFT_MUL(gamma_i, y0r)));
+                        SolveRealT xr, xi;
+                        fast_Y(std::integral_constant<int, k>{}, xr, xi);
+                        l_cmac(gamma_r, gamma_i, y0r, y0i, xr, xi);
 
                         constexpr int kPairs = (k - 1) / 2;
                         unroll_for<kPairs>([&](auto p_ic) {
@@ -1291,45 +1318,45 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                             const SolveRealT ahr = a_r_reg[hi];
                             const SolveRealT ahi = a_i_reg[hi];
 
-                            const SolveRealT nlr = SYCL_FFT_ADD(alr, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, ahr), SYCL_FFT_MUL(gamma_i, ahi)));
-                            const SolveRealT nli = SYCL_FFT_ADD(ali, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_i, ahr), SYCL_FFT_MUL(gamma_r, ahi)));
-                            const SolveRealT nhr = SYCL_FFT_ADD(ahr, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, alr), SYCL_FFT_MUL(gamma_i, ali)));
-                            const SolveRealT nhi = SYCL_FFT_ADD(ahi, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_i, alr), SYCL_FFT_MUL(gamma_r, ali)));
+                            SolveRealT nlr, nli, nhr, nhi;
+                            l_cmac_conj(gamma_r, gamma_i, ahr, ahi, alr, ali, nlr, nli);
+                            l_cmac_conj(gamma_r, gamma_i, alr, ali, ahr, ahi, nhr, nhi);
 
-                            a_r_reg[lo] = nlr;
-                            a_i_reg[lo] = nli;
-                            a_r_reg[hi] = nhr;
-                            a_i_reg[hi] = nhi;
+                            if constexpr (kSaveA) {
+                                a_r_reg[lo] = nlr;
+                                a_i_reg[lo] = nli;
+                                a_r_reg[hi] = nhr;
+                                a_i_reg[hi] = nhi;
+                            }
 
                             SolveRealT yhr, yhi, ylr, yli;
                             fast_Y(std::integral_constant<int, hi>{}, yhr, yhi);
                             fast_Y(std::integral_constant<int, lo>{}, ylr, yli);
 
-                            xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nlr, yhr), SYCL_FFT_MUL(nli, yhi)));
-                            xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nlr, yhi), SYCL_FFT_MUL(nli, yhr)));
-                            xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nhr, ylr), SYCL_FFT_MUL(nhi, yli)));
-                            xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nhr, yli), SYCL_FFT_MUL(nhi, ylr)));
+                            l_cmac(nlr, nli, yhr, yhi, xr, xi);
+                            l_cmac(nhr, nhi, ylr, yli, xr, xi);
                         });
                         if constexpr ((k & 1) == 0) {
                             constexpr int mid = k / 2;
                             const SolveRealT alr = a_r_reg[mid];
                             const SolveRealT ali = a_i_reg[mid];
-                            const SolveRealT nlr = SYCL_FFT_ADD(alr, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, alr), SYCL_FFT_MUL(gamma_i, ali)));
-                            const SolveRealT nli = SYCL_FFT_ADD(ali, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_i, alr), SYCL_FFT_MUL(gamma_r, ali)));
-                            a_r_reg[mid] = nlr;
-                            a_i_reg[mid] = nli;
+                            SolveRealT nlr, nli;
+                            l_cmac_conj(gamma_r, gamma_i, alr, ali, alr, ali, nlr, nli);
+                            if constexpr (kSaveA) {
+                                a_r_reg[mid] = nlr;
+                                a_i_reg[mid] = nli;
+                            }
 
                             SolveRealT ylr, yli;
                             fast_Y(std::integral_constant<int, mid>{}, ylr, yli);
-                            xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nlr, ylr), SYCL_FFT_MUL(nli, yli)));
-                            xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nlr, yli), SYCL_FFT_MUL(nli, ylr)));
+                            l_cmac(nlr, nli, ylr, yli, xr, xi);
                         }
 
                         cond_num = SYCL_FFT_MUL(cond_num, SYCL_FFT_ADD(SYCL_FFT_ONE, abs_gamma));
                         cond_den = SYCL_FFT_MUL(cond_den, SYCL_FFT_SUB(SYCL_FFT_ONE, abs_gamma));
 
-                        const SolveRealT abs2_xi = SYCL_FFT_ADD(SYCL_FFT_MUL(xr, xr), SYCL_FFT_MUL(xi, xi));
-                        r2 = SYCL_FFT_ADD(r2, SYCL_FFT_MUL(abs2_xi, inv_E));
+                        const SolveRealT abs2_xi = l_abs2(xr, xi);
+                        r2 = l_fma(abs2_xi, inv_E, r2);
                     });
                 } else {
                     for (int k = 1; k < norder; ++k) {
@@ -1439,6 +1466,17 @@ void SYCL_FFT_SUFFIX(launch_fastchi2_solve)(
         case 5:
             SYCL_FFT_SUFFIX(launch_levinson_kernel)<11, 5>(q, d_trig, d_slot_phi_hat, d_slot_deconv, d_a_scratch, d_power, d_cond, p);
             return;
+#if defined(SYCL_FFT_HALF) || defined(SYCL_FFT_FLOAT)
+        case 6:
+            SYCL_FFT_SUFFIX(launch_levinson_kernel)<13, 6>(q, d_trig, d_slot_phi_hat, d_slot_deconv, d_a_scratch, d_power, d_cond, p);
+            return;
+        case 7:
+            SYCL_FFT_SUFFIX(launch_levinson_kernel)<15, 7>(q, d_trig, d_slot_phi_hat, d_slot_deconv, d_a_scratch, d_power, d_cond, p);
+            return;
+        case 8:
+            SYCL_FFT_SUFFIX(launch_levinson_kernel)<17, 8>(q, d_trig, d_slot_phi_hat, d_slot_deconv, d_a_scratch, d_power, d_cond, p);
+            return;
+#endif
         default:
             break;
     }
@@ -1469,15 +1507,20 @@ void SYCL_FFT_SUFFIX(launch_ihs_accum)(
     const size_t num_wg = (total_bins + wg - 1) / wg;
     const bool nll_multi = (p.norm == NormKind::Nll && p.degree > 1);
 
+    const double inv_n_eff_d = (p.n_eff > 0.0 && std::isfinite(p.n_eff)) ? (1.0 / p.n_eff) : 0.0;
+    const double inv_n2_288_d = (inv_n_eff_d * inv_n_eff_d) / 288.0;
 #if defined(SYCL_FFT_DOUBLE)
     const double nll_scale = p.nll_scale;
-    const double n_eff = p.n_eff;
+    const double inv_n_eff = inv_n_eff_d;
+    const double inv_n2_288 = inv_n2_288_d;
 #elif defined(SYCL_FFT_DF)
     const df_t nll_scale = df_from_double(p.nll_scale);
-    const df_t n_eff = df_from_double(p.n_eff);
+    const df_t inv_n_eff = df_from_double(inv_n_eff_d);
+    const df_t inv_n2_288 = df_from_double(inv_n2_288_d);
 #else
     const float nll_scale = static_cast<float>(p.nll_scale);
-    const float n_eff = static_cast<float>(p.n_eff);
+    const float inv_n_eff = static_cast<float>(inv_n_eff_d);
+    const float inv_n2_288 = static_cast<float>(inv_n2_288_d);
 #endif
 
     q.submit([&](sycl::handler& cgh) {
@@ -1496,7 +1539,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_accum)(
                 if (nll_multi) {
                     const int slot_i = static_cast<int>(idx % static_cast<size_t>(nout));
                     const float d = d_slot_deconv[slot_i];
-                    val = ihs_wilkie_f(val * (nll_scale * d * d), n_eff);
+                    val = ihs_wilkie_f(val * (nll_scale * d * d), inv_n_eff, inv_n2_288);
                 }
                 d_acc[idx] = first_harmonic ? val : (d_acc[idx] + val);
 #elif defined(SYCL_FFT_DOUBLE)
@@ -1505,7 +1548,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_accum)(
                 if (nll_multi) {
                     const int slot_i = static_cast<int>(idx % static_cast<size_t>(nout));
                     const double d = d_slot_deconv[slot_i];
-                    val = ihs_wilkie_d(val * (nll_scale * d * d), n_eff);
+                    val = ihs_wilkie_d(val * (nll_scale * d * d), inv_n_eff, inv_n2_288);
                 }
                 d_acc[idx] = first_harmonic ? val : (d_acc[idx] + val);
 #elif defined(SYCL_FFT_DF)
@@ -1514,7 +1557,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_accum)(
                 if (nll_multi) {
                     const int slot_i = static_cast<int>(idx % static_cast<size_t>(nout));
                     const df_t d = d_slot_deconv[slot_i];
-                    val = ihs_wilkie_df(df_mul(val, df_mul(nll_scale, df_sqr(d))), n_eff);
+                    val = ihs_wilkie_df(df_mul(val, df_mul(nll_scale, df_sqr(d))), inv_n_eff, inv_n2_288);
                 }
                 d_acc[idx] = first_harmonic ? val : df_add(d_acc[idx], val);
 #else
@@ -1523,7 +1566,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_accum)(
                 if (nll_multi) {
                     const int slot_i = static_cast<int>(idx % static_cast<size_t>(nout));
                     const float d = d_slot_deconv[slot_i];
-                    val = ihs_wilkie_f(val * (nll_scale * d * d), n_eff);
+                    val = ihs_wilkie_f(val * (nll_scale * d * d), inv_n_eff, inv_n2_288);
                 }
                 d_acc[idx] = first_harmonic ? val : (d_acc[idx] + val);
 #endif
@@ -1554,15 +1597,20 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
     const size_t num_wg = (total_bins + wg - 1) / wg;
 
     const double base_scale_d = (norm == NormKind::Standard) ? p.standard_scale : p.nll_scale;
+    const double inv_n_eff_d = (p.n_eff > 0.0 && std::isfinite(p.n_eff)) ? (1.0 / p.n_eff) : 0.0;
+    const double inv_n2_288_d = (inv_n_eff_d * inv_n_eff_d) / 288.0;
 #if defined(SYCL_FFT_DOUBLE)
     const double base_scale = base_scale_d;
-    const double n_eff = p.n_eff;
+    const double inv_n_eff = inv_n_eff_d;
+    const double inv_n2_288 = inv_n2_288_d;
 #elif defined(SYCL_FFT_DF)
     const df_t base_scale = df_from_double(base_scale_d);
-    const df_t n_eff = df_from_double(p.n_eff);
+    const df_t inv_n_eff = df_from_double(inv_n_eff_d);
+    const df_t inv_n2_288 = df_from_double(inv_n2_288_d);
 #else
     const float base_scale = static_cast<float>(base_scale_d);
-    const float n_eff = static_cast<float>(p.n_eff);
+    const float inv_n_eff = static_cast<float>(inv_n_eff_d);
+    const float inv_n2_288 = static_cast<float>(inv_n2_288_d);
 #endif
 
     q.submit([&](sycl::handler& cgh) {
@@ -1589,7 +1637,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
                     if (degree == 1 && (!d_is_finite(val) || val >= 1.0)) val = d_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll && degree == 1) {
-                    const double v = ihs_wilkie_d(val, n_eff);
+                    const double v = ihs_wilkie_d(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (d_is_finite(v) && v > 0.0) ? v : 0.0;
                 } else {
                     const double v = ihs_erlang_d(val, degree);
@@ -1609,7 +1657,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
                         d_power[gf] = val;
                     }
                 } else if (norm == NormKind::Nll && degree == 1) {
-                    const df_t v = ihs_wilkie_df(val, n_eff);
+                    const df_t v = ihs_wilkie_df(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (f_is_finite(v.hi) && (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f))) ? v : df_make(0.0f, 0.0f);
                 } else {
                     const df_t v = ihs_erlang_df(val, degree);
@@ -1625,7 +1673,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
                     if (degree == 1 && (!f_is_finite(val) || val >= 1.0f)) val = f_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll && degree == 1) {
-                    const float v = ihs_wilkie_f(val, n_eff);
+                    const float v = ihs_wilkie_f(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
                 } else {
                     const float v = ihs_erlang_f(val, degree);
@@ -1659,15 +1707,20 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
     const size_t num_wg = (total_bins + wg - 1) / wg;
 
     const double base_scale_d = (norm == NormKind::Standard) ? p.standard_scale : p.nll_scale;
+    const double inv_n_eff_d = (p.n_eff > 0.0 && std::isfinite(p.n_eff)) ? (1.0 / p.n_eff) : 0.0;
+    const double inv_n2_288_d = (inv_n_eff_d * inv_n_eff_d) / 288.0;
 #if defined(SYCL_FFT_DOUBLE)
     const double base_scale = base_scale_d;
-    const double n_eff = p.n_eff;
+    const double inv_n_eff = inv_n_eff_d;
+    const double inv_n2_288 = inv_n2_288_d;
 #elif defined(SYCL_FFT_DF)
     const df_t base_scale = df_from_double(base_scale_d);
-    const df_t n_eff = df_from_double(p.n_eff);
+    const df_t inv_n_eff = df_from_double(inv_n_eff_d);
+    const df_t inv_n2_288 = df_from_double(inv_n2_288_d);
 #else
     const float base_scale = static_cast<float>(base_scale_d);
-    const float n_eff = static_cast<float>(p.n_eff);
+    const float inv_n_eff = static_cast<float>(inv_n_eff_d);
+    const float inv_n2_288 = static_cast<float>(inv_n2_288_d);
 #endif
 
     q.submit([&](sycl::handler& cgh) {
@@ -1692,7 +1745,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     if (!d_is_finite(val) || val >= 1.0) val = d_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll) {
-                    const double v = ihs_wilkie_d(val, n_eff);
+                    const double v = ihs_wilkie_d(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (d_is_finite(v) && v > 0.0) ? v : 0.0;
                 } else {
                     d_power[gf] = (d_is_finite(val) && val > 0.0) ? val : 0.0;
@@ -1705,7 +1758,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     const bool ge_one = (val.hi > 1.0f || (val.hi == 1.0f && val.lo >= 0.0f));
                     d_power[gf] = (!f_is_finite(val.hi) || ge_one) ? df_make(f_nan(), f_nan()) : val;
                 } else if (norm == NormKind::Nll) {
-                    const df_t v = ihs_wilkie_df(val, n_eff);
+                    const df_t v = ihs_wilkie_df(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (f_is_finite(v.hi) && (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f))) ? v : df_make(0.0f, 0.0f);
                 } else {
                     d_power[gf] = (f_is_finite(val.hi) && (val.hi > 0.0f || (val.hi == 0.0f && val.lo > 0.0f))) ? val : df_make(0.0f, 0.0f);
@@ -1721,7 +1774,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     if (!f_is_finite(val) || val >= 1.0f) val = f_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll) {
-                    const float v = ihs_wilkie_f(val, n_eff);
+                    const float v = ihs_wilkie_f(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
                 } else {
                     d_power[gf] = (f_is_finite(val) && val > 0.0f) ? val : 0.0f;
@@ -1734,7 +1787,7 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     if (!f_is_finite(val) || val >= 1.0f) val = f_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll) {
-                    const float v = ihs_wilkie_f(val, n_eff);
+                    const float v = ihs_wilkie_f(val, inv_n_eff, inv_n2_288);
                     d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
                 } else {
                     d_power[gf] = (f_is_finite(val) && val > 0.0f) ? val : 0.0f;

@@ -35,6 +35,12 @@ static inline float vk_u32_to_f32(uint32_t u) {
 }
 
 static inline uint16_t vk_f32_to_f16_bits(float f) {
+#if defined(__FLT16_MAX__)
+    _Float16 h = (_Float16)f;
+    uint16_t bits;
+    memcpy(&bits, &h, sizeof(bits));
+    return bits;
+#else
     uint32_t u = vk_f32_to_u32(f);
     uint32_t sign = (u >> 16) & 0x8000u;
     uint32_t exp  = (u >> 23) & 0xFFu;
@@ -57,6 +63,7 @@ static inline uint16_t vk_f32_to_f16_bits(float f) {
     uint32_t h = ((uint32_t)e << 10) | (mant >> 13);
     if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
     return (uint16_t)(sign | h);
+#endif
 }
 
 static inline float vk_f16_bits_to_f32(uint16_t h) {

@@ -14,7 +14,9 @@
 typedef enum VkBufferMemKind {
     VK_MEM_DEVICE_LOCAL  = 0,
     VK_MEM_HOST_UPLOAD   = 1,
-    VK_MEM_HOST_READBACK = 2
+    VK_MEM_HOST_READBACK = 2,
+    VK_MEM_UMA_UPLOAD    = 3,
+    VK_MEM_UMA_READBACK  = 4
 } VkBufferMemKind;
 
 typedef struct VkBufferSlice {
@@ -85,6 +87,7 @@ typedef struct VkCmdBatch {
     VkDescriptorPool ds_pool;
     uint32_t         ds_used;
     uint32_t         ds_cap;
+    VkPipeline       last_pipeline;
     bool             recording;
     VkBufferAlloc    staging_up;
     VkBufferAlloc    staging_dn;
@@ -97,6 +100,7 @@ void vk_batch_copy(VkCmdBatch* b, VkBufferSlice src, VkBufferSlice dst, VkDevice
 void vk_batch_fill(VkCmdBatch* b, VkBufferSlice dst, VkDeviceSize bytes, uint32_t val);
 void vk_batch_barrier_t2c(VkCmdBatch* b);
 void vk_batch_barrier_c2c(VkCmdBatch* b);
+void vk_batch_barrier_tc2c(VkCmdBatch* b);
 void vk_batch_barrier_c2t(VkCmdBatch* b);
 void vk_batch_barrier_t2t(VkCmdBatch* b);
 bool vk_batch_dispatch(

@@ -245,11 +245,13 @@ inline double eval_gpu_block_cost(
 
     // 1. SinglePass SMEM ceiling derived directly from dev_cfg.local_mem_size
     const size_t smem_usable = dev_cfg.local_mem_size - (dev_cfg.local_mem_size / 16);
+    const size_t sp_cap = (smem_elem_bytes <= size_t{8} && smem_usable >= size_t{32768})
+        ? size_t{16384} : size_t{8192};
     const int sp_max_nfft = (!dev_cfg.has_native_local_mem || smem_usable < 4096)
         ? 2048
         : static_cast<int>(std::clamp<size_t>(
               pow2_floor_sz(smem_usable / std::max<size_t>(1, smem_elem_bytes)) * 2,
-              size_t{1024}, size_t{8192}));
+              size_t{1024}, sp_cap));
 
     // 2. Native FP64 compute weight derived from runtime probe_fp64_ratio()
     //    (full-rate datacenter FP64 >= 0.45 -> 1.0; throttled consumer FP64 -> smoothly scaled)
@@ -259,9 +261,14 @@ inline double eval_gpu_block_cost(
     }
 
     // 3. FFT traffic + compute cost:
-    //    SinglePass = 1 global pass; TwoPass = 2 global passes + transpose overhead.
+    //    SinglePass = 1 global pass; TwoPass = 2 global passes + transpose overhead;
+    //    >64K or >4*sp_max_nfft incurs L2-exceeding transpose / multi-stage traffic.
     double fft_pass_mult = 1.0;
-    if (nfft > sp_max_nfft) {
+    if (nfft > 65536) {
+        fft_pass_mult = 4.0;
+    } else if (nfft > 4 * sp_max_nfft) {
+        fft_pass_mult = 2.8;
+    } else if (nfft > sp_max_nfft) {
         fft_pass_mult = 2.25;
     } else if (nfft == sp_max_nfft && sp_max_nfft >= 4096) {
         // Near-ceiling SinglePass reduces resident work-groups per CU
@@ -269,7 +276,7 @@ inline double eval_gpu_block_cost(
     }
     const double fft_per_blk =
         static_cast<double>(nfft) * (0.35 + 0.065 * static_cast<double>(log_nfft)) *
-        fft_pass_mult * (prec_bytes / 8.0);
+        fft_pass_mult * (prec_bytes / 8.0) * fp64_alu_mult;
     const double fft_cost = n_exec * B * fft_per_blk;
 
     // 4. Spreading + window-bucketing cost:
@@ -279,9 +286,13 @@ inline double eval_gpu_block_cost(
         : std::clamp<size_t>(pow2_floor_sz(smem_usable / std::max<size_t>(1, size_t{4} * smem_elem_bytes)),
                              size_t{128}, size_t{4096});
     const double num_wins = std::max(1.0, static_cast<double>(nfft) / static_cast<double>(win_cap_sz));
-    const double win_pen = (num_wins <= 1.0) ? 1.0 : (1.0 + 0.12 * std::log2(num_wins));
+    const double win_pen = (num_wins <= 1.0) ? 1.0 : (1.0 + 0.14 * std::log2(num_wins));
+    const double win_flush_cost = (num_wins > 1.0)
+        ? (n_exec * B * num_wins * static_cast<double>(win_cap_sz) * 0.18 * (prec_bytes / 8.0))
+        : 0.0;
     const double spread_beta = 0.55 * fp64_alu_mult;
-    const double spread_cost = n_exec * B * static_cast<double>(M) * static_cast<double>(w) * spread_beta * win_pen;
+    const double spread_cost =
+        n_exec * B * static_cast<double>(M) * static_cast<double>(w) * spread_beta * win_pen + win_flush_cost;
 
     // 5. Subgrid phase-modulation + O(M) set_points precompute:
     //    With strip-recurrence in subgrid.cpp, trig cost per block is amortized;
@@ -290,17 +301,18 @@ inline double eval_gpu_block_cost(
         ? 2.2
         : ((prec == TLS_SYCL_PREC_DOUBLE) ? (1.2 * fp64_alu_mult) : 0.75);
     const double phase_cost = n_factors * B * static_cast<double>(M) * phase_beta;
-    const double pre_cost = n_factors * static_cast<double>(M) * (2.0 + 0.5 * num_wins);
+    const double pre_cost = n_factors * (static_cast<double>(M) * (2.0 + 0.5 * num_wins) + num_wins * 32.0);
 
     // 6. Per-stream compute-unit occupancy penalty:
     //    Avoid overly large N_block that leaves B too small to occupy this stream's CU share.
+    const int slot_div = std::clamp(num_slots, 1, 4);
     const double cus_per_slot = std::max(
-        2.0,
-        static_cast<double>(dev_cfg.max_compute_units) / static_cast<double>(std::max(1, num_slots)));
+        4.0,
+        static_cast<double>(dev_cfg.max_compute_units) / static_cast<double>(slot_div));
     const double eff_bs = B * (is_ihs ? 1.0 : 1.5);
     double occ_pen = 1.0;
     if (dev_cfg.is_gpu && eff_bs < cus_per_slot) {
-        occ_pen = 1.0 + 0.30 * ((cus_per_slot - eff_bs) / cus_per_slot);
+        occ_pen = 1.0 + 0.45 * ((cus_per_slot - eff_bs) / cus_per_slot);
     }
 
     // 7. Small fixed dispatch overhead per harmonic

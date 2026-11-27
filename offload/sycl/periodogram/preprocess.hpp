@@ -177,10 +177,11 @@ inline int preprocess_fastchi2_half_typed(
     out.neff_w    = (ws_d * ws_d) / sum_w2_d;
     out.cyb       = init_cybenko_model(degree, out.neff_w);
     out.b_param   = 0.5 * (out.neff_w - 1.0 - 2.0 * static_cast<double>(degree));
-    out.row_scale = static_cast<double>(nfft) / ws_d;
-    out.ws_fft    = 1.0;
-    out.yws_fft   = yws_d / ws_d;
-    out.chi2_ref  = chi2_ref_d / ws_d;
+    const double inv_wt = 1.0 / w_target;
+    out.row_scale = static_cast<double>(nfft) * inv_wt;
+    out.ws_fft    = ws_d * inv_wt;
+    out.yws_fft   = yws_d * inv_wt;
+    out.chi2_ref  = chi2_ref_d * inv_wt;
     return TLS_SYCL_OK;
 }
 

@@ -209,25 +209,57 @@ static inline int vk_preprocess_fastchi2(
 
     const double yc_scale = inv_yc_max * sqrt(ws / chi2_tmp);
     double chi2_ref = 0.0, yws = 0.0;
-    for (int m = 0; m < M; ++m) {
-        double ym = use_d ? y_d[m] : (double)y_f[m];
-        double yc = ((ym - y0) - dy_mean) * yc_scale;
-        double wm = w_d[m];
-        double ywm = yc * wm;
-        yws += ywm;
-        chi2_ref += yc * ywm;
-        if (prec == VK_PREC_HALF) {
-            ((uint16_t*)out->w)[m]  = vk_f32_to_f16_bits((float)wm);
-            ((uint16_t*)out->yw)[m] = vk_f32_to_f16_bits((float)ywm);
-        } else if (prec == VK_PREC_FLOAT) {
-            ((float*)out->w)[m]  = (float)wm;
-            ((float*)out->yw)[m] = (float)ywm;
-        } else if (prec == VK_PREC_DF) {
-            ((VkDf*)out->w)[m]  = vk_df_from_double(wm);
-            ((VkDf*)out->yw)[m] = vk_df_from_double(ywm);
-        } else {
-            ((double*)out->w)[m]  = wm;
-            ((double*)out->yw)[m] = ywm;
+    if (prec == VK_PREC_HALF) {
+        uint16_t* restrict ow = (uint16_t*)out->w;
+        uint16_t* restrict oyw = (uint16_t*)out->yw;
+        for (int m = 0; m < M; ++m) {
+            double ym = use_d ? y_d[m] : (double)y_f[m];
+            double yc = ((ym - y0) - dy_mean) * yc_scale;
+            double wm = w_d[m];
+            double ywm = yc * wm;
+            yws += ywm;
+            chi2_ref += yc * ywm;
+            ow[m]  = vk_f32_to_f16_bits((float)wm);
+            oyw[m] = vk_f32_to_f16_bits((float)ywm);
+        }
+    } else if (prec == VK_PREC_FLOAT) {
+        float* restrict ow = (float*)out->w;
+        float* restrict oyw = (float*)out->yw;
+        for (int m = 0; m < M; ++m) {
+            double ym = use_d ? y_d[m] : (double)y_f[m];
+            double yc = ((ym - y0) - dy_mean) * yc_scale;
+            double wm = w_d[m];
+            double ywm = yc * wm;
+            yws += ywm;
+            chi2_ref += yc * ywm;
+            ow[m]  = (float)wm;
+            oyw[m] = (float)ywm;
+        }
+    } else if (prec == VK_PREC_DF) {
+        VkDf* restrict ow = (VkDf*)out->w;
+        VkDf* restrict oyw = (VkDf*)out->yw;
+        for (int m = 0; m < M; ++m) {
+            double ym = use_d ? y_d[m] : (double)y_f[m];
+            double yc = ((ym - y0) - dy_mean) * yc_scale;
+            double wm = w_d[m];
+            double ywm = yc * wm;
+            yws += ywm;
+            chi2_ref += yc * ywm;
+            ow[m]  = vk_df_from_double(wm);
+            oyw[m] = vk_df_from_double(ywm);
+        }
+    } else {
+        double* restrict ow = (double*)out->w;
+        double* restrict oyw = (double*)out->yw;
+        for (int m = 0; m < M; ++m) {
+            double ym = use_d ? y_d[m] : (double)y_f[m];
+            double yc = ((ym - y0) - dy_mean) * yc_scale;
+            double wm = w_d[m];
+            double ywm = yc * wm;
+            yws += ywm;
+            chi2_ref += yc * ywm;
+            ow[m]  = wm;
+            oyw[m] = ywm;
         }
     }
     if (chi2_ref == 0.0 || !isfinite(chi2_ref)) return TLS_VK_ERR_DEGENERATE;
@@ -236,10 +268,13 @@ static inline int vk_preprocess_fastchi2(
     out->cyb     = vk_init_cybenko_model(degree, out->neff_w);
     out->b_param = 0.5 * (out->neff_w - 1.0 - 2.0 * (double)degree);
     if (prec == VK_PREC_HALF) {
-        out->row_scale = (double)nfft / ws;
-        out->ws_fft    = 1.0;
-        out->yws_fft   = yws / ws;
-        out->chi2_ref  = chi2_ref / ws;
+        /* Use exact w_target (not FP64-summed ws) so row_scale is bit-identical across
+         * lightcurves and never triggers spurious d_slot_deconv LUT rebuilds. */
+        double inv_wt  = 1.0 / w_target;
+        out->row_scale = (double)nfft * inv_wt;
+        out->ws_fft    = ws * inv_wt;
+        out->yws_fft   = yws * inv_wt;
+        out->chi2_ref  = chi2_ref * inv_wt;
     } else {
         double inv_nfft = 1.0 / (double)nfft;
         out->row_scale = 1.0;

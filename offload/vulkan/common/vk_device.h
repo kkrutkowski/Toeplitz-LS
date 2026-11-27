@@ -106,6 +106,8 @@ typedef struct VkDeviceFftConfig {
     bool is_discrete_gpu;
     bool has_native_local_mem;
     bool has_host_unified_memory;
+    bool has_uma_cached;
+    bool has_push_descriptor;
     bool has_fp64;
     bool has_fp16;
     bool has_subgroup_basic;

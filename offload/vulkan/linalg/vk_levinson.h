@@ -47,6 +47,9 @@ typedef struct VkIhsSolveParams {
     size_t     wg_size;
 } VkIhsSolveParams;
 
+bool vk_fastchi2_uses_smem(const VkDeviceFftConfig* dev_cfg, VkPrecKind prec, int degree, uint32_t* out_wg);
+bool vk_fastchi2_needs_scratch(const VkDeviceFftConfig* dev_cfg, VkPrecKind prec, int degree);
+
 bool vk_record_fastchi2_solve(
     VkDeviceContext* ctx,
     VkCmdBatch* batch,

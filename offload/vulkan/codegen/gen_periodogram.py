@@ -82,12 +82,19 @@ double d_log(double x) {
 }
 
 double d_log1p(double x) {
-    double u = 1.0lf + x;
-    if (u == 1.0lf) return x;
-    if (abs(x) < 1e-4lf) {
-        return d_log(u) * (x / (u - 1.0lf));
+    if (abs(x) < 0.15lf) {
+        double t = x / (2.0lf + x);
+        double t2 = t * t;
+        double p = 1.0lf / 13.0lf;
+        p = fma(p, t2, 1.0lf / 11.0lf);
+        p = fma(p, t2, 1.0lf /  9.0lf);
+        p = fma(p, t2, 1.0lf /  7.0lf);
+        p = fma(p, t2, 1.0lf /  5.0lf);
+        p = fma(p, t2, 1.0lf /  3.0lf);
+        p = fma(p, t2, 1.0lf);
+        return 2.0lf * t * p;
     }
-    return d_log(u);
+    return d_log(1.0lf + x);
 }
 
 double d_exp(double x) {
@@ -159,6 +166,21 @@ df_t df_log(df_t x) {{
     return df_add(ln_m, df_mul_f(kLn2Df, float(e)));
 }}
 
+df_t df_log1p(df_t x) {{
+    if (abs(x.x) < 0.15f) {{
+        df_t t = df_div(x, df_add(vec2(2.0f, 0.0f), x));
+        df_t t2 = df_sqr(t);
+        df_t poly = {fmt_df(1.0 / 11.0)};
+        poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 9.0)});
+        poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 7.0)});
+        poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 5.0)});
+        poly = df_add(df_mul(poly, t2), {fmt_df(1.0 / 3.0)});
+        poly = df_add(df_mul(poly, t2), vec2(1.0f, 0.0f));
+        return df_scale_pow2(df_mul(t, poly), 2.0f);
+    }}
+    return df_log(df_add(vec2(1.0f, 0.0f), x));
+}}
+
 df_t df_exp(df_t x) {{
     float xf = x.x + x.y;
     if (xf < -87.0f) return vec2(0.0f, 0.0f);
@@ -192,10 +214,13 @@ bool f_is_finite(float v) {{ return (floatBitsToUint(v) & 0x7f800000u) != 0x7f80
 bool cond_is_singular_f(float cb) {{ return !f_is_finite(cb) || cb < 0.0f || cb > {singularity_thresh}; }}
 
 float f_log1p(float x) {{
-    float u = 1.0f + x;
-    if (u == 1.0f) return x;
-    if (abs(x) < 1e-3f) return log(u) * (x / (u - 1.0f));
-    return log(u);
+    if (abs(x) < 0.15f) {{
+        float t = x / (2.0f + x);
+        float t2 = t * t;
+        float p = fma(t2, fma(t2, fma(t2, 1.0f / 7.0f, 1.0f / 5.0f), 1.0f / 3.0f), 1.0f);
+        return 2.0f * t * p;
+    }}
+    return log(1.0f + x);
 }}
 """
 
@@ -494,16 +519,16 @@ double compute_bayes_laplace(double delta) {
 }
 
 double normalize_power(double dot, double cond_bound, int norm, int degree) {
-    if (!d_is_finite(dot) || dot >= pc.chi2_ref) return d_nan();
+    if (!d_is_finite(dot)) return d_nan();
     if (dot <= 0.0lf) return 0.0lf;
-    double r2 = dot / pc.chi2_ref;
+    double r2 = dot * pc.inv_chi2_ref;
     if (!d_is_finite(r2) || r2 >= 1.0lf) return d_nan();
     if (norm == 0) return r2;
     if (norm == 1) {
         double d1 = 2.0lf * double(degree) + 1.0lf;
         double d2 = double(pc.M) - 1.0lf - d1;
-        double residual = max(pc.chi2_ref - dot, 1e-32lf);
-        return (d2 * dot) / (d1 * residual);
+        double residual = max(1.0lf - r2, 1e-32lf);
+        return (d2 * r2) / (d1 * residual);
     }
     if (norm == 2) return nll_exact_pochhammer(degree, r2, pc.b_param);
     double nll_r2 = nll_exact_pochhammer(degree, r2, pc.b_param);
@@ -534,15 +559,15 @@ df_t nll_exact_pochhammer(int d, df_t r2, df_t b) {{
     df_t kMaxR2 = {fmt_df(0.999999999999)};
     if (r2.x > kMaxR2.x || (r2.x == kMaxR2.x && r2.y > kMaxR2.y)) r2 = kMaxR2;
     df_t one = vec2(1.0f, 0.0f);
-    df_t term0 = df_mul(df_neg(b), df_log(df_sub(one, r2)));
+    df_t term0 = df_mul(df_neg(b), df_log1p(df_neg(r2)));
     if (d <= 1) return (term0.x > 0.0f && f_is_finite(term0.x)) ? term0 : vec2(0.0f, 0.0f);
-    df_t c = one, s = one;
+    df_t c = one, s_minus_1 = vec2(0.0f, 0.0f);
     for (int k = 1; k < d; ++k) {{
         df_t fac = df_div(df_add(b, vec2(float(k - 1), 0.0f)), vec2(float(k), 0.0f));
         c = df_mul(df_mul(c, fac), r2);
-        s = df_add(s, c);
+        s_minus_1 = df_add(s_minus_1, c);
     }}
-    df_t nll = df_sub(term0, df_log(s));
+    df_t nll = df_sub(term0, df_log1p(s_minus_1));
     return (nll.x > 0.0f && f_is_finite(nll.x)) ? nll : vec2(0.0f, 0.0f);
 }}
 
@@ -603,17 +628,16 @@ df_t compute_bayes_laplace(df_t delta) {{
 
 df_t normalize_power(df_t dot, df_t cond_bound, int norm, int degree) {{
     if (!f_is_finite(dot.x) || !f_is_finite(dot.y)) return vec2(f_nan(), f_nan());
-    if (dot.x > pc.chi2_ref.x || (dot.x == pc.chi2_ref.x && dot.y >= pc.chi2_ref.y)) return vec2(f_nan(), f_nan());
     if (dot.x < 0.0f || (dot.x == 0.0f && dot.y <= 0.0f)) return vec2(0.0f, 0.0f);
-    df_t r2 = df_div(dot, pc.chi2_ref);
+    df_t r2 = df_mul(dot, pc.inv_chi2_ref);
     if (!f_is_finite(r2.x) || !f_is_finite(r2.y) || r2.x > 1.0f || (r2.x == 1.0f && r2.y >= 0.0f)) return vec2(f_nan(), f_nan());
     if (norm == 0) return r2;
     if (norm == 1) {{
         df_t d1 = vec2(float(2 * degree + 1), 0.0f);
         df_t d2 = vec2(float(pc.M - 1 - (2 * degree + 1)), 0.0f);
-        df_t residual = df_sub(pc.chi2_ref, dot);
+        df_t residual = df_sub(vec2(1.0f, 0.0f), r2);
         if (residual.x < 1e-32f) residual = vec2(1e-32f, 0.0f);
-        return df_div(df_mul(d2, dot), df_mul(d1, residual));
+        return df_div(df_mul(d2, r2), df_mul(d1, residual));
     }}
     if (norm == 2) return nll_exact_pochhammer(degree, r2, pc.b_param);
     df_t nll_r2 = nll_exact_pochhammer(degree, r2, pc.b_param);
@@ -705,16 +729,16 @@ float compute_bayes_laplace(float delta) {
 }
 
 float normalize_power(float dot, float cond_bound, int norm, int degree) {
-    if (!f_is_finite(dot) || dot >= pc.chi2_ref) return f_nan();
+    if (!f_is_finite(dot)) return f_nan();
     if (dot <= 0.0f) return 0.0f;
-    float r2 = dot / pc.chi2_ref;
+    float r2 = dot * pc.inv_chi2_ref;
     if (!f_is_finite(r2) || r2 >= 1.0f) return f_nan();
     if (norm == 0) return r2;
     if (norm == 1) {
         float d1 = 2.0f * float(degree) + 1.0f;
         float d2 = float(pc.M) - 1.0f - d1;
-        float residual = max(pc.chi2_ref - dot, 1e-32f);
-        return (d2 * dot) / (d1 * residual);
+        float residual = max(1.0f - r2, 1e-32f);
+        return (d2 * r2) / (d1 * residual);
     }
     if (norm == 2) return nll_exact_pochhammer(degree, r2, pc.b_param);
     float nll_r2 = nll_exact_pochhammer(degree, r2, pc.b_param);
@@ -927,7 +951,7 @@ layout(push_constant) uniform Push {{
     {push_sc_t} ws_fft;
     {push_sc_t} inv_ws_fft;
     {push_sc_t} yws_fft;
-    {push_sc_t} chi2_ref;
+    {push_sc_t} inv_chi2_ref;
     {push_sc_t} b_param;
     {push_sc_t} cyb_sum_N_eff;
     {push_sc_t} cyb_inv_2d;
@@ -1115,6 +1139,12 @@ void compute_gls_trig({t} num_l, {t} den_l, {t} rad_l,
         p["hdr"]
         + _glsl_compact_slot_helpers()
         + f"""
+layout(constant_id = 0) const uint WG_SIZE       = 64u;
+layout(constant_id = 1) const uint SPEC_USE_1D   = 0u;
+layout(constant_id = 2) const uint SPEC_NORM     = 0u;
+layout(constant_id = 3) const uint SPEC_HAS_COND = 0u;
+layout(constant_id = 4) const uint SPEC_USE_RAW  = 0u;
+layout(constant_id = 5) const uint SPEC_MODE43   = 1u;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly  buffer TrigBuf   {{ {p['buf_t']} d_trig[]; }};
@@ -1127,19 +1157,26 @@ layout(std430, binding = 4) writeonly buffer CondBuf   {{ {p['out_t']} d_cond[];
 {_glsl_fastchi2_norm_helpers(prec)}
 {trig_helper}
 void main() {{
-    uint gid = gl_GlobalInvocationID.x;
     int items_per_blk = {items_expr};
-    uint total_items = uint(pc.b_count) * uint(items_per_blk);
-    if (gid >= total_items) return;
+    int b, local_i;
+    if (SPEC_USE_1D != 0u) {{
+        uint gid = gl_GlobalInvocationID.x;
+        uint total_items = uint(pc.b_count) * uint(items_per_blk);
+        if (gid >= total_items) return;
+        b = int(gid / uint(items_per_blk));
+        local_i = int(gid - uint(b) * uint(items_per_blk));
+    }} else {{
+        local_i = int(gl_GlobalInvocationID.x);
+        b = int(gl_WorkGroupID.y);
+        if (local_i >= items_per_blk || b >= pc.b_count) return;
+    }}
 
-    int mode43     = int(pc.flags & 1u);
-    int norm       = int((pc.flags >> 1) & 7u);
-    bool has_cond  = ((pc.flags >> 4) & 1u) != 0u;
-    bool use_raw   = ((pc.flags >> 5) & 1u) != 0u;
+    int mode43     = int(SPEC_MODE43);
+    int norm       = int(SPEC_NORM);
+    bool has_cond  = (SPEC_HAS_COND != 0u);
+    bool use_raw   = (SPEC_USE_RAW != 0u);
     bool need_cond = (norm == 3) || has_cond;
 
-    int b = int(gid / uint(items_per_blk));
-    int local_i = int(gid - uint(b) * uint(items_per_blk));
     int slot_i = {slot_expr};
     uint bin_idx = uint(b) * uint(pc.nout) + uint(slot_i);
     uint chunk_bins = uint(pc.b_count) * uint(pc.nout);
@@ -1309,8 +1346,8 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
     if mode == "unrolled":
         norder = 2 * exact_deg + 1
         # Preload all 2*d R entries and d Y entries once into registers for d<=3 (all precisions)
-        # and d<=5 (narrow h/f), eliminating O(d^2) redundant strided global loads from d_trig.
-        preload_ry = (exact_deg <= 3) or (prec in ("h", "f") and exact_deg <= 5)
+        # and d<=6 (narrow h/f), eliminating O(d^2) redundant strided global loads from d_trig.
+        preload_ry = (exact_deg <= 3) or (prec in ("h", "f") and exact_deg <= 6)
         if preload_ry:
             preload_lines = [
                 f"    S_REAL a_r[{norder - 1}];",
@@ -1396,17 +1433,23 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
             step_lines.append("        r2 = s_fma(abs2_xi, inv_E, r2);")
             step_lines.append("    }")
         lev_body = "\n".join(step_lines)
-    else:  # large (32-lane warp-tiled contiguous paired scratch: 1 LDG/STG per (ar,ai), L1-resident, full occupancy)
-        scratch_binding = f"layout(std430, binding = 5) buffer ScratchBuf {{ {p['scr_pair_t']} d_a_scratch[]; }};"
-        pred_decl = "    uint scr_base = (((gid >> 5) * uint(norder - 2)) << 5) | (gid & 31u);"
+    elif mode == "smem":  # bank-conflict-free SoA shared memory (a_r[], a_i[] in LDS/SMEM; zero global scratch)
+        extra_decls = (
+            f"layout(constant_id = 6) const uint SMEM_ELEMS = 1024u;\n"
+            f"shared {p['scr_t']} l_ar[SMEM_ELEMS];\n"
+            f"shared {p['scr_t']} l_ai[SMEM_ELEMS];\n"
+        )
+        pred_decl = "    uint tid = gl_LocalInvocationID.x;"
         lev_body = """
     for (int k = 1; k < norder; ++k) {
         S_REAL lam_r, lam_i;
         get_R(k, degree, chunk_bins, bin_idx, ws_k, lam_r, lam_i);
         for (int i = 1; i < k; ++i) {
-            S_REAL rr, ri, ar, ai;
+            S_REAL rr, ri;
             get_R(k - i, degree, chunk_bins, bin_idx, ws_k, rr, ri);
-            s_unpack_pair(d_a_scratch[scr_base + (uint(i - 1) << 5)], ar, ai);
+            uint si = uint(i - 1) * WG_SIZE + tid;
+            S_REAL ar = s_unpack(l_ar[si]);
+            S_REAL ai = s_unpack(l_ai[si]);
             s_cmac(rr, ri, ar, ai, lam_r, lam_i);
         }
         S_REAL gamma_r = s_neg(s_mul(lam_r, inv_E));
@@ -1417,7 +1460,9 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
         inv_E = s_div(S_ONE, E);
         bool save_a = (k + 1 < norder);
         if (save_a) {
-            d_a_scratch[scr_base + (uint(k - 1) << 5)] = s_pack_pair(gamma_r, gamma_i);
+            uint sk = uint(k - 1) * WG_SIZE + tid;
+            l_ar[sk] = s_pack(gamma_r);
+            l_ai[sk] = s_pack(gamma_i);
         }
 
         S_REAL xr, xi;
@@ -1426,8 +1471,80 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
 
         int lo = 1, hi = k - 1;
         for (; lo < hi; ++lo, --hi) {
-            uint blo = scr_base + (uint(lo - 1) << 5);
-            uint bhi = scr_base + (uint(hi - 1) << 5);
+            uint slo = uint(lo - 1) * WG_SIZE + tid;
+            uint shi = uint(hi - 1) * WG_SIZE + tid;
+            S_REAL alr = s_unpack(l_ar[slo]), ali = s_unpack(l_ai[slo]);
+            S_REAL ahr = s_unpack(l_ar[shi]), ahi = s_unpack(l_ai[shi]);
+            S_REAL nlr, nli, nhr, nhi;
+            s_cmac_conj(gamma_r, gamma_i, ahr, ahi, alr, ali, nlr, nli);
+            s_cmac_conj(gamma_r, gamma_i, alr, ali, ahr, ahi, nhr, nhi);
+            if (save_a) {
+                l_ar[slo] = s_pack(nlr); l_ai[slo] = s_pack(nli);
+                l_ar[shi] = s_pack(nhr); l_ai[shi] = s_pack(nhi);
+            }
+            S_REAL yhr, yhi, ylr, yli;
+            get_Y(hi, degree, chunk_bins, bin_idx, yws_k, yhr, yhi);
+            get_Y(lo, degree, chunk_bins, bin_idx, yws_k, ylr, yli);
+            s_cmac(nlr, nli, yhr, yhi, xr, xi);
+            s_cmac(nhr, nhi, ylr, yli, xr, xi);
+        }
+        if (lo == hi) {
+            uint slo = uint(lo - 1) * WG_SIZE + tid;
+            S_REAL alr = s_unpack(l_ar[slo]), ali = s_unpack(l_ai[slo]);
+            S_REAL nlr, nli;
+            s_cmac_conj(gamma_r, gamma_i, alr, ali, alr, ali, nlr, nli);
+            if (save_a) {
+                l_ar[slo] = s_pack(nlr); l_ai[slo] = s_pack(nli);
+            }
+            S_REAL ylr, yli;
+            get_Y(lo, degree, chunk_bins, bin_idx, yws_k, ylr, yli);
+            s_cmac(nlr, nli, ylr, yli, xr, xi);
+        }
+        cond_num = s_mul(cond_num, s_add(S_ONE, abs_g));
+        cond_den = s_mul(cond_den, s_sub(S_ONE, abs_g));
+        S_REAL abs2_xi = s_abs2(xr, xi);
+        r2 = s_fma(abs2_xi, inv_E, r2);
+    }"""
+    else:  # large (warp-tiled contiguous paired scratch parameterized by TILE_LANES)
+        extra_decls = (
+            "layout(constant_id = 6) const uint TILE_LANES      = 32u;\n"
+            "layout(constant_id = 7) const uint LOG2_TILE_LANES = 5u;\n"
+        )
+        scratch_binding = f"layout(std430, binding = 5) buffer ScratchBuf {{ {p['scr_pair_t']} d_a_scratch[]; }};"
+        pred_decl = (
+            "    uint item_stride = (uint(items_per_blk) + TILE_LANES - 1u) & ~(TILE_LANES - 1u);\n"
+            "    uint scr_gid = uint(b) * item_stride + uint(local_i);\n"
+            "    uint scr_base = (((scr_gid >> LOG2_TILE_LANES) * uint(norder - 2)) << LOG2_TILE_LANES) | (scr_gid & (TILE_LANES - 1u));"
+        )
+        lev_body = """
+    for (int k = 1; k < norder; ++k) {
+        S_REAL lam_r, lam_i;
+        get_R(k, degree, chunk_bins, bin_idx, ws_k, lam_r, lam_i);
+        for (int i = 1; i < k; ++i) {
+            S_REAL rr, ri, ar, ai;
+            get_R(k - i, degree, chunk_bins, bin_idx, ws_k, rr, ri);
+            s_unpack_pair(d_a_scratch[scr_base + (uint(i - 1) << LOG2_TILE_LANES)], ar, ai);
+            s_cmac(rr, ri, ar, ai, lam_r, lam_i);
+        }
+        S_REAL gamma_r = s_neg(s_mul(lam_r, inv_E));
+        S_REAL gamma_i = s_neg(s_mul(lam_i, inv_E));
+        S_REAL abs2_g = s_abs2(gamma_r, gamma_i);
+        S_REAL abs_g  = s_sqrt(abs2_g);
+        E = s_mul(E, s_sub(S_ONE, abs2_g));
+        inv_E = s_div(S_ONE, E);
+        bool save_a = (k + 1 < norder);
+        if (save_a) {
+            d_a_scratch[scr_base + (uint(k - 1) << LOG2_TILE_LANES)] = s_pack_pair(gamma_r, gamma_i);
+        }
+
+        S_REAL xr, xi;
+        get_Y(k, degree, chunk_bins, bin_idx, yws_k, xr, xi);
+        s_cmac(gamma_r, gamma_i, y0r, y0i, xr, xi);
+
+        int lo = 1, hi = k - 1;
+        for (; lo < hi; ++lo, --hi) {
+            uint blo = scr_base + (uint(lo - 1) << LOG2_TILE_LANES);
+            uint bhi = scr_base + (uint(hi - 1) << LOG2_TILE_LANES);
             S_REAL alr, ali, ahr, ahi;
             s_unpack_pair(d_a_scratch[blo], alr, ali);
             s_unpack_pair(d_a_scratch[bhi], ahr, ahi);
@@ -1445,7 +1562,7 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
             s_cmac(nhr, nhi, ylr, yli, xr, xi);
         }
         if (lo == hi) {
-            uint blo = scr_base + (uint(lo - 1) << 5);
+            uint blo = scr_base + (uint(lo - 1) << LOG2_TILE_LANES);
             S_REAL alr, ali, nlr, nli;
             s_unpack_pair(d_a_scratch[blo], alr, ali);
             s_cmac_conj(gamma_r, gamma_i, alr, ali, alr, ali, nlr, nli);
@@ -1466,6 +1583,12 @@ def _gen_fastchi2_lev(prec: str, exact_deg: int, mode: str) -> dict:
         p["hdr"]
         + _glsl_compact_slot_helpers()
         + f"""
+layout(constant_id = 0) const uint WG_SIZE       = 64u;
+layout(constant_id = 1) const uint SPEC_USE_1D   = 0u;
+layout(constant_id = 2) const uint SPEC_NORM     = 0u;
+layout(constant_id = 3) const uint SPEC_HAS_COND = 0u;
+layout(constant_id = 4) const uint SPEC_USE_RAW  = 0u;
+layout(constant_id = 5) const uint SPEC_MODE43   = 1u;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 {extra_decls}
 layout(std430, binding = 0) readonly  buffer TrigBuf {{ {p['buf_t']} d_trig[]; }};
@@ -1505,20 +1628,27 @@ void get_Y(int k, int degree, uint chunk_bins, uint bin_idx, S_REAL yws_k, out S
 }}
 {extra_helpers}
 void main() {{
-    uint gid = gl_GlobalInvocationID.x;
     int items_per_blk = {items_expr};
-    uint total_items = uint(pc.b_count) * uint(items_per_blk);
-    if (gid >= total_items) return;
+    int b, local_i;
+    if (SPEC_USE_1D != 0u) {{
+        uint gid = gl_GlobalInvocationID.x;
+        uint total_items = uint(pc.b_count) * uint(items_per_blk);
+        if (gid >= total_items) return;
+        b = int(gid / uint(items_per_blk));
+        local_i = int(gid - uint(b) * uint(items_per_blk));
+    }} else {{
+        local_i = int(gl_GlobalInvocationID.x);
+        b = int(gl_WorkGroupID.y);
+        if (local_i >= items_per_blk || b >= pc.b_count) return;
+    }}
 
     int degree     = {deg_expr};
     int norder     = {norder_expr};
-    int mode43     = int(pc.flags & 1u);
-    int norm       = int((pc.flags >> 1) & 7u);
-    bool has_cond  = ((pc.flags >> 4) & 1u) != 0u;
-    bool use_raw   = ((pc.flags >> 5) & 1u) != 0u;
+    int mode43     = int(SPEC_MODE43);
+    int norm       = int(SPEC_NORM);
+    bool has_cond  = (SPEC_HAS_COND != 0u);
+    bool use_raw   = (SPEC_USE_RAW != 0u);
 
-    int b = int(gid / uint(items_per_blk));
-    int local_i = int(gid - uint(b) * uint(items_per_blk));
     int slot_i = {slot_expr};
     uint bin_idx = uint(b) * uint(pc.nout) + uint(slot_i);
     uint chunk_bins = uint(pc.b_count) * uint(pc.nout);
@@ -1564,14 +1694,13 @@ def _glsl_ihs_math(prec: str) -> str:
         return (
             _glsl_fp64_transcendentals()
             + """
-double ihs_wilkie(double z, double n_eff) {
-    if (!(n_eff > 0.0lf) || !d_is_finite(n_eff)) return z;
+double ihs_wilkie(double z, double inv_n, double inv_n2_288) {
+    if (!(inv_n > 0.0lf)) return z;
     if (!(z > 0.0lf) || !d_is_finite(z)) return 0.0lf;
-    double inv_n = 1.0lf / n_eff;
-    double inv_n2 = inv_n * inv_n;
-    double z2 = z * z, z3 = z2 * z, z4 = z3 * z;
-    double delta = (2.0lf * z - z2) * 0.25lf * inv_n;
-    delta -= (24.0lf * z - 132.0lf * z2 + 76.0lf * z3 - 9.0lf * z4) * inv_n2 / 288.0lf;
+    double p2 = fma(-9.0lf, z, 76.0lf);
+    p2 = fma(p2, z, -132.0lf);
+    p2 = fma(p2, z, 24.0lf);
+    double delta = fma(z * (2.0lf - z), 0.25lf * inv_n, -(z * p2) * inv_n2_288);
     if (!(delta > -1.0lf) || !d_is_finite(delta)) return z;
     double corr = z - d_log1p(delta);
     return (corr > 0.0lf && d_is_finite(corr)) ? corr : z;
@@ -1594,20 +1723,16 @@ double ihs_erlang(double s, int degree) {
         return (
             _glsl_df_transcendentals()
             + """
-df_t ihs_wilkie(df_t z, df_t n_eff) {
-    if (!(n_eff.x > 0.0f) || !f_is_finite(n_eff.x)) return z;
+df_t ihs_wilkie(df_t z, df_t inv_n, df_t inv_n2_288) {
+    if (!(inv_n.x > 0.0f)) return z;
     if (!(z.x > 0.0f) || !f_is_finite(z.x)) return vec2(0.0f, 0.0f);
-    df_t one = vec2(1.0f, 0.0f);
-    df_t inv_n = df_div(one, n_eff);
-    df_t inv_n2 = df_sqr(inv_n);
-    df_t z2 = df_sqr(z), z3 = df_mul(z2, z), z4 = df_sqr(z2);
-    df_t t1 = df_mul(df_sub(df_scale_pow2(z, 2.0f), z2), df_scale_pow2(inv_n, 0.25f));
-    df_t num = df_add(df_sub(df_mul_f(z, 24.0f), df_mul_f(z2, 132.0f)),
-                      df_sub(df_mul_f(z3, 76.0f), df_mul_f(z4, 9.0f)));
-    df_t delta = df_sub(t1, df_mul(num, df_div(inv_n2, vec2(288.0f, 0.0f))));
-    df_t one_plus = df_add(one, delta);
-    if (!(one_plus.x > 0.0f) || !f_is_finite(one_plus.x)) return z;
-    df_t corr = df_sub(z, df_log(one_plus));
+    df_t p2 = df_add(df_mul_f(z, -9.0f), vec2(76.0f, 0.0f));
+    p2 = df_add(df_mul(p2, z), vec2(-132.0f, 0.0f));
+    p2 = df_add(df_mul(p2, z), vec2(24.0f, 0.0f));
+    df_t t1 = df_mul(df_mul(z, df_sub(vec2(2.0f, 0.0f), z)), df_scale_pow2(inv_n, 0.25f));
+    df_t delta = df_sub(t1, df_mul(df_mul(z, p2), inv_n2_288));
+    if (!(delta.x > -1.0f) || !f_is_finite(delta.x)) return z;
+    df_t corr = df_sub(z, df_log1p(delta));
     return (corr.x > 0.0f && f_is_finite(corr.x)) ? corr : z;
 }
 
@@ -1627,14 +1752,13 @@ df_t ihs_erlang(df_t s, int degree) {
     return (
         _glsl_f32_helpers("5.0e5f")
         + """
-float ihs_wilkie(float z, float n_eff) {
-    if (!(n_eff > 0.0f) || !f_is_finite(n_eff)) return z;
+float ihs_wilkie(float z, float inv_n, float inv_n2_288) {
+    if (!(inv_n > 0.0f)) return z;
     if (!(z > 0.0f) || !f_is_finite(z)) return 0.0f;
-    float inv_n = 1.0f / n_eff;
-    float inv_n2 = inv_n * inv_n;
-    float z2 = z * z, z3 = z2 * z, z4 = z3 * z;
-    float delta = (2.0f * z - z2) * 0.25f * inv_n;
-    delta -= (24.0f * z - 132.0f * z2 + 76.0f * z3 - 9.0f * z4) * inv_n2 / 288.0f;
+    float p2 = fma(-9.0f, z, 76.0f);
+    p2 = fma(p2, z, -132.0f);
+    p2 = fma(p2, z, 24.0f);
+    float delta = fma(z * (2.0f - z), 0.25f * inv_n, -(z * p2) * inv_n2_288);
     if (!(delta > -1.0f) || !f_is_finite(delta)) return z;
     float corr = z - f_log1p(delta);
     return (corr > 0.0f && f_is_finite(corr)) ? corr : z;
@@ -1659,7 +1783,8 @@ def _ihs_push_block(out_t: str) -> str:
     return f"""
 layout(push_constant) uniform Push {{
     {out_t} base_scale;
-    {out_t} n_eff;
+    {out_t} inv_n_eff;
+    {out_t} inv_n2_288;
     int degree;
     int Nf;
     int nfft;
@@ -1680,11 +1805,11 @@ def _gen_ihs_shaders(prec: str) -> dict[str, dict]:
     if prec == "h":
         hdr = glsl_header("f")  # Note: d_z is uint (unpackHalf2x16), d_slot_deconv & d_power are float! Zero FP16 ext needed!
         z_t, out_t, check_nc = "uint", "float", False
-        load_abs2 = "vec2 z = unpackHalf2x16(d_z[idx]); float val = z.x * z.x + z.y * z.y;"
+        load_abs2 = "vec2 z = unpackHalf2x16(d_z[idx]); float val = fma(z.x, z.x, z.y * z.y);"
     elif prec == "f":
         hdr = glsl_header("f")
         z_t, out_t, check_nc = "vec2", "float", False
-        load_abs2 = "vec2 z = d_z[idx]; float val = z.x * z.x + z.y * z.y;"
+        load_abs2 = "vec2 z = d_z[idx]; float val = fma(z.x, z.x, z.y * z.y);"
     elif prec == "df":
         hdr = glsl_header("df") + glsl_df_math()
         z_t, out_t, check_nc = "vec4", "vec2", True
@@ -1692,7 +1817,7 @@ def _gen_ihs_shaders(prec: str) -> dict[str, dict]:
     else:
         hdr = glsl_header("d")
         z_t, out_t, check_nc = "dvec2", "double", False
-        load_abs2 = "dvec2 z = d_z[idx]; double val = z.x * z.x + z.y * z.y;"
+        load_abs2 = "dvec2 z = d_z[idx]; double val = fma(z.x, z.x, z.y * z.y);"
 
     math_blk = _glsl_ihs_math(prec)
     push_blk = _ihs_push_block(out_t)
@@ -1702,33 +1827,32 @@ def _gen_ihs_shaders(prec: str) -> dict[str, dict]:
         single_body = """
     df_t d = d_slot_deconv[slot_i];
     val = df_mul(val, df_mul(pc.base_scale, df_sqr(d)));
-    if (pc.norm == 0) {
+    if (SPEC_NORM == 0u) {
         bool ge_one = (val.x > 1.0f || (val.x == 1.0f && val.y >= 0.0f));
         d_power[gf] = (!f_is_finite(val.x) || ge_one) ? vec2(f_nan(), f_nan()) : val;
-    } else if (pc.norm == 2) {
-        df_t v = ihs_wilkie(val, pc.n_eff);
+    } else if (SPEC_NORM == 2u) {
+        df_t v = ihs_wilkie(val, pc.inv_n_eff, pc.inv_n2_288);
         d_power[gf] = (f_is_finite(v.x) && (v.x > 0.0f || (v.x == 0.0f && v.y > 0.0f))) ? v : vec2(0.0f, 0.0f);
     } else {
         d_power[gf] = (f_is_finite(val.x) && (val.x > 0.0f || (val.x == 0.0f && val.y > 0.0f))) ? val : vec2(0.0f, 0.0f);
     }"""
         accum_body = """
-    if (pc.norm == 2 && pc.degree > 1) {
-        int slot_i = int(idx % uint(pc.nout));
+    if (SPEC_NORM == 2u && SPEC_MULTI_HARM != 0u) {
         df_t d = d_slot_deconv[slot_i];
-        val = ihs_wilkie(df_mul(val, df_mul(pc.base_scale, df_sqr(d))), pc.n_eff);
+        val = ihs_wilkie(df_mul(val, df_mul(pc.base_scale, df_sqr(d))), pc.inv_n_eff, pc.inv_n2_288);
     }
     d_acc[idx] = (pc.first_harmonic != 0) ? val : df_add(d_acc[idx], val);"""
         fin_body = """
     df_t val = d_acc[idx];
-    if (!(pc.norm == 2 && pc.degree > 1)) {
+    if (!(SPEC_NORM == 2u && SPEC_MULTI_HARM != 0u)) {
         df_t d = d_slot_deconv[slot_i];
         val = df_mul(val, df_mul(pc.base_scale, df_sqr(d)));
     }
-    if (pc.norm == 0) {
+    if (SPEC_NORM == 0u) {
         bool ge_one = (val.x > 1.0f || (val.x == 1.0f && val.y >= 0.0f));
-        d_power[gf] = (pc.degree == 1 && (!f_is_finite(val.x) || ge_one)) ? vec2(f_nan(), f_nan()) : val;
-    } else if (pc.norm == 2 && pc.degree == 1) {
-        df_t v = ihs_wilkie(val, pc.n_eff);
+        d_power[gf] = (SPEC_MULTI_HARM == 0u && (!f_is_finite(val.x) || ge_one)) ? vec2(f_nan(), f_nan()) : val;
+    } else if (SPEC_NORM == 2u && SPEC_MULTI_HARM == 0u) {
+        df_t v = ihs_wilkie(val, pc.inv_n_eff, pc.inv_n2_288);
         d_power[gf] = (f_is_finite(v.x) && (v.x > 0.0f || (v.x == 0.0f && v.y > 0.0f))) ? v : vec2(0.0f, 0.0f);
     } else {
         df_t v = ihs_erlang(val, pc.degree);
@@ -1738,31 +1862,30 @@ def _gen_ihs_shaders(prec: str) -> dict[str, dict]:
         single_body = """
     double d = d_slot_deconv[slot_i];
     val *= pc.base_scale * d * d;
-    if (pc.norm == 0) {
+    if (SPEC_NORM == 0u) {
         d_power[gf] = (!d_is_finite(val) || val >= 1.0lf) ? d_nan() : val;
-    } else if (pc.norm == 2) {
-        double v = ihs_wilkie(val, pc.n_eff);
+    } else if (SPEC_NORM == 2u) {
+        double v = ihs_wilkie(val, pc.inv_n_eff, pc.inv_n2_288);
         d_power[gf] = (d_is_finite(v) && v > 0.0lf) ? v : 0.0lf;
     } else {
         d_power[gf] = (d_is_finite(val) && val > 0.0lf) ? val : 0.0lf;
     }"""
         accum_body = """
-    if (pc.norm == 2 && pc.degree > 1) {
-        int slot_i = int(idx % uint(pc.nout));
+    if (SPEC_NORM == 2u && SPEC_MULTI_HARM != 0u) {
         double d = d_slot_deconv[slot_i];
-        val = ihs_wilkie(val * (pc.base_scale * d * d), pc.n_eff);
+        val = ihs_wilkie(val * (pc.base_scale * d * d), pc.inv_n_eff, pc.inv_n2_288);
     }
     d_acc[idx] = (pc.first_harmonic != 0) ? val : (d_acc[idx] + val);"""
         fin_body = """
     double val = d_acc[idx];
-    if (!(pc.norm == 2 && pc.degree > 1)) {
+    if (!(SPEC_NORM == 2u && SPEC_MULTI_HARM != 0u)) {
         double d = d_slot_deconv[slot_i];
         val *= pc.base_scale * d * d;
     }
-    if (pc.norm == 0) {
-        d_power[gf] = (pc.degree == 1 && (!d_is_finite(val) || val >= 1.0lf)) ? d_nan() : val;
-    } else if (pc.norm == 2 && pc.degree == 1) {
-        double v = ihs_wilkie(val, pc.n_eff);
+    if (SPEC_NORM == 0u) {
+        d_power[gf] = (SPEC_MULTI_HARM == 0u && (!d_is_finite(val) || val >= 1.0lf)) ? d_nan() : val;
+    } else if (SPEC_NORM == 2u && SPEC_MULTI_HARM == 0u) {
+        double v = ihs_wilkie(val, pc.inv_n_eff, pc.inv_n2_288);
         d_power[gf] = (d_is_finite(v) && v > 0.0lf) ? v : 0.0lf;
     } else {
         double v = ihs_erlang(val, pc.degree);
@@ -1772,52 +1895,69 @@ def _gen_ihs_shaders(prec: str) -> dict[str, dict]:
         single_body = """
     float d = d_slot_deconv[slot_i];
     val *= pc.base_scale * d * d;
-    if (pc.norm == 0) {
+    if (SPEC_NORM == 0u) {
         d_power[gf] = (!f_is_finite(val) || val >= 1.0f) ? f_nan() : val;
-    } else if (pc.norm == 2) {
-        float v = ihs_wilkie(val, pc.n_eff);
+    } else if (SPEC_NORM == 2u) {
+        float v = ihs_wilkie(val, pc.inv_n_eff, pc.inv_n2_288);
         d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
     } else {
         d_power[gf] = (f_is_finite(val) && val > 0.0f) ? val : 0.0f;
     }"""
         accum_body = """
-    if (pc.norm == 2 && pc.degree > 1) {
-        int slot_i = int(idx % uint(pc.nout));
+    if (SPEC_NORM == 2u && SPEC_MULTI_HARM != 0u) {
         float d = d_slot_deconv[slot_i];
-        val = ihs_wilkie(val * (pc.base_scale * d * d), pc.n_eff);
+        val = ihs_wilkie(val * (pc.base_scale * d * d), pc.inv_n_eff, pc.inv_n2_288);
     }
     d_acc[idx] = (pc.first_harmonic != 0) ? val : (d_acc[idx] + val);"""
         fin_body = """
     float val = d_acc[idx];
-    if (!(pc.norm == 2 && pc.degree > 1)) {
+    if (!(SPEC_NORM == 2u && SPEC_MULTI_HARM != 0u)) {
         float d = d_slot_deconv[slot_i];
         val *= pc.base_scale * d * d;
     }
-    if (pc.norm == 0) {
-        d_power[gf] = (pc.degree == 1 && (!f_is_finite(val) || val >= 1.0f)) ? f_nan() : val;
-    } else if (pc.norm == 2 && pc.degree == 1) {
-        float v = ihs_wilkie(val, pc.n_eff);
+    if (SPEC_NORM == 0u) {
+        d_power[gf] = (SPEC_MULTI_HARM == 0u && (!f_is_finite(val) || val >= 1.0f)) ? f_nan() : val;
+    } else if (SPEC_NORM == 2u && SPEC_MULTI_HARM == 0u) {
+        float v = ihs_wilkie(val, pc.inv_n_eff, pc.inv_n2_288);
         d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
     } else {
         float v = ihs_erlang(val, pc.degree);
         d_power[gf] = (v >= 0.0f) ? v : 0.0f;
     }"""
 
-    out[f"ihs_single_{prec}"] = {
-        "source": hdr + slot_blk + f"""
+    ihs_specs = """
+layout(constant_id = 0) const uint WG_SIZE         = 64u;
+layout(constant_id = 1) const uint SPEC_USE_1D     = 0u;
+layout(constant_id = 2) const uint SPEC_NORM       = 0u;
+layout(constant_id = 3) const uint SPEC_MODE43     = 1u;
+layout(constant_id = 4) const uint SPEC_MULTI_HARM = 0u;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+"""
+    ihs_coord = """
+    int b, slot_i;
+    uint idx;
+    if (SPEC_USE_1D != 0u) {
+        idx = gl_GlobalInvocationID.x;
+        uint total_bins = uint(pc.b_count) * uint(pc.nout);
+        if (idx >= total_bins) return;
+        b = int(idx / uint(pc.nout));
+        slot_i = int(idx - uint(b) * uint(pc.nout));
+    } else {
+        slot_i = int(gl_GlobalInvocationID.x);
+        b = int(gl_WorkGroupID.y);
+        if (slot_i >= pc.nout || b >= pc.b_count) return;
+        idx = uint(b) * uint(pc.nout) + uint(slot_i);
+    }"""
+
+    out[f"ihs_single_{prec}"] = {
+        "source": hdr + slot_blk + ihs_specs + f"""
 layout(std430, binding = 0) readonly  buffer ZBuf   {{ {z_t}   d_z[]; }};
 layout(std430, binding = 1) readonly  buffer DecBuf {{ {out_t} d_slot_deconv[]; }};
 layout(std430, binding = 2) writeonly buffer PowBuf {{ {out_t} d_power[]; }};
 {push_blk}
 {math_blk}
-void main() {{
-    uint idx = gl_GlobalInvocationID.x;
-    uint total_bins = uint(pc.b_count) * uint(pc.nout);
-    if (idx >= total_bins) return;
-    int b = int(idx / uint(pc.nout));
-    int slot_i = int(idx - uint(b) * uint(pc.nout));
-    int slot_p = nufft1_compact_idx_to_slot(slot_i, pc.mode43);
+void main() {{{ihs_coord}
+    int slot_p = nufft1_compact_idx_to_slot(slot_i, int(SPEC_MODE43));
     int nat_k = nufft1_slot_to_natural_idx(slot_p, pc.log_nfft, pc.nfft, pc.output_shift);
     int gf = (pc.b_start + b) * pc.nout + nat_k;
     if (gf >= pc.Nf) return;
@@ -1829,17 +1969,13 @@ void main() {{
     }
 
     out[f"ihs_accum_{prec}"] = {
-        "source": hdr + f"""
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+        "source": hdr + ihs_specs + f"""
 layout(std430, binding = 0) readonly buffer ZBuf   {{ {z_t}   d_z[]; }};
 layout(std430, binding = 1) readonly buffer DecBuf {{ {out_t} d_slot_deconv[]; }};
 layout(std430, binding = 2) buffer          AccBuf {{ {out_t} d_acc[]; }};
 {push_blk}
 {math_blk}
-void main() {{
-    uint idx = gl_GlobalInvocationID.x;
-    uint total_bins = uint(pc.b_count) * uint(pc.nout);
-    if (idx >= total_bins) return;
+void main() {{{ihs_coord}
     {load_abs2}
 {accum_body}
 }}
@@ -1848,20 +1984,14 @@ void main() {{
     }
 
     out[f"ihs_finalize_{prec}"] = {
-        "source": hdr + slot_blk + f"""
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+        "source": hdr + slot_blk + ihs_specs + f"""
 layout(std430, binding = 0) readonly  buffer AccBuf {{ {out_t} d_acc[]; }};
 layout(std430, binding = 1) readonly  buffer DecBuf {{ {out_t} d_slot_deconv[]; }};
 layout(std430, binding = 2) writeonly buffer PowBuf {{ {out_t} d_power[]; }};
 {push_blk}
 {math_blk}
-void main() {{
-    uint idx = gl_GlobalInvocationID.x;
-    uint total_bins = uint(pc.b_count) * uint(pc.nout);
-    if (idx >= total_bins) return;
-    int b = int(idx / uint(pc.nout));
-    int slot_i = int(idx - uint(b) * uint(pc.nout));
-    int slot_p = nufft1_compact_idx_to_slot(slot_i, pc.mode43);
+void main() {{{ihs_coord}
+    int slot_p = nufft1_compact_idx_to_slot(slot_i, int(SPEC_MODE43));
     int nat_k = nufft1_slot_to_natural_idx(slot_p, pc.log_nfft, pc.nfft, pc.output_shift);
     int gf = (pc.b_start + b) * pc.nout + nat_k;
     if (gf >= pc.Nf) return;
@@ -1879,8 +2009,10 @@ def generate_periodogram_shaders() -> dict[str, dict]:
     for prec in ("h", "f", "df", "d"):
         shaders[f"subgrid_{prec}"] = _gen_subgrid(prec)
         shaders[f"fastchi2_gls_{prec}"] = _gen_fastchi2_gls(prec)
-        for deg in (2, 3, 4, 5):
+        unroll_degs = (2, 3, 4, 5, 6, 7, 8) if prec in ("h", "f") else (2, 3, 4, 5)
+        for deg in unroll_degs:
             shaders[f"fastchi2_lev_d{deg}_{prec}"] = _gen_fastchi2_lev(prec, exact_deg=deg, mode="unrolled")
+        shaders[f"fastchi2_lev_smem_{prec}"] = _gen_fastchi2_lev(prec, exact_deg=0, mode="smem")
         shaders[f"fastchi2_lev_large_{prec}"] = _gen_fastchi2_lev(prec, exact_deg=0, mode="large")
         shaders.update(_gen_ihs_shaders(prec))
     return shaders
