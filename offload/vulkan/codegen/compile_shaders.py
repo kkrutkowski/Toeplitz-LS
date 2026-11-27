@@ -60,7 +60,7 @@ def _compile_one(task: tuple[str, dict, str, str, str, str, str, str, str]) -> t
 
     # Avoid unnecessary rewrites if source & compiled spv are up-to-date
     src_hash_path = Path(spv_dir) / f"{name}.sha256"
-    src_digest = hashlib.sha256(("v3_noinline_df_strip\n" + target_env + "\n" + src).encode("utf-8")).hexdigest()
+    src_digest = hashlib.sha256(("v4_noinline_df_os_strip\n" + target_env + "\n" + src).encode("utf-8")).hexdigest()
     if (
         opt_spv.is_file()
         and src_hash_path.is_file()
@@ -149,7 +149,7 @@ def _compile_one(task: tuple[str, dict, str, str, str, str, str, str, str]) -> t
     else:
         opt_args = [
             spirv_opt,
-            "-O",
+            "-Os",
             "--strip-debug",
             "--strip-nonsemantic",
             "--compact-ids",

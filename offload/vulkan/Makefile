@@ -9,7 +9,7 @@ GEN_DIR  := $(BUILD)/gen
 OBJ_DIR  := $(BUILD)/obj
 TARGET   := $(BUILD)/tls_vulkan.so
 
-CFLAGS   := -O3 -std=c23 -Wall -Wextra -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -I. -I$(GEN_DIR)
+CFLAGS   := -O3 -std=c23 -Wall -Wextra -fno-math-errno -fno-trapping-math -ffp-contract=fast -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -I. -I$(GEN_DIR)
 LDFLAGS  := -shared -Wl,--version-script=tls_vulkan.map -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed -lvulkan -lm -lpthread
 
 CODEGEN_SCRIPTS := $(wildcard codegen/*.py)
@@ -47,10 +47,10 @@ $(SPV_SRC): $(CODEGEN_SCRIPTS)
 $(SPV_HDR): $(SPV_SRC)
 	@test -f $@ || $(PYTHON) codegen/compile_shaders.py --out-dir $(GEN_DIR)
 
-# Compile large static SPIR-V byte arrays at -O0 for fast builds
+# Compile large static SPIR-V byte arrays at -Os (fast build, compact lookup helpers)
 $(SPV_OBJ): $(SPV_SRC) $(SPV_HDR)
 	@mkdir -p $(dir $@)
-	$(CC) -O0 -std=c23 -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -I$(GEN_DIR) -c $< -o $@
+	$(CC) -Os -std=c23 -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -I$(GEN_DIR) -c $< -o $@
 
 $(OBJ_DIR)/%.o: %.c $(C_HDRS) $(SPV_HDR) $(PSWF_HDR)
 	@mkdir -p $(dir $@)
