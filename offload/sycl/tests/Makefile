@@ -58,7 +58,7 @@ CORE_OBJS := \
 	$(OBJDIR)/fft/dif_fp64_large.o \
 	$(OBJDIR)/fft/dif_df_small.o \
 	$(OBJDIR)/fft/dif_df_large.o \
-	$(OBJDIR)/nufft/aux.o \
+	$(OBJDIR)/nufft/auxiliary.o \
 	$(OBJDIR)/nufft/spread_fp16.o \
 	$(OBJDIR)/nufft/spread_fp32.o \
 	$(OBJDIR)/nufft/spread_fp64.o \

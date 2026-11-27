@@ -31,6 +31,7 @@ PACKAGE = ROOT / "toeplitz-ls" / "toeplitz_ls"
 
 PACKAGE_FILES = (
     "__init__.py",
+    "_astropy.py",
     "_fastchi2.py",
     "_ihs.py",
     "_dispatch.py",

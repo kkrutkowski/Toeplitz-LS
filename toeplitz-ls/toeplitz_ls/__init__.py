@@ -1,6 +1,6 @@
 """Python interface for the Toeplitz least-squares FastChi2 library."""
 
-from . import _dispatch
+from . import _astropy, _dispatch
 from ._fastchi2 import DD, tls, tlsdd, tlsf, tlsh, trim_mantissa
 from ._ihs import ihs, ihsdd, ihsf, ihsh
 from .utils import Peak, Peaks, get_peaks
@@ -9,6 +9,8 @@ __version__ = "1.1.0rc1"
 
 #: Manifest entry of the microarchitecture variant this process loaded.
 __dispatch__ = _dispatch.selected()
+
+_astropy.register_astropy_methods()
 
 __all__ = [
     "DD",

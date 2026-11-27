@@ -140,7 +140,7 @@ inline void unpermute_slots_to_natural_host(const ComplexT* h_slots, ComplexT* h
 
 namespace detail {
 
-// --- Auxiliary kernels (sycl_nufft1_aux.cpp) ---
+// --- Auxiliary kernels (auxiliary.cpp) ---
 void launch_precompute_pointsh(sycl::queue& q, const sycl_fft::df_t* d_x, sycl_fft::df_t df_scaled, int M, int nfft, int w, int output_shift, bool mode43,
                                bool pos_sign, int* d_first, sycl_fft::f16_scalar_t* d_u, sycl_fft::Complexh* d_shift, size_t wg_size);
 

@@ -76,7 +76,7 @@ CORE_OBJS := \
 	$(OBJDIR)/fft/dif_fp64_large.o \
 	$(OBJDIR)/fft/dif_df_small.o \
 	$(OBJDIR)/fft/dif_df_large.o \
-	$(OBJDIR)/nufft/aux.o \
+	$(OBJDIR)/nufft/auxiliary.o \
 	$(OBJDIR)/nufft/spread_fp16.o \
 	$(OBJDIR)/nufft/spread_fp32.o \
 	$(OBJDIR)/nufft/spread_fp64.o \
@@ -127,7 +127,7 @@ KERNEL_HASH_INPUTS := \
 	fft/dif.cpp \
 	nufft/pswf_coeffs.hpp \
 	nufft/nufft1.hpp \
-	nufft/aux.cpp \
+	nufft/auxiliary.cpp \
 	nufft/spread.cpp \
 	nufft/deconv.cpp \
 	nufft/plan.cpp \
@@ -159,7 +159,7 @@ $(OBJDIR)/fft/dif_%_large.o: fft/dif.cpp $(FFT_HEADERS) common/precision.hpp
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) $(PREC_FLAG_$*) -DSYCL_FFT_INST_LARGE_ONLY -c $< -o $@
 
-$(OBJDIR)/nufft/aux.o: nufft/aux.cpp $(NUFFT_BASE_HEADERS)
+$(OBJDIR)/nufft/auxiliary.o: nufft/auxiliary.cpp $(NUFFT_BASE_HEADERS)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_COMPILE_FLAGS) -c $< -o $@
 

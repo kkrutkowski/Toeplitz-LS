@@ -35,6 +35,7 @@ BACKEND = Path(__file__).resolve().parent / "sdist_backend.py"
 # the LUT generators stay in the repository.
 PACKAGE_FILES = (
     "__init__.py",
+    "_astropy.py",
     "_dispatch.py",
     "_fastchi2.py",
     "_ihs.py",
