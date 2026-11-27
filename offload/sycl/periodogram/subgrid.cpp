@@ -131,8 +131,8 @@ void SYCL_FFT_SUFFIX(launch_build_subgrid_sources)(
                     df_t dc, ds;
                     sincos2pidf_branchless<+1>(df_mul(xm, f_step_df), dc, ds);
                     for (int b = b0 + 1; b < b_end; ++b) {
-                        const df_t nc = df_sub(df_mul(c, dc), df_mul(s, ds));
-                        const df_t ns = df_add(df_mul(c, ds), df_mul(s, dc));
+                        df_t nc, ns;
+                        df_cmul_fused(c, s, dc, ds, nc, ns);
                         c = nc;
                         s = ns;
                         out_idx += M_sz;

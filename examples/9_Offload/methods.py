@@ -22,6 +22,7 @@ from toeplitz_ls import tls as _cpu_tls  # noqa: E402
 from toeplitz_ls import tlsf as _cpu_tlsf  # noqa: E402
 from toeplitz_ls import tlsh as _cpu_tlsh  # noqa: E402
 from toeplitz_ls.offload import sycl as _sycl  # noqa: E402
+from toeplitz_ls.offload import vulkan as _vulkan  # noqa: E402
 
 _C_INT_MAX = 2**31 - 1
 
@@ -183,8 +184,17 @@ class CpuIhsMethod(OffloadMethod):
         )
 
 
-def build_registry(device: int = 0, pswf_backend: str = "pswf43") -> dict[str, OffloadMethod]:
-    """Build the method registry for the selected SYCL device ID."""
+class VulkanFastChi2Method(SyclFastChi2Method):
+    backend_family = "vulkan"
+
+
+class VulkanIhsMethod(SyclIhsMethod):
+    backend_family = "vulkan"
+
+
+def build_registry(device: int = 0, pswf_backend: str = "pswf43", vk_device: int | None = None) -> dict[str, OffloadMethod]:
+    """Build the method registry for the selected SYCL and Vulkan device IDs."""
+    vk_dev = device if vk_device is None else vk_device
     methods: list[OffloadMethod] = [
         SyclFastChi2Method("sycl_tlsh", _sycl.tlsh, device=device, pswf_backend=pswf_backend),
         SyclFastChi2Method("sycl_tlsf", _sycl.tlsf, device=device, pswf_backend=pswf_backend),
@@ -195,6 +205,15 @@ def build_registry(device: int = 0, pswf_backend: str = "pswf43") -> dict[str, O
         SyclIhsMethod("sycl_ihsf", _sycl.ihsf, device=device, pswf_backend=pswf_backend),
         SyclIhsMethod("sycl_ihsdf", _sycl.ihsdf, device=device, pswf_backend=pswf_backend),
         SyclIhsMethod("sycl_ihs", _sycl.ihs, device=device, pswf_backend=pswf_backend),
+        VulkanFastChi2Method("vk_tlsh", _vulkan.tlsh, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanFastChi2Method("vk_tlsf", _vulkan.tlsf, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanFastChi2Method("vk_tlsdf", _vulkan.tlsdf, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanFastChi2Method("vk_tls", _vulkan.tls, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanFastChi2Method("vk_tlsf_regularized", _vulkan.tlsf, device=vk_dev, pswf_backend=pswf_backend, normalization="regularized"),
+        VulkanIhsMethod("vk_ihsh", _vulkan.ihsh, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanIhsMethod("vk_ihsf", _vulkan.ihsf, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanIhsMethod("vk_ihsdf", _vulkan.ihsdf, device=vk_dev, pswf_backend=pswf_backend),
+        VulkanIhsMethod("vk_ihs", _vulkan.ihs, device=vk_dev, pswf_backend=pswf_backend),
         CpuFastChi2Method("cpu_tlsh", _cpu_tlsh, pswf_backend=pswf_backend),
         CpuFastChi2Method("cpu_tlsf", _cpu_tlsf, pswf_backend=pswf_backend),
         CpuFastChi2Method("cpu_tls", _cpu_tls, pswf_backend=pswf_backend),

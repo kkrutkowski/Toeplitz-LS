@@ -27,6 +27,10 @@ REASONIX.md
 /offload/sycl/build/
 /offload/sycl/tests/build/
 /offload/sycl/deploy/
+/offload/vulkan/build/
+/offload/vulkan/tests/build/
+/offload/vulkan/deploy/
+/examples/9_Offload/out*/
 /tmp/
 /lib/
 /dist/
@@ -46,6 +50,9 @@ REASONIX.md
 *.pyd
 *.whl
 *.egg-info/
+*.spv
+*.spvasm
+/offload/vulkan/tests/test_m[0-9]
 /src/miscellaneous/remez_test
 /src/miscellaneous/remez_exp
 
@@ -65,12 +72,16 @@ REASONIX.md
 /examples/8_Benchmark/index.tsv
 /examples/8_Benchmark/index_rrlyr.tsv
 /examples/8_Benchmark/*.tar.xz
+/offload/TurboFFT.tar.gz
+/offload/toeplitz_ls_gpu-draft-*.tar.gz
 
 # Local environments and logs
 .venv/
 venv/
 .env
 *.log
+vk_pipe_*.bin
+*_autotune_*.txt
 .DS_Store
 offload/refs
- scratch*
+scratch*

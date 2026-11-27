@@ -1,3 +1,3 @@
-"""Hardware-offloaded periodogram backends for Toeplitz-LS (SYCL, future Vulkan/GLSL)."""
+"""Hardware-offloaded periodogram backends for Toeplitz-LS (SYCL and Vulkan/GLSL)."""
 
-__all__ = ["sycl"]
+__all__ = ["sycl", "vulkan"]

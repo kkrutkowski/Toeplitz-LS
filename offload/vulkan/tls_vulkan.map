@@ -1,0 +1,6 @@
+{
+  global:
+    tls_vk_*;
+  local:
+    *;
+};

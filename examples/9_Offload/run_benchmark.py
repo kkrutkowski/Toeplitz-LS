@@ -31,6 +31,7 @@ if str(HERE) not in sys.path:
 
 from methods import OffloadMethod, build_registry, make_frequency_grid  # noqa: E402
 from toeplitz_ls.offload import sycl as _sycl  # noqa: E402
+from toeplitz_ls.offload import vulkan as _vulkan  # noqa: E402
 
 MIN_MEASUREMENTS = 50
 
@@ -281,7 +282,8 @@ def parse_args(argv=None):
     parser.add_argument("--methods", default="sycl_tlsh,sycl_tlsf,sycl_tlsdf,sycl_tls")
     parser.add_argument("--phot-dir", default="/home/krutkowski/Pulpit/LMC_ECL/phot")
     parser.add_argument("--output-dir", default="./out_offload")
-    parser.add_argument("--device", type=int, default=0, help="SYCL device ID from list_devices().")
+    parser.add_argument("--device", type=int, default=0, help="SYCL device ID from sycl.list_devices().")
+    parser.add_argument("--vk-device", type=int, default=None, help="Vulkan device ID from vulkan.list_devices() (defaults to --device).")
     parser.add_argument("--backend", default="pswf43", choices=("pswf43", "pswf21"))
     parser.add_argument("--dataset-limit", type=int, default=0)
     parser.add_argument("--nterms", default="1,3", help="Comma-separated harmonic orders, e.g. 1,3.")
@@ -297,13 +299,27 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    devices = _sycl.list_devices(print_table=True)
+    sycl_devices = []
+    vk_devices = []
+    try:
+        print("=== SYCL Devices ===")
+        sycl_devices = _sycl.list_devices(print_table=True)
+    except FileNotFoundError:
+        pass
+    try:
+        print("=== Vulkan Devices ===")
+        vk_devices = _vulkan.list_devices(print_table=True)
+    except FileNotFoundError:
+        pass
     if args.list_devices:
         return
-    dev_desc = next((d for d in devices if d.id == args.device), None)
-    dev_label = f"[{dev_desc.id}] {dev_desc.name}" if dev_desc is not None else f"[{args.device}] unknown"
+    vk_dev_id = args.device if args.vk_device is None else args.vk_device
+    sycl_desc = next((d for d in sycl_devices if d.id == args.device), None)
+    sycl_label = f"[{sycl_desc.id}] {sycl_desc.name}" if sycl_desc is not None else f"[{args.device}] unknown"
+    vk_desc = next((d for d in vk_devices if d.id == vk_dev_id), None)
+    vk_label = f"[{vk_desc.id}] {vk_desc.name}" if vk_desc is not None else f"[{vk_dev_id}] unknown"
 
-    registry = build_registry(device=args.device, pswf_backend=args.backend)
+    registry = build_registry(device=args.device, pswf_backend=args.backend, vk_device=vk_dev_id)
     if args.methods.strip().lower() == "all":
         method_names = list(registry)
     else:
@@ -338,11 +354,16 @@ def main(argv=None):
                 show_progress=not args.no_progress,
             )
             out_path = out_dir / f"{mname}_nterms{nterms}.tsv"
+            dev_name = (
+                sycl_label
+                if method.backend_family == "sycl"
+                else (vk_label if method.backend_family == "vulkan" else "CPU")
+            )
             write_output(
                 out_path,
                 method_name=mname,
                 nterms=nterms,
-                device_name=dev_label if method.backend_family == "sycl" else "CPU",
+                device_name=dev_name,
                 selected_files=len(selected),
                 eligible_files=len(curves),
                 result=res,

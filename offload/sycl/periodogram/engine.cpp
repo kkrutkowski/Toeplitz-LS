@@ -639,9 +639,15 @@ int execute_fastchi2_common(
     using PlanT      = typename Traits::PlanT;
 
     DeviceRuntime& rt = DeviceManager::instance().get(device_id);
+    if constexpr (Traits::kPrec == TLS_SYCL_PREC_HALF) {
+        if (!rt.desc.has_fp16) {
+            set_last_error("Selected SYCL device does not support native FP16; switch to FP32 (tlsf) instead");
+            return TLS_SYCL_ERR_DEVICE;
+        }
+    }
     if constexpr (Traits::kPrec == TLS_SYCL_PREC_DOUBLE) {
         if (!rt.dev_cfg.has_fp64) {
-            set_last_error("Selected SYCL device does not support native FP64; use tlsdf instead");
+            set_last_error("Selected SYCL device does not support native FP64; use Dekker double-float (tlsdf) instead");
             return TLS_SYCL_ERR_DEVICE;
         }
     }
@@ -836,9 +842,15 @@ int execute_ihs_common(
     using PlanT    = typename Traits::PlanT;
 
     DeviceRuntime& rt = DeviceManager::instance().get(device_id);
+    if constexpr (Traits::kPrec == TLS_SYCL_PREC_HALF) {
+        if (!rt.desc.has_fp16) {
+            set_last_error("Selected SYCL device does not support native FP16; switch to FP32 (ihsf) instead");
+            return TLS_SYCL_ERR_DEVICE;
+        }
+    }
     if constexpr (Traits::kPrec == TLS_SYCL_PREC_DOUBLE) {
         if (!rt.dev_cfg.has_fp64) {
-            set_last_error("Selected SYCL device does not support native FP64; use ihsdf instead");
+            set_last_error("Selected SYCL device does not support native FP64; use Dekker double-float (ihsdf) instead");
             return TLS_SYCL_ERR_DEVICE;
         }
     }

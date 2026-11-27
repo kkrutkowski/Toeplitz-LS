@@ -16,6 +16,7 @@
 
 ACPP ?= acpp
 CXX ?= clang++
+STRIP ?= strip
 ACPP_TARGETS ?= generic
 SIGN ?= pos
 
@@ -30,12 +31,12 @@ $(error Invalid SIGN='$(SIGN)'. Expected pos, neg, or both)
 endif
 
 CXXFLAGS ?= -O3 -std=c++20 -Wall -Wextra -fno-fast-math -ffp-contract=fast $(SIGN_FLAGS)
-PICFLAGS := -fPIC -fvisibility=hidden -fvisibility-inlines-hidden
+PICFLAGS := -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -ffunction-sections -fdata-sections
 INCLUDES := -I.
 VERSION_SCRIPT := tls_sycl.map
 
 ACPP_COMPILE_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS) $(PICFLAGS) $(INCLUDES)
-ACPP_LINK_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS) -Wl,--version-script=$(VERSION_SCRIPT)
+ACPP_LINK_FLAGS := --acpp-targets=$(ACPP_TARGETS) $(CXXFLAGS) -Wl,--version-script=$(VERSION_SCRIPT) -Wl,--gc-sections -Wl,-O1 -Wl,--as-needed
 
 BUILD_DIR ?= build
 OBJDIR ?= $(BUILD_DIR)/obj
@@ -109,6 +110,7 @@ objs: $(CORE_OBJS)
 $(TARGET_SO): $(LIB_OBJS) $(VERSION_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(ACPP) $(ACPP_LINK_FLAGS) -shared $(LIB_OBJS) -o $@
+	$(STRIP) -s $@
 
 $(OBJDIR)/impl.o: impl.cpp periodogram/engine.hpp
 	@mkdir -p $(dir $@)

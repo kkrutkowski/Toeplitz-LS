@@ -1021,9 +1021,10 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
     const size_t wg = std::max<size_t>(1, std::min<size_t>(p.wg_size, 256));
     const size_t num_wg = (total_items + wg - 1) / wg;
 
-    const SolveRealT ws_base    = splat_from_double(p.ws_fft);
-    const SolveRealT yws_base   = splat_from_double(p.yws_fft);
-    const SolveRealT norder_val = splat_from_double(static_cast<double>(norder_rt));
+    const SolveRealT ws_base     = splat_from_double(p.ws_fft);
+    const SolveRealT inv_ws_base = splat_from_double(1.0 / p.ws_fft);
+    const SolveRealT yws_base    = splat_from_double(p.yws_fft);
+    const SolveRealT norder_val  = splat_from_double(static_cast<double>(norder_rt));
 
 #if defined(SYCL_FFT_DOUBLE)
     const double chi2_ref_out = p.chi2_ref;
@@ -1060,12 +1061,14 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
 
                 SolveRealT ws_k = ws_base;
                 SolveRealT yws_k = yws_base;
+                SolveRealT inv_E = inv_ws_base;
                 SolveRealT dscale = SYCL_FFT_ONE;
                 if (use_raw_dec) {
                     const SolveRealT pk = load_slot_scalar(d_slot_phi_hat, slot_i);
                     dscale = load_slot_scalar(d_slot_deconv, slot_i);
                     ws_k  = SYCL_FFT_MUL(ws_base, pk);
                     yws_k = SYCL_FFT_MUL(yws_base, pk);
+                    inv_E = SYCL_FFT_MUL(inv_ws_base, dscale);
                 }
 
                 // Helpers to fetch R[idx] and Y[idx] directly from coalesced L1-cached d_trig
@@ -1122,7 +1125,6 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
 
                 // --- Fused in-place Levinson-Durbin recursion (mirrors src/linalg.c) ---
                 SolveRealT E = ws_k;
-                SolveRealT inv_E = l_div(SYCL_FFT_ONE, E);
                 SolveRealT y0r, y0i;
                 get_Y(0, y0r, y0i);
                 SolveRealT r2 = SYCL_FFT_MUL(SYCL_FFT_ADD(SYCL_FFT_MUL(y0r, y0r), SYCL_FFT_MUL(y0i, y0i)), inv_E);
@@ -1205,14 +1207,59 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                 if constexpr (ExactDeg > 0) {
                     // Fully compile-time unrolled outer & inner loops -> SROA keeps a_r_reg/a_i_reg
                     // 100% in hardware registers with 0 bytes stack / 0 ld.local / 0 st.local!
+                    // Preload R[1..2*d] and Y[1..d] once into registers for d<=3 (all precisions)
+                    // and d<=5 (narrow FP16/FP32) to eliminate O(d^2) redundant strided d_trig loads.
+#if defined(SYCL_FFT_HALF) || defined(SYCL_FFT_FLOAT)
+                    constexpr bool kPreloadRY = (ExactDeg <= 5);
+#else
+                    constexpr bool kPreloadRY = (ExactDeg <= 3);
+#endif
+                    constexpr int kRLen = kPreloadRY ? (2 * ExactDeg) : 1;
+                    constexpr int kYLen = kPreloadRY ? ExactDeg : 1;
+                    SolveRealT R_r_reg[kRLen], R_i_reg[kRLen];
+                    SolveRealT Y_r_reg[kYLen], Y_i_reg[kYLen];
+                    if constexpr (kPreloadRY) {
+                        unroll_for<2 * ExactDeg>([&](auto q_ic) {
+                            constexpr int q = decltype(q_ic)::value + 1;
+                            const size_t row_off = trig_w_row(q, ExactDeg) * chunk_bins;
+                            load_trig_slot(d_trig, row_off, bin_idx, R_r_reg[q - 1], R_i_reg[q - 1]);
+                            R_i_reg[q - 1] = SYCL_FFT_NEG(R_i_reg[q - 1]);
+                        });
+                        unroll_for<ExactDeg>([&](auto q_ic) {
+                            constexpr int q = decltype(q_ic)::value + 1;
+                            const size_t row_off = trig_yw_row(q) * chunk_bins;
+                            load_trig_slot(d_trig, row_off, bin_idx, Y_r_reg[q - 1], Y_i_reg[q - 1]);
+                        });
+                    }
+                    auto fast_R = [&](auto k_tag, SolveRealT& rr, SolveRealT& ri) SYCL_FFT_LAMBDA_INLINE {
+                        constexpr int k_idx = decltype(k_tag)::value;
+                        if constexpr (kPreloadRY) {
+                            if constexpr (k_idx == 0) { rr = ws_k; ri = SYCL_FFT_ZERO; }
+                            else { rr = R_r_reg[k_idx - 1]; ri = R_i_reg[k_idx - 1]; }
+                        } else {
+                            get_R(k_idx, rr, ri);
+                        }
+                    };
+                    auto fast_Y = [&](auto k_tag, SolveRealT& yr, SolveRealT& yi) SYCL_FFT_LAMBDA_INLINE {
+                        constexpr int k_idx = decltype(k_tag)::value;
+                        if constexpr (kPreloadRY) {
+                            constexpr int h = k_idx - ExactDeg;
+                            if constexpr (h == 0) { yr = yws_k; yi = SYCL_FFT_ZERO; }
+                            else if constexpr (h > 0) { yr = Y_r_reg[h - 1]; yi = SYCL_FFT_NEG(Y_i_reg[h - 1]); }
+                            else { yr = Y_r_reg[-h - 1]; yi = Y_i_reg[-h - 1]; }
+                        } else {
+                            get_Y(k_idx, yr, yi);
+                        }
+                    };
+
                     unroll_for<2 * ExactDeg>([&](auto k_ic) {
                         constexpr int k = decltype(k_ic)::value + 1;
                         SolveRealT lam_r, lam_i;
-                        get_R(k, lam_r, lam_i);
+                        fast_R(std::integral_constant<int, k>{}, lam_r, lam_i);
                         unroll_for<k - 1>([&](auto i_ic) {
                             constexpr int i = decltype(i_ic)::value + 1;
                             SolveRealT rr, ri;
-                            get_R(k - i, rr, ri);
+                            fast_R(std::integral_constant<int, k - i>{}, rr, ri);
                             const SolveRealT ar = a_r_reg[i];
                             const SolveRealT ai = a_i_reg[i];
                             lam_r = l_fma(rr, ar, SYCL_FFT_SUB(lam_r, SYCL_FFT_MUL(ri, ai)));
@@ -1231,7 +1278,7 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                         a_i_reg[k] = gamma_i;
 
                         SolveRealT ykr, yki;
-                        get_Y(k, ykr, yki);
+                        fast_Y(std::integral_constant<int, k>{}, ykr, yki);
                         SolveRealT xr = SYCL_FFT_ADD(ykr, SYCL_FFT_SUB(SYCL_FFT_MUL(gamma_r, y0r), SYCL_FFT_MUL(gamma_i, y0i)));
                         SolveRealT xi = SYCL_FFT_ADD(yki, SYCL_FFT_ADD(SYCL_FFT_MUL(gamma_r, y0i), SYCL_FFT_MUL(gamma_i, y0r)));
 
@@ -1255,8 +1302,8 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                             a_i_reg[hi] = nhi;
 
                             SolveRealT yhr, yhi, ylr, yli;
-                            get_Y(hi, yhr, yhi);
-                            get_Y(lo, ylr, yli);
+                            fast_Y(std::integral_constant<int, hi>{}, yhr, yhi);
+                            fast_Y(std::integral_constant<int, lo>{}, ylr, yli);
 
                             xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nlr, yhr), SYCL_FFT_MUL(nli, yhi)));
                             xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nlr, yhi), SYCL_FFT_MUL(nli, yhr)));
@@ -1273,7 +1320,7 @@ inline void SYCL_FFT_SUFFIX(launch_levinson_kernel)(
                             a_i_reg[mid] = nli;
 
                             SolveRealT ylr, yli;
-                            get_Y(mid, ylr, yli);
+                            fast_Y(std::integral_constant<int, mid>{}, ylr, yli);
                             xr = SYCL_FFT_ADD(xr, SYCL_FFT_SUB(SYCL_FFT_MUL(nlr, ylr), SYCL_FFT_MUL(nli, yli)));
                             xi = SYCL_FFT_ADD(xi, SYCL_FFT_ADD(SYCL_FFT_MUL(nlr, yli), SYCL_FFT_MUL(nli, ylr)));
                         }
@@ -1542,9 +1589,8 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
                     if (degree == 1 && (!d_is_finite(val) || val >= 1.0)) val = d_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll && degree == 1) {
-                    const double z = ihs_wilkie_d(val, n_eff);
-                    const double v = ihs_erlang_d(z, 1);
-                    d_power[gf] = (v >= 0.0) ? v : 0.0;
+                    const double v = ihs_wilkie_d(val, n_eff);
+                    d_power[gf] = (d_is_finite(v) && v > 0.0) ? v : 0.0;
                 } else {
                     const double v = ihs_erlang_d(val, degree);
                     d_power[gf] = (v >= 0.0) ? v : 0.0;
@@ -1563,9 +1609,8 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
                         d_power[gf] = val;
                     }
                 } else if (norm == NormKind::Nll && degree == 1) {
-                    const df_t z = ihs_wilkie_df(val, n_eff);
-                    const df_t v = ihs_erlang_df(z, 1);
-                    d_power[gf] = (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f)) ? v : df_make(0.0f, 0.0f);
+                    const df_t v = ihs_wilkie_df(val, n_eff);
+                    d_power[gf] = (f_is_finite(v.hi) && (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f))) ? v : df_make(0.0f, 0.0f);
                 } else {
                     const df_t v = ihs_erlang_df(val, degree);
                     d_power[gf] = (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f)) ? v : df_make(0.0f, 0.0f);
@@ -1580,9 +1625,8 @@ void SYCL_FFT_SUFFIX(launch_ihs_finalize)(
                     if (degree == 1 && (!f_is_finite(val) || val >= 1.0f)) val = f_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll && degree == 1) {
-                    const float z = ihs_wilkie_f(val, n_eff);
-                    const float v = ihs_erlang_f(z, 1);
-                    d_power[gf] = (v >= 0.0f) ? v : 0.0f;
+                    const float v = ihs_wilkie_f(val, n_eff);
+                    d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
                 } else {
                     const float v = ihs_erlang_f(val, degree);
                     d_power[gf] = (v >= 0.0f) ? v : 0.0f;
@@ -1648,12 +1692,10 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     if (!d_is_finite(val) || val >= 1.0) val = d_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll) {
-                    const double zw = ihs_wilkie_d(val, n_eff);
-                    const double v = ihs_erlang_d(zw, 1);
-                    d_power[gf] = (v >= 0.0) ? v : 0.0;
+                    const double v = ihs_wilkie_d(val, n_eff);
+                    d_power[gf] = (d_is_finite(v) && v > 0.0) ? v : 0.0;
                 } else {
-                    const double v = ihs_erlang_d(val, 1);
-                    d_power[gf] = (v >= 0.0) ? v : 0.0;
+                    d_power[gf] = (d_is_finite(val) && val > 0.0) ? val : 0.0;
                 }
 #elif defined(SYCL_FFT_DF)
                 const Complexdf z = d_z[idx];
@@ -1663,12 +1705,10 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     const bool ge_one = (val.hi > 1.0f || (val.hi == 1.0f && val.lo >= 0.0f));
                     d_power[gf] = (!f_is_finite(val.hi) || ge_one) ? df_make(f_nan(), f_nan()) : val;
                 } else if (norm == NormKind::Nll) {
-                    const df_t zw = ihs_wilkie_df(val, n_eff);
-                    const df_t v = ihs_erlang_df(zw, 1);
-                    d_power[gf] = (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f)) ? v : df_make(0.0f, 0.0f);
+                    const df_t v = ihs_wilkie_df(val, n_eff);
+                    d_power[gf] = (f_is_finite(v.hi) && (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f))) ? v : df_make(0.0f, 0.0f);
                 } else {
-                    const df_t v = ihs_erlang_df(val, 1);
-                    d_power[gf] = (v.hi > 0.0f || (v.hi == 0.0f && v.lo > 0.0f)) ? v : df_make(0.0f, 0.0f);
+                    d_power[gf] = (f_is_finite(val.hi) && (val.hi > 0.0f || (val.hi == 0.0f && val.lo > 0.0f))) ? val : df_make(0.0f, 0.0f);
                 }
 #elif defined(SYCL_FFT_HALF)
                 const uint32_t u = sycl_fft_bit_cast<uint32_t>(d_z[idx]);
@@ -1681,12 +1721,10 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     if (!f_is_finite(val) || val >= 1.0f) val = f_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll) {
-                    const float zw = ihs_wilkie_f(val, n_eff);
-                    const float v = ihs_erlang_f(zw, 1);
-                    d_power[gf] = (v >= 0.0f) ? v : 0.0f;
+                    const float v = ihs_wilkie_f(val, n_eff);
+                    d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
                 } else {
-                    const float v = ihs_erlang_f(val, 1);
-                    d_power[gf] = (v >= 0.0f) ? v : 0.0f;
+                    d_power[gf] = (f_is_finite(val) && val > 0.0f) ? val : 0.0f;
                 }
 #else
                 const Complexf z = d_z[idx];
@@ -1696,12 +1734,10 @@ void SYCL_FFT_SUFFIX(launch_ihs_single)(
                     if (!f_is_finite(val) || val >= 1.0f) val = f_nan();
                     d_power[gf] = val;
                 } else if (norm == NormKind::Nll) {
-                    const float zw = ihs_wilkie_f(val, n_eff);
-                    const float v = ihs_erlang_f(zw, 1);
-                    d_power[gf] = (v >= 0.0f) ? v : 0.0f;
+                    const float v = ihs_wilkie_f(val, n_eff);
+                    d_power[gf] = (f_is_finite(v) && v > 0.0f) ? v : 0.0f;
                 } else {
-                    const float v = ihs_erlang_f(val, 1);
-                    d_power[gf] = (v >= 0.0f) ? v : 0.0f;
+                    d_power[gf] = (f_is_finite(val) && val > 0.0f) ? val : 0.0f;
                 }
 #endif
             });

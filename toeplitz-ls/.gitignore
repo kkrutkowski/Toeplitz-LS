@@ -1,5 +1,7 @@
 /build/
 /*.egg-info/
 /toeplitz_ls/*.so
+/toeplitz_ls/offload/*/*.so
+.pytest_cache/
 __pycache__/
 *.py[cod]
