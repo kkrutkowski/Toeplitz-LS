@@ -210,7 +210,7 @@ inline ChunkMemoryFit evaluate_chunk_memory(
         fit.fits = false;
         return fit;
     }
-    if (prec == TLS_SYCL_PREC_HALF && b_chunk > 1 && (b_chunk & 1u)) {
+    if (prec == TLS_SYCL_PREC_HALF && b_chunk < static_cast<size_t>(B_total) && b_chunk > 1 && (b_chunk & 1u)) {
         --b_chunk;
     }
     fit.B_chunk = static_cast<int>(std::max<size_t>(1, b_chunk));
